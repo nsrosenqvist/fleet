@@ -97,22 +97,3 @@ pub fn key(k: &str) -> Span<'_> {
         Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
     )
 }
-
-/// OSC 8 hyperlink: makes `text` cmd/ctrl-clickable in terminals that
-/// support the escape (`Ghostty`, `iTerm2`, `WezTerm`, `Kitty`, `Windows
-/// Terminal`, modern xterm). Terminals that ignore the escape render
-/// `text` plainly, so the URL is still readable and copy-pasteable.
-/// Styled underlined so users get a visual cue that the text behaves
-/// like a link.
-pub fn hyperlink(url: &str, text: &str) -> Span<'static> {
-    // OSC 8 wire format: ESC ] 8 ;; <url> ESC \ <text> ESC ] 8 ;; ESC \
-    // The escape characters have width 0 in unicode-width, but the URL
-    // is embedded literally, which inflates Line::width() by ~url-len
-    // chars. Acceptable here since the docs line is never the widest
-    // line in the modal.
-    let raw = format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\");
-    Span::styled(
-        raw,
-        Style::default().fg(ACCENT).add_modifier(Modifier::UNDERLINED),
-    )
-}
