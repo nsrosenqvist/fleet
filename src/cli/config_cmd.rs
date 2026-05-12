@@ -15,6 +15,14 @@ pub fn run_show(repo_root: &Path) -> Result<i32> {
     );
     println!("# Repo override: {}/.fleet.local.toml", repo_root.display());
     println!();
+    println!(
+        "agent_auth = \"{}\"",
+        match cfg.agent_auth() {
+            crate::config::AgentAuthMode::ClaudeOauth => "claude-oauth",
+            crate::config::AgentAuthMode::Passthrough => "passthrough",
+        }
+    );
+    println!();
     if cfg.secrets.is_empty() {
         println!("# (no secrets configured)");
     } else {
@@ -75,6 +83,23 @@ pub fn run_init() -> Result<i32> {
 
 fn default_template() -> &'static str {
     r#"# fleet — per-engineer config.
+#
+# ─── Agent auth flow ──────────────────────────────────────────────
+# How `fleet start` prepares auth inside the VM before `ao start`:
+#
+#   "claude-oauth" (default) — writes ~/.claude/.credentials.json from
+#     the resolved `claude_code_oauth_token` secret. Required for
+#     Claude Code subscription auth. Refuses to start if
+#     ANTHROPIC_API_KEY is set in the shell (it would override).
+#
+#   "passthrough" — no claude-specific prep; just forwards
+#     ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY /
+#     COMPOSIO_API_KEY into the VM. Use this when AO's configured
+#     agent is Codex, Aider, or any non-Claude flow.
+#
+# agent_auth = "claude-oauth"
+#
+# ─── Secret backend (only used under agent_auth = "claude-oauth") ───
 # Pick ONE backend for the `claude_code_oauth_token` secret.
 #
 # Option A: OS keyring (cross-platform — macOS Keychain, Linux Secret

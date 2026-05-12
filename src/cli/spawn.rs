@@ -9,12 +9,19 @@ use secrecy::ExposeSecret;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::config::Config;
+use crate::config::{AgentAuthMode, Config};
 use crate::lima::{Lima, VmStatus};
 use crate::process::{RealProcessInvoker, run_interactive};
 use crate::secrets::{self, SecretBackendConfig};
 
 const SECRET_KEY: &str = "claude_code_oauth_token";
+
+/// Provider env vars forwarded into the VM by `passthrough` mode. AO's
+/// agent plugins read whichever subset they need; fleet doesn't have
+/// to know the per-agent mapping. Extending this list is cheap — add
+/// the var here and Lima will pass it through.
+const PASSTHROUGH_ENV_ALLOW: &str =
+    "ANTHROPIC_API_KEY,OPENAI_API_KEY,GEMINI_API_KEY,GOOGLE_API_KEY,COMPOSIO_API_KEY";
 
 pub fn run_start(repo_root: &Path, no_dashboard: bool, no_orchestrator: bool) -> Result<i32> {
     let mut argv = vec!["start".to_string()];
@@ -52,32 +59,37 @@ pub fn run_batch_spawn(repo_root: &Path, issues: &[String]) -> Result<i32> {
 }
 
 fn run_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
+    let cfg = Config::load(repo_root)?;
+    match cfg.agent_auth() {
+        AgentAuthMode::ClaudeOauth => run_claude_oauth(repo_root, ao_argv, &cfg),
+        AgentAuthMode::Passthrough => run_passthrough(repo_root, ao_argv),
+    }
+}
+
+/// Pre-`ao start` flow for the Claude Code subscription path: write
+/// `~/.claude/.credentials.json` inside the VM with the OAuth token,
+/// scrub the env, anchor a tmux server, then hand off to AO. This is
+/// the historical default and refuses to start if `ANTHROPIC_API_KEY`
+/// is set in the shell — that var would make claude prefer API auth
+/// over the OAuth credential we just wrote and silently bypass the
+/// handoff.
+fn run_claude_oauth(repo_root: &Path, ao_argv: &[String], cfg: &Config) -> Result<i32> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker.clone(), "fleet-vm");
+    ensure_vm_running(&lima)?;
 
-    // Preflight: VM up?
-    match lima.status() {
-        VmStatus::Running => {}
-        VmStatus::Stopped => bail!(
-            "Lima VM `{}` is stopped. Start it with: fleet vm-start",
-            lima.vm_name()
-        ),
-        VmStatus::Missing => bail!(
-            "Lima VM `{}` not found. Create with the template at ~/.lima/fleet-vm.yaml.",
-            lima.vm_name()
-        ),
-    }
-
-    // Preflight: ANTHROPIC_API_KEY would override the subscription token.
+    // Refusal only fires under claude-oauth: under `passthrough`, an
+    // ANTHROPIC_API_KEY is exactly what Codex / Aider users need to
+    // pass into the VM.
     if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
         bail!(
-            "ANTHROPIC_API_KEY is set in this shell; it would override the subscription token. \
-             Run: unset ANTHROPIC_API_KEY"
+            "ANTHROPIC_API_KEY is set in this shell; under `agent_auth = \"claude-oauth\"` it \
+             would override the subscription token. Either `unset ANTHROPIC_API_KEY` or switch \
+             to `agent_auth = \"passthrough\"` in your fleet config."
         );
     }
 
     // Resolve secret.
-    let cfg = Config::load(repo_root)?;
     let secret_cfg: &SecretBackendConfig = cfg.secrets.get(SECRET_KEY).with_context(|| {
         format!(
             "no secret configured under `[secrets.{SECRET_KEY}]`. Run `fleet config init` to scaffold \
@@ -142,6 +154,56 @@ fn run_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
         ],
         &["ANTHROPIC_API_KEY"],
     )
+}
+
+/// Pre-`ao start` flow for non-Claude agents (Codex, Aider, …) — no
+/// credentials handoff, no env scrubbing, just forward a known set of
+/// provider env vars into the VM and run `ao` directly. Lima's
+/// `--preserve-env` carries the env over; `LIMA_SHELLENV_ALLOW` opts
+/// each var into the guest shell.
+fn run_passthrough(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
+    let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
+    let lima = Lima::new(invoker, "fleet-vm");
+    ensure_vm_running(&lima)?;
+
+    let ao_cmd = ao_argv
+        .iter()
+        .map(|a| shell_quote_single(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    run_interactive(
+        "limactl",
+        &[
+            "shell".to_string(),
+            "--preserve-env".to_string(),
+            "--workdir".to_string(),
+            repo_root.display().to_string(),
+            lima.vm_name().to_string(),
+            "bash".to_string(),
+            "-c".to_string(),
+            format!("ao {ao_cmd}"),
+        ],
+        &[
+            ("LIMA_SHELLENV_ALLOW", PASSTHROUGH_ENV_ALLOW),
+            ("TERM", "xterm-256color"),
+        ],
+        &[],
+    )
+}
+
+fn ensure_vm_running(lima: &Lima) -> Result<()> {
+    match lima.status() {
+        VmStatus::Running => Ok(()),
+        VmStatus::Stopped => bail!(
+            "Lima VM `{}` is stopped. Start it with: fleet vm-start",
+            lima.vm_name()
+        ),
+        VmStatus::Missing => bail!(
+            "Lima VM `{}` not found. Launch `fleet ui` to bring it up from the bundled template.",
+            lima.vm_name()
+        ),
+    }
 }
 
 /// In-VM bootstrap: write claude's credentials file + onboarding marker,
