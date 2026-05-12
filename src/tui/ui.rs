@@ -322,7 +322,11 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    if let Some(e) = &app.last_error {
+    // Action errors take priority over refresh errors: a fresh "Shift+S
+    // failed" needs to be visible even if a stale "ao probe timed out"
+    // is also pending. Refresh errors only surface when nothing else
+    // demands the row.
+    if let Some(e) = app.action_error.as_ref().or(app.refresh_error.as_ref()) {
         let line = Line::from(vec![
             badge(" ! ", ERR),
             Span::raw(" "),

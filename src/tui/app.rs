@@ -89,7 +89,20 @@ pub struct App {
 
     pub(super) sessions: Vec<SessionInfo>,
     pub(super) selected: usize,
-    pub(super) last_error: Option<String>,
+    /// Most recent error from the background refresh thread (probe
+    /// failure, etc.). Cleared automatically the next time `Sessions`
+    /// arrives successfully — refresh errors are by their nature
+    /// transient, so a recovered refresh should make the row green
+    /// again without user action.
+    pub(super) refresh_error: Option<String>,
+    /// Most recent error from a user-triggered action (Shift+S, kill,
+    /// etc.). Sticky until the next user action either succeeds (which
+    /// sets `last_info`) or fails (which overwrites this). Refresh
+    /// ticks must NOT clear this — otherwise an error from `Shift+S`
+    /// flashes for ~1.5s and then disappears when the next sessions
+    /// snapshot lands, which is exactly what users described as the
+    /// "flash and vanish" bug.
+    pub(super) action_error: Option<String>,
     pub(super) last_info: Option<String>,
     pub(super) ao_up: bool,
     pub(super) vm_status: VmStatus,
@@ -127,7 +140,8 @@ impl App {
             invoker: Arc::new(RealProcessInvoker),
             sessions: Vec::new(),
             selected: 0,
-            last_error: None,
+            refresh_error: None,
+            action_error: None,
             last_info: None,
             ao_up: false,
             vm_status: VmStatus::Missing,
@@ -172,7 +186,12 @@ impl App {
                         s.iter().filter_map(|s| s.id.clone()).collect();
                     self.pane_outputs.retain(|k, _| alive.contains(k));
                     self.sessions = s;
-                    self.last_error = None;
+                    // A successful refresh clears only the refresh-channel
+                    // error. Action errors stay until the next user
+                    // action — otherwise pressing Shift+S, seeing the
+                    // resulting error, and watching it vanish 1.5s later
+                    // makes the failure look like a glitch.
+                    self.refresh_error = None;
                     if !self.sessions.is_empty() && self.selected >= self.sessions.len() {
                         self.selected = self.sessions.len() - 1;
                     }
@@ -181,7 +200,7 @@ impl App {
                     self.pane_outputs.insert(session_id, output);
                 }
                 RefreshUpdate::Error(e) => {
-                    self.last_error = Some(e);
+                    self.refresh_error = Some(e);
                 }
                 RefreshUpdate::AoUp(up) => self.ao_up = up,
                 RefreshUpdate::VmUp(s) => self.vm_status = s,
@@ -245,15 +264,20 @@ impl App {
         self.selected_session().and_then(|s| s.id.clone())
     }
 
-    /// Single-line success flash for the status bar; also clears any pending
-    /// error so a successful action doesn't sit next to a stale red message.
+    /// Single-line success flash for the status bar; also clears any
+    /// pending action error so a successful action doesn't sit next to a
+    /// stale red message. Refresh errors are left alone — a successful
+    /// user action doesn't make the AO probe magically recover.
     pub(super) fn flash_ok(&mut self, msg: impl Into<String>) {
         self.last_info = Some(msg.into());
-        self.last_error = None;
+        self.action_error = None;
     }
 
+    /// Record an error from a user-triggered action. Sticky until the
+    /// next action overwrites it; see the doc on `action_error`.
     pub(super) fn flash_err(&mut self, msg: impl Into<String>) {
-        self.last_error = Some(msg.into());
+        self.action_error = Some(msg.into());
+        self.last_info = None;
     }
 
     /// Fold an action's `Result` into the flash slot. On error keeps the
@@ -388,7 +412,44 @@ mod tests {
         tx.send(RefreshUpdate::Error("ao unreachable".into()))
             .unwrap();
         app.drain_updates();
-        assert_eq!(app.last_error.as_deref(), Some("ao unreachable"));
+        assert_eq!(app.refresh_error.as_deref(), Some("ao unreachable"));
+    }
+
+    #[test]
+    fn action_error_survives_a_sessions_refresh() {
+        // Regression: refresh ticks used to clear the single last_error
+        // field, so an error from `Shift+S` would flash for ~1.5s and
+        // then vanish on the next sessions snapshot. Action errors are
+        // now sticky until the user takes another action.
+        let mut app = app_with(0);
+        app.flash_err("no secret configured");
+        let (tx, rx) = mpsc::channel();
+        app.refresh_update_rx = Some(rx);
+        tx.send(RefreshUpdate::Sessions(vec![session("sb-1")])).unwrap();
+        app.drain_updates();
+        assert_eq!(app.action_error.as_deref(), Some("no secret configured"));
+    }
+
+    #[test]
+    fn sessions_refresh_clears_refresh_error_only() {
+        // The other half of the split: refresh errors *should* clear on
+        // a successful Sessions snapshot — they're transient by nature.
+        let mut app = app_with(0);
+        app.refresh_error = Some("stale probe failure".into());
+        let (tx, rx) = mpsc::channel();
+        app.refresh_update_rx = Some(rx);
+        tx.send(RefreshUpdate::Sessions(vec![session("sb-1")])).unwrap();
+        app.drain_updates();
+        assert!(app.refresh_error.is_none());
+    }
+
+    #[test]
+    fn flash_ok_clears_action_error() {
+        let mut app = app_with(0);
+        app.flash_err("kill failed");
+        app.flash_ok("killed sb-1");
+        assert_eq!(app.last_info.as_deref(), Some("killed sb-1"));
+        assert!(app.action_error.is_none());
     }
 
     #[test]
