@@ -15,12 +15,19 @@ pub fn run_show(repo_root: &Path) -> Result<i32> {
     );
     println!("# Repo override: {}/.fleet.local.toml", repo_root.display());
     println!();
+    let mode = cfg.agent_auth();
+    let resolved = mode.resolve(repo_root);
     println!(
-        "agent_auth = \"{}\"",
-        match cfg.agent_auth() {
+        "agent_auth = \"{}\"   # resolves to: {}",
+        match mode {
+            crate::config::AgentAuthMode::Auto => "auto",
             crate::config::AgentAuthMode::ClaudeOauth => "claude-oauth",
             crate::config::AgentAuthMode::Passthrough => "passthrough",
-        }
+        },
+        match resolved {
+            crate::config::ResolvedAuthMode::ClaudeOauth => "claude-oauth",
+            crate::config::ResolvedAuthMode::Passthrough => "passthrough",
+        },
     );
     println!();
     if cfg.secrets.is_empty() {
@@ -87,17 +94,21 @@ fn default_template() -> &'static str {
 # ─── Agent auth flow ──────────────────────────────────────────────
 # How `fleet start` prepares auth inside the VM before `ao start`:
 #
-#   "claude-oauth" (default) — writes ~/.claude/.credentials.json from
-#     the resolved `claude_code_oauth_token` secret. Required for
-#     Claude Code subscription auth. Refuses to start if
-#     ANTHROPIC_API_KEY is set in the shell (it would override).
+#   "auto" (default) — read `defaults.agent` from
+#     agent-orchestrator.yaml. `claude-code` → claude-oauth, anything
+#     else → passthrough. The right answer for almost everyone.
 #
-#   "passthrough" — no claude-specific prep; just forwards
-#     ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY /
-#     COMPOSIO_API_KEY into the VM. Use this when AO's configured
-#     agent is Codex, Aider, or any non-Claude flow.
+#   "claude-oauth" — force claude-oauth regardless of AO config.
+#     Writes ~/.claude/.credentials.json from the resolved
+#     `claude_code_oauth_token` secret. Required for Claude Code
+#     subscription auth. Refuses to start if ANTHROPIC_API_KEY is set
+#     in the shell (it would override).
 #
-# agent_auth = "claude-oauth"
+#   "passthrough" — force passthrough regardless of AO config. No
+#     claude-specific prep; forwards ANTHROPIC_API_KEY /
+#     OPENAI_API_KEY / GEMINI_API_KEY / COMPOSIO_API_KEY into the VM.
+#
+# agent_auth = "auto"
 #
 # ─── Secret backend (only used under agent_auth = "claude-oauth") ───
 # Pick ONE backend for the `claude_code_oauth_token` secret.

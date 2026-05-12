@@ -36,17 +36,52 @@ pub struct Config {
 /// Other AO-supported agents (Codex, Aider, …) use whatever env-var
 /// flow their underlying provider expects; `passthrough` skips fleet's
 /// claude-specific prep entirely and just forwards a common allowlist
-/// of provider env vars into the VM. Users running those agents need
-/// `passthrough` so the `ANTHROPIC_API_KEY` refusal doesn't block
-/// `fleet start`.
+/// of provider env vars into the VM.
+///
+/// `auto` (the new default) reads `agent-orchestrator.yaml` and picks
+/// `claude-oauth` when the configured agent is `claude-code`, else
+/// `passthrough`. Use the explicit variants only when you need to
+/// override that mapping — e.g. running claude-code with API-key auth
+/// instead of subscription.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentAuthMode {
-    /// Claude Code subscription OAuth handoff. The historical default.
+    /// Derive the flow from `agent-orchestrator.yaml`. Default.
     #[default]
+    Auto,
+    /// Claude Code subscription OAuth handoff.
     ClaudeOauth,
     /// No claude-specific prep — forwards provider env vars into the VM
     /// and runs `ao start` directly.
+    Passthrough,
+}
+
+impl AgentAuthMode {
+    /// Resolve to a concrete flow (`ClaudeOauth` or `Passthrough`).
+    /// `Auto` reads the AO yaml from `repo_root` and consults the
+    /// configured agent; unreadable yaml or unset agent falls through
+    /// to `ClaudeOauth` for backwards compatibility.
+    pub fn resolve(self, repo_root: &Path) -> ResolvedAuthMode {
+        match self {
+            Self::ClaudeOauth => ResolvedAuthMode::ClaudeOauth,
+            Self::Passthrough => ResolvedAuthMode::Passthrough,
+            Self::Auto => {
+                let ao_cfg = crate::ao::config::AoConfig::load(repo_root).ok().flatten();
+                let agent = ao_cfg.as_ref().and_then(|c| c.agent());
+                match crate::ao::config::auth_mode_for_agent(agent) {
+                    crate::ao::config::AuthModeHint::ClaudeOauth => ResolvedAuthMode::ClaudeOauth,
+                    crate::ao::config::AuthModeHint::Passthrough => ResolvedAuthMode::Passthrough,
+                }
+            }
+        }
+    }
+}
+
+/// The concrete auth flow `fleet start` runs. `AgentAuthMode::Auto`
+/// collapses into one of these via [`AgentAuthMode::resolve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedAuthMode {
+    ClaudeOauth,
     Passthrough,
 }
 
@@ -160,9 +195,57 @@ mod tests {
     }
 
     #[test]
-    fn agent_auth_defaults_to_claude_oauth_when_unset() {
+    fn agent_auth_defaults_to_auto_when_unset() {
         let cfg = Config::default();
-        assert_eq!(cfg.agent_auth(), AgentAuthMode::ClaudeOauth);
+        assert_eq!(cfg.agent_auth(), AgentAuthMode::Auto);
+    }
+
+    #[test]
+    fn auto_resolves_to_claude_oauth_when_yaml_missing() {
+        // Backwards compat: no agent-orchestrator.yaml in the repo →
+        // historical claude-oauth behaviour.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resolved = AgentAuthMode::Auto.resolve(tmp.path());
+        assert_eq!(resolved, ResolvedAuthMode::ClaudeOauth);
+    }
+
+    #[test]
+    fn auto_resolves_to_claude_oauth_when_agent_is_claude_code() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("agent-orchestrator.yaml"),
+            "defaults:\n  agent: claude-code\n",
+        )
+        .unwrap();
+        let resolved = AgentAuthMode::Auto.resolve(tmp.path());
+        assert_eq!(resolved, ResolvedAuthMode::ClaudeOauth);
+    }
+
+    #[test]
+    fn auto_resolves_to_passthrough_for_non_claude_agent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("agent-orchestrator.yaml"),
+            "defaults:\n  agent: codex\n",
+        )
+        .unwrap();
+        let resolved = AgentAuthMode::Auto.resolve(tmp.path());
+        assert_eq!(resolved, ResolvedAuthMode::Passthrough);
+    }
+
+    #[test]
+    fn explicit_modes_ignore_yaml() {
+        // An explicit `agent_auth = "passthrough"` overrides whatever
+        // the AO yaml says; the user is forcing the mode for a reason
+        // (e.g. claude-code with API-key auth instead of subscription).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("agent-orchestrator.yaml"),
+            "defaults:\n  agent: claude-code\n",
+        )
+        .unwrap();
+        let resolved = AgentAuthMode::Passthrough.resolve(tmp.path());
+        assert_eq!(resolved, ResolvedAuthMode::Passthrough);
     }
 
     #[test]

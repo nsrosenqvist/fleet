@@ -1,0 +1,214 @@
+//! `agent-orchestrator.yaml` parsing.
+//!
+//! Strongly-typed view of the subset of AO's config fleet cares about
+//! today — `defaults`, `projects` (name / path / branch / tracker), and
+//! a tiny shell of `reactions` / `plugins` so we can present + edit
+//! them later. Unknown fields are preserved as raw [`serde_yml::Value`]
+//! so a round-trip doesn't drop schema-rich keys we haven't modelled
+//! yet (e.g. fleet hasn't surfaced `notifiers` in the UI, but losing
+//! those entries on save would be obnoxious).
+//!
+//! Read-only for the moment; the eventual writeback path lives in a
+//! sibling commit and uses [`save`] which is currently absent. Comments
+//! are not preserved by `serde_yml` — callers planning to write back
+//! should confirm with the user before clobbering hand-written notes.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// The agent fleet's `start` flow optimizes for. Mirrors what AO's
+/// own enum is named; we keep it as a free string so unrecognised
+/// values from a newer AO release don't crash the parser — they just
+/// fall through to `passthrough` in [`Self::auth_mode_hint`].
+pub const AGENT_CLAUDE_CODE: &str = "claude-code";
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AoConfig {
+    #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub defaults: Defaults,
+    #[serde(default)]
+    pub projects: BTreeMap<String, Project>,
+    /// Unknown / not-yet-modelled top-level keys (`reactions`,
+    /// `plugins`, `notifiers`, …). Round-tripped verbatim so save
+    /// doesn't drop them; the config UI will surface model'd
+    /// sections in their own panels and leave these alone until we
+    /// extend the schema.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_yml::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Defaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Project {
+    pub name: String,
+    #[serde(rename = "sessionPrefix", default, skip_serializing_if = "Option::is_none")]
+    pub session_prefix: Option<String>,
+    pub path: PathBuf,
+    #[serde(rename = "defaultBranch", default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    #[serde(rename = "agentRulesFile", default, skip_serializing_if = "Option::is_none")]
+    pub agent_rules_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracker: Option<Tracker>,
+    #[serde(rename = "postCreate", default, skip_serializing_if = "Vec::is_empty")]
+    pub post_create: Vec<String>,
+    /// Other per-project keys we haven't surfaced yet.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_yml::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tracker {
+    pub plugin: String,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_yml::Value>,
+}
+
+impl AoConfig {
+    /// Repo-relative path to the AO config — same location AO itself
+    /// reads, and the same file the existing `c` keybind opens in
+    /// `$EDITOR`.
+    pub fn path(repo_root: &Path) -> PathBuf {
+        repo_root.join("agent-orchestrator.yaml")
+    }
+
+    /// Parse the on-disk yaml. Returns `Ok(None)` if the file is
+    /// absent — useful for codebases bootstrapping fleet before AO is
+    /// wired up. Anything else (parse error, IO error) bubbles as
+    /// `Err` with context.
+    pub fn load(repo_root: &Path) -> Result<Option<Self>> {
+        let path = Self::path(repo_root);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let parsed: Self = serde_yml::from_str(&text)
+            .with_context(|| format!("parse {}", path.display()))?;
+        Ok(Some(parsed))
+    }
+
+    /// Effective agent name. Looks at the `Self::defaults.agent` field;
+    /// returns `None` when neither defaults nor the file set one (AO
+    /// falls back to claude-code internally, but fleet treats "not set"
+    /// distinctly so the config UI can show "(default)" instead of
+    /// pretending the user chose it).
+    pub fn agent(&self) -> Option<&str> {
+        self.defaults.agent.as_deref()
+    }
+}
+
+/// Heuristic mapping from a free-form agent name to the auth flow
+/// fleet's `start` should run. Used by [`crate::config::AgentAuthMode::Auto`].
+///
+/// `claude-code` → `claude-oauth` (writes credentials file, scrubs env).
+/// Anything else → `passthrough` (forwards provider env vars, no
+/// claude-specific prep). Unset / unparseable AO config also yields
+/// `claude-oauth` for backwards compatibility — that's the historical
+/// behaviour and keeps existing setups working.
+pub fn auth_mode_for_agent(agent: Option<&str>) -> AuthModeHint {
+    match agent {
+        Some(name) if name == AGENT_CLAUDE_CODE => AuthModeHint::ClaudeOauth,
+        Some(_) => AuthModeHint::Passthrough,
+        None => AuthModeHint::ClaudeOauth,
+    }
+}
+
+/// Two-state hint returned by [`auth_mode_for_agent`]. Mirrors the
+/// concrete variants of [`crate::config::AgentAuthMode`] minus `Auto`
+/// itself, since this function is the *resolver* — it can't return
+/// "auto, figure it out yourself."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthModeHint {
+    ClaudeOauth,
+    Passthrough,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_minimum_yaml() {
+        let yaml = "port: 3000\n";
+        let cfg: AoConfig = serde_yml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.port, Some(3000));
+        assert!(cfg.defaults.agent.is_none());
+    }
+
+    #[test]
+    fn parses_full_sample() {
+        // Modelled on the actual agent-orchestrator.yaml shipped in
+        // this repo, including unknown top-level keys (`reactions`,
+        // `plugins`) we expect to round-trip via `extra`.
+        let yaml = r"
+port: 3000
+defaults:
+  runtime: tmux
+  agent: claude-code
+  workspace: worktree
+  notifiers: []
+projects:
+  sandbox:
+    name: sandbox
+    sessionPrefix: sb
+    path: /tmp/sandbox
+    defaultBranch: main
+    tracker:
+      plugin: git-bug
+reactions:
+  approved-and-green:
+    auto: false
+";
+        let cfg: AoConfig = serde_yml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.defaults.agent.as_deref(), Some("claude-code"));
+        assert_eq!(cfg.defaults.runtime.as_deref(), Some("tmux"));
+        let sandbox = cfg.projects.get("sandbox").expect("sandbox project");
+        assert_eq!(sandbox.name, "sandbox");
+        assert_eq!(sandbox.session_prefix.as_deref(), Some("sb"));
+        assert_eq!(sandbox.tracker.as_ref().map(|t| t.plugin.as_str()), Some("git-bug"));
+        // Unknown top-level key preserved.
+        assert!(cfg.extra.contains_key("reactions"));
+    }
+
+    #[test]
+    fn auth_mode_hint_claude_code() {
+        assert_eq!(auth_mode_for_agent(Some("claude-code")), AuthModeHint::ClaudeOauth);
+    }
+
+    #[test]
+    fn auth_mode_hint_codex_is_passthrough() {
+        assert_eq!(auth_mode_for_agent(Some("codex")), AuthModeHint::Passthrough);
+    }
+
+    #[test]
+    fn auth_mode_hint_aider_is_passthrough() {
+        assert_eq!(auth_mode_for_agent(Some("aider")), AuthModeHint::Passthrough);
+    }
+
+    #[test]
+    fn auth_mode_hint_unset_defaults_to_claude_oauth() {
+        // Backwards compat: a missing or unreadable AO config keeps
+        // the historical behaviour for users who haven't migrated.
+        assert_eq!(auth_mode_for_agent(None), AuthModeHint::ClaudeOauth);
+    }
+}

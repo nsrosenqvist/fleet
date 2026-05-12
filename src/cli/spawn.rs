@@ -9,7 +9,7 @@ use secrecy::ExposeSecret;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::config::{AgentAuthMode, Config};
+use crate::config::{Config, ResolvedAuthMode};
 use crate::lima::{Lima, VmStatus};
 use crate::process::{RealProcessInvoker, run_interactive};
 use crate::secrets::{self, SecretBackendConfig};
@@ -60,9 +60,9 @@ pub fn run_batch_spawn(repo_root: &Path, issues: &[String]) -> Result<i32> {
 
 fn run_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
     let cfg = Config::load(repo_root)?;
-    match cfg.agent_auth() {
-        AgentAuthMode::ClaudeOauth => run_claude_oauth(repo_root, ao_argv, &cfg),
-        AgentAuthMode::Passthrough => run_passthrough(repo_root, ao_argv),
+    match cfg.agent_auth().resolve(repo_root) {
+        ResolvedAuthMode::ClaudeOauth => run_claude_oauth(repo_root, ao_argv, &cfg),
+        ResolvedAuthMode::Passthrough => run_passthrough(repo_root, ao_argv),
     }
 }
 
