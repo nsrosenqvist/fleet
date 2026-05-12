@@ -16,8 +16,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::app::{App, Command};
+use super::bringup::BringUp;
 use super::input;
-use super::preflight::{self, MissingDep, Preflight, VM_NAME};
+use super::preflight::{self, MissingDep, Preflight};
 use super::subprocess::suspend_around;
 use super::ui;
 
@@ -133,23 +134,42 @@ fn prompt_vm_action(
     }
 }
 
-/// Suspend the alt screen and run `limactl start fleet-vm` interactively.
-/// Lima prompts for template choice on first run and streams cloud-init
-/// progress over many minutes — letting it own the terminal during that
-/// window is far less surprising than trying to surface a fraction of
-/// the output in a TUI pane. On return we redraw and let `settle_preflight`
-/// re-check VM status.
+/// Run `limactl start --tty=false fleet-vm` as a piped child and render
+/// a live progress modal until it exits. The non-interactive flag skips
+/// Lima's template picker (silently accepts `template:default`), and
+/// piping stdio keeps the user inside the TUI for the whole 5–10 min
+/// cloud-init window. On exit we drop the modal and let
+/// [`settle_preflight`] re-check VM status — if limactl returned non-zero
+/// or the VM still isn't running, the next iteration shows the relevant
+/// modal again rather than blindly proceeding into a broken TUI.
 fn bring_up_vm(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    suspend_around(term, || {
-        crate::process::run_interactive(
-            "limactl",
-            &["start".to_string(), VM_NAME.to_string()],
-            &[],
-            &[],
-        )
-        .map(|_| ())
-    })?;
-    Ok(())
+    let mut bringup = BringUp::spawn()?;
+    loop {
+        bringup.tick();
+        term.draw(|f| ui::render_vm_bringup(f, &bringup))?;
+        if bringup.is_finished() {
+            // One last drain after the Exited event to flush any trailing
+            // log lines that arrived in the same tick window.
+            bringup.tick();
+            term.draw(|f| ui::render_vm_bringup(f, &bringup))?;
+            // Surface a hard failure (spawn / wait error) immediately so
+            // the caller doesn't loop preflight forever against a broken
+            // limactl. Non-zero exit codes flow through the normal path —
+            // preflight re-runs and either advances (VM came up despite
+            // the code) or shows the relevant modal again.
+            if let Some(Err(e)) = bringup.outcome() {
+                return Err(anyhow::anyhow!("vm bring-up: {e}"));
+            }
+            return Ok(());
+        }
+        // Drain stray crossterm events while the child runs so a stuck
+        // queue doesn't bloat. We don't act on them — the modal has no
+        // keymap by design (cancelling a half-baked Lima create is worse
+        // than waiting it out).
+        if event::poll(TICK_INTERVAL)? {
+            let _ = event::read();
+        }
+    }
 }
 
 fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {

@@ -14,6 +14,7 @@
 //! titles inline on the border, dot-separated status bar at the bottom.
 
 mod app;
+mod bringup;
 mod input;
 mod preflight;
 mod refresh;

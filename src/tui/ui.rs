@@ -26,6 +26,7 @@ use crate::ao::SessionInfo;
 use crate::lima::VmStatus;
 
 use super::app::App;
+use super::bringup::BringUp;
 use super::preflight::MissingDep;
 use super::theme::{
     ACCENT, ERR, KEY_FG, MUTED, OK, WARN, badge, chip, framed_block, framed_block_titled, key,
@@ -505,6 +506,77 @@ pub(super) fn render_vm_stopped(frame: &mut Frame<'_>) {
         )),
     ];
     draw_modal(frame, " vm setup ", WARN, lines, &footer_yn("start"));
+}
+
+/// Live progress modal painted while [`crate::tui::bringup::BringUp`] is
+/// in flight. Spinner cycles each draw; the body shows the tail of
+/// limactl output so the user has something to watch other than an
+/// elapsed-time counter.
+pub(super) fn render_vm_bringup(frame: &mut Frame<'_>, bringup: &BringUp) {
+    // Mod down to the frame index first so `try_from` can never fail.
+    let n = SPINNER_FRAMES.len() as u64;
+    let frame_idx = usize::try_from(bringup.elapsed_secs() % n).unwrap_or(0);
+    let spinner = SPINNER_FRAMES[frame_idx];
+    let header = Line::from(vec![
+        Span::styled(
+            format!("{spinner} "),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Bringing up fleet-vm",
+            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("{}s", bringup.elapsed_secs()),
+            Style::default().fg(MUTED),
+        ),
+    ]);
+
+    let mut lines = vec![
+        header,
+        Line::raw(""),
+        Line::from(Span::styled(
+            "limactl output (most recent):",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    let mut had_any = false;
+    for raw in bringup.tail_lines() {
+        had_any = true;
+        // Indent so the tail block reads as a quoted subprocess log,
+        // not as part of the modal's own copy. Truncate at a generous
+        // width — the modal sizes itself to fit, but a stray 400-char
+        // line shouldn't define the layout.
+        let truncated = truncate_for_modal(raw, 80);
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default().fg(MUTED)),
+            Span::styled(truncated, Style::default().fg(MUTED)),
+        ]));
+    }
+    if !had_any {
+        lines.push(Line::from(Span::styled(
+            "  (waiting for limactl…)",
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    let footer = vec![Line::from(Span::styled(
+        "Cloud-init can take 5–10 minutes on first boot.",
+        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+    ))];
+    draw_modal(frame, " vm setup ", ACCENT, lines, &footer);
+}
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn truncate_for_modal(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn footer_yn(verb: &str) -> Vec<Line<'static>> {
