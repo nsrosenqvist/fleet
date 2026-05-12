@@ -15,12 +15,15 @@
 use std::process::{Command, Stdio};
 
 /// One missing dependency, ready to display in the preflight modal.
-/// `purpose` answers "why does fleet need this?"; `install_hint` is the
-/// one-liner the user can copy-paste.
+/// `purpose` answers "why does fleet need this?"; `install` is the one
+/// copy-pasteable command for the platform we expect most users on
+/// (macOS via Homebrew); `docs` is an optional URL for anyone on a
+/// different platform.
 pub struct MissingDep {
     pub name: &'static str,
     pub purpose: &'static str,
-    pub install_hint: &'static str,
+    pub install: &'static str,
+    pub docs: Option<&'static str>,
 }
 
 /// Run the preflight probes. Returns an empty vec on success.
@@ -30,7 +33,8 @@ pub fn check() -> Vec<MissingDep> {
         out.push(MissingDep {
             name: "limactl",
             purpose: "drives the Lima VM that hosts the ao orchestrator and tmux sessions",
-            install_hint: "brew install lima   (macOS)   |   see https://lima-vm.io for other platforms",
+            install: "brew install lima",
+            docs: Some("https://lima-vm.io"),
         });
     }
     out

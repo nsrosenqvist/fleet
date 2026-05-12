@@ -405,10 +405,19 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
             Span::raw("  "),
             Span::styled(f.purpose.to_string(), Style::default().fg(MUTED)),
         ]));
+        // Two rows so the copy-pasteable command lives on its own line
+        // (no whitespace ambiguity, easy to triple-click) and the docs
+        // URL sits below it as a clearly secondary aid.
         lines.push(Line::from(vec![
-            Span::raw("  install: "),
-            Span::styled(f.install_hint.to_string(), Style::default().fg(ACCENT)),
+            Span::styled("  install  ", Style::default().fg(MUTED)),
+            Span::styled(f.install.to_string(), Style::default().fg(ACCENT)),
         ]));
+        if let Some(url) = f.docs {
+            lines.push(Line::from(vec![
+                Span::styled("  docs     ", Style::default().fg(MUTED)),
+                Span::styled(url.to_string(), Style::default().fg(ACCENT)),
+            ]));
+        }
         lines.push(Line::raw(""));
     }
     lines.push(Line::from(Span::styled(
