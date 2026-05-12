@@ -27,7 +27,8 @@ use crate::lima::VmStatus;
 
 use super::app::App;
 use super::theme::{
-    ACCENT, ERR, MUTED, OK, WARN, chip, framed_block, framed_block_titled, key, kv_line, sep,
+    ACCENT, ERR, MUTED, OK, WARN, badge, chip, framed_block, framed_block_titled, key, kv_line,
+    sep,
 };
 
 pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
@@ -304,21 +305,41 @@ fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    // Confirmation prompt takes over the status bar when active.
+    // Three overlays replace the legend rather than appending to it: a
+    // pending confirm, an error flash, an info flash. Match keel's pattern
+    // — appending was fine while messages stayed short, but a real shell
+    // error ("failed to spawn `limactl`: No such file or directory") runs
+    // past the right edge of a typical terminal and chops off the relevant
+    // text. Anything load-bearing belongs on the left.
     if let Some(c) = &app.confirm {
-        let prompt = Line::from(vec![
-            chip("[confirm]", WARN),
-            Span::raw("  "),
-            Span::raw(c.prompt()),
+        let line = Line::from(vec![
+            badge(" ? ", WARN),
+            Span::raw(" "),
+            Span::styled(c.prompt(), Style::default().fg(WARN)),
         ]);
-        frame.render_widget(
-            Paragraph::new(prompt).style(Style::default().fg(WARN)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if let Some(e) = &app.last_error {
+        let line = Line::from(vec![
+            badge(" ! ", ERR),
+            Span::raw(" "),
+            Span::styled(e.clone(), Style::default().fg(ERR)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if let Some(m) = &app.last_info {
+        let line = Line::from(vec![
+            badge(" ✓ ", OK),
+            Span::raw(" "),
+            Span::styled(m.clone(), Style::default().fg(OK)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
         return;
     }
 
-    let mut spans: Vec<Span<'_>> = vec![
+    let spans: Vec<Span<'_>> = vec![
         chip("[fleet]", ACCENT),
         sep(),
         key("↑/↓"),
@@ -348,16 +369,6 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         key("q"),
         Span::raw(" quit"),
     ];
-    if let Some(e) = &app.last_error {
-        spans.push(sep());
-        spans.push(Span::styled(
-            format!("[error] {e}"),
-            Style::default().fg(ERR),
-        ));
-    } else if let Some(m) = &app.last_info {
-        spans.push(sep());
-        spans.push(Span::styled(m.clone(), Style::default().fg(OK)));
-    }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().fg(MUTED)),
         area,

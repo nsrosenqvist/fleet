@@ -72,6 +72,19 @@ pub fn chip(text: &str, color: Color) -> Span<'_> {
     )
 }
 
+/// Block-style badge — black foreground on a coloured background, used by
+/// status-bar flashes (`! `, `? `, `✓ `) to read as a discrete pill that
+/// won't disappear into a long red error line.
+pub fn badge(text: &str, color: Color) -> Span<'_> {
+    Span::styled(
+        text.to_string(),
+        Style::default()
+            .fg(Color::Black)
+            .bg(color)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 /// Dot separator between hotkey groups in the status bar.
 pub fn sep() -> Span<'static> {
     Span::styled("  ·  ", Style::default().fg(MUTED))
