@@ -1,0 +1,21 @@
+# Local scratch space — git-bug sandbox repo for plugin dev, agent worktrees, etc.
+tmp/
+
+# Node / pnpm
+node_modules/
+dist/
+*.tsbuildinfo
+.pnpm-store/
+
+# Rust / Cargo
+target/
+**/target/
+
+# Per-engineer fleet config override (gitignored; XDG copy is the default)
+.fleet.local.toml
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

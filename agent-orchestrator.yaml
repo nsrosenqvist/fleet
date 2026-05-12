@@ -1,0 +1,40 @@
+$schema: https://raw.githubusercontent.com/ComposioHQ/agent-orchestrator/main/schema/config.schema.json
+port: 3000
+defaults:
+  runtime: tmux
+  agent: claude-code
+  workspace: worktree
+  notifiers: []
+projects:
+  sandbox:
+    name: sandbox
+    sessionPrefix: sb
+    # Throwaway sandbox repo under tmp/, with no GitHub remote so the
+    # scm-github plugin stays out of the picture. Replace with a real project
+    # whenever AO should operate against a non-throwaway codebase.
+    path: /Users/niklas/Code/agent-team/tmp/git-bug-sandbox
+    defaultBranch: main
+    # `agentRulesFile: AGENTS.md` would point at the AGENTS.md inside the
+    # project path. The sandbox doesn't have one; once you swap in a real
+    # codebase with its own AGENTS.md, uncomment the line below.
+    # agentRulesFile: AGENTS.md
+    tracker:
+      plugin: git-bug
+    # AO defaults to permissionless workers, which adds `--dangerously-skip-permissions`
+    # to claude — that triggers a one-time per-worktree "Bypass Permissions"
+    # confirmation dialog. The postCreate hook below pre-marks each new
+    # worktree as trust-accepted + bypass-accepted in ~/.claude.json so
+    # claude skips both dialogs.
+    postCreate:
+      - node /Users/niklas/Code/agent-team/scripts/fleet-postcreate-trust-cwd.cjs
+reactions:
+  # Defensive guardrail. Auto-merge is opt-in and reviewed; do not flip to
+  # true without an explicit human decision.
+  approved-and-green:
+    auto: false
+    action: auto-merge
+plugins:
+  - name: git-bug
+    source: local
+    path: /Users/niklas/Code/agent-team/packages/tracker-git-bug
+    enabled: true
