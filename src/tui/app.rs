@@ -63,11 +63,10 @@ pub(super) enum View {
 /// Which form field the Config view currently has focused. Order
 /// matters — Tab cycles in declaration order.
 ///
-/// `ProjectSelection` sits at the top of the project panel; the
-/// trailing `Project*` variants are detail rows of whichever project
-/// is currently selected by that cycle field. Cycling away from
-/// `ProjectSelection` keeps the per-project fields pointed at the same
-/// project so the user can keep editing it.
+/// Per-repo fleet means there's exactly one in-scope project at a
+/// time (the one whose path matches cwd), so the form has no project
+/// *selector* — the target project is implied. Each `Project*` field
+/// edits that one project's value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ConfigField {
     #[default]
@@ -75,7 +74,6 @@ pub(super) enum ConfigField {
     Runtime,
     Workspace,
     Port,
-    ProjectSelection,
     ProjectName,
     ProjectSessionPrefix,
     ProjectPath,
@@ -90,7 +88,6 @@ impl ConfigField {
         Self::Runtime,
         Self::Workspace,
         Self::Port,
-        Self::ProjectSelection,
         Self::ProjectName,
         Self::ProjectSessionPrefix,
         Self::ProjectPath,
@@ -105,7 +102,6 @@ impl ConfigField {
             Self::Runtime => "runtime",
             Self::Workspace => "workspace",
             Self::Port => "port",
-            Self::ProjectSelection => "project",
             Self::ProjectName => "name",
             Self::ProjectSessionPrefix => "sessionPrefix",
             Self::ProjectPath => "path",
@@ -115,10 +111,9 @@ impl ConfigField {
         }
     }
 
-    /// True when this field targets the currently selected project
-    /// rather than the defaults block. Used by the renderer to skip
-    /// per-project rows when no projects exist, and by edit handlers
-    /// to look up the right mutable target.
+    /// True when this field targets the in-scope project rather than
+    /// the defaults block. Used by the renderer to skip per-project
+    /// rows when no project is in scope.
     pub(super) fn is_project_field(self) -> bool {
         matches!(
             self,
@@ -160,11 +155,13 @@ pub(super) struct ConfigForm {
     /// `Some` when the user is mid-text-edit on a string/number field.
     /// Carries the in-progress string; commit on Enter, revert on Esc.
     pub(super) editing: Option<String>,
-    /// Which project's detail rows are visible right now. Sorted-key
-    /// index into `draft.projects`. Survives across form-field focus
-    /// changes — moving Tab away from `ProjectSelection` doesn't reset
-    /// which project you were inspecting.
-    pub(super) selected_project_idx: usize,
+    /// Project key the form's per-project rows target. Set once at
+    /// form creation from `App::current_project_key`; stays fixed for
+    /// the form's lifetime so reload-on-save doesn't have to chase a
+    /// moving target. `None` when fleet was launched outside any
+    /// known project — the project rows render an "init this dir as
+    /// a project" hint instead of fields.
+    pub(super) target_project_key: Option<String>,
 }
 
 impl ConfigForm {
@@ -173,27 +170,15 @@ impl ConfigForm {
             draft: cfg,
             focus: ConfigField::default(),
             editing: None,
-            selected_project_idx: 0,
+            target_project_key: None,
         }
     }
 
-    /// Sorted project keys — drives the project-selector cycling and
-    /// the "(N of M)" indicator. Sorted (`BTreeMap`) so the order is
-    /// stable across reloads.
-    pub(super) fn project_keys(&self) -> Vec<&str> {
-        self.draft.projects.keys().map(String::as_str).collect()
-    }
-
-    /// Currently selected project's `(key, value)` pair, if any.
-    /// Clamps the index in case the project list shrunk since the
-    /// last frame (e.g. a save that removed an entry).
+    /// Project the per-project rows write into, if any. Returns the
+    /// `(key, value)` pair so the renderer can title-case the panel
+    /// with the project's key.
     pub(super) fn selected_project(&self) -> Option<(&str, &crate::ao::config::Project)> {
-        let keys = self.project_keys();
-        if keys.is_empty() {
-            return None;
-        }
-        let idx = self.selected_project_idx.min(keys.len() - 1);
-        let key = keys[idx];
+        let key = self.target_project_key.as_deref()?;
         self.draft.projects.get_key_value(key).map(|(k, v)| (k.as_str(), v))
     }
 
@@ -234,7 +219,8 @@ impl ConfigForm {
                     delta,
                 );
             }
-            // Text-edited fields don't respond to cycle keystrokes.
+            // Text-edited fields don't respond to cycle keystrokes;
+            // they enter edit mode on Enter / Space instead.
             ConfigField::Port
             | ConfigField::ProjectName
             | ConfigField::ProjectSessionPrefix
@@ -242,18 +228,6 @@ impl ConfigForm {
             | ConfigField::ProjectDefaultBranch
             | ConfigField::ProjectAgentRulesFile
             | ConfigField::ProjectAgent => {}
-            ConfigField::ProjectSelection => {
-                let n = self.draft.projects.len();
-                if n == 0 {
-                    return;
-                }
-                // Unsigned modulo: shift by `delta` rounded into `[0, n)`.
-                self.selected_project_idx = if delta >= 0 {
-                    (self.selected_project_idx + delta.unsigned_abs() as usize) % n
-                } else {
-                    (self.selected_project_idx + n - (delta.unsigned_abs() as usize % n)) % n
-                };
-            }
         }
     }
 
@@ -292,10 +266,7 @@ impl ConfigForm {
                 .and_then(|(_, p)| p.agent.clone())
                 .unwrap_or_default(),
             // Enum / cycle fields don't have a text editor.
-            ConfigField::Agent
-            | ConfigField::Runtime
-            | ConfigField::Workspace
-            | ConfigField::ProjectSelection => return,
+            ConfigField::Agent | ConfigField::Runtime | ConfigField::Workspace => return,
         };
         self.editing = Some(initial);
     }
@@ -401,10 +372,7 @@ impl ConfigForm {
         };
         self.draft.projects.insert(key.clone(), project);
         // Land the form on the new project for immediate editing.
-        let keys = self.project_keys();
-        if let Some(idx) = keys.iter().position(|k| *k == key.as_str()) {
-            self.selected_project_idx = idx;
-        }
+        self.target_project_key = Some(key.clone());
         key
     }
 
@@ -439,24 +407,30 @@ impl ConfigForm {
     }
 
     fn field_reachable(&self, field: ConfigField) -> bool {
-        if field.is_project_field() || matches!(field, ConfigField::ProjectSelection) {
-            !self.draft.projects.is_empty()
+        if field.is_project_field() {
+            // Per-project fields are only reachable when there's a
+            // resolved target project to write into.
+            self.target_project_key.is_some()
+                && self
+                    .target_project_key
+                    .as_deref()
+                    .is_some_and(|k| self.draft.projects.contains_key(k))
         } else {
             true
         }
     }
 
-    /// Owned copy of the currently selected project's map key, if any.
-    /// Returns an owned `String` rather than a reference to avoid a
-    /// long borrow against `self.draft.projects` from the call sites
-    /// in `commit_edit` (which then needs to mutate the same map).
+    /// Owned copy of the in-scope project's map key, if any. Returns
+    /// an owned `String` rather than a reference so `commit_edit`
+    /// (which mutates `self.draft.projects` in the same call) can hold
+    /// the key past the immutable borrow.
     fn selected_project_key(&self) -> Option<String> {
-        let keys = self.project_keys();
-        if keys.is_empty() {
-            return None;
+        let key = self.target_project_key.as_deref()?;
+        if self.draft.projects.contains_key(key) {
+            Some(key.to_string())
+        } else {
+            None
         }
-        let idx = self.selected_project_idx.min(keys.len() - 1);
-        Some(keys[idx].to_string())
     }
 }
 
@@ -686,14 +660,10 @@ impl App {
             .and_then(|c| c.project_for_cwd(repo_root).map(String::from));
         let config_form = ao_config.clone().map(|cfg| {
             let mut form = ConfigForm::new(cfg);
-            // Pre-select the project matching cwd so the Config view
-            // lands on the right one without the user cycling.
-            if let Some(key) = &current_project_key {
-                let keys = form.project_keys();
-                if let Some(idx) = keys.iter().position(|k| *k == key.as_str()) {
-                    form.selected_project_idx = idx;
-                }
-            }
+            // Per-repo fleet: bind the form's project rows to the
+            // cwd-matched project. None = the form's project rows
+            // become unreachable until the user runs `N` to init one.
+            form.target_project_key.clone_from(&current_project_key);
             form
         });
         Ok(Self {
@@ -812,12 +782,8 @@ impl App {
                     .and_then(|c| c.project_for_cwd(&self.repo_root).map(String::from));
                 self.config_form = cfg.clone().map(|c| {
                     let mut form = ConfigForm::new(c);
-                    if let Some(key) = &self.current_project_key {
-                        let keys = form.project_keys();
-                        if let Some(idx) = keys.iter().position(|k| *k == key.as_str()) {
-                            form.selected_project_idx = idx;
-                        }
-                    }
+                    form.target_project_key
+                        .clone_from(&self.current_project_key);
                     form
                 });
                 self.ao_config = cfg;
@@ -1185,11 +1151,7 @@ mod tests {
     #[test]
     fn config_field_cycles_forward_and_back() {
         assert_eq!(ConfigField::Agent.next(), ConfigField::Runtime);
-        assert_eq!(ConfigField::Port.next(), ConfigField::ProjectSelection);
-        assert_eq!(
-            ConfigField::ProjectSelection.next(),
-            ConfigField::ProjectName,
-        );
+        assert_eq!(ConfigField::Port.next(), ConfigField::ProjectName);
         assert_eq!(
             ConfigField::ProjectAgent.next(),
             ConfigField::Agent,
@@ -1214,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_next_walks_project_fields_when_present() {
+    fn focus_next_walks_project_fields_when_target_set() {
         let yaml = r"
 projects:
   one:
@@ -1223,11 +1185,12 @@ projects:
 ";
         let cfg: crate::ao::config::AoConfig = serde_yml::from_str(yaml).expect("parse");
         let mut form = ConfigForm::new(cfg);
+        form.target_project_key = Some("one".to_string());
         form.focus = ConfigField::Port;
         form.focus_next();
-        assert_eq!(form.focus, ConfigField::ProjectSelection);
-        form.focus_next();
         assert_eq!(form.focus, ConfigField::ProjectName);
+        form.focus_next();
+        assert_eq!(form.focus, ConfigField::ProjectSessionPrefix);
     }
 
     #[test]
@@ -1282,7 +1245,7 @@ projects:
     }
 
     #[test]
-    fn project_name_edit_writes_into_selected_project() {
+    fn project_name_edit_writes_into_target_project() {
         let yaml = r"
 projects:
   one:
@@ -1291,6 +1254,7 @@ projects:
 ";
         let cfg: crate::ao::config::AoConfig = serde_yml::from_str(yaml).expect("parse");
         let mut form = ConfigForm::new(cfg);
+        form.target_project_key = Some("one".to_string());
         form.focus = ConfigField::ProjectName;
         form.begin_edit();
         let buf = form.editing.as_mut().expect("editing started");
@@ -1301,28 +1265,26 @@ projects:
     }
 
     #[test]
-    fn project_selection_cycles_through_project_keys() {
-        // Two-project config; cycling the selection field should walk
-        // sorted keys forward and wrap.
+    fn unscoped_form_makes_project_fields_unreachable() {
+        // A form with no target project (cwd outside any catalog
+        // entry) must skip all per-project rows when navigating.
         let yaml = r"
 projects:
   alpha:
     name: alpha
     path: /tmp/a
-  beta:
-    name: beta
-    path: /tmp/b
 ";
         let cfg: crate::ao::config::AoConfig = serde_yml::from_str(yaml).expect("parse");
         let mut form = ConfigForm::new(cfg);
-        form.focus = ConfigField::ProjectSelection;
-        assert_eq!(form.selected_project_idx, 0);
-        form.cycle_focused(1);
-        assert_eq!(form.selected_project_idx, 1);
-        form.cycle_focused(1);
-        assert_eq!(form.selected_project_idx, 0, "wraps");
-        form.cycle_focused(-1);
-        assert_eq!(form.selected_project_idx, 1, "wraps backwards");
+        // target_project_key stays None — fleet wasn't launched
+        // inside any project's path.
+        form.focus = ConfigField::Port;
+        form.focus_next();
+        assert_eq!(
+            form.focus,
+            ConfigField::Agent,
+            "unreachable project rows → Tab wraps to defaults",
+        );
     }
 
     #[test]

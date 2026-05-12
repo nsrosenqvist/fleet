@@ -515,77 +515,68 @@ fn build_defaults_form_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>
     out
 }
 
-/// Project panel body. First row is the focusable selector ("project");
-/// rows below show the selected project's fields read-only. When no
-/// projects exist, prints a single italic-muted placeholder.
+/// Project panel body. Renders the target project's fields when fleet is
+/// scoped to a project; otherwise prints a hint nudging the user toward
+/// `N` to initialise this directory as a new project entry.
 fn build_project_panel_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>> {
-    let keys = form.project_keys();
-    if keys.is_empty() {
+    let Some((_, project)) = form.selected_project() else {
         return vec![
-            field_line(
-                ConfigField::ProjectSelection,
-                "(no projects defined)",
-                form,
-            ),
-            Line::raw(""),
             Line::from(Span::styled(
-                "  Add a project to agent-orchestrator.yaml via `c` editor;",
-                Style::default().fg(MUTED),
+                "(this directory isn't a known fleet project)",
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
             )),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  Press ", Style::default().fg(MUTED)),
+                Span::styled(
+                    "N",
+                    Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " to add this directory as a project entry,",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
             Line::from(Span::styled(
-                "  inline project creation arrives in a later pass.",
+                "  seeded from the cwd basename + the current git branch.",
                 Style::default().fg(MUTED),
             )),
         ];
-    }
-    let idx = form.selected_project_idx.min(keys.len() - 1);
-    let key = keys[idx];
-    let project = form
-        .draft
-        .projects
-        .get(key)
-        .expect("selected project key resolves");
-
-    let mut out = vec![
-        field_line(
-            ConfigField::ProjectSelection,
-            &format!("{key} ({}/{})", idx + 1, keys.len()),
-            form,
-        ),
-        Line::raw(""),
-    ];
+    };
 
     // Editable project rows — each routed through `field_line` so the
     // focus/edit chrome is identical to the defaults block.
-    out.push(field_line(ConfigField::ProjectName, &project.name, form));
-    out.push(field_line(
-        ConfigField::ProjectSessionPrefix,
-        project.session_prefix.as_deref().unwrap_or("(unset)"),
-        form,
-    ));
-    out.push(field_line(
-        ConfigField::ProjectPath,
-        &project.path.display().to_string(),
-        form,
-    ));
-    out.push(field_line(
-        ConfigField::ProjectDefaultBranch,
-        project.default_branch.as_deref().unwrap_or("(unset)"),
-        form,
-    ));
-    out.push(field_line(
-        ConfigField::ProjectAgentRulesFile,
-        project.agent_rules_file.as_deref().unwrap_or("(unset)"),
-        form,
-    ));
-    out.push(field_line(
-        ConfigField::ProjectAgent,
-        project
-            .agent
-            .as_deref()
-            .unwrap_or("(unset — use defaults.agent)"),
-        form,
-    ));
+    let mut out = vec![
+        field_line(ConfigField::ProjectName, &project.name, form),
+        field_line(
+            ConfigField::ProjectSessionPrefix,
+            project.session_prefix.as_deref().unwrap_or("(unset)"),
+            form,
+        ),
+        field_line(
+            ConfigField::ProjectPath,
+            &project.path.display().to_string(),
+            form,
+        ),
+        field_line(
+            ConfigField::ProjectDefaultBranch,
+            project.default_branch.as_deref().unwrap_or("(unset)"),
+            form,
+        ),
+        field_line(
+            ConfigField::ProjectAgentRulesFile,
+            project.agent_rules_file.as_deref().unwrap_or("(unset)"),
+            form,
+        ),
+        field_line(
+            ConfigField::ProjectAgent,
+            project
+                .agent
+                .as_deref()
+                .unwrap_or("(unset — use defaults.agent)"),
+            form,
+        ),
+    ];
 
     // Tracker + postCreate stay read-only for now — tracker is a nested
     // object and postCreate is a string list; both want richer editors
@@ -652,21 +643,24 @@ fn draw_project_panel(
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    let n = form.draft.projects.len();
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::raw(" "),
         Span::styled(
             "project",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled(
-            format!("({n} configured)"),
-            Style::default().fg(MUTED),
-        ),
-        Span::raw(" "),
-    ]);
-    let block = framed_block_titled(title).padding(Padding::horizontal(2));
+    ];
+    if let Some((key, _)) = form.selected_project() {
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(
+            key.to_string(),
+            Style::default()
+                .fg(MUTED)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    title_spans.push(Span::raw(" "));
+    let block = framed_block_titled(Line::from(title_spans)).padding(Padding::horizontal(2));
     frame.render_widget(
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
         area,
