@@ -50,6 +50,16 @@ pub(super) enum ClickKind {
     Activate,
 }
 
+/// Top-level view the TUI is showing right now. View switches happen on
+/// global keys (`Shift+C` / `Shift+H`) and survive across refresh ticks
+/// so a slow probe doesn't bounce the user back to Sessions mid-edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum View {
+    #[default]
+    Sessions,
+    Config,
+}
+
 /// Pending destructive action awaiting a y/N confirmation in the status bar.
 #[derive(Debug, Clone)]
 pub(super) enum Confirm {
@@ -86,6 +96,14 @@ pub(super) enum Command {
 pub struct App {
     pub(super) repo_root: PathBuf,
     pub(super) invoker: Arc<dyn ProcessInvoker>,
+
+    pub(super) view: View,
+
+    /// Parsed `agent-orchestrator.yaml`, cached so the Config view doesn't
+    /// re-parse on every draw. `None` when the file is missing; an `Err`
+    /// gets folded into [`Self::action_error`] at load time so the user
+    /// sees the failure instead of an empty Config panel.
+    pub(super) ao_config: Option<crate::ao::config::AoConfig>,
 
     pub(super) sessions: Vec<SessionInfo>,
     pub(super) selected: usize,
@@ -135,9 +153,15 @@ pub struct App {
 impl App {
     #[allow(clippy::unnecessary_wraps)]
     pub fn new(repo_root: &Path) -> Result<Self> {
+        // Eagerly read AO config so the Config view has something to
+        // show on first switch. A parse error here is non-fatal — the
+        // view renders the error in place of the kv table.
+        let ao_config = crate::ao::config::AoConfig::load(repo_root).ok().flatten();
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
             invoker: Arc::new(RealProcessInvoker),
+            view: View::default(),
+            ao_config,
             sessions: Vec::new(),
             selected: 0,
             refresh_error: None,
@@ -211,6 +235,22 @@ impl App {
     pub(super) fn request_refresh(&self) {
         if let Some(tx) = &self.refresh_cmd_tx {
             let _ = tx.send(RefreshCommand::ForceRefresh);
+        }
+    }
+
+    /// Re-read `agent-orchestrator.yaml`. Called when the user toggles
+    /// into the Config view (catches edits made via `c` + $EDITOR) and
+    /// when they press `r` while in that view. Read failures surface as
+    /// an action error rather than crashing the cached value to `None`.
+    pub(super) fn reload_ao_config(&mut self) {
+        match crate::ao::config::AoConfig::load(&self.repo_root) {
+            Ok(cfg) => {
+                self.ao_config = cfg;
+                self.action_error = None;
+            }
+            Err(e) => {
+                self.flash_err(format!("read agent-orchestrator.yaml: {e:#}"));
+            }
         }
     }
 

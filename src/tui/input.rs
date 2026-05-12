@@ -8,7 +8,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use super::app::{App, ClickKind, ClickTarget, Command, Confirm};
+use super::app::{App, ClickKind, ClickTarget, Command, Confirm, View};
 
 /// Lines moved per scroll-wheel notch. Three matches the j/k cadence
 /// closely enough that mixing keyboard and wheel doesn't feel jumpy.
@@ -17,13 +17,36 @@ const WHEEL_LINES: usize = 3;
 /// Default mode: navigation + action keys. Falls through to no-op on
 /// unknown keys so e.g. `Shift+F1` doesn't accidentally fire an action.
 pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
+    // Global keys (work from any view).
     match (key.code, key.modifiers) {
-        // Quit (`q`, `Ctrl+C`). The Ctrl+C arm is listed first so it
-        // wins over the plain `c` arm below.
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
+            return;
         }
+        // Top-level view switches. Uppercase = "deliberate, modified
+        // key"; lowercase letters stay free for per-view actions.
+        (KeyCode::Char('C'), _) => {
+            app.view = View::Config;
+            // Re-read in case `c` + $EDITOR or an external edit changed
+            // the file since we last looked.
+            app.reload_ao_config();
+            return;
+        }
+        (KeyCode::Char('H'), _) => {
+            app.view = View::Sessions;
+            return;
+        }
+        _ => {}
+    }
 
+    match app.view {
+        View::Sessions => handle_key_sessions(app, key),
+        View::Config => handle_key_config(app, key),
+    }
+}
+
+fn handle_key_sessions(app: &mut App, key: KeyEvent) {
+    match (key.code, key.modifiers) {
         (KeyCode::Down | KeyCode::Char('j'), _) => app.nav_down(),
         (KeyCode::Up, _) => app.nav_up(),
         // `k` alone navigates up (vim). Holding shift uses `K` for kill.
@@ -44,6 +67,17 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
             app.confirm = Some(Confirm::StopAo);
         }
         (KeyCode::Char('W'), _) => app.push_command(Command::OpenWeb),
+        _ => {}
+    }
+}
+
+fn handle_key_config(app: &mut App, key: KeyEvent) {
+    // Read-only first pass: `r` to re-read, `c` still shells out to
+    // $EDITOR until the form-editor lands. No selection / navigation
+    // yet — that arrives with the editing pass.
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('r'), _) => app.reload_ao_config(),
+        (KeyCode::Char('c'), _) => app.push_command(Command::EditConfig),
         _ => {}
     }
 }

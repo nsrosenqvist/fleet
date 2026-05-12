@@ -23,9 +23,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
 use crate::ao::SessionInfo;
+use crate::ao::config::AoConfig;
 use crate::lima::VmStatus;
 
-use super::app::App;
+use super::app::{App, View};
 use super::bringup::BringUp;
 use super::preflight::MissingDep;
 use super::theme::{
@@ -45,40 +46,52 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
         .split(area);
 
     draw_breadcrumb(app, frame, layout[0]);
-    draw_body(app, frame, layout[1]);
+    match app.view {
+        View::Sessions => draw_body(app, frame, layout[1]),
+        View::Config => draw_config(app, frame, layout[1]),
+    }
     draw_status_bar(app, frame, layout[2]);
 }
 
 fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    // Left chunk: project chain. Right chunk: AO/VM badges.
+    // Left chunk: view-specific chain. Right chunk: AO/VM badges
+    // (always shown — they reflect host-level health and are useful
+    // context regardless of which view the user is in).
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(18)])
         .split(area);
 
-    let chain = app.selected_session().map_or_else(
-        || {
-            vec![
-                chip("fleet", ACCENT),
-                Span::raw(" | "),
-                Span::raw("(no sessions)"),
-            ]
-        },
-        |s| {
-            vec![
-                chip("fleet", ACCENT),
-                Span::raw(" | "),
-                Span::raw(s.project_id.clone().unwrap_or_else(|| "?".into())),
-                Span::raw(" | "),
-                Span::raw(s.id.clone().unwrap_or_else(|| "?".into())),
-                Span::raw(" "),
-                Span::styled(
-                    s.status.clone().unwrap_or_else(|| "?".into()),
-                    Style::default().fg(MUTED),
-                ),
-            ]
-        },
-    );
+    let chain: Vec<Span<'_>> = match app.view {
+        View::Sessions => app.selected_session().map_or_else(
+            || {
+                vec![
+                    chip("fleet", ACCENT),
+                    Span::raw(" | "),
+                    Span::raw("(no sessions)"),
+                ]
+            },
+            |s| {
+                vec![
+                    chip("fleet", ACCENT),
+                    Span::raw(" | "),
+                    Span::raw(s.project_id.clone().unwrap_or_else(|| "?".into())),
+                    Span::raw(" | "),
+                    Span::raw(s.id.clone().unwrap_or_else(|| "?".into())),
+                    Span::raw(" "),
+                    Span::styled(
+                        s.status.clone().unwrap_or_else(|| "?".into()),
+                        Style::default().fg(MUTED),
+                    ),
+                ]
+            },
+        ),
+        View::Config => vec![
+            chip("fleet", ACCENT),
+            Span::raw(" | "),
+            Span::styled("config", Style::default().fg(MUTED)),
+        ],
+    };
     frame.render_widget(Paragraph::new(Line::from(chain)), cols[0]);
 
     let ao_color = if app.ao_up { OK } else { ERR };
@@ -306,6 +319,199 @@ fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+// ─────────────────────── Config view ───────────────────────
+//
+// First-cut read-only render: a single column with two stacked panels
+// — `defaults` (agent / runtime / workspace / port) on top, the list
+// of configured projects below. Editing arrives in the next pass; for
+// now `c` keeps opening $EDITOR as the escape hatch.
+
+fn draw_config(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(cfg) = app.ao_config.as_ref() else {
+        draw_config_missing(app, frame, area);
+        return;
+    };
+
+    let defaults_lines = build_defaults_lines(cfg);
+    let projects_lines = build_projects_lines(cfg);
+
+    // Defaults panel sizes to its content; projects panel takes the
+    // rest. Both auto-shrink if the terminal is too short.
+    let defaults_h = u16::try_from(defaults_lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(defaults_h.min(area.height.saturating_sub(5).max(3))),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    draw_defaults_panel(cfg, defaults_lines, frame, rows[0]);
+    draw_projects_panel(cfg, projects_lines, frame, rows[1]);
+}
+
+fn draw_config_missing(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let path = crate::ao::config::AoConfig::path(&app.repo_root);
+    let lines = vec![
+        Line::from(Span::styled(
+            "agent-orchestrator.yaml not found",
+            Style::default().fg(MUTED),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("expected at  ", Style::default().fg(MUTED)),
+            Span::styled(path.display().to_string(), Style::default().fg(ACCENT)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Press `r` to retry after creating the file, or `⇧H` to return to sessions.",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    let title = Line::from(vec![Span::styled(
+        " agent-orchestrator.yaml ",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(framed_block_titled(title).padding(Padding::horizontal(2))),
+        area,
+    );
+}
+
+fn build_defaults_lines(cfg: &AoConfig) -> Vec<Line<'static>> {
+    let d = &cfg.defaults;
+    let port_str = cfg.port.map_or_else(
+        || "(unset — AO default)".to_string(),
+        |p| p.to_string(),
+    );
+    let mut out = vec![
+        kv_line("agent", d.agent.as_deref().unwrap_or("(unset — AO default)")),
+        kv_line(
+            "runtime",
+            d.runtime.as_deref().unwrap_or("(unset — AO default)"),
+        ),
+        kv_line(
+            "workspace",
+            d.workspace.as_deref().unwrap_or("(unset — AO default)"),
+        ),
+        kv_line("port", &port_str),
+    ];
+    if !d.notifiers.is_empty() {
+        out.push(kv_line("notifiers", &d.notifiers.join(", ")));
+    }
+    out
+}
+
+fn build_projects_lines(cfg: &AoConfig) -> Vec<Line<'static>> {
+    if cfg.projects.is_empty() {
+        return vec![Line::from(Span::styled(
+            "(no projects defined)",
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        ))];
+    }
+    let mut out = Vec::new();
+    for (key, project) in &cfg.projects {
+        // Project header: bold name + dim "(key)" tag matching the
+        // session-details panel idiom.
+        out.push(Line::from(vec![
+            Span::styled(
+                project.name.clone(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("({key})"),
+                Style::default()
+                    .fg(MUTED)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+        out.push(kv_line("path", &project.path.display().to_string()));
+        if let Some(branch) = &project.default_branch {
+            out.push(kv_line("branch", branch));
+        }
+        if let Some(prefix) = &project.session_prefix {
+            out.push(kv_line("sessionPrefix", prefix));
+        }
+        if let Some(tracker) = &project.tracker {
+            out.push(kv_line("tracker", &tracker.plugin));
+        }
+        if let Some(rules) = &project.agent_rules_file {
+            out.push(kv_line("rules", rules));
+        }
+        if let Some(agent) = &project.agent {
+            out.push(kv_line("agent override", agent));
+        }
+        out.push(Line::raw(""));
+    }
+    // Trim the trailing blank.
+    if matches!(out.last(), Some(line) if line.spans.is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+fn draw_defaults_panel(
+    cfg: &AoConfig,
+    body: Vec<Line<'static>>,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "defaults",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            if cfg.schema.is_some() {
+                "AO config".to_string()
+            } else {
+                "AO config (no $schema)".to_string()
+            },
+            Style::default()
+                .fg(MUTED)
+                .add_modifier(Modifier::ITALIC),
+        ),
+        Span::raw(" "),
+    ]);
+    let block = framed_block_titled(title).padding(Padding::horizontal(2));
+    frame.render_widget(
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_projects_panel(
+    cfg: &AoConfig,
+    body: Vec<Line<'static>>,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "projects",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("({})", cfg.projects.len()),
+            Style::default().fg(MUTED),
+        ),
+        Span::raw(" "),
+    ]);
+    let block = framed_block_titled(title).padding(Padding::horizontal(2));
+    frame.render_widget(
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // Three overlays replace the legend rather than appending to it: a
     // pending confirm, an error flash, an info flash. Match keel's pattern
@@ -345,36 +551,56 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         return;
     }
 
-    let spans: Vec<Span<'_>> = vec![
-        chip("[fleet]", ACCENT),
-        sep(),
-        key("↑/↓"),
-        Span::raw(" nav"),
-        sep(),
-        key("Enter"),
-        Span::raw(" attach"),
-        sep(),
-        key("t"),
-        Span::raw(" tracker"),
-        sep(),
-        key("c"),
-        Span::raw(" config"),
-        sep(),
-        key("K"),
-        Span::raw(" kill"),
-        sep(),
-        key("⇧S"),
-        Span::raw("/⇧X start/stop"),
-        sep(),
-        key("⇧W"),
-        Span::raw(" web"),
-        sep(),
-        key("r"),
-        Span::raw(" refresh"),
-        sep(),
-        key("q"),
-        Span::raw(" quit"),
-    ];
+    let spans: Vec<Span<'_>> = match app.view {
+        View::Sessions => vec![
+            chip("[fleet]", ACCENT),
+            sep(),
+            key("↑/↓"),
+            Span::raw(" nav"),
+            sep(),
+            key("Enter"),
+            Span::raw(" attach"),
+            sep(),
+            key("⇧C"),
+            Span::raw(" config"),
+            sep(),
+            key("t"),
+            Span::raw(" tracker"),
+            sep(),
+            key("c"),
+            Span::raw(" edit yaml"),
+            sep(),
+            key("K"),
+            Span::raw(" kill"),
+            sep(),
+            key("⇧S"),
+            Span::raw("/⇧X start/stop"),
+            sep(),
+            key("⇧W"),
+            Span::raw(" web"),
+            sep(),
+            key("r"),
+            Span::raw(" refresh"),
+            sep(),
+            key("q"),
+            Span::raw(" quit"),
+        ],
+        View::Config => vec![
+            chip("[fleet:config]", ACCENT),
+            sep(),
+            key("⇧H"),
+            Span::raw(" sessions"),
+            sep(),
+            key("c"),
+            Span::raw(" edit yaml"),
+            sep(),
+            key("r"),
+            Span::raw(" reload"),
+            sep(),
+            key("q"),
+            Span::raw(" quit"),
+        ],
+    };
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().fg(MUTED)),
         area,
