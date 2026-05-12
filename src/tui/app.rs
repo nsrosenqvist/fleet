@@ -61,7 +61,9 @@ pub(super) enum View {
 }
 
 /// Which form field the Config view currently has focused. Order
-/// matters — Tab cycles in declaration order.
+/// matters — Tab cycles in declaration order. The trailing
+/// `ProjectSelection` row sits inside the project panel and cycles
+/// which project the detail rows below it reflect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ConfigField {
     #[default]
@@ -69,10 +71,18 @@ pub(super) enum ConfigField {
     Runtime,
     Workspace,
     Port,
+    /// Cycle which project's read-only detail panel is visible.
+    ProjectSelection,
 }
 
 impl ConfigField {
-    pub(super) const ALL: &'static [Self] = &[Self::Agent, Self::Runtime, Self::Workspace, Self::Port];
+    pub(super) const ALL: &'static [Self] = &[
+        Self::Agent,
+        Self::Runtime,
+        Self::Workspace,
+        Self::Port,
+        Self::ProjectSelection,
+    ];
 
     pub(super) fn label(self) -> &'static str {
         match self {
@@ -80,6 +90,7 @@ impl ConfigField {
             Self::Runtime => "runtime",
             Self::Workspace => "workspace",
             Self::Port => "port",
+            Self::ProjectSelection => "project",
         }
     }
 
@@ -112,6 +123,11 @@ pub(super) struct ConfigForm {
     /// `Some` when the user is mid-text-edit on a string/number field.
     /// Carries the in-progress string; commit on Enter, revert on Esc.
     pub(super) editing: Option<String>,
+    /// Which project's detail rows are visible right now. Sorted-key
+    /// index into `draft.projects`. Survives across form-field focus
+    /// changes — moving Tab away from `ProjectSelection` doesn't reset
+    /// which project you were inspecting.
+    pub(super) selected_project_idx: usize,
 }
 
 impl ConfigForm {
@@ -120,7 +136,28 @@ impl ConfigForm {
             draft: cfg,
             focus: ConfigField::default(),
             editing: None,
+            selected_project_idx: 0,
         }
+    }
+
+    /// Sorted project keys — drives the project-selector cycling and
+    /// the "(N of M)" indicator. Sorted (`BTreeMap`) so the order is
+    /// stable across reloads.
+    pub(super) fn project_keys(&self) -> Vec<&str> {
+        self.draft.projects.keys().map(String::as_str).collect()
+    }
+
+    /// Currently selected project's `(key, value)` pair, if any.
+    /// Clamps the index in case the project list shrunk since the
+    /// last frame (e.g. a save that removed an entry).
+    pub(super) fn selected_project(&self) -> Option<(&str, &crate::ao::config::Project)> {
+        let keys = self.project_keys();
+        if keys.is_empty() {
+            return None;
+        }
+        let idx = self.selected_project_idx.min(keys.len() - 1);
+        let key = keys[idx];
+        self.draft.projects.get_key_value(key).map(|(k, v)| (k.as_str(), v))
     }
 
     /// True when the draft has diverged from the on-disk yaml. Drives
@@ -161,6 +198,18 @@ impl ConfigForm {
                 );
             }
             ConfigField::Port => {} // Port is text-edited, not cycled.
+            ConfigField::ProjectSelection => {
+                let n = self.draft.projects.len();
+                if n == 0 {
+                    return;
+                }
+                // Unsigned modulo: shift by `delta` rounded into `[0, n)`.
+                self.selected_project_idx = if delta >= 0 {
+                    (self.selected_project_idx + delta.unsigned_abs() as usize) % n
+                } else {
+                    (self.selected_project_idx + n - (delta.unsigned_abs() as usize % n)) % n
+                };
+            }
         }
     }
 
@@ -743,8 +792,38 @@ mod tests {
     #[test]
     fn config_field_cycles_forward_and_back() {
         assert_eq!(ConfigField::Agent.next(), ConfigField::Runtime);
-        assert_eq!(ConfigField::Port.next(), ConfigField::Agent);
-        assert_eq!(ConfigField::Agent.prev(), ConfigField::Port);
+        assert_eq!(ConfigField::Port.next(), ConfigField::ProjectSelection);
+        assert_eq!(
+            ConfigField::ProjectSelection.next(),
+            ConfigField::Agent,
+            "cycle wraps after the last field",
+        );
+        assert_eq!(ConfigField::Agent.prev(), ConfigField::ProjectSelection);
+    }
+
+    #[test]
+    fn project_selection_cycles_through_project_keys() {
+        // Two-project config; cycling the selection field should walk
+        // sorted keys forward and wrap.
+        let yaml = r"
+projects:
+  alpha:
+    name: alpha
+    path: /tmp/a
+  beta:
+    name: beta
+    path: /tmp/b
+";
+        let cfg: crate::ao::config::AoConfig = serde_yml::from_str(yaml).expect("parse");
+        let mut form = ConfigForm::new(cfg);
+        form.focus = ConfigField::ProjectSelection;
+        assert_eq!(form.selected_project_idx, 0);
+        form.cycle_focused(1);
+        assert_eq!(form.selected_project_idx, 1);
+        form.cycle_focused(1);
+        assert_eq!(form.selected_project_idx, 0, "wraps");
+        form.cycle_focused(-1);
+        assert_eq!(form.selected_project_idx, 1, "wraps backwards");
     }
 
     #[test]

@@ -385,7 +385,7 @@ fn draw_config(app: &App, frame: &mut Frame<'_>, area: Rect) {
     };
 
     let defaults_lines = build_defaults_form_lines(form);
-    let projects_lines = build_projects_lines(&form.draft);
+    let project_lines = build_project_panel_lines(form);
 
     let defaults_h = u16::try_from(defaults_lines.len())
         .unwrap_or(u16::MAX)
@@ -399,7 +399,7 @@ fn draw_config(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .split(area);
 
     draw_defaults_panel(form, orig, defaults_lines, frame, rows[0]);
-    draw_projects_panel(&form.draft, projects_lines, frame, rows[1]);
+    draw_project_panel(form, project_lines, frame, rows[1]);
 }
 
 fn draw_config_missing(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -437,8 +437,16 @@ fn draw_config_missing(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// during text-edit shows a `█` caret in place of the value.
 fn build_defaults_form_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>> {
     let d = &form.draft.defaults;
+    // Only the four `defaults.*` fields render in the defaults panel —
+    // `ProjectSelection` lives in the project panel below.
+    let defaults_fields = [
+        ConfigField::Agent,
+        ConfigField::Runtime,
+        ConfigField::Workspace,
+        ConfigField::Port,
+    ];
     let mut out = Vec::new();
-    for field in ConfigField::ALL {
+    for field in defaults_fields {
         let value: String = match field {
             ConfigField::Agent => d
                 .agent
@@ -456,8 +464,87 @@ fn build_defaults_form_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>
                 .draft
                 .port
                 .map_or_else(|| "(unset — AO default)".into(), |p| p.to_string()),
+            ConfigField::ProjectSelection => continue,
         };
-        out.push(field_line(*field, &value, form));
+        out.push(field_line(field, &value, form));
+    }
+    out
+}
+
+/// Project panel body. First row is the focusable selector ("project");
+/// rows below show the selected project's fields read-only. When no
+/// projects exist, prints a single italic-muted placeholder.
+fn build_project_panel_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>> {
+    let keys = form.project_keys();
+    if keys.is_empty() {
+        return vec![
+            field_line(
+                ConfigField::ProjectSelection,
+                "(no projects defined)",
+                form,
+            ),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "  Add a project to agent-orchestrator.yaml via `c` editor;",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "  inline project creation arrives in a later pass.",
+                Style::default().fg(MUTED),
+            )),
+        ];
+    }
+    let idx = form.selected_project_idx.min(keys.len() - 1);
+    let key = keys[idx];
+    let project = form
+        .draft
+        .projects
+        .get(key)
+        .expect("selected project key resolves");
+
+    let mut out = Vec::new();
+    out.push(field_line(
+        ConfigField::ProjectSelection,
+        &format!("{key} ({}/{})", idx + 1, keys.len()),
+        form,
+    ));
+    out.push(Line::raw(""));
+    // Detail rows: indented to align under the cycle field's value
+    // column, muted-key style matching `kv_line`.
+    let push = |out: &mut Vec<Line<'static>>, label: &str, value: &str| {
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("  {label:<14}"),
+                Style::default().fg(MUTED),
+            ),
+            Span::raw(value.to_string()),
+        ]));
+    };
+    push(&mut out, "name", &project.name);
+    if let Some(prefix) = &project.session_prefix {
+        push(&mut out, "sessionPrefix", prefix);
+    }
+    push(&mut out, "path", &project.path.display().to_string());
+    if let Some(branch) = &project.default_branch {
+        push(&mut out, "defaultBranch", branch);
+    }
+    if let Some(rules) = &project.agent_rules_file {
+        push(&mut out, "agentRulesFile", rules);
+    }
+    if let Some(agent) = &project.agent {
+        push(&mut out, "agent override", agent);
+    }
+    if let Some(tracker) = &project.tracker {
+        push(&mut out, "tracker", &tracker.plugin);
+    }
+    if !project.post_create.is_empty() {
+        push(&mut out, "postCreate", "");
+        for cmd in &project.post_create {
+            out.push(Line::from(vec![
+                Span::styled("                  ", Style::default().fg(MUTED)),
+                Span::raw(cmd.clone()),
+            ]));
+        }
     }
     out
 }
@@ -494,53 +581,31 @@ fn field_line(field: ConfigField, value: &str, form: &super::app::ConfigForm) ->
     Line::from(vec![label_span, value_span])
 }
 
-fn build_projects_lines(cfg: &AoConfig) -> Vec<Line<'static>> {
-    if cfg.projects.is_empty() {
-        return vec![Line::from(Span::styled(
-            "(no projects defined)",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-        ))];
-    }
-    let mut out = Vec::new();
-    for (key, project) in &cfg.projects {
-        // Project header: bold name + dim "(key)" tag matching the
-        // session-details panel idiom.
-        out.push(Line::from(vec![
-            Span::styled(
-                project.name.clone(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("({key})"),
-                Style::default()
-                    .fg(MUTED)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
-        out.push(kv_line("path", &project.path.display().to_string()));
-        if let Some(branch) = &project.default_branch {
-            out.push(kv_line("branch", branch));
-        }
-        if let Some(prefix) = &project.session_prefix {
-            out.push(kv_line("sessionPrefix", prefix));
-        }
-        if let Some(tracker) = &project.tracker {
-            out.push(kv_line("tracker", &tracker.plugin));
-        }
-        if let Some(rules) = &project.agent_rules_file {
-            out.push(kv_line("rules", rules));
-        }
-        if let Some(agent) = &project.agent {
-            out.push(kv_line("agent override", agent));
-        }
-        out.push(Line::raw(""));
-    }
-    // Trim the trailing blank.
-    if matches!(out.last(), Some(line) if line.spans.is_empty()) {
-        out.pop();
-    }
-    out
+fn draw_project_panel(
+    form: &super::app::ConfigForm,
+    body: Vec<Line<'static>>,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let n = form.draft.projects.len();
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "project",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("({n} configured)"),
+            Style::default().fg(MUTED),
+        ),
+        Span::raw(" "),
+    ]);
+    let block = framed_block_titled(title).padding(Padding::horizontal(2));
+    frame.render_widget(
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_defaults_panel(
@@ -569,32 +634,6 @@ fn draw_defaults_panel(
     }
     title_spans.push(Span::raw(" "));
     let block = framed_block_titled(Line::from(title_spans)).padding(Padding::horizontal(2));
-    frame.render_widget(
-        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn draw_projects_panel(
-    cfg: &AoConfig,
-    body: Vec<Line<'static>>,
-    frame: &mut Frame<'_>,
-    area: Rect,
-) {
-    let title = Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            "projects",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("({})", cfg.projects.len()),
-            Style::default().fg(MUTED),
-        ),
-        Span::raw(" "),
-    ]);
-    let block = framed_block_titled(title).padding(Padding::horizontal(2));
     frame.render_widget(
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
         area,
