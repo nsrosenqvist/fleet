@@ -265,7 +265,7 @@ fn draw_details(app: &App, body: Vec<Line<'static>>, frame: &mut Frame<'_>, area
 }
 
 fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let block = framed_block(" output ");
+    let block = framed_block(" output ").padding(Padding::horizontal(2));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
