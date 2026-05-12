@@ -1,17 +1,30 @@
-//! ratatui dashboard. Entry point + module wiring; the app state machine
-//! and panel rendering live in submodules.
+//! ratatui dashboard.
 //!
-//! Aesthetic inspiration: `example.png` (a similar tool, `keel`) — dark
-//! background, rounded borders, section titles inline on the border, single
-//! dot-separated status bar at the bottom. Stage 3 task #23 implements the
-//! panels in that style.
+//! Module layout (mirrors keel's TUI structure, adapted to fleet's scale):
+//!
+//! - [`app`]        — state only; no rendering, no I/O, no crossterm
+//! - [`ui`]         — pure render `(&App, &mut Frame) -> ()`
+//! - [`theme`]      — colour tokens + small inline-span helpers
+//! - [`input`]      — per-mode keyboard handlers
+//! - [`terminal`]   — crossterm lifecycle, event loop, command executor
+//! - [`refresh`]    — background refresh thread + channel types
+//! - [`subprocess`] — alt-screen suspend/resume around foreground children
+//!
+//! Aesthetic inspiration: keel — dark background, rounded borders, section
+//! titles inline on the border, dot-separated status bar at the bottom.
 
-pub mod app;
+mod app;
+mod input;
+mod refresh;
 pub mod subprocess;
+mod terminal;
+mod theme;
+mod ui;
 
 use anyhow::Result;
 use std::path::Path;
 
 pub fn run(repo_root: &Path) -> Result<i32> {
-    app::App::new(repo_root)?.run()
+    let mut app = app::App::new(repo_root)?;
+    terminal::run(&mut app)
 }
