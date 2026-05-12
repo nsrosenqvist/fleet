@@ -73,11 +73,32 @@ fn handle_key_sessions(app: &mut App, key: KeyEvent) {
 
 fn handle_key_config(app: &mut App, key: KeyEvent) {
     let Some(form) = app.config_form.as_mut() else {
-        // No form to drive (yaml missing). Same fallback keys as the
-        // missing-file panel.
+        // No form to drive (yaml missing). The escape hatches are
+        // reload, $EDITOR, and N to bootstrap a fresh config seeded
+        // with this directory as its first project.
         match (key.code, key.modifiers) {
             (KeyCode::Char('r'), _) => app.reload_ao_config(),
             (KeyCode::Char('c'), _) => app.push_command(Command::EditConfig),
+            (KeyCode::Char('N'), _) => {
+                // Seed a fresh in-memory config + form. The save flow
+                // will create the XDG file on Ctrl+S.
+                let blank = crate::ao::config::AoConfig {
+                    schema: None,
+                    port: None,
+                    defaults: crate::ao::config::Defaults::default(),
+                    projects: std::collections::BTreeMap::new(),
+                    extra: std::collections::BTreeMap::new(),
+                };
+                app.ao_config = Some(blank.clone());
+                let cwd = app.repo_root.clone();
+                let mut new_form = super::app::ConfigForm::new(blank);
+                let key = new_form.add_project_for_cwd(&cwd);
+                new_form.focus = ConfigField::ProjectName;
+                app.config_form = Some(new_form);
+                app.flash_ok(format!(
+                    "drafted project `{key}` — edit and press ^S to save"
+                ));
+            }
             _ => {}
         }
         return;
@@ -101,6 +122,20 @@ fn handle_key_config(app: &mut App, key: KeyEvent) {
                     app.flash_ok("no changes to save");
                 }
             }
+        }
+
+        // Init: create a new project entry seeded from cwd + git.
+        // Capital `N` matches the existing convention of uppercase
+        // letters for "deliberate, modified" actions (S start, X stop).
+        (KeyCode::Char('N'), _) => {
+            let cwd = app.repo_root.clone();
+            let key = form.add_project_for_cwd(&cwd);
+            // Drop focus on the name field so the user can rename if
+            // the cwd-derived default isn't what they want.
+            form.focus = ConfigField::ProjectName;
+            app.flash_ok(format!(
+                "added project `{key}` — edit and press ^S to save"
+            ));
         }
 
         // Navigation between form fields. Tab/Down + Shift+Tab/Up are

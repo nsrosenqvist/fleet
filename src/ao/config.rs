@@ -378,7 +378,7 @@ reactions:
                     Project {
                         name: "parent".into(),
                         session_prefix: None,
-                        path: parent.clone(),
+                        path: parent,
                         default_branch: None,
                         agent_rules_file: None,
                         agent: None,

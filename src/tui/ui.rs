@@ -363,6 +363,9 @@ fn config_status_spans(app: &App) -> Vec<Span<'_>> {
             key("^S"),
             Span::raw(" save"),
             sep(),
+            key("N"),
+            Span::raw(" new project"),
+            sep(),
             key("⇧H"),
             Span::raw(" sessions"),
             sep(),
@@ -440,8 +443,19 @@ fn draw_config_missing(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Span::raw("  (per-repo)"),
     ]));
     lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Press ", Style::default().fg(MUTED)),
+        Span::styled(
+            "N",
+            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " to bootstrap a fresh config seeded with this directory ",
+            Style::default().fg(MUTED),
+        ),
+    ]));
     lines.push(Line::from(Span::styled(
-        "Press `r` to retry after creating the file, or `⇧H` to return to sessions.",
+        "as its first project, `r` to retry, or `⇧H` for sessions.",
         Style::default().fg(MUTED),
     )));
     let title = Line::from(vec![Span::styled(

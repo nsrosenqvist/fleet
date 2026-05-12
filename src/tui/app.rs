@@ -364,6 +364,50 @@ impl ConfigForm {
         self.editing = None;
     }
 
+    /// Insert a new project entry seeded from `cwd` and (when
+    /// available) the current git branch. Returns the freshly-minted
+    /// map key so the caller can update navigation state (the
+    /// renderer wants `selected_project_idx` pointed at the new row;
+    /// the input layer wants focus on `ProjectName` so the user can
+    /// rename if the cwd-derived default isn't what they want).
+    pub(super) fn add_project_for_cwd(&mut self, cwd: &std::path::Path) -> String {
+        let base = cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project");
+        let sanitized = sanitize_project_key(base);
+        let key = uniquify_key(&self.draft.projects, &sanitized);
+        let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let default_branch = detect_git_branch(&canonical);
+        let session_prefix = key
+            .chars()
+            .take(2)
+            .collect::<String>()
+            .to_lowercase();
+        let project = crate::ao::config::Project {
+            name: key.clone(),
+            session_prefix: if session_prefix.is_empty() {
+                None
+            } else {
+                Some(session_prefix)
+            },
+            path: canonical,
+            default_branch,
+            agent_rules_file: None,
+            agent: None,
+            tracker: None,
+            post_create: Vec::new(),
+            extra: std::collections::BTreeMap::new(),
+        };
+        self.draft.projects.insert(key.clone(), project);
+        // Land the form on the new project for immediate editing.
+        let keys = self.project_keys();
+        if let Some(idx) = keys.iter().position(|k| *k == key.as_str()) {
+            self.selected_project_idx = idx;
+        }
+        key
+    }
+
     /// Tab navigation that skips fields with no content to edit.
     /// Today that means: when `draft.projects` is empty, the project
     /// detail fields are all unreachable — Tab walks past them so the
@@ -414,6 +458,84 @@ impl ConfigForm {
         let idx = self.selected_project_idx.min(keys.len() - 1);
         Some(keys[idx].to_string())
     }
+}
+
+/// Reduce a cwd basename to a valid AO project key. The schema doesn't
+/// strictly require any specific character set, but lowercase-alnum-plus-
+/// dashes is the convention every existing config follows and avoids
+/// having to quote the key in yaml.
+fn sanitize_project_key(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Trim leading/trailing dashes; collapse internal runs. Cheap
+    // version: scan once, push only when the previous char wasn't a
+    // dash.
+    let mut compact = String::with_capacity(out.len());
+    let mut prev_dash = true; // suppresses leading dashes
+    for c in out.drain(..) {
+        if c == '-' {
+            if !prev_dash {
+                compact.push('-');
+                prev_dash = true;
+            }
+        } else {
+            compact.push(c);
+            prev_dash = false;
+        }
+    }
+    while compact.ends_with('-') {
+        compact.pop();
+    }
+    if compact.is_empty() {
+        "project".to_string()
+    } else {
+        compact
+    }
+}
+
+/// Append `-2`, `-3`, … until the key isn't already in `projects`.
+/// Guarantees a fresh entry even when the user has multiple repos
+/// with the same basename.
+fn uniquify_key(
+    projects: &std::collections::BTreeMap<String, crate::ao::config::Project>,
+    base: &str,
+) -> String {
+    if !projects.contains_key(base) {
+        return base.to_string();
+    }
+    for n in 2..u32::MAX {
+        let candidate = format!("{base}-{n}");
+        if !projects.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    base.to_string()
+}
+
+/// Best-effort current branch via `git symbolic-ref --short HEAD`.
+/// Returns `None` when the dir isn't a git repo, git isn't installed,
+/// or the repo is in detached-HEAD state. The user can edit the
+/// field after creation if our guess is wrong.
+fn detect_git_branch(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn cycle_value(values: &[&str], current: Option<&str>, delta: i32) -> Option<String> {
@@ -1048,6 +1170,57 @@ projects:
         assert_eq!(form.focus, ConfigField::ProjectSelection);
         form.focus_next();
         assert_eq!(form.focus, ConfigField::ProjectName);
+    }
+
+    #[test]
+    fn sanitize_project_key_lowercases_and_dashes() {
+        assert_eq!(super::sanitize_project_key("My Repo"), "my-repo");
+        assert_eq!(super::sanitize_project_key("__weird name__"), "weird-name");
+        assert_eq!(super::sanitize_project_key("Hello!World"), "hello-world");
+        assert_eq!(super::sanitize_project_key("123abc"), "123abc");
+    }
+
+    #[test]
+    fn sanitize_project_key_falls_back_when_empty() {
+        assert_eq!(super::sanitize_project_key(""), "project");
+        assert_eq!(super::sanitize_project_key("!@#$"), "project");
+    }
+
+    #[test]
+    fn uniquify_key_suffixes_on_collision() {
+        let mut projects = std::collections::BTreeMap::new();
+        projects.insert(
+            "alpha".to_string(),
+            crate::ao::config::Project {
+                name: "alpha".into(),
+                session_prefix: None,
+                path: std::path::PathBuf::from("/tmp/alpha"),
+                default_branch: None,
+                agent_rules_file: None,
+                agent: None,
+                tracker: None,
+                post_create: Vec::new(),
+                extra: std::collections::BTreeMap::new(),
+            },
+        );
+        assert_eq!(super::uniquify_key(&projects, "alpha"), "alpha-2");
+        assert_eq!(super::uniquify_key(&projects, "beta"), "beta");
+    }
+
+    #[test]
+    fn add_project_for_cwd_seeds_from_basename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("my-fancy-repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut form = ConfigForm::new(empty_ao_config());
+        let key = form.add_project_for_cwd(&cwd);
+        assert_eq!(key, "my-fancy-repo");
+        let project = form.draft.projects.get(&key).expect("project added");
+        assert_eq!(project.name, "my-fancy-repo");
+        assert_eq!(project.session_prefix.as_deref(), Some("my"));
+        // Path should resolve to the canonicalised cwd (or fall back).
+        assert!(project.path.ends_with("my-fancy-repo"));
     }
 
     #[test]
