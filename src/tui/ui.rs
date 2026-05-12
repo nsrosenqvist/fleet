@@ -376,13 +376,16 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-// ─────────────────────── preflight modal ───────────────────────
+// ─────────────────────── setup modals ───────────────────────
 //
 // Painted in place of the normal UI when [`crate::tui::preflight::check`]
-// found a missing host binary. The modal floats centered on a cleared
-// area, lists each missing dep with its install hint, and tells the user
-// the only available action is "press any key to quit".
+// found something that needs handling before the main loop can run: a
+// missing host binary (dead-end, quit only), or a missing/stopped VM
+// (actionable — press y to remediate, q to quit).
 
+/// Missing host binary — fleet can't proceed and there's nothing fleet can
+/// do about it. Body lists each dep with its install hint; footer says
+/// "press any key to quit".
 pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -420,40 +423,147 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
         }
         lines.push(Line::raw(""));
     }
-    lines.push(Line::from(Span::styled(
-        "Press any key to quit.",
-        Style::default().fg(MUTED),
-    )));
+    draw_modal(
+        frame,
+        " preflight failed ",
+        ERR,
+        lines,
+        &[Line::from(Span::styled(
+            "Press any key to quit.",
+            Style::default().fg(MUTED),
+        ))],
+    );
+}
 
+/// VM missing — `limactl` is installed but no `fleet-vm` instance exists.
+/// Offers to run `limactl start fleet-vm` (which creates the instance the
+/// first time). 5–10 minute download + cloud-init, so the warning row sets
+/// the expectation.
+pub(super) fn render_vm_missing(frame: &mut Frame<'_>) {
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "fleet-vm",
+                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "Lima instance does not exist",
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Fleet needs a Lima VM named `fleet-vm` to host the ao",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            "orchestrator and tmux sessions.",
+            Style::default().fg(MUTED),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Creating it downloads ~1 GB and runs cloud-init —",
+            Style::default().fg(WARN),
+        )),
+        Line::from(Span::styled(
+            "expect 5–10 minutes the first time.",
+            Style::default().fg(WARN),
+        )),
+    ];
+    draw_modal(frame, " vm setup ", WARN, lines, &footer_yn("create"));
+}
+
+/// VM stopped — instance exists, just isn't running. Offers `limactl
+/// start fleet-vm`, which is quick (boot + a small cloud-init replay).
+pub(super) fn render_vm_stopped(frame: &mut Frame<'_>) {
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "○ ",
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "fleet-vm",
+                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Lima instance is stopped", Style::default().fg(MUTED)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Fleet can't reach the ao orchestrator until the VM",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            "is running.",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    draw_modal(frame, " vm setup ", WARN, lines, &footer_yn("start"));
+}
+
+fn footer_yn(verb: &str) -> Vec<Line<'static>> {
+    vec![Line::from(vec![
+        Span::styled(
+            "[y]",
+            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(verb.to_string(), Style::default().fg(MUTED)),
+        Span::raw("   "),
+        Span::styled(
+            "[q]",
+            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled("quit", Style::default().fg(MUTED)),
+    ])]
+}
+
+/// Generic centred modal: title chrome + body + footer, separated by a
+/// blank row. Body sizes the modal; the footer comes after another blank
+/// row so the action keys read as a discrete bar at the bottom.
+fn draw_modal(
+    frame: &mut Frame<'_>,
+    title_text: &str,
+    title_color: ratatui::style::Color,
+    body: Vec<Line<'static>>,
+    footer: &[Line<'static>],
+) {
+    let mut lines = body;
+    if !footer.is_empty() {
+        lines.push(Line::raw(""));
+        lines.extend(footer.iter().cloned());
+    }
     let width = lines
         .iter()
         .map(Line::width)
         .max()
         .unwrap_or(40)
         .max(40)
-        .saturating_add(6); // 2 borders + 4 horizontal padding (2 each side)
+        .saturating_add(6); // 2 borders + 4 horizontal padding
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(2); // 2 borders; padding is horizontal-only
+        .saturating_add(2); // borders only; padding is horizontal-only
     let area = center_rect(
         frame.area(),
         u16::try_from(width).unwrap_or(u16::MAX),
         height,
     );
 
-    let title = Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            "preflight failed",
-            Style::default().fg(ERR).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-    ]);
+    let title = Line::from(vec![Span::styled(
+        title_text.to_string(),
+        Style::default()
+            .fg(title_color)
+            .add_modifier(Modifier::BOLD),
+    )]);
     let block = framed_block_titled(title).padding(Padding::horizontal(2));
 
-    // Clear punches a hole through whatever was painted underneath; we
-    // don't render the normal UI in this code path, but Clear also wipes
-    // any leftover frame buffer from prior draws (resize, etc.).
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }

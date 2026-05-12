@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use super::app::{App, Command};
 use super::input;
-use super::preflight::{self, MissingDep};
+use super::preflight::{self, MissingDep, Preflight, VM_NAME};
 use super::subprocess::suspend_around;
 use super::ui;
 
@@ -26,27 +26,74 @@ const TICK_INTERVAL: Duration = Duration::from_millis(50);
 /// Enter the TUI and drive the event loop. Returns the process exit code
 /// the caller should propagate.
 ///
-/// Runs a host-dependency preflight first. If anything is missing the user
-/// gets a blocking modal explaining what to install; any key quits with
-/// exit code 1. We enter the alt screen *before* the probe so the modal
-/// renders consistently with the rest of the UI (same rounded borders,
-/// same theme).
+/// Runs preflight first. The host-bin case is a dead-end modal (any key
+/// quits); the VM cases are actionable — `y` suspends to `limactl start
+/// fleet-vm`, then we loop back through preflight in case the VM came up
+/// stopped (rare but possible if start failed mid-cloud-init).
 pub(super) fn run(app: &mut App) -> Result<i32> {
-    let failures = preflight::check();
     let mut term = enter_terminal()?;
-    if !failures.is_empty() {
-        let result = run_preflight_modal(&mut term, &failures);
-        leave_terminal()?;
-        return result;
-    }
-    app.spawn_refresh_thread();
-    let result = drive(app, &mut term);
-    app.shutdown_refresh_thread();
+    let outcome = settle_preflight(&mut term);
+    let result = match outcome {
+        PreflightOutcome::Proceed => {
+            app.spawn_refresh_thread();
+            let res = drive(app, &mut term);
+            app.shutdown_refresh_thread();
+            res
+        }
+        PreflightOutcome::Quit(code) => Ok(code),
+        PreflightOutcome::Err(e) => Err(e),
+    };
     leave_terminal()?;
     result
 }
 
-/// Block on the preflight modal until the user dismisses it. Exit code 1
+enum PreflightOutcome {
+    Proceed,
+    Quit(i32),
+    Err(anyhow::Error),
+}
+
+/// Loop preflight → modal → remediation until the user either lands in
+/// an `Ok` state or quits. Remediation runs `limactl start fleet-vm`
+/// suspended; any keystroke other than `y` in a VM-setup modal is a
+/// quit, matching the existing kill/stop confirm convention.
+fn settle_preflight(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> PreflightOutcome {
+    loop {
+        match preflight::check() {
+            Preflight::Ok => return PreflightOutcome::Proceed,
+            Preflight::HostBinsMissing(deps) => {
+                return match run_preflight_modal(term, &deps) {
+                    Ok(code) => PreflightOutcome::Quit(code),
+                    Err(e) => PreflightOutcome::Err(e),
+                };
+            }
+            Preflight::VmMissing => match prompt_vm_action(term, VmAction::Create) {
+                Ok(true) => match bring_up_vm(term) {
+                    Ok(()) => {} // re-check
+                    Err(e) => return PreflightOutcome::Err(e),
+                },
+                Ok(false) => return PreflightOutcome::Quit(1),
+                Err(e) => return PreflightOutcome::Err(e),
+            },
+            Preflight::VmStopped => match prompt_vm_action(term, VmAction::Start) {
+                Ok(true) => match bring_up_vm(term) {
+                    Ok(()) => {} // re-check
+                    Err(e) => return PreflightOutcome::Err(e),
+                },
+                Ok(false) => return PreflightOutcome::Quit(1),
+                Err(e) => return PreflightOutcome::Err(e),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VmAction {
+    Create,
+    Start,
+}
+
+/// Block on the host-bins modal until the user dismisses it. Exit code 1
 /// so calling shells / CI can tell a preflight-failed run apart from a
 /// clean quit.
 fn run_preflight_modal(
@@ -62,6 +109,47 @@ fn run_preflight_modal(
             return Ok(1);
         }
     }
+}
+
+/// Draw the VM-setup modal (missing or stopped variant) and wait for a
+/// y/n decision. Returns `Ok(true)` for "yes, remediate" and `Ok(false)`
+/// for "quit"; anything that isn't an explicit `y`/`Y` is a quit, same
+/// as the in-app confirm dialogs.
+fn prompt_vm_action(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    action: VmAction,
+) -> Result<bool> {
+    loop {
+        term.draw(|f| match action {
+            VmAction::Create => ui::render_vm_missing(f),
+            VmAction::Start => ui::render_vm_stopped(f),
+        })?;
+        if event::poll(TICK_INTERVAL)?
+            && let event::Event::Key(k) = event::read()?
+            && k.kind == event::KeyEventKind::Press
+        {
+            return Ok(matches!(k.code, event::KeyCode::Char('y' | 'Y')));
+        }
+    }
+}
+
+/// Suspend the alt screen and run `limactl start fleet-vm` interactively.
+/// Lima prompts for template choice on first run and streams cloud-init
+/// progress over many minutes — letting it own the terminal during that
+/// window is far less surprising than trying to surface a fraction of
+/// the output in a TUI pane. On return we redraw and let `settle_preflight`
+/// re-check VM status.
+fn bring_up_vm(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    suspend_around(term, || {
+        crate::process::run_interactive(
+            "limactl",
+            &["start".to_string(), VM_NAME.to_string()],
+            &[],
+            &[],
+        )
+        .map(|_| ())
+    })?;
+    Ok(())
 }
 
 fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
