@@ -15,6 +15,7 @@
 
 mod app;
 mod input;
+mod preflight;
 mod refresh;
 pub mod subprocess;
 mod terminal;

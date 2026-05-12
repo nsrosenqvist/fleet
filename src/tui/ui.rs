@@ -20,15 +20,16 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
 use crate::ao::SessionInfo;
 use crate::lima::VmStatus;
 
 use super::app::App;
+use super::preflight::MissingDep;
 use super::theme::{
-    ACCENT, ERR, MUTED, OK, WARN, badge, chip, framed_block, framed_block_titled, key, kv_line,
-    sep,
+    ACCENT, ERR, KEY_FG, MUTED, OK, WARN, badge, chip, framed_block, framed_block_titled, key,
+    kv_line, sep,
 };
 
 pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
@@ -373,4 +374,88 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Paragraph::new(Line::from(spans)).style(Style::default().fg(MUTED)),
         area,
     );
+}
+
+// ─────────────────────── preflight modal ───────────────────────
+//
+// Painted in place of the normal UI when [`crate::tui::preflight::check`]
+// found a missing host binary. The modal floats centered on a cleared
+// area, lists each missing dep with its install hint, and tells the user
+// the only available action is "press any key to quit".
+
+pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Fleet needs the following on this host:",
+        Style::default().fg(MUTED),
+    )));
+    lines.push(Line::raw(""));
+    for f in failures {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                f.name.to_string(),
+                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(f.purpose.to_string(), Style::default().fg(MUTED)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  install: "),
+            Span::styled(f.install_hint.to_string(), Style::default().fg(ACCENT)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "Press any key to quit.",
+        Style::default().fg(MUTED),
+    )));
+
+    let width = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(40)
+        .max(40)
+        .saturating_add(6); // 2 borders + 4 horizontal padding (2 each side)
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2); // 2 borders; padding is horizontal-only
+    let area = center_rect(
+        frame.area(),
+        u16::try_from(width).unwrap_or(u16::MAX),
+        height,
+    );
+
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "preflight failed",
+            Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ]);
+    let block = framed_block_titled(title).padding(Padding::horizontal(2));
+
+    // Clear punches a hole through whatever was painted underneath; we
+    // don't render the normal UI in this code path, but Clear also wipes
+    // any leftover frame buffer from prior draws (resize, etc.).
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn center_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }

@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use super::app::{App, Command};
 use super::input;
+use super::preflight::{self, MissingDep};
 use super::subprocess::suspend_around;
 use super::ui;
 
@@ -24,13 +25,43 @@ const TICK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Enter the TUI and drive the event loop. Returns the process exit code
 /// the caller should propagate.
+///
+/// Runs a host-dependency preflight first. If anything is missing the user
+/// gets a blocking modal explaining what to install; any key quits with
+/// exit code 1. We enter the alt screen *before* the probe so the modal
+/// renders consistently with the rest of the UI (same rounded borders,
+/// same theme).
 pub(super) fn run(app: &mut App) -> Result<i32> {
+    let failures = preflight::check();
     let mut term = enter_terminal()?;
+    if !failures.is_empty() {
+        let result = run_preflight_modal(&mut term, &failures);
+        leave_terminal()?;
+        return result;
+    }
     app.spawn_refresh_thread();
     let result = drive(app, &mut term);
     app.shutdown_refresh_thread();
     leave_terminal()?;
     result
+}
+
+/// Block on the preflight modal until the user dismisses it. Exit code 1
+/// so calling shells / CI can tell a preflight-failed run apart from a
+/// clean quit.
+fn run_preflight_modal(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    failures: &[MissingDep],
+) -> Result<i32> {
+    loop {
+        term.draw(|f| ui::render_preflight(f, failures))?;
+        if event::poll(TICK_INTERVAL)?
+            && let event::Event::Key(k) = event::read()?
+            && k.kind == event::KeyEventKind::Press
+        {
+            return Ok(1);
+        }
+    }
 }
 
 fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
