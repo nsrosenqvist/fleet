@@ -30,6 +30,11 @@ thiserror = "2"
 
 # Secrets handling
 secrecy = "0.10"
+# Cross-platform credential storage: macOS Keychain via Security framework,
+# Linux Secret Service via DBus (libsecret-compatible), Windows Credential
+# Manager. `crypto-rust` swaps libsecret's optional encryption out for a
+# pure-Rust AES implementation so we don't drag openssl in as a runtime dep.
+keyring = { version = "3", features = ["apple-native", "sync-secret-service", "crypto-rust"] }
 
 # Discovery
 which = "7"

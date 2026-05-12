@@ -75,7 +75,7 @@ pub fn build(
     match cfg {
         SecretBackendConfig::Env { var } => Box::new(env::EnvBackend::new(var.clone())),
         SecretBackendConfig::Keychain { service, account } => Box::new(
-            keychain::KeychainBackend::new(service.clone(), account.clone(), invoker),
+            keychain::KeychainBackend::new(service.clone(), account.clone()),
         ),
         SecretBackendConfig::Op { reference } => {
             Box::new(one_password::OpBackend::new(reference.clone(), invoker))

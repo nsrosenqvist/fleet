@@ -77,16 +77,24 @@ fn default_template() -> &'static str {
     r#"# fleet — per-engineer config.
 # Pick ONE backend for the `claude_code_oauth_token` secret.
 #
-# Option A: 1Password CLI (requires `op` in PATH; biometric prompt on first use)
-# [secrets.claude_code_oauth_token]
-# backend = "op"
-# ref = "op://<vault>/<item>/<field>"
+# Option A: OS keyring (cross-platform — macOS Keychain, Linux Secret
+# Service / GNOME Keyring / KWallet, Windows Credential Manager).
 #
-# Option B: macOS Keychain (`security add-generic-password -a $USER -s claude-code-oauth-token -w 'sk-ant-oat01-...'`)
+# Populate the entry once, before pressing Shift+S:
+#   macOS:    security add-generic-password -a $USER -s claude-code-oauth-token -w 'sk-ant-oat01-...'
+#   Linux:    secret-tool store --label='fleet' service claude-code-oauth-token account $USER
+#             (then paste the token at the prompt)
+#   Windows:  cmdkey /generic:claude-code-oauth-token /user:%USERNAME% /pass:'sk-ant-oat01-...'
+#
 # [secrets.claude_code_oauth_token]
 # backend = "keychain"
 # service = "claude-code-oauth-token"
 # # account = "<override $USER>"
+#
+# Option B: 1Password CLI (requires `op` in PATH; biometric prompt on first use)
+# [secrets.claude_code_oauth_token]
+# backend = "op"
+# ref = "op://<vault>/<item>/<field>"
 #
 # Option C: env var (explicit; usually CI only)
 # [secrets.claude_code_oauth_token]
