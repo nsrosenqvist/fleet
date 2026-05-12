@@ -746,8 +746,22 @@ impl App {
         };
         while let Ok(update) = rx.try_recv() {
             match update {
-                RefreshUpdate::Sessions(s) => {
-                    // Drop captures for sessions that vanished.
+                RefreshUpdate::Sessions(all) => {
+                    // Scope to the project this fleet instance is
+                    // pinned to. AO is multi-tenant, but the design
+                    // is "one fleet per repo / project" — surfacing
+                    // sessions for other projects would just confuse
+                    // the user.
+                    let s: Vec<SessionInfo> = match &self.current_project_key {
+                        Some(key) => all
+                            .into_iter()
+                            .filter(|info| info.project_id.as_deref() == Some(key.as_str()))
+                            .collect(),
+                        None => all,
+                    };
+                    // Drop pane captures whose session is no longer in
+                    // our visible set — frees memory for sessions that
+                    // either vanished from AO or moved out of scope.
                     let alive: std::collections::HashSet<String> =
                         s.iter().filter_map(|s| s.id.clone()).collect();
                     self.pane_outputs.retain(|k, _| alive.contains(k));
@@ -969,6 +983,50 @@ mod tests {
         app.drain_updates();
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(app.selected, 0, "selection should clamp to new length");
+    }
+
+    #[test]
+    fn drain_updates_filters_sessions_to_current_project() {
+        let mut app = app_with(0);
+        app.current_project_key = Some("alpha".to_string());
+        let (tx, rx) = mpsc::channel();
+        app.refresh_update_rx = Some(rx);
+
+        let mk = |id: &str, project: &str| SessionInfo {
+            id: Some(id.to_string()),
+            project_id: Some(project.to_string()),
+            ..Default::default()
+        };
+        tx.send(RefreshUpdate::Sessions(vec![
+            mk("sb-1", "alpha"),
+            mk("sb-2", "beta"),
+            mk("sb-3", "alpha"),
+        ]))
+        .unwrap();
+        app.drain_updates();
+        assert_eq!(app.sessions.len(), 2, "only alpha's sessions remain");
+        assert!(app.sessions.iter().all(|s| s.project_id.as_deref() == Some("alpha")));
+    }
+
+    #[test]
+    fn drain_updates_keeps_all_sessions_when_unscoped() {
+        let mut app = app_with(0);
+        assert!(app.current_project_key.is_none());
+        let (tx, rx) = mpsc::channel();
+        app.refresh_update_rx = Some(rx);
+
+        let mk = |id: &str, project: &str| SessionInfo {
+            id: Some(id.to_string()),
+            project_id: Some(project.to_string()),
+            ..Default::default()
+        };
+        tx.send(RefreshUpdate::Sessions(vec![
+            mk("sb-1", "alpha"),
+            mk("sb-2", "beta"),
+        ]))
+        .unwrap();
+        app.drain_updates();
+        assert_eq!(app.sessions.len(), 2, "unscoped fleet sees everything");
     }
 
     #[test]

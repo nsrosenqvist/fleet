@@ -144,8 +144,12 @@ fn draw_body(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 fn draw_sessions_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let items: Vec<ListItem<'_>> = if app.sessions.is_empty() {
+        let empty = app.current_project_key.as_ref().map_or_else(
+            || "(no sessions)".to_string(),
+            |key| format!("(no sessions for `{key}`)"),
+        );
         vec![ListItem::new(Line::from(Span::styled(
-            "(no sessions)",
+            empty,
             Style::default().fg(MUTED),
         )))]
     } else {
