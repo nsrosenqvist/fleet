@@ -487,6 +487,12 @@ pub struct App {
     /// sees the failure instead of an empty Config panel.
     pub(super) ao_config: Option<crate::ao::config::AoConfig>,
 
+    /// Path the cached `ao_config` was read from. `None` mirrors
+    /// `ao_config = None`. Save writes back to this path so an edit
+    /// loaded from the central catalog doesn't accidentally land in
+    /// the per-repo file (or vice-versa).
+    pub(super) ao_config_path: Option<std::path::PathBuf>,
+
     /// Edit state for the Config view. Built on entry (or reset on `r`
     /// reload) from `ao_config`. `None` when the yaml doesn't exist —
     /// the Config view shows the missing-file panel instead of a form.
@@ -543,13 +549,16 @@ impl App {
         // Eagerly read AO config so the Config view has something to
         // show on first switch. A parse error here is non-fatal — the
         // view renders the error in place of the kv table.
-        let ao_config = crate::ao::config::AoConfig::load(repo_root).ok().flatten();
+        let loaded = crate::ao::config::AoConfig::load(repo_root).ok().flatten();
+        let (ao_config_path, ao_config) = loaded
+            .map_or((None, None), |(p, c)| (Some(p), Some(c)));
         let config_form = ao_config.clone().map(ConfigForm::new);
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
             invoker: Arc::new(RealProcessInvoker),
             view: View::default(),
             ao_config,
+            ao_config_path,
             config_form,
             sessions: Vec::new(),
             selected: 0,
@@ -633,14 +642,16 @@ impl App {
     /// an action error rather than crashing the cached value to `None`.
     pub(super) fn reload_ao_config(&mut self) {
         match crate::ao::config::AoConfig::load(&self.repo_root) {
-            Ok(cfg) => {
+            Ok(loaded) => {
                 // Reload always resets the form draft — picking up
                 // external edits is the whole point of `r`. Unsaved
                 // form changes are intentionally lost; the user can
                 // press Ctrl+S before reloading if they want to keep
                 // them.
+                let (path, cfg) = loaded.map_or((None, None), |(p, c)| (Some(p), Some(c)));
                 self.config_form = cfg.clone().map(ConfigForm::new);
                 self.ao_config = cfg;
+                self.ao_config_path = path;
                 self.action_error = None;
             }
             Err(e) => {

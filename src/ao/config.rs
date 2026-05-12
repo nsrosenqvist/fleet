@@ -84,27 +84,54 @@ pub struct Tracker {
 }
 
 impl AoConfig {
-    /// Repo-relative path to the AO config — same location AO itself
-    /// reads, and the same file the existing `c` keybind opens in
-    /// `$EDITOR`.
-    pub fn path(repo_root: &Path) -> PathBuf {
-        repo_root.join("agent-orchestrator.yaml")
+    /// Where a *new* AO config should land when nothing exists yet.
+    /// XDG-style central catalog so the same file drives every fleet
+    /// instance the user runs, regardless of which repo they're in.
+    pub fn default_xdg_path() -> Option<PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        Some(base.join("fleet").join("agent-orchestrator.yaml"))
     }
 
-    /// Parse the on-disk yaml. Returns `Ok(None)` if the file is
-    /// absent — useful for codebases bootstrapping fleet before AO is
-    /// wired up. Anything else (parse error, IO error) bubbles as
-    /// `Err` with context.
-    pub fn load(repo_root: &Path) -> Result<Option<Self>> {
-        let path = Self::path(repo_root);
-        if !path.is_file() {
-            return Ok(None);
+    /// Resolve the path fleet should read from, in order of precedence:
+    ///
+    /// 1. `$XDG_CONFIG_HOME/fleet/agent-orchestrator.yaml` (or
+    ///    `~/.config/fleet/…`) — the central catalog. Wins when
+    ///    present; lets one yaml drive many per-repo fleet instances.
+    /// 2. `<repo_root>/agent-orchestrator.yaml` — the historical
+    ///    per-repo location. Kept as a fallback so existing setups
+    ///    keep working until users migrate.
+    ///
+    /// Returns `None` when neither file exists — caller should treat
+    /// that as "nothing configured yet" rather than an error.
+    pub fn resolve_path(repo_root: &Path) -> Option<PathBuf> {
+        if let Some(xdg) = Self::default_xdg_path()
+            && xdg.is_file()
+        {
+            return Some(xdg);
         }
+        let repo_path = repo_root.join("agent-orchestrator.yaml");
+        if repo_path.is_file() {
+            return Some(repo_path);
+        }
+        None
+    }
+
+    /// Parse the on-disk yaml. Returns `Ok(None)` when neither the
+    /// XDG nor the repo-local file exists. Anything else (parse error,
+    /// IO error) bubbles as `Err` with context. The successful return
+    /// includes the *path* the config was loaded from so callers can
+    /// save back to the same file.
+    pub fn load(repo_root: &Path) -> Result<Option<(PathBuf, Self)>> {
+        let Some(path) = Self::resolve_path(repo_root) else {
+            return Ok(None);
+        };
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("read {}", path.display()))?;
         let parsed: Self = serde_yml::from_str(&text)
             .with_context(|| format!("parse {}", path.display()))?;
-        Ok(Some(parsed))
+        Ok(Some((path, parsed)))
     }
 
     /// Effective agent name. Looks at the `Self::defaults.agent` field;

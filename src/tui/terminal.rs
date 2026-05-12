@@ -378,7 +378,25 @@ fn save_ao_config(app: &mut App) {
             return;
         }
     };
-    let path = crate::ao::config::AoConfig::path(&app.repo_root);
+    // Write back to whichever path the config was loaded from — an
+    // edit started against the XDG catalog must not land in the
+    // per-repo fallback or vice versa. If no path was tracked (config
+    // didn't exist at startup), default to XDG so new configs land in
+    // the central catalog.
+    let Some(path) = app
+        .ao_config_path
+        .clone()
+        .or_else(crate::ao::config::AoConfig::default_xdg_path)
+    else {
+        app.flash_err("can't resolve a target path (no HOME / XDG_CONFIG_HOME set)");
+        return;
+    };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        app.flash_err(format!("mkdir {}: {}", parent.display(), e));
+        return;
+    }
     // Write to a sibling tempfile in the same directory so the rename
     // stays on the same filesystem (atomic rename only crosses devices
     // unreliably). `.tmp` suffix matches the convention git uses for
@@ -394,8 +412,11 @@ fn save_ao_config(app: &mut App) {
         let _ = std::fs::remove_file(&tmp);
         return;
     }
-    app.flash_ok(format!("saved {}", path.display()));
+    let saved_to = path.display().to_string();
     app.reload_ao_config();
+    // reload may have re-pointed ao_config_path; the flash should
+    // reflect what we actually just wrote, not the post-reload state.
+    app.flash_ok(format!("saved {saved_to}"));
 }
 
 fn stop_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {

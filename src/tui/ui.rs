@@ -403,23 +403,39 @@ fn draw_config(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_config_missing(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let path = crate::ao::config::AoConfig::path(&app.repo_root);
-    let lines = vec![
+    let xdg = crate::ao::config::AoConfig::default_xdg_path();
+    let repo = app.repo_root.join("agent-orchestrator.yaml");
+    let mut lines = vec![
         Line::from(Span::styled(
             "agent-orchestrator.yaml not found",
             Style::default().fg(MUTED),
         )),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled("expected at  ", Style::default().fg(MUTED)),
-            Span::styled(path.display().to_string(), Style::default().fg(ACCENT)),
-        ]),
-        Line::raw(""),
         Line::from(Span::styled(
-            "Press `r` to retry after creating the file, or `⇧H` to return to sessions.",
+            "Fleet looks for the AO catalog in two places, in order:",
             Style::default().fg(MUTED),
         )),
     ];
+    if let Some(xdg_path) = &xdg {
+        lines.push(Line::from(vec![
+            Span::styled("  1.  ", Style::default().fg(MUTED)),
+            Span::styled(
+                xdg_path.display().to_string(),
+                Style::default().fg(ACCENT),
+            ),
+            Span::raw("  (central)"),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("  2.  ", Style::default().fg(MUTED)),
+        Span::styled(repo.display().to_string(), Style::default().fg(ACCENT)),
+        Span::raw("  (per-repo)"),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Press `r` to retry after creating the file, or `⇧H` to return to sessions.",
+        Style::default().fg(MUTED),
+    )));
     let title = Line::from(vec![Span::styled(
         " agent-orchestrator.yaml ",
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),

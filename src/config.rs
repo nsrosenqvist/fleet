@@ -66,7 +66,10 @@ impl AgentAuthMode {
             Self::ClaudeOauth => ResolvedAuthMode::ClaudeOauth,
             Self::Passthrough => ResolvedAuthMode::Passthrough,
             Self::Auto => {
-                let ao_cfg = crate::ao::config::AoConfig::load(repo_root).ok().flatten();
+                let ao_cfg = crate::ao::config::AoConfig::load(repo_root)
+                    .ok()
+                    .flatten()
+                    .map(|(_, cfg)| cfg);
                 let agent = ao_cfg.as_ref().and_then(|c| c.agent());
                 match crate::ao::config::auth_mode_for_agent(agent) {
                     crate::ao::config::AuthModeHint::ClaudeOauth => ResolvedAuthMode::ClaudeOauth,
