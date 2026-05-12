@@ -8,7 +8,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use super::app::{App, ClickKind, ClickTarget, Command, Confirm, View};
+use super::app::{App, ClickKind, ClickTarget, Command, ConfigField, Confirm, View};
 
 /// Lines moved per scroll-wheel notch. Three matches the j/k cadence
 /// closely enough that mixing keyboard and wheel doesn't feel jumpy.
@@ -72,12 +72,78 @@ fn handle_key_sessions(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_key_config(app: &mut App, key: KeyEvent) {
-    // Read-only first pass: `r` to re-read, `c` still shells out to
-    // $EDITOR until the form-editor lands. No selection / navigation
-    // yet — that arrives with the editing pass.
+    let Some(form) = app.config_form.as_mut() else {
+        // No form to drive (yaml missing). Same fallback keys as the
+        // missing-file panel.
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('r'), _) => app.reload_ao_config(),
+            (KeyCode::Char('c'), _) => app.push_command(Command::EditConfig),
+            _ => {}
+        }
+        return;
+    };
+
+    // Text-edit mode takes precedence: every keystroke either updates
+    // the buffer, commits, or cancels.
+    if form.editing.is_some() {
+        handle_text_edit(form, key);
+        return;
+    }
+
     match (key.code, key.modifiers) {
+        // Navigation between form fields. Tab/Down + Shift+Tab/Up are
+        // standard for forms; j/k stay reserved for vim users.
+        (KeyCode::Tab | KeyCode::Down | KeyCode::Char('j'), _) => {
+            form.focus = form.focus.next();
+        }
+        (KeyCode::BackTab | KeyCode::Up, _) => {
+            form.focus = form.focus.prev();
+        }
+        (KeyCode::Char('k'), m) if !m.contains(KeyModifiers::SHIFT) => {
+            form.focus = form.focus.prev();
+        }
+
+        // Enter / Space cycles the focused enum, or enters text edit
+        // mode for numeric / string fields (port today).
+        (KeyCode::Enter | KeyCode::Char(' '), _) => match form.focus {
+            ConfigField::Port => form.begin_edit(),
+            _ => form.cycle_focused(1),
+        },
+        // Shift-Enter cycles backwards on enums; on text fields it
+        // also enters edit mode (same as plain Enter).
+        (KeyCode::Char('h'), m) if !m.contains(KeyModifiers::SHIFT) => {
+            form.cycle_focused(-1);
+        }
+        (KeyCode::Char('l'), m) if !m.contains(KeyModifiers::SHIFT) => {
+            form.cycle_focused(1);
+        }
+
         (KeyCode::Char('r'), _) => app.reload_ao_config(),
         (KeyCode::Char('c'), _) => app.push_command(Command::EditConfig),
+        _ => {}
+    }
+}
+
+fn handle_text_edit(form: &mut crate::tui::app::ConfigForm, key: KeyEvent) {
+    let Some(buf) = form.editing.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Enter => form.commit_edit(),
+        KeyCode::Esc => form.cancel_edit(),
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char(c) => {
+            // For the port field, restrict to digits — saves the user
+            // typing a non-number and having it silently revert on
+            // commit. Other text fields (when they arrive) get
+            // permissive input here.
+            if matches!(form.focus, ConfigField::Port) && !c.is_ascii_digit() {
+                return;
+            }
+            buf.push(c);
+        }
         _ => {}
     }
 }

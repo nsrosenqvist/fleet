@@ -26,7 +26,7 @@ use crate::ao::SessionInfo;
 use crate::ao::config::AoConfig;
 use crate::lima::VmStatus;
 
-use super::app::{App, View};
+use super::app::{App, ConfigField, View};
 use super::bringup::BringUp;
 use super::preflight::MissingDep;
 use super::theme::{
@@ -319,6 +319,55 @@ fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+/// View-specific status-bar hints. The form's mode (idle / editing /
+/// nothing-loaded) decides which keys matter — showing irrelevant ones
+/// would clutter the legend without helping the user.
+fn config_status_spans(app: &App) -> Vec<Span<'_>> {
+    let mut out = vec![chip("[fleet:config]", ACCENT), sep()];
+
+    let editing = app
+        .config_form
+        .as_ref()
+        .is_some_and(|f| f.editing.is_some());
+
+    if editing {
+        out.extend([
+            key("Enter"),
+            Span::raw(" commit"),
+            sep(),
+            key("Esc"),
+            Span::raw(" cancel"),
+            sep(),
+            key("⌫"),
+            Span::raw(" del"),
+        ]);
+    } else {
+        out.extend([
+            key("Tab/↑↓"),
+            Span::raw(" nav"),
+            sep(),
+            key("Enter"),
+            Span::raw(" edit/cycle"),
+            sep(),
+            key("h/l"),
+            Span::raw(" prev/next"),
+            sep(),
+            key("⇧H"),
+            Span::raw(" sessions"),
+            sep(),
+            key("c"),
+            Span::raw(" yaml editor"),
+            sep(),
+            key("r"),
+            Span::raw(" reload"),
+            sep(),
+            key("q"),
+            Span::raw(" quit"),
+        ]);
+    }
+    out
+}
+
 // ─────────────────────── Config view ───────────────────────
 //
 // First-cut read-only render: a single column with two stacked panels
@@ -327,16 +376,14 @@ fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
 // now `c` keeps opening $EDITOR as the escape hatch.
 
 fn draw_config(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let Some(cfg) = app.ao_config.as_ref() else {
+    let (Some(orig), Some(form)) = (app.ao_config.as_ref(), app.config_form.as_ref()) else {
         draw_config_missing(app, frame, area);
         return;
     };
 
-    let defaults_lines = build_defaults_lines(cfg);
-    let projects_lines = build_projects_lines(cfg);
+    let defaults_lines = build_defaults_form_lines(form);
+    let projects_lines = build_projects_lines(&form.draft);
 
-    // Defaults panel sizes to its content; projects panel takes the
-    // rest. Both auto-shrink if the terminal is too short.
     let defaults_h = u16::try_from(defaults_lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
@@ -348,8 +395,8 @@ fn draw_config(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ])
         .split(area);
 
-    draw_defaults_panel(cfg, defaults_lines, frame, rows[0]);
-    draw_projects_panel(cfg, projects_lines, frame, rows[1]);
+    draw_defaults_panel(form, orig, defaults_lines, frame, rows[0]);
+    draw_projects_panel(&form.draft, projects_lines, frame, rows[1]);
 }
 
 fn draw_config_missing(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -381,28 +428,67 @@ fn draw_config_missing(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn build_defaults_lines(cfg: &AoConfig) -> Vec<Line<'static>> {
-    let d = &cfg.defaults;
-    let port_str = cfg.port.map_or_else(
-        || "(unset — AO default)".to_string(),
-        |p| p.to_string(),
-    );
-    let mut out = vec![
-        kv_line("agent", d.agent.as_deref().unwrap_or("(unset — AO default)")),
-        kv_line(
-            "runtime",
-            d.runtime.as_deref().unwrap_or("(unset — AO default)"),
-        ),
-        kv_line(
-            "workspace",
-            d.workspace.as_deref().unwrap_or("(unset — AO default)"),
-        ),
-        kv_line("port", &port_str),
-    ];
-    if !d.notifiers.is_empty() {
-        out.push(kv_line("notifiers", &d.notifiers.join(", ")));
+/// Build the defaults form lines with focus + edit-mode indicators.
+/// Each row reads as `kv_line` would, but the focused row carries a
+/// `▶` gutter glyph and an accent-coloured value; the focused row
+/// during text-edit shows a `█` caret in place of the value.
+fn build_defaults_form_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>> {
+    let d = &form.draft.defaults;
+    let mut out = Vec::new();
+    for field in ConfigField::ALL {
+        let value: String = match field {
+            ConfigField::Agent => d
+                .agent
+                .clone()
+                .unwrap_or_else(|| "(unset — AO default)".into()),
+            ConfigField::Runtime => d
+                .runtime
+                .clone()
+                .unwrap_or_else(|| "(unset — AO default)".into()),
+            ConfigField::Workspace => d
+                .workspace
+                .clone()
+                .unwrap_or_else(|| "(unset — AO default)".into()),
+            ConfigField::Port => form
+                .draft
+                .port
+                .map_or_else(|| "(unset — AO default)".into(), |p| p.to_string()),
+        };
+        out.push(field_line(*field, &value, form));
     }
     out
+}
+
+fn field_line(field: ConfigField, value: &str, form: &super::app::ConfigForm) -> Line<'static> {
+    let focused = field == form.focus;
+    let editing = focused && form.editing.is_some();
+    let gutter = if focused { "▶ " } else { "  " };
+
+    // Label: same 14-col muted column as kv_line, plus the gutter.
+    let label_span = Span::styled(
+        format!("{gutter}{:<14}", field.label()),
+        Style::default().fg(if focused { ACCENT } else { MUTED }),
+    );
+
+    // Value: when editing, show the in-progress buffer + caret. When
+    // focused-but-not-editing, accent colour to signal "this is what
+    // the keys will affect." Otherwise plain.
+    let value_span = if editing {
+        let buf = form.editing.as_deref().unwrap_or("");
+        Span::styled(
+            format!("{buf}█"),
+            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+        )
+    } else if focused {
+        Span::styled(
+            value.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw(value.to_string())
+    };
+
+    Line::from(vec![label_span, value_span])
 }
 
 fn build_projects_lines(cfg: &AoConfig) -> Vec<Line<'static>> {
@@ -455,31 +541,31 @@ fn build_projects_lines(cfg: &AoConfig) -> Vec<Line<'static>> {
 }
 
 fn draw_defaults_panel(
-    cfg: &AoConfig,
+    form: &super::app::ConfigForm,
+    orig: &AoConfig,
     body: Vec<Line<'static>>,
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    let title = Line::from(vec![
+    let dirty = form.is_dirty(orig);
+    let mut title_spans = vec![
         Span::raw(" "),
         Span::styled(
             "defaults",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled(
-            if cfg.schema.is_some() {
-                "AO config".to_string()
-            } else {
-                "AO config (no $schema)".to_string()
-            },
+    ];
+    if dirty {
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(
+            "modified",
             Style::default()
-                .fg(MUTED)
-                .add_modifier(Modifier::ITALIC),
-        ),
-        Span::raw(" "),
-    ]);
-    let block = framed_block_titled(title).padding(Padding::horizontal(2));
+                .fg(WARN)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        ));
+    }
+    title_spans.push(Span::raw(" "));
+    let block = framed_block_titled(Line::from(title_spans)).padding(Padding::horizontal(2));
     frame.render_widget(
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
         area,
@@ -585,21 +671,7 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
             key("q"),
             Span::raw(" quit"),
         ],
-        View::Config => vec![
-            chip("[fleet:config]", ACCENT),
-            sep(),
-            key("⇧H"),
-            Span::raw(" sessions"),
-            sep(),
-            key("c"),
-            Span::raw(" edit yaml"),
-            sep(),
-            key("r"),
-            Span::raw(" reload"),
-            sep(),
-            key("q"),
-            Span::raw(" quit"),
-        ],
+        View::Config => config_status_spans(app),
     };
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().fg(MUTED)),

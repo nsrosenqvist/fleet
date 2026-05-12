@@ -60,6 +60,166 @@ pub(super) enum View {
     Config,
 }
 
+/// Which form field the Config view currently has focused. Order
+/// matters — Tab cycles in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ConfigField {
+    #[default]
+    Agent,
+    Runtime,
+    Workspace,
+    Port,
+}
+
+impl ConfigField {
+    pub(super) const ALL: &'static [Self] = &[Self::Agent, Self::Runtime, Self::Workspace, Self::Port];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Runtime => "runtime",
+            Self::Workspace => "workspace",
+            Self::Port => "port",
+        }
+    }
+
+    pub(super) fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    pub(super) fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+/// Known values for each enum field, in cycle order. The trailing `""`
+/// represents "unset — fall back to AO's internal default" which is a
+/// legitimate state worth being able to reach from the form.
+pub(super) const AGENT_VALUES: &[&str] = &["claude-code", "codex", "aider", ""];
+pub(super) const RUNTIME_VALUES: &[&str] = &["tmux", ""];
+pub(super) const WORKSPACE_VALUES: &[&str] = &["worktree", "in-place", ""];
+
+/// Form state for the Config view. Wraps a writable draft of the
+/// parsed AO config so edits don't touch `app.ao_config` until the
+/// user saves; the original cached copy stays as the comparison
+/// baseline that determines whether the form is "dirty."
+#[derive(Debug, Clone)]
+pub(super) struct ConfigForm {
+    pub(super) draft: crate::ao::config::AoConfig,
+    pub(super) focus: ConfigField,
+    /// `Some` when the user is mid-text-edit on a string/number field.
+    /// Carries the in-progress string; commit on Enter, revert on Esc.
+    pub(super) editing: Option<String>,
+}
+
+impl ConfigForm {
+    pub(super) fn new(cfg: crate::ao::config::AoConfig) -> Self {
+        Self {
+            draft: cfg,
+            focus: ConfigField::default(),
+            editing: None,
+        }
+    }
+
+    /// True when the draft has diverged from the on-disk yaml. Drives
+    /// the "(modified)" indicator and gates the save flow.
+    pub(super) fn is_dirty(&self, original: &crate::ao::config::AoConfig) -> bool {
+        // Serialise both and compare strings. Simpler than implementing
+        // a manual deep-equal across the schema and round-trips the same
+        // shape we'd write to disk on save, so "no diff" is conservative.
+        let a = serde_yml::to_string(&self.draft).unwrap_or_default();
+        let b = serde_yml::to_string(original).unwrap_or_default();
+        a != b
+    }
+
+    /// Cycle to the next known value for an enum field. `delta = 1`
+    /// for "next", `-1` for "prev" so Tab + Shift-Tab don't have to
+    /// reach into the cycle table themselves.
+    pub(super) fn cycle_focused(&mut self, delta: i32) {
+        match self.focus {
+            ConfigField::Agent => {
+                self.draft.defaults.agent = cycle_value(
+                    AGENT_VALUES,
+                    self.draft.defaults.agent.as_deref(),
+                    delta,
+                );
+            }
+            ConfigField::Runtime => {
+                self.draft.defaults.runtime = cycle_value(
+                    RUNTIME_VALUES,
+                    self.draft.defaults.runtime.as_deref(),
+                    delta,
+                );
+            }
+            ConfigField::Workspace => {
+                self.draft.defaults.workspace = cycle_value(
+                    WORKSPACE_VALUES,
+                    self.draft.defaults.workspace.as_deref(),
+                    delta,
+                );
+            }
+            ConfigField::Port => {} // Port is text-edited, not cycled.
+        }
+    }
+
+    /// Start a text edit on the focused field, seeding the buffer with
+    /// the current value. No-op on enum fields.
+    pub(super) fn begin_edit(&mut self) {
+        if !matches!(self.focus, ConfigField::Port) {
+            return;
+        }
+        self.editing = Some(
+            self.draft
+                .port
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        );
+    }
+
+    /// Commit the current text-edit buffer back into the draft. Bad
+    /// input on numeric fields drops back into "(unset)" rather than
+    /// rejecting the keystroke — the user can re-edit if they meant
+    /// something specific.
+    pub(super) fn commit_edit(&mut self) {
+        let Some(buf) = self.editing.take() else { return };
+        if matches!(self.focus, ConfigField::Port) {
+            let trimmed = buf.trim();
+            self.draft.port = if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<u16>().ok()
+            };
+        }
+    }
+
+    pub(super) fn cancel_edit(&mut self) {
+        self.editing = None;
+    }
+}
+
+fn cycle_value(values: &[&str], current: Option<&str>, delta: i32) -> Option<String> {
+    // `values` is a small `&'static [&str]` (4 entries at most for any
+    // field today) — the casts here can never overflow in practice.
+    let idx = values
+        .iter()
+        .position(|v| *v == current.unwrap_or(""))
+        .unwrap_or(0);
+    let len = values.len();
+    let next = if delta >= 0 {
+        (idx + delta.unsigned_abs() as usize) % len
+    } else {
+        (idx + len - (delta.unsigned_abs() as usize % len)) % len
+    };
+    let val = values[next];
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
 /// Pending destructive action awaiting a y/N confirmation in the status bar.
 #[derive(Debug, Clone)]
 pub(super) enum Confirm {
@@ -104,6 +264,11 @@ pub struct App {
     /// gets folded into [`Self::action_error`] at load time so the user
     /// sees the failure instead of an empty Config panel.
     pub(super) ao_config: Option<crate::ao::config::AoConfig>,
+
+    /// Edit state for the Config view. Built on entry (or reset on `r`
+    /// reload) from `ao_config`. `None` when the yaml doesn't exist —
+    /// the Config view shows the missing-file panel instead of a form.
+    pub(super) config_form: Option<ConfigForm>,
 
     pub(super) sessions: Vec<SessionInfo>,
     pub(super) selected: usize,
@@ -157,11 +322,13 @@ impl App {
         // show on first switch. A parse error here is non-fatal — the
         // view renders the error in place of the kv table.
         let ao_config = crate::ao::config::AoConfig::load(repo_root).ok().flatten();
+        let config_form = ao_config.clone().map(ConfigForm::new);
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
             invoker: Arc::new(RealProcessInvoker),
             view: View::default(),
             ao_config,
+            config_form,
             sessions: Vec::new(),
             selected: 0,
             refresh_error: None,
@@ -245,6 +412,12 @@ impl App {
     pub(super) fn reload_ao_config(&mut self) {
         match crate::ao::config::AoConfig::load(&self.repo_root) {
             Ok(cfg) => {
+                // Reload always resets the form draft — picking up
+                // external edits is the whole point of `r`. Unsaved
+                // form changes are intentionally lost; the user can
+                // press Ctrl+S before reloading if they want to keep
+                // them.
+                self.config_form = cfg.clone().map(ConfigForm::new);
                 self.ao_config = cfg;
                 self.action_error = None;
             }
@@ -556,6 +729,87 @@ mod tests {
             app.resolve_click(ClickTarget::SidebarItem(1)),
             ClickKind::Select,
         ));
+    }
+
+    fn empty_ao_config() -> crate::ao::config::AoConfig {
+        serde_yml::from_str("").unwrap()
+    }
+
+    #[test]
+    fn config_field_cycles_forward_and_back() {
+        assert_eq!(ConfigField::Agent.next(), ConfigField::Runtime);
+        assert_eq!(ConfigField::Port.next(), ConfigField::Agent);
+        assert_eq!(ConfigField::Agent.prev(), ConfigField::Port);
+    }
+
+    #[test]
+    fn cycle_value_walks_agent_options() {
+        let v = cycle_value(AGENT_VALUES, Some("claude-code"), 1);
+        assert_eq!(v.as_deref(), Some("codex"));
+        let v = cycle_value(AGENT_VALUES, Some("codex"), 1);
+        assert_eq!(v.as_deref(), Some("aider"));
+        // "" (the unset sentinel) maps to `None`, then wraps to the
+        // first non-empty value.
+        let v = cycle_value(AGENT_VALUES, Some("aider"), 1);
+        assert!(v.is_none(), "expected (unset) after aider");
+        let v = cycle_value(AGENT_VALUES, None, 1);
+        assert_eq!(v.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn cycle_value_walks_backward() {
+        let v = cycle_value(AGENT_VALUES, Some("codex"), -1);
+        assert_eq!(v.as_deref(), Some("claude-code"));
+        let v = cycle_value(AGENT_VALUES, Some("claude-code"), -1);
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn form_dirty_only_when_draft_diverges() {
+        let cfg = empty_ao_config();
+        let form = ConfigForm::new(cfg.clone());
+        assert!(!form.is_dirty(&cfg));
+
+        let mut form = ConfigForm::new(cfg.clone());
+        form.draft.defaults.agent = Some("codex".into());
+        assert!(form.is_dirty(&cfg));
+    }
+
+    #[test]
+    fn cycle_focused_writes_into_draft() {
+        let cfg = empty_ao_config();
+        let mut form = ConfigForm::new(cfg);
+        form.focus = ConfigField::Agent;
+        // `None` (unset) is the sentinel at the end of AGENT_VALUES;
+        // +1 from there wraps to the first explicit entry.
+        form.cycle_focused(1);
+        assert_eq!(form.draft.defaults.agent.as_deref(), Some("claude-code"));
+        form.cycle_focused(1);
+        assert_eq!(form.draft.defaults.agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn port_text_edit_commit_parses() {
+        let cfg = empty_ao_config();
+        let mut form = ConfigForm::new(cfg);
+        form.focus = ConfigField::Port;
+        form.begin_edit();
+        form.editing.as_mut().unwrap().push_str("3001");
+        form.commit_edit();
+        assert_eq!(form.draft.port, Some(3001));
+    }
+
+    #[test]
+    fn port_text_edit_cancel_does_not_mutate() {
+        let cfg = empty_ao_config();
+        let mut form = ConfigForm::new(cfg);
+        form.draft.port = Some(3000);
+        form.focus = ConfigField::Port;
+        form.begin_edit();
+        form.editing.as_mut().unwrap().clear();
+        form.editing.as_mut().unwrap().push_str("9999");
+        form.cancel_edit();
+        assert_eq!(form.draft.port, Some(3000), "cancel must revert");
     }
 
     #[test]
