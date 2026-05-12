@@ -142,6 +142,33 @@ impl AoConfig {
     pub fn agent(&self) -> Option<&str> {
         self.defaults.agent.as_deref()
     }
+
+    /// Find the project whose `path` is an ancestor of (or equal to)
+    /// `cwd`. Used by fleet to scope the per-instance UI to one
+    /// project based on where the user launched it from.
+    ///
+    /// When multiple projects could match (nested project paths,
+    /// rare in practice), the deepest one wins so a sub-project takes
+    /// precedence over its parent. Paths are canonicalised so a
+    /// symlinked checkout still matches.
+    pub fn project_for_cwd(&self, cwd: &Path) -> Option<&str> {
+        let Ok(cwd_real) = cwd.canonicalize() else {
+            return None;
+        };
+        let mut best: Option<(usize, &str)> = None;
+        for (key, project) in &self.projects {
+            let Ok(p_real) = project.path.canonicalize() else {
+                continue;
+            };
+            if cwd_real.starts_with(&p_real) {
+                let depth = p_real.components().count();
+                if best.is_none_or(|(d, _)| depth > d) {
+                    best = Some((depth, key.as_str()));
+                }
+            }
+        }
+        best.map(|(_, k)| k)
+    }
 }
 
 /// Heuristic mapping from a free-form agent name to the auth flow
@@ -237,5 +264,146 @@ reactions:
         // Backwards compat: a missing or unreadable AO config keeps
         // the historical behaviour for users who haven't migrated.
         assert_eq!(auth_mode_for_agent(None), AuthModeHint::ClaudeOauth);
+    }
+
+    #[test]
+    fn project_for_cwd_matches_exact_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let cfg = AoConfig {
+            schema: None,
+            port: None,
+            defaults: Defaults::default(),
+            projects: BTreeMap::from([(
+                "alpha".to_string(),
+                Project {
+                    name: "alpha".into(),
+                    session_prefix: None,
+                    path: project_dir.clone(),
+                    default_branch: None,
+                    agent_rules_file: None,
+                    agent: None,
+                    tracker: None,
+                    post_create: Vec::new(),
+                    extra: BTreeMap::new(),
+                },
+            )]),
+            extra: BTreeMap::new(),
+        };
+        assert_eq!(cfg.project_for_cwd(&project_dir), Some("alpha"));
+    }
+
+    #[test]
+    fn project_for_cwd_matches_subdir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tmp.path().join("alpha");
+        let sub_dir = project_dir.join("src/inner");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let cfg = AoConfig {
+            schema: None,
+            port: None,
+            defaults: Defaults::default(),
+            projects: BTreeMap::from([(
+                "alpha".to_string(),
+                Project {
+                    name: "alpha".into(),
+                    session_prefix: None,
+                    path: project_dir,
+                    default_branch: None,
+                    agent_rules_file: None,
+                    agent: None,
+                    tracker: None,
+                    post_create: Vec::new(),
+                    extra: BTreeMap::new(),
+                },
+            )]),
+            extra: BTreeMap::new(),
+        };
+        // cwd is a subdir of the project path — the project still
+        // matches, since "you're working inside it" is the right
+        // interpretation.
+        assert_eq!(cfg.project_for_cwd(&sub_dir), Some("alpha"));
+    }
+
+    #[test]
+    fn project_for_cwd_returns_none_when_outside() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tmp.path().join("alpha");
+        let unrelated = tmp.path().join("beta");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        let cfg = AoConfig {
+            schema: None,
+            port: None,
+            defaults: Defaults::default(),
+            projects: BTreeMap::from([(
+                "alpha".to_string(),
+                Project {
+                    name: "alpha".into(),
+                    session_prefix: None,
+                    path: project_dir,
+                    default_branch: None,
+                    agent_rules_file: None,
+                    agent: None,
+                    tracker: None,
+                    post_create: Vec::new(),
+                    extra: BTreeMap::new(),
+                },
+            )]),
+            extra: BTreeMap::new(),
+        };
+        assert_eq!(cfg.project_for_cwd(&unrelated), None);
+    }
+
+    #[test]
+    fn project_for_cwd_picks_deepest_match() {
+        // Nested projects: parent + child. cwd inside child should
+        // resolve to the child, not the parent.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("parent");
+        let child = parent.join("nested-child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let cfg = AoConfig {
+            schema: None,
+            port: None,
+            defaults: Defaults::default(),
+            projects: BTreeMap::from([
+                (
+                    "parent".to_string(),
+                    Project {
+                        name: "parent".into(),
+                        session_prefix: None,
+                        path: parent.clone(),
+                        default_branch: None,
+                        agent_rules_file: None,
+                        agent: None,
+                        tracker: None,
+                        post_create: Vec::new(),
+                        extra: BTreeMap::new(),
+                    },
+                ),
+                (
+                    "child".to_string(),
+                    Project {
+                        name: "child".into(),
+                        session_prefix: None,
+                        path: child.clone(),
+                        default_branch: None,
+                        agent_rules_file: None,
+                        agent: None,
+                        tracker: None,
+                        post_create: Vec::new(),
+                        extra: BTreeMap::new(),
+                    },
+                ),
+            ]),
+            extra: BTreeMap::new(),
+        };
+        assert_eq!(cfg.project_for_cwd(&child), Some("child"));
     }
 }

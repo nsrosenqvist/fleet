@@ -62,20 +62,26 @@ fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .constraints([Constraint::Min(0), Constraint::Length(18)])
         .split(area);
 
+    let project_chip = app
+        .current_project_key
+        .as_deref()
+        .unwrap_or("(unscoped)");
     let chain: Vec<Span<'_>> = match app.view {
         View::Sessions => app.selected_session().map_or_else(
             || {
                 vec![
                     chip("fleet", ACCENT),
                     Span::raw(" | "),
-                    Span::raw("(no sessions)"),
+                    chip(project_chip, ACCENT),
+                    Span::raw(" | "),
+                    Span::styled("(no sessions)", Style::default().fg(MUTED)),
                 ]
             },
             |s| {
                 vec![
                     chip("fleet", ACCENT),
                     Span::raw(" | "),
-                    Span::raw(s.project_id.clone().unwrap_or_else(|| "?".into())),
+                    chip(project_chip, ACCENT),
                     Span::raw(" | "),
                     Span::raw(s.id.clone().unwrap_or_else(|| "?".into())),
                     Span::raw(" "),
@@ -88,6 +94,8 @@ fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ),
         View::Config => vec![
             chip("fleet", ACCENT),
+            Span::raw(" | "),
+            chip(project_chip, ACCENT),
             Span::raw(" | "),
             Span::styled("config", Style::default().fg(MUTED)),
         ],

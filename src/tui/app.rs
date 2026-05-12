@@ -493,6 +493,13 @@ pub struct App {
     /// the per-repo file (or vice-versa).
     pub(super) ao_config_path: Option<std::path::PathBuf>,
 
+    /// Project key (the map key inside `ao_config.projects`) matching
+    /// the directory fleet was launched from. `None` when no project
+    /// in the catalog claims this cwd — the user is either outside
+    /// any known project or hasn't initialised one for this repo yet.
+    /// Drives view scoping and the breadcrumb.
+    pub(super) current_project_key: Option<String>,
+
     /// Edit state for the Config view. Built on entry (or reset on `r`
     /// reload) from `ao_config`. `None` when the yaml doesn't exist —
     /// the Config view shows the missing-file panel instead of a form.
@@ -552,13 +559,28 @@ impl App {
         let loaded = crate::ao::config::AoConfig::load(repo_root).ok().flatten();
         let (ao_config_path, ao_config) = loaded
             .map_or((None, None), |(p, c)| (Some(p), Some(c)));
-        let config_form = ao_config.clone().map(ConfigForm::new);
+        let current_project_key = ao_config
+            .as_ref()
+            .and_then(|c| c.project_for_cwd(repo_root).map(String::from));
+        let config_form = ao_config.clone().map(|cfg| {
+            let mut form = ConfigForm::new(cfg);
+            // Pre-select the project matching cwd so the Config view
+            // lands on the right one without the user cycling.
+            if let Some(key) = &current_project_key {
+                let keys = form.project_keys();
+                if let Some(idx) = keys.iter().position(|k| *k == key.as_str()) {
+                    form.selected_project_idx = idx;
+                }
+            }
+            form
+        });
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
             invoker: Arc::new(RealProcessInvoker),
             view: View::default(),
             ao_config,
             ao_config_path,
+            current_project_key,
             config_form,
             sessions: Vec::new(),
             selected: 0,
@@ -649,7 +671,19 @@ impl App {
                 // press Ctrl+S before reloading if they want to keep
                 // them.
                 let (path, cfg) = loaded.map_or((None, None), |(p, c)| (Some(p), Some(c)));
-                self.config_form = cfg.clone().map(ConfigForm::new);
+                self.current_project_key = cfg
+                    .as_ref()
+                    .and_then(|c| c.project_for_cwd(&self.repo_root).map(String::from));
+                self.config_form = cfg.clone().map(|c| {
+                    let mut form = ConfigForm::new(c);
+                    if let Some(key) = &self.current_project_key {
+                        let keys = form.project_keys();
+                        if let Some(idx) = keys.iter().position(|k| *k == key.as_str()) {
+                            form.selected_project_idx = idx;
+                        }
+                    }
+                    form
+                });
                 self.ao_config = cfg;
                 self.ao_config_path = path;
                 self.action_error = None;
