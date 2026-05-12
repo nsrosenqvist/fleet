@@ -28,8 +28,8 @@ use crate::lima::VmStatus;
 use super::app::App;
 use super::preflight::MissingDep;
 use super::theme::{
-    ACCENT, ERR, KEY_FG, MUTED, OK, WARN, badge, chip, framed_block, framed_block_titled, key,
-    kv_line, sep,
+    ACCENT, ERR, KEY_FG, MUTED, OK, WARN, badge, chip, framed_block, framed_block_titled,
+    hyperlink, key, kv_line, sep,
 };
 
 pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
@@ -415,7 +415,7 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
         if let Some(url) = f.docs {
             lines.push(Line::from(vec![
                 Span::styled("  docs     ", Style::default().fg(MUTED)),
-                Span::styled(url.to_string(), Style::default().fg(ACCENT)),
+                hyperlink(url, url),
             ]));
         }
         lines.push(Line::raw(""));
