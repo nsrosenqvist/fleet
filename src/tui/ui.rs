@@ -19,13 +19,16 @@
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{List, ListItem, ListState, Padding, Paragraph, Wrap};
 
+use crate::ao::SessionInfo;
 use crate::lima::VmStatus;
 
 use super::app::App;
-use super::theme::{ACCENT, ERR, MUTED, OK, WARN, chip, framed_block, key, sep};
+use super::theme::{
+    ACCENT, ERR, MUTED, OK, WARN, chip, framed_block, framed_block_titled, key, kv_line, sep,
+};
 
 pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
     let area = frame.area();
@@ -101,11 +104,17 @@ fn draw_body(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     draw_sessions_list(app, frame, cols[0]);
 
+    // Size the details panel to its content: `body.len()` rows + 2 borders.
+    // Cap at `area.height - 5` so the output panel always gets at least 5
+    // rows even when a future session grows extra kv fields.
+    let body = build_details_body(app.selected_session());
+    let max_info_h = cols[1].height.saturating_sub(5).max(3);
+    let info_h = (u16::try_from(body.len()).unwrap_or(u16::MAX) + 2).min(max_info_h);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(0)])
+        .constraints([Constraint::Length(info_h), Constraint::Min(0)])
         .split(cols[1]);
-    draw_details(app, frame, rows[0]);
+    draw_details(app, body, frame, rows[0]);
     draw_output(app, frame, rows[1]);
 }
 
@@ -172,41 +181,85 @@ fn record_sidebar_rects(app: &App, area: Rect) {
     }
 }
 
-fn draw_details(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let selected = app.selected_session();
-    let body = selected.map_or_else(
-        || Text::from("(no session selected)").style(Style::default().fg(MUTED)),
-        |s| {
-            let kv = |label: &str, value: &str| {
-                Line::from(vec![
-                    Span::styled(format!("  {label:<10}"), Style::default().fg(MUTED)),
-                    Span::raw(value.to_string()),
-                ])
-            };
-            Text::from(vec![
-                kv("Branch", s.branch.as_deref().unwrap_or("(none)")),
-                kv("Ticket", s.issue_id.as_deref().unwrap_or("(none)")),
-                kv("Project", s.project_id.as_deref().unwrap_or("(none)")),
-                kv("Status", s.status.as_deref().unwrap_or("(none)")),
-                kv("Activity", s.activity.as_deref().unwrap_or("(none)")),
-                kv("Last", s.last_activity.as_deref().unwrap_or("(none)")),
-                kv(
-                    "Summary",
-                    s.claude_summary
-                        .as_deref()
-                        .or(s.summary.as_deref())
-                        .unwrap_or("(none)"),
-                ),
-            ])
-        },
+/// Build the details-panel body for the currently selected session.
+/// Empty-value rows are skipped — keel's pattern is "what's relevant
+/// shows up; what isn't, doesn't" rather than padding with `(none)`.
+/// The first row is always present when a session is selected so the
+/// panel never collapses to zero rows mid-frame.
+fn build_details_body(session: Option<&SessionInfo>) -> Vec<Line<'static>> {
+    let Some(s) = session else {
+        return vec![Line::from(Span::styled(
+            "(no session selected)",
+            Style::default().fg(MUTED),
+        ))];
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut push = |label: &str, value: Option<&str>| {
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            lines.push(kv_line(label, v));
+        }
+    };
+    push("branch", s.branch.as_deref());
+    push("ticket", s.issue_id.as_deref());
+    push("project", s.project_id.as_deref());
+    push("activity", s.activity.as_deref());
+    push("last", s.last_activity.as_deref());
+    push(
+        "summary",
+        s.claude_summary.as_deref().or(s.summary.as_deref()),
     );
-    let title = selected
-        .and_then(|s| s.id.as_deref())
-        .map_or_else(|| " details ".to_string(), |id| format!(" details — {id} "));
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no metadata)",
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines
+}
+
+fn details_title(session: Option<&SessionInfo>) -> Line<'static> {
+    // Mirror keel's info-panel header: leading space, bold-accent name,
+    // double space, italic-dim "kind" tag, trailing space. For fleet the
+    // kind tag is the live session status (`agentic`, `idle`, …) so the
+    // title doubles as a live state indicator.
+    let Some(s) = session else {
+        return Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "details",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]);
+    };
+    let id = s.id.clone().unwrap_or_else(|| "?".into());
+    let tag = s
+        .status
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "session".into());
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            id,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            tag,
+            Style::default()
+                .fg(MUTED)
+                .add_modifier(Modifier::ITALIC),
+        ),
+        Span::raw(" "),
+    ])
+}
+
+fn draw_details(app: &App, body: Vec<Line<'static>>, frame: &mut Frame<'_>, area: Rect) {
+    let title = details_title(app.selected_session());
+    let block = framed_block_titled(title).padding(Padding::horizontal(2));
     frame.render_widget(
-        Paragraph::new(body)
-            .block(framed_block(&title))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
         area,
     );
 }

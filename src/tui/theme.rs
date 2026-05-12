@@ -7,7 +7,7 @@
 //! place.
 
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
 
 /// Primary accent — section titles, the leading chip in the breadcrumb /
@@ -28,8 +28,9 @@ pub const WARN: Color = Color::Yellow;
 /// muted-grey body of the bar so the keys read at a glance.
 pub const KEY_FG: Color = Color::White;
 
-/// A bordered panel with a coloured title. Used by every framed pane
-/// (sessions list, details, output).
+/// A bordered panel with a single-string title rendered bold-accent.
+/// Used by panels whose title is plain text (the sessions list, the
+/// output pane).
 pub fn framed_block(title: &str) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
@@ -37,8 +38,29 @@ pub fn framed_block(title: &str) -> Block<'_> {
         .border_style(Style::default().fg(MUTED))
         .title(Span::styled(
             title.to_string(),
-            Style::default().fg(ACCENT),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))
+}
+
+/// Variant of [`framed_block`] that takes a pre-styled [`Line`] so the
+/// caller can compose multiple spans (e.g. bold name + dim italic kind
+/// tag, like keel's info-panel header).
+pub fn framed_block_titled(title: Line<'_>) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(MUTED))
+        .title(title)
+}
+
+/// One key/value row for the details panel. 14-col left-aligned muted
+/// key + plain value matches keel's info panel; the panel block adds
+/// horizontal padding so there's breathing room from the border.
+pub fn kv_line(key: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{key:<14}"), Style::default().fg(MUTED)),
+        Span::raw(value.to_string()),
+    ])
 }
 
 /// Bold coloured label — used for breadcrumb chips and the leading `[fleet]`
