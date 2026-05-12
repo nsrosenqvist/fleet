@@ -2,12 +2,16 @@
 //! process that wants its own TTY (tmux attach, `$EDITOR`, `gh dash`, …).
 //!
 //! Pattern:
-//!   1. Disable raw mode + leave alternate screen → terminal returns to its
-//!      normal scrollback buffer, child gets a clean TTY.
+//!   1. Disable mouse capture + raw mode, leave alternate screen → terminal
+//!      returns to its normal scrollback buffer, child gets a clean TTY
+//!      without our SGR mouse-tracking escape sequences bleeding into its
+//!      input stream.
 //!   2. Spawn the child, wait for it to exit.
-//!   3. Re-enter alternate screen + re-enable raw mode + force redraw.
+//!   3. Re-enter alternate screen + re-enable raw mode + re-enable mouse
+//!      capture + force redraw.
 
 use anyhow::Result;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::{execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -20,6 +24,7 @@ where
     // Leave the TUI's terminal state.
     execute!(
         io::stdout(),
+        DisableMouseCapture,
         terminal::LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;
@@ -33,6 +38,7 @@ where
     execute!(
         io::stdout(),
         terminal::EnterAlternateScreen,
+        EnableMouseCapture,
         crossterm::cursor::Hide
     )
     .ok();

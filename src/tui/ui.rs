@@ -138,6 +138,38 @@ fn draw_sessions_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
         state.select(Some(app.selected));
     }
     frame.render_stateful_widget(list, area, &mut state);
+
+    record_sidebar_rects(app, area);
+}
+
+/// Compute the per-row rect for each session in the sidebar list so the
+/// mouse handler can hit-test wheel/click events against rows. Mirrors the
+/// list's internal geometry (1-row border on each side, height 1 per row);
+/// rows that overflow the visible area get `Rect::default()` and so can
+/// never match a click.
+fn record_sidebar_rects(app: &App, area: Rect) {
+    let mut rects = app.sidebar_item_rects.borrow_mut();
+    rects.clear();
+    if app.sessions.is_empty() || area.height < 2 || area.width < 2 {
+        return;
+    }
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
+    rects.resize(app.sessions.len(), Rect::default());
+    // Cap the visible rows at the smaller of (sessions, inner_h, u16::MAX).
+    // Anything past the cap stays as `Rect::default()` so a click can never
+    // hit an off-screen row.
+    let visible = inner_h.min(u16::try_from(rects.len()).unwrap_or(u16::MAX));
+    for row in 0..visible {
+        rects[row as usize] = Rect {
+            x: inner_x,
+            y: inner_y + row,
+            width: inner_w,
+            height: 1,
+        };
+    }
 }
 
 fn draw_details(app: &App, frame: &mut Frame<'_>, area: Rect) {

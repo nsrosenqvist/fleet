@@ -5,9 +5,14 @@
 //! are deferred by pushing a [`Command`] onto the app's command queue —
 //! [`crate::tui::terminal`] drains the queue after each draw.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
-use super::app::{App, Command, Confirm};
+use super::app::{App, ClickKind, ClickTarget, Command, Confirm};
+
+/// Lines moved per scroll-wheel notch. Three matches the j/k cadence
+/// closely enough that mixing keyboard and wheel doesn't feel jumpy.
+const WHEEL_LINES: usize = 3;
 
 /// Default mode: navigation + action keys. Falls through to no-op on
 /// unknown keys so e.g. `Shift+F1` doesn't accidentally fire an action.
@@ -56,5 +61,90 @@ pub(super) fn handle_key_confirm(app: &mut App, key: KeyEvent) {
         }
     } else {
         app.flash_ok("cancelled");
+    }
+}
+
+/// Normal-mode mouse handler. Left-click on a sidebar row selects it;
+/// double-click within `DOUBLE_CLICK_WINDOW` attaches (same effect as
+/// Enter). Scroll wheel moves the selection at the keyboard cadence.
+/// Clicks outside any tracked rect are no-ops.
+pub(super) fn handle_mouse_normal(app: &mut App, me: MouseEvent) {
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Borrow the rect buffer in a tight scope so it's released
+            // before we mutate `app` further.
+            let hit = {
+                let rects = app.sidebar_item_rects.borrow();
+                hit_test(&rects, me.column, me.row)
+            };
+            let Some(idx) = hit else { return };
+            let target = ClickTarget::SidebarItem(idx);
+            match app.resolve_click(target) {
+                ClickKind::Select => app.select_at(idx),
+                ClickKind::Activate => {
+                    // Make sure the attach runs against the row we just
+                    // clicked, even if a stale selection still points
+                    // elsewhere.
+                    app.select_at(idx);
+                    app.push_command(Command::AttachSelected);
+                }
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            for _ in 0..WHEEL_LINES {
+                app.nav_down();
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            for _ in 0..WHEEL_LINES {
+                app.nav_up();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Find the index of the first rect that contains `(col, row)`. Linear
+/// scan — these vecs are tiny (one entry per visible session) so a
+/// y-sorted binary search wouldn't pay back the added complexity.
+fn hit_test(rects: &[Rect], col: u16, row: u16) -> Option<usize> {
+    rects.iter().position(|r| rect_contains(*r, col, row))
+}
+
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect { x, y, width: w, height: h }
+    }
+
+    #[test]
+    fn hit_test_returns_first_matching_rect() {
+        let rects = vec![r(1, 1, 10, 1), r(1, 2, 10, 1), r(1, 3, 10, 1)];
+        assert_eq!(hit_test(&rects, 5, 2), Some(1));
+    }
+
+    #[test]
+    fn hit_test_misses_outside_all_rects() {
+        let rects = vec![r(1, 1, 10, 1)];
+        assert_eq!(hit_test(&rects, 50, 50), None);
+    }
+
+    #[test]
+    fn hit_test_skips_zero_area_rects_for_offscreen_rows() {
+        // Off-screen rows are stored as Rect::default() — width=0,
+        // height=0. A click that happens to land at (0,0) must not match
+        // those slots.
+        let rects = vec![Rect::default(), r(1, 1, 10, 1)];
+        assert_eq!(hit_test(&rects, 0, 0), None);
+        assert_eq!(hit_test(&rects, 5, 1), Some(1));
     }
 }

@@ -12,16 +12,43 @@
 //! touches the terminal handle.
 
 use anyhow::Result;
+use ratatui::layout::Rect;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::ao::SessionInfo;
 use crate::lima::VmStatus;
 use crate::process::{ProcessInvoker, RealProcessInvoker};
 
 use super::refresh::{self, RefreshCommand, RefreshUpdate};
+
+/// Maximum gap between two clicks on the same target to count as a
+/// double-click. 400 ms matches the desktop default; users mixing keyboard
+/// and mouse don't accidentally activate when re-clicking to re-select.
+pub(super) const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+/// Identifier for a mouse-clickable region. Stored in `last_click` so a
+/// double-click only fires when the *same* target is clicked twice — a
+/// click on row 2 followed by a click on row 5 within 400 ms is a select,
+/// not an activate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClickTarget {
+    SidebarItem(usize),
+}
+
+/// Outcome of `resolve_click`. `Select` for the first click in a fresh
+/// double-click window; `Activate` for a second click on the same target
+/// within the window. Reset after an activation so triple-click doesn't
+/// re-activate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClickKind {
+    Select,
+    Activate,
+}
 
 /// Pending destructive action awaiting a y/N confirmation in the status bar.
 #[derive(Debug, Clone)]
@@ -79,6 +106,16 @@ pub struct App {
     pub(super) refresh_update_rx: Option<mpsc::Receiver<RefreshUpdate>>,
     pub(super) refresh_handle: Option<JoinHandle<()>>,
 
+    /// Per-row hit-test rects for the sessions sidebar, populated by the
+    /// renderer each frame and read by the mouse handler. `RefCell` because
+    /// `ui::render` takes `&App`; off-screen rows store `Rect::default()` so
+    /// a click can never match a row the layout couldn't fit.
+    pub(super) sidebar_item_rects: RefCell<Vec<Rect>>,
+
+    /// Last mouse-click timestamp + target, used by `resolve_click` to
+    /// detect a double-click within `DOUBLE_CLICK_WINDOW`.
+    last_click: Option<(Instant, ClickTarget)>,
+
     pending_commands: Vec<Command>,
 }
 
@@ -100,6 +137,8 @@ impl App {
             refresh_cmd_tx: None,
             refresh_update_rx: None,
             refresh_handle: None,
+            sidebar_item_rects: RefCell::new(Vec::new()),
+            last_click: None,
             pending_commands: Vec::new(),
         })
     }
@@ -168,6 +207,33 @@ impl App {
                 .selected
                 .checked_sub(1)
                 .unwrap_or(self.sessions.len() - 1);
+        }
+    }
+
+    /// Move selection to an explicit index. Guards against stale rects —
+    /// a click that hit-tested against the previous frame's rects might
+    /// point at an index that no longer exists if the session list shrunk
+    /// in the same draw cycle.
+    pub(super) fn select_at(&mut self, idx: usize) {
+        if idx < self.sessions.len() {
+            self.selected = idx;
+        }
+    }
+
+    /// First click on `target` returns `Select`; a second click on the
+    /// same target within `DOUBLE_CLICK_WINDOW` returns `Activate`.
+    /// Activation resets the timer so a triple-click doesn't re-activate.
+    pub(super) fn resolve_click(&mut self, target: ClickTarget) -> ClickKind {
+        let now = Instant::now();
+        let activate = self
+            .last_click
+            .is_some_and(|(t, prev)| prev == target && now.duration_since(t) <= DOUBLE_CLICK_WINDOW);
+        if activate {
+            self.last_click = None;
+            ClickKind::Activate
+        } else {
+            self.last_click = Some((now, target));
+            ClickKind::Select
         }
     }
 
@@ -345,6 +411,50 @@ mod tests {
 
         let stop = Confirm::StopAo;
         assert!(stop.prompt().contains("Stop AO"));
+    }
+
+    #[test]
+    fn select_at_clamps_against_empty_session_list() {
+        let mut app = app_with(0);
+        app.select_at(3);
+        assert_eq!(app.selected, 0, "no-op on empty list");
+    }
+
+    #[test]
+    fn select_at_ignores_out_of_range_index() {
+        let mut app = app_with(2);
+        app.selected = 1;
+        app.select_at(5);
+        assert_eq!(app.selected, 1, "out-of-range index must not move selection");
+    }
+
+    #[test]
+    fn resolve_click_is_select_then_activate_on_same_target() {
+        let mut app = app_with(2);
+        let target = ClickTarget::SidebarItem(0);
+        assert!(matches!(app.resolve_click(target), ClickKind::Select));
+        assert!(matches!(app.resolve_click(target), ClickKind::Activate));
+    }
+
+    #[test]
+    fn resolve_click_resets_after_activation() {
+        let mut app = app_with(2);
+        let target = ClickTarget::SidebarItem(0);
+        app.resolve_click(target);
+        app.resolve_click(target);
+        // Third click on the same target after an activation starts a new
+        // double-click window — it's a Select, not another Activate.
+        assert!(matches!(app.resolve_click(target), ClickKind::Select));
+    }
+
+    #[test]
+    fn resolve_click_different_target_is_select() {
+        let mut app = app_with(3);
+        app.resolve_click(ClickTarget::SidebarItem(0));
+        assert!(matches!(
+            app.resolve_click(ClickTarget::SidebarItem(1)),
+            ClickKind::Select,
+        ));
     }
 
     #[test]

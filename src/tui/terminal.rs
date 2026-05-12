@@ -39,6 +39,7 @@ fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     execute!(
         stdout,
         terminal::EnterAlternateScreen,
+        event::EnableMouseCapture,
         crossterm::cursor::Hide
     )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
@@ -47,6 +48,7 @@ fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 fn leave_terminal() -> Result<()> {
     execute!(
         io::stdout(),
+        event::DisableMouseCapture,
         terminal::LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;
@@ -89,6 +91,12 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
             } else {
                 input::handle_key_normal(app, *k);
             }
+        }
+        // Mouse is ignored while a confirm is pending — keyboard-only
+        // resolution avoids accidentally killing a session by clicking
+        // somewhere unrelated.
+        event::Event::Mouse(m) if app.confirm.is_none() => {
+            input::handle_mouse_normal(app, *m);
         }
         _ => {}
     }
