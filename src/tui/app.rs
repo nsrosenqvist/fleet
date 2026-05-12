@@ -61,9 +61,13 @@ pub(super) enum View {
 }
 
 /// Which form field the Config view currently has focused. Order
-/// matters — Tab cycles in declaration order. The trailing
-/// `ProjectSelection` row sits inside the project panel and cycles
-/// which project the detail rows below it reflect.
+/// matters — Tab cycles in declaration order.
+///
+/// `ProjectSelection` sits at the top of the project panel; the
+/// trailing `Project*` variants are detail rows of whichever project
+/// is currently selected by that cycle field. Cycling away from
+/// `ProjectSelection` keeps the per-project fields pointed at the same
+/// project so the user can keep editing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ConfigField {
     #[default]
@@ -71,8 +75,13 @@ pub(super) enum ConfigField {
     Runtime,
     Workspace,
     Port,
-    /// Cycle which project's read-only detail panel is visible.
     ProjectSelection,
+    ProjectName,
+    ProjectSessionPrefix,
+    ProjectPath,
+    ProjectDefaultBranch,
+    ProjectAgentRulesFile,
+    ProjectAgent,
 }
 
 impl ConfigField {
@@ -82,6 +91,12 @@ impl ConfigField {
         Self::Workspace,
         Self::Port,
         Self::ProjectSelection,
+        Self::ProjectName,
+        Self::ProjectSessionPrefix,
+        Self::ProjectPath,
+        Self::ProjectDefaultBranch,
+        Self::ProjectAgentRulesFile,
+        Self::ProjectAgent,
     ];
 
     pub(super) fn label(self) -> &'static str {
@@ -91,7 +106,29 @@ impl ConfigField {
             Self::Workspace => "workspace",
             Self::Port => "port",
             Self::ProjectSelection => "project",
+            Self::ProjectName => "name",
+            Self::ProjectSessionPrefix => "sessionPrefix",
+            Self::ProjectPath => "path",
+            Self::ProjectDefaultBranch => "defaultBranch",
+            Self::ProjectAgentRulesFile => "agentRulesFile",
+            Self::ProjectAgent => "agent override",
         }
+    }
+
+    /// True when this field targets the currently selected project
+    /// rather than the defaults block. Used by the renderer to skip
+    /// per-project rows when no projects exist, and by edit handlers
+    /// to look up the right mutable target.
+    pub(super) fn is_project_field(self) -> bool {
+        matches!(
+            self,
+            Self::ProjectName
+                | Self::ProjectSessionPrefix
+                | Self::ProjectPath
+                | Self::ProjectDefaultBranch
+                | Self::ProjectAgentRulesFile
+                | Self::ProjectAgent,
+        )
     }
 
     pub(super) fn next(self) -> Self {
@@ -197,7 +234,14 @@ impl ConfigForm {
                     delta,
                 );
             }
-            ConfigField::Port => {} // Port is text-edited, not cycled.
+            // Text-edited fields don't respond to cycle keystrokes.
+            ConfigField::Port
+            | ConfigField::ProjectName
+            | ConfigField::ProjectSessionPrefix
+            | ConfigField::ProjectPath
+            | ConfigField::ProjectDefaultBranch
+            | ConfigField::ProjectAgentRulesFile
+            | ConfigField::ProjectAgent => {}
             ConfigField::ProjectSelection => {
                 let n = self.draft.projects.len();
                 if n == 0 {
@@ -213,38 +257,162 @@ impl ConfigForm {
         }
     }
 
-    /// Start a text edit on the focused field, seeding the buffer with
-    /// the current value. No-op on enum fields.
+    /// Start a text edit on the focused field, seeding the buffer
+    /// with the current value. No-op on enum fields (which cycle
+    /// instead) and on the project-selector field (which cycles).
     pub(super) fn begin_edit(&mut self) {
-        if !matches!(self.focus, ConfigField::Port) {
-            return;
-        }
-        self.editing = Some(
-            self.draft
+        let initial: String = match self.focus {
+            ConfigField::Port => self
+                .draft
                 .port
                 .map(|p| p.to_string())
                 .unwrap_or_default(),
-        );
+            ConfigField::ProjectName => self
+                .selected_project()
+                .map(|(_, p)| p.name.clone())
+                .unwrap_or_default(),
+            ConfigField::ProjectSessionPrefix => self
+                .selected_project()
+                .and_then(|(_, p)| p.session_prefix.clone())
+                .unwrap_or_default(),
+            ConfigField::ProjectPath => self
+                .selected_project()
+                .map(|(_, p)| p.path.display().to_string())
+                .unwrap_or_default(),
+            ConfigField::ProjectDefaultBranch => self
+                .selected_project()
+                .and_then(|(_, p)| p.default_branch.clone())
+                .unwrap_or_default(),
+            ConfigField::ProjectAgentRulesFile => self
+                .selected_project()
+                .and_then(|(_, p)| p.agent_rules_file.clone())
+                .unwrap_or_default(),
+            ConfigField::ProjectAgent => self
+                .selected_project()
+                .and_then(|(_, p)| p.agent.clone())
+                .unwrap_or_default(),
+            // Enum / cycle fields don't have a text editor.
+            ConfigField::Agent
+            | ConfigField::Runtime
+            | ConfigField::Workspace
+            | ConfigField::ProjectSelection => return,
+        };
+        self.editing = Some(initial);
     }
 
     /// Commit the current text-edit buffer back into the draft. Bad
     /// input on numeric fields drops back into "(unset)" rather than
     /// rejecting the keystroke — the user can re-edit if they meant
-    /// something specific.
+    /// something specific. Project-field commits write into the
+    /// currently selected project; if it vanished between begin/commit
+    /// (rare, but possible if an external edit removed it), the buffer
+    /// is silently dropped.
     pub(super) fn commit_edit(&mut self) {
         let Some(buf) = self.editing.take() else { return };
-        if matches!(self.focus, ConfigField::Port) {
-            let trimmed = buf.trim();
-            self.draft.port = if trimmed.is_empty() {
-                None
-            } else {
-                trimmed.parse::<u16>().ok()
-            };
+        match self.focus {
+            ConfigField::Port => {
+                let trimmed = buf.trim();
+                self.draft.port = if trimmed.is_empty() {
+                    None
+                } else {
+                    trimmed.parse::<u16>().ok()
+                };
+            }
+            ConfigField::ProjectName
+            | ConfigField::ProjectSessionPrefix
+            | ConfigField::ProjectPath
+            | ConfigField::ProjectDefaultBranch
+            | ConfigField::ProjectAgentRulesFile
+            | ConfigField::ProjectAgent => {
+                let Some(key) = self.selected_project_key() else {
+                    return;
+                };
+                let Some(project) = self.draft.projects.get_mut(&key) else {
+                    return;
+                };
+                let trimmed = buf.trim();
+                let opt_string = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                match self.focus {
+                    ConfigField::ProjectName => {
+                        // `name` is non-optional in the schema — an
+                        // empty buffer reverts to the map key as a
+                        // safe-ish placeholder rather than producing
+                        // invalid yaml.
+                        project.name = opt_string.unwrap_or_else(|| key.clone());
+                    }
+                    ConfigField::ProjectSessionPrefix => project.session_prefix = opt_string,
+                    ConfigField::ProjectPath => {
+                        if let Some(s) = opt_string {
+                            project.path = std::path::PathBuf::from(s);
+                        }
+                    }
+                    ConfigField::ProjectDefaultBranch => project.default_branch = opt_string,
+                    ConfigField::ProjectAgentRulesFile => project.agent_rules_file = opt_string,
+                    ConfigField::ProjectAgent => project.agent = opt_string,
+                    _ => unreachable!(),
+                }
+            }
+            _ => {}
         }
     }
 
     pub(super) fn cancel_edit(&mut self) {
         self.editing = None;
+    }
+
+    /// Tab navigation that skips fields with no content to edit.
+    /// Today that means: when `draft.projects` is empty, the project
+    /// detail fields are all unreachable — Tab walks past them so the
+    /// user doesn't land on a row that won't accept input.
+    pub(super) fn focus_next(&mut self) {
+        self.focus = self.advance(1);
+    }
+
+    pub(super) fn focus_prev(&mut self) {
+        self.focus = self.advance(-1);
+    }
+
+    fn advance(&self, delta: i32) -> ConfigField {
+        let mut next = if delta >= 0 {
+            self.focus.next()
+        } else {
+            self.focus.prev()
+        };
+        // Bounded loop — at most `ALL.len()` skips before we've walked
+        // the full cycle. Guards against an unreachable infinite loop
+        // if every field somehow gets disabled.
+        for _ in 0..ConfigField::ALL.len() {
+            if self.field_reachable(next) {
+                return next;
+            }
+            next = if delta >= 0 { next.next() } else { next.prev() };
+        }
+        self.focus
+    }
+
+    fn field_reachable(&self, field: ConfigField) -> bool {
+        if field.is_project_field() || matches!(field, ConfigField::ProjectSelection) {
+            !self.draft.projects.is_empty()
+        } else {
+            true
+        }
+    }
+
+    /// Owned copy of the currently selected project's map key, if any.
+    /// Returns an owned `String` rather than a reference to avoid a
+    /// long borrow against `self.draft.projects` from the call sites
+    /// in `commit_edit` (which then needs to mutate the same map).
+    fn selected_project_key(&self) -> Option<String> {
+        let keys = self.project_keys();
+        if keys.is_empty() {
+            return None;
+        }
+        let idx = self.selected_project_idx.min(keys.len() - 1);
+        Some(keys[idx].to_string())
     }
 }
 
@@ -795,10 +963,65 @@ mod tests {
         assert_eq!(ConfigField::Port.next(), ConfigField::ProjectSelection);
         assert_eq!(
             ConfigField::ProjectSelection.next(),
-            ConfigField::Agent,
-            "cycle wraps after the last field",
+            ConfigField::ProjectName,
         );
-        assert_eq!(ConfigField::Agent.prev(), ConfigField::ProjectSelection);
+        assert_eq!(
+            ConfigField::ProjectAgent.next(),
+            ConfigField::Agent,
+            "cycle wraps after the last project field",
+        );
+        assert_eq!(ConfigField::Agent.prev(), ConfigField::ProjectAgent);
+    }
+
+    #[test]
+    fn focus_next_skips_project_fields_when_none_defined() {
+        // Empty project map → Tab should walk Port → Agent, skipping
+        // ProjectSelection + the six per-project field variants.
+        let cfg = empty_ao_config();
+        let mut form = ConfigForm::new(cfg);
+        form.focus = ConfigField::Port;
+        form.focus_next();
+        assert_eq!(
+            form.focus,
+            ConfigField::Agent,
+            "no projects → skip the project section entirely",
+        );
+    }
+
+    #[test]
+    fn focus_next_walks_project_fields_when_present() {
+        let yaml = r"
+projects:
+  one:
+    name: one
+    path: /tmp/one
+";
+        let cfg: crate::ao::config::AoConfig = serde_yml::from_str(yaml).expect("parse");
+        let mut form = ConfigForm::new(cfg);
+        form.focus = ConfigField::Port;
+        form.focus_next();
+        assert_eq!(form.focus, ConfigField::ProjectSelection);
+        form.focus_next();
+        assert_eq!(form.focus, ConfigField::ProjectName);
+    }
+
+    #[test]
+    fn project_name_edit_writes_into_selected_project() {
+        let yaml = r"
+projects:
+  one:
+    name: one
+    path: /tmp/one
+";
+        let cfg: crate::ao::config::AoConfig = serde_yml::from_str(yaml).expect("parse");
+        let mut form = ConfigForm::new(cfg);
+        form.focus = ConfigField::ProjectName;
+        form.begin_edit();
+        let buf = form.editing.as_mut().expect("editing started");
+        buf.clear();
+        buf.push_str("renamed");
+        form.commit_edit();
+        assert_eq!(form.draft.projects.get("one").unwrap().name, "renamed");
     }
 
     #[test]

@@ -105,20 +105,23 @@ fn handle_key_config(app: &mut App, key: KeyEvent) {
 
         // Navigation between form fields. Tab/Down + Shift+Tab/Up are
         // standard for forms; j/k stay reserved for vim users.
-        (KeyCode::Tab | KeyCode::Down | KeyCode::Char('j'), _) => {
-            form.focus = form.focus.next();
-        }
-        (KeyCode::BackTab | KeyCode::Up, _) => {
-            form.focus = form.focus.prev();
-        }
-        (KeyCode::Char('k'), m) if !m.contains(KeyModifiers::SHIFT) => {
-            form.focus = form.focus.prev();
-        }
+        // `focus_next/prev` skip rows that have nothing to edit (e.g.
+        // project fields when no projects are defined).
+        (KeyCode::Tab | KeyCode::Down | KeyCode::Char('j'), _) => form.focus_next(),
+        (KeyCode::BackTab | KeyCode::Up, _) => form.focus_prev(),
+        (KeyCode::Char('k'), m) if !m.contains(KeyModifiers::SHIFT) => form.focus_prev(),
 
         // Enter / Space cycles the focused enum, or enters text edit
-        // mode for numeric / string fields (port today).
+        // mode for numeric / string fields. Project enum (selection)
+        // also cycles; project text fields enter edit mode.
         (KeyCode::Enter | KeyCode::Char(' '), _) => match form.focus {
-            ConfigField::Port => form.begin_edit(),
+            ConfigField::Port
+            | ConfigField::ProjectName
+            | ConfigField::ProjectSessionPrefix
+            | ConfigField::ProjectPath
+            | ConfigField::ProjectDefaultBranch
+            | ConfigField::ProjectAgentRulesFile
+            | ConfigField::ProjectAgent => form.begin_edit(),
             _ => form.cycle_focused(1),
         },
         // Shift-Enter cycles backwards on enums; on text fields it
@@ -147,10 +150,9 @@ fn handle_text_edit(form: &mut crate::tui::app::ConfigForm, key: KeyEvent) {
             buf.pop();
         }
         KeyCode::Char(c) => {
-            // For the port field, restrict to digits — saves the user
-            // typing a non-number and having it silently revert on
-            // commit. Other text fields (when they arrive) get
-            // permissive input here.
+            // Numeric fields (port) restrict to digits; all other text
+            // fields accept anything the user types — validation is
+            // best done at commit / save time rather than per-key.
             if matches!(form.focus, ConfigField::Port) && !c.is_ascii_digit() {
                 return;
             }

@@ -464,7 +464,9 @@ fn build_defaults_form_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>
                 .draft
                 .port
                 .map_or_else(|| "(unset — AO default)".into(), |p| p.to_string()),
-            ConfigField::ProjectSelection => continue,
+            // Anything else (ProjectSelection + the per-project rows)
+            // is rendered by the project panel, not here.
+            _ => continue,
         };
         out.push(field_line(field, &value, form));
     }
@@ -502,15 +504,50 @@ fn build_project_panel_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>
         .get(key)
         .expect("selected project key resolves");
 
-    let mut out = Vec::new();
+    let mut out = vec![
+        field_line(
+            ConfigField::ProjectSelection,
+            &format!("{key} ({}/{})", idx + 1, keys.len()),
+            form,
+        ),
+        Line::raw(""),
+    ];
+
+    // Editable project rows — each routed through `field_line` so the
+    // focus/edit chrome is identical to the defaults block.
+    out.push(field_line(ConfigField::ProjectName, &project.name, form));
     out.push(field_line(
-        ConfigField::ProjectSelection,
-        &format!("{key} ({}/{})", idx + 1, keys.len()),
+        ConfigField::ProjectSessionPrefix,
+        project.session_prefix.as_deref().unwrap_or("(unset)"),
         form,
     ));
-    out.push(Line::raw(""));
-    // Detail rows: indented to align under the cycle field's value
-    // column, muted-key style matching `kv_line`.
+    out.push(field_line(
+        ConfigField::ProjectPath,
+        &project.path.display().to_string(),
+        form,
+    ));
+    out.push(field_line(
+        ConfigField::ProjectDefaultBranch,
+        project.default_branch.as_deref().unwrap_or("(unset)"),
+        form,
+    ));
+    out.push(field_line(
+        ConfigField::ProjectAgentRulesFile,
+        project.agent_rules_file.as_deref().unwrap_or("(unset)"),
+        form,
+    ));
+    out.push(field_line(
+        ConfigField::ProjectAgent,
+        project
+            .agent
+            .as_deref()
+            .unwrap_or("(unset — use defaults.agent)"),
+        form,
+    ));
+
+    // Tracker + postCreate stay read-only for now — tracker is a nested
+    // object and postCreate is a string list; both want richer editors
+    // than the single-line text input.
     let push = |out: &mut Vec<Line<'static>>, label: &str, value: &str| {
         out.push(Line::from(vec![
             Span::styled(
@@ -520,20 +557,6 @@ fn build_project_panel_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>
             Span::raw(value.to_string()),
         ]));
     };
-    push(&mut out, "name", &project.name);
-    if let Some(prefix) = &project.session_prefix {
-        push(&mut out, "sessionPrefix", prefix);
-    }
-    push(&mut out, "path", &project.path.display().to_string());
-    if let Some(branch) = &project.default_branch {
-        push(&mut out, "defaultBranch", branch);
-    }
-    if let Some(rules) = &project.agent_rules_file {
-        push(&mut out, "agentRulesFile", rules);
-    }
-    if let Some(agent) = &project.agent {
-        push(&mut out, "agent override", agent);
-    }
     if let Some(tracker) = &project.tracker {
         push(&mut out, "tracker", &tracker.plugin);
     }
