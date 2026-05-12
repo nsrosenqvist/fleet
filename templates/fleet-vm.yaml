@@ -1,0 +1,86 @@
+# Lima template for the `fleet-vm` instance.
+#
+# A small Ubuntu 24.04 LTS VM provisioned with the full set of tools the
+# @aoagents/ao orchestrator needs. fleet's TUI invokes
+# `limactl start --tty=false --name=fleet-vm <this-file>` on the
+# missing-VM path; after that Lima copies the resolved config into
+# ~/.lima/fleet-vm/ and subsequent starts ignore this file entirely.
+#
+# To re-provision (e.g. after editing the script), the simplest path is
+# `limactl delete fleet-vm` and then re-trigger the bring-up flow.
+# Lima only runs provision blocks on first boot of an instance.
+
+images:
+  - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+# Sized for a single concurrent agent worker doing typical software-eng
+# tasks (cargo / npm builds, gh CLI calls, claude-code IO). Bump if you
+# run multiple sessions in parallel.
+cpus: 4
+memory: "4GiB"
+disk: "30GiB"
+
+mounts:
+  # Make the host's home dir visible inside the VM at the same path so
+  # `limactl shell --workdir /home/<user>/Code/<repo>` works without
+  # path translation. `writable: true` so agents can edit checked-out
+  # source.
+  - location: "~"
+    writable: true
+
+provision:
+  # System-level install: distro packages, Node 20 (NodeSource), gh CLI,
+  # and the @aoagents/ao + claude-code npm globals. Runs as root, so npm
+  # globals land in /usr/lib/node_modules with bins symlinked to /usr/bin
+  # — that puts them on PATH for any shell `limactl shell` spawns
+  # without depending on .bashrc being sourced.
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y \
+        ca-certificates curl git gnupg tmux build-essential
+
+      # Node 20 (NodeSource). Ubuntu's apt-shipped nodejs trails by a
+      # couple of majors; @aoagents/ao requires node ≥ 20.
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      apt-get install -y nodejs
+
+      # gh CLI. Noble's repo carries 2.45+ which satisfies the AO
+      # docs' "git 2.25+, gh recent" requirement; fall back to GitHub's
+      # apt source if the distro package is missing or too old.
+      if ! apt-get install -y gh; then
+        mkdir -p -m 755 /etc/apt/keyrings
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          | dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg
+        chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+          > /etc/apt/sources.list.d/github-cli.list
+        apt-get update
+        apt-get install -y gh
+      fi
+
+      npm install -g @aoagents/ao @anthropic-ai/claude-code
+
+probes:
+  # Block `limactl start` from declaring the instance Ready until ao is
+  # actually on PATH. Without this, fleet's first `ao status` call would
+  # race against the npm install and the user would see a spurious
+  # "command not found" flash mid-provisioning. 10-minute ceiling
+  # comfortably covers a slow cloud-init on a constrained host.
+  - description: "ao binary installed and on PATH"
+    script: |
+      #!/bin/bash
+      set -eux
+      timeout 600s bash -c 'until command -v ao >/dev/null 2>&1; do sleep 3; done'
+    hint: |
+      The ao binary is not yet on PATH. The provisioning script may
+      still be running — inside the VM:
+        sudo tail -f /var/log/cloud-init-output.log
+      to watch progress.

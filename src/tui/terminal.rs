@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::app::{App, Command};
-use super::bringup::BringUp;
+use super::bringup::{BringUp, BringUpMode};
 use super::input;
 use super::preflight::{self, MissingDep, Preflight};
 use super::subprocess::suspend_around;
@@ -69,7 +69,7 @@ fn settle_preflight(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Prefli
                 };
             }
             Preflight::VmMissing => match prompt_vm_action(term, VmAction::Create) {
-                Ok(true) => match bring_up_vm(term) {
+                Ok(true) => match bring_up_vm(term, BringUpMode::Create) {
                     Ok(()) => {} // re-check
                     Err(e) => return PreflightOutcome::Err(e),
                 },
@@ -77,7 +77,7 @@ fn settle_preflight(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Prefli
                 Err(e) => return PreflightOutcome::Err(e),
             },
             Preflight::VmStopped => match prompt_vm_action(term, VmAction::Start) {
-                Ok(true) => match bring_up_vm(term) {
+                Ok(true) => match bring_up_vm(term, BringUpMode::StartExisting) {
                     Ok(()) => {} // re-check
                     Err(e) => return PreflightOutcome::Err(e),
                 },
@@ -134,16 +134,29 @@ fn prompt_vm_action(
     }
 }
 
-/// Run `limactl start --tty=false fleet-vm` as a piped child and render
-/// a live progress modal until it exits. The non-interactive flag skips
-/// Lima's template picker (silently accepts `template:default`), and
-/// piping stdio keeps the user inside the TUI for the whole 5–10 min
-/// cloud-init window. On exit we drop the modal and let
-/// [`settle_preflight`] re-check VM status — if limactl returned non-zero
-/// or the VM still isn't running, the next iteration shows the relevant
-/// modal again rather than blindly proceeding into a broken TUI.
-fn bring_up_vm(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    let mut bringup = BringUp::spawn()?;
+/// Run `limactl start --tty=false …` as a piped child and render a live
+/// progress modal until it exits.
+///
+/// On `BringUpMode::Create`, fleet's bundled `templates/fleet-vm.yaml`
+/// is written to a tempfile and passed in so Lima provisions a VM with
+/// Node 20, git, tmux, gh, claude-code, and `@aoagents/ao`. The probe
+/// in that template blocks Lima from reporting "Ready" until `ao` is
+/// actually on PATH, so the first `ao status` call after bring-up
+/// doesn't race against the npm install.
+///
+/// On `BringUpMode::StartExisting`, fleet just runs `limactl start
+/// fleet-vm` against the existing instance config.
+///
+/// Either way: piping stdio keeps the user inside the TUI for the whole
+/// boot window. On exit we drop the modal and let [`settle_preflight`]
+/// re-check VM status — if limactl returned non-zero or the VM still
+/// isn't running, the next iteration shows the relevant modal again
+/// rather than blindly proceeding into a broken TUI.
+fn bring_up_vm(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mode: BringUpMode,
+) -> Result<()> {
+    let mut bringup = BringUp::spawn(mode)?;
     loop {
         bringup.tick();
         term.draw(|f| ui::render_vm_bringup(f, &bringup))?;

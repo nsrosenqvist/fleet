@@ -16,12 +16,28 @@
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use super::preflight::VM_NAME;
+
+/// Lima template embedded at compile time. Source of truth lives at
+/// `templates/fleet-vm.yaml`; `include_str!` lets cargo track changes
+/// and rebuilds the binary when the yaml is edited.
+const FLEET_VM_TEMPLATE: &str = include_str!("../../templates/fleet-vm.yaml");
+
+/// Whether the bring-up needs to create a new instance from the
+/// template, or just start an existing stopped instance. Determined by
+/// `preflight::check` upstream — keeps the subprocess args here
+/// straightforward instead of inspecting Lima state again.
+#[derive(Clone, Copy)]
+pub(super) enum BringUpMode {
+    Create,
+    StartExisting,
+}
 
 /// How many tail lines we keep for the modal. 12 fits comfortably in a
 /// modal sized to typical terminals while still showing enough scrollback
@@ -52,19 +68,42 @@ pub(super) struct BringUp {
 impl BringUp {
     /// Spawn the child and wire up the reader threads. Caller drives the
     /// modal via [`Self::tick`] + [`Self::is_finished`].
-    pub(super) fn spawn() -> Result<Self> {
+    ///
+    /// In [`BringUpMode::Create`], the embedded template is written to a
+    /// tempfile and passed as `limactl start --name=fleet-vm <yaml>` so
+    /// Lima provisions the instance with Node + ao + claude-code on first
+    /// boot. Lima copies the resolved config into `~/.lima/fleet-vm/`
+    /// during create, so the tempfile is only needed for that one call —
+    /// the supervisor thread deletes it after the child exits.
+    ///
+    /// In [`BringUpMode::StartExisting`], we just `limactl start
+    /// fleet-vm`. Lima reads the existing on-disk config.
+    pub(super) fn spawn(mode: BringUpMode) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
-        // `--tty=false` skips the "Proceed / Open editor / Choose template"
-        // picker and silently accepts template:default. The picker is
-        // useful interactively but the wrong shape for an embedded
-        // bring-up; users who want a non-default template can run
-        // `limactl create` themselves before launching fleet.
+
+        // `--tty=false` accepts default prompts silently. Without it,
+        // Lima asks "Proceed / Open editor / Choose template" on create
+        // — interactive and the wrong shape for an embedded bring-up.
+        let mut args: Vec<String> = vec!["start".into(), "--tty=false".into()];
+        let template_tmp: Option<PathBuf> = match mode {
+            BringUpMode::Create => {
+                let path = write_template_tmpfile()?;
+                args.push(format!("--name={VM_NAME}"));
+                args.push(path.display().to_string());
+                Some(path)
+            }
+            BringUpMode::StartExisting => {
+                args.push(VM_NAME.into());
+                None
+            }
+        };
+
         let mut child = Command::new("limactl")
-            .args(["start", "--tty=false", VM_NAME])
+            .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("spawn `limactl start fleet-vm`")?;
+            .with_context(|| format!("spawn `limactl {}`", args.join(" ")))?;
         let stdout = child
             .stdout
             .take()
@@ -74,7 +113,7 @@ impl BringUp {
             .take()
             .context("limactl child has no stderr")?;
 
-        let join = thread::spawn(move || drive_child(child, stdout, stderr, &tx));
+        let join = thread::spawn(move || drive_child(child, stdout, stderr, &tx, template_tmp));
 
         Ok(Self {
             rx,
@@ -133,8 +172,16 @@ impl BringUp {
 
 /// Supervisor thread: spawn per-stream reader threads, wait for the
 /// child, then send the final `Exited` event. Owns the `Child` so a drop
-/// at TUI shutdown reliably reaps the subprocess.
-fn drive_child(mut child: Child, stdout: impl Read + Send + 'static, stderr: impl Read + Send + 'static, tx: &Sender<BringUpEvent>) {
+/// at TUI shutdown reliably reaps the subprocess. If a `template_tmp`
+/// path was passed it gets unlinked after the child exits — Lima has
+/// already copied the resolved config into `~/.lima/fleet-vm/` by then.
+fn drive_child(
+    mut child: Child,
+    stdout: impl Read + Send + 'static,
+    stderr: impl Read + Send + 'static,
+    tx: &Sender<BringUpEvent>,
+    template_tmp: Option<PathBuf>,
+) {
     let tx_stdout = tx.clone();
     let tx_stderr = tx.clone();
     let h_out = thread::spawn(move || forward_lines(stdout, &tx_stdout));
@@ -149,7 +196,21 @@ fn drive_child(mut child: Child, stdout: impl Read + Send + 'static, stderr: imp
     let _ = h_out.join();
     let _ = h_err.join();
 
+    if let Some(path) = template_tmp {
+        let _ = std::fs::remove_file(path);
+    }
+
     let _ = tx.send(BringUpEvent::Exited(result));
+}
+
+/// Write the embedded template to a unique tempfile under the system
+/// temp dir. Including the pid avoids collisions if (for some reason)
+/// two fleet processes try to bring the VM up at the same time.
+fn write_template_tmpfile() -> Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("fleet-vm-{}.yaml", std::process::id()));
+    std::fs::write(&path, FLEET_VM_TEMPLATE)
+        .with_context(|| format!("write lima template to {}", path.display()))?;
+    Ok(path)
 }
 
 /// Read `reader` line-by-line, push each into the channel. Silent on
