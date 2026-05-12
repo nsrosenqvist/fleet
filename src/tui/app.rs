@@ -225,6 +225,7 @@ fn cycle_value(values: &[&str], current: Option<&str>, delta: i32) -> Option<Str
 pub(super) enum Confirm {
     KillSession(String),
     StopAo,
+    SaveAoConfig,
 }
 
 impl Confirm {
@@ -232,6 +233,9 @@ impl Confirm {
         match self {
             Self::KillSession(id) => format!("Kill session {id}? [y/N]"),
             Self::StopAo => "Stop AO orchestrator + dashboard? [y/N]".to_string(),
+            Self::SaveAoConfig => {
+                "Save agent-orchestrator.yaml? Comments will be stripped. [y/N]".to_string()
+            }
         }
     }
 }
@@ -251,6 +255,7 @@ pub(super) enum Command {
     KillSession(String),
     StopAo,
     RequestRefresh,
+    SaveAoConfig,
 }
 
 pub struct App {

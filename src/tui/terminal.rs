@@ -264,6 +264,7 @@ fn run_command(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>,
         Command::KillSession(id) => kill_session(app, term, id),
         Command::StopAo => stop_ao(app, term),
         Command::RequestRefresh => app.request_refresh(),
+        Command::SaveAoConfig => save_ao_config(app),
     }
 }
 
@@ -358,6 +359,43 @@ fn kill_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>
     });
     app.flash_result(format!("killed {killed_id}"), res);
     app.request_refresh();
+}
+
+/// Serialise the Config view's draft back to `agent-orchestrator.yaml`
+/// via a tempfile + rename so a partial write can never leave the
+/// file truncated. The user already confirmed the comment-loss via
+/// the `Confirm::SaveAoConfig` dialog. Re-loads the cached config
+/// after the rename so subsequent `is_dirty` checks see a clean
+/// baseline.
+fn save_ao_config(app: &mut App) {
+    let Some(form) = app.config_form.as_ref() else {
+        return;
+    };
+    let yaml_text = match serde_yml::to_string(&form.draft) {
+        Ok(s) => s,
+        Err(e) => {
+            app.flash_err(format!("serialize agent-orchestrator.yaml: {e}"));
+            return;
+        }
+    };
+    let path = crate::ao::config::AoConfig::path(&app.repo_root);
+    // Write to a sibling tempfile in the same directory so the rename
+    // stays on the same filesystem (atomic rename only crosses devices
+    // unreliably). `.tmp` suffix matches the convention git uses for
+    // its own writes.
+    let tmp = path.with_extension("yaml.tmp");
+    if let Err(e) = std::fs::write(&tmp, &yaml_text) {
+        app.flash_err(format!("write {}: {}", tmp.display(), e));
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        app.flash_err(format!("rename to {}: {}", path.display(), e));
+        // Best-effort cleanup so we don't leave the tmpfile behind.
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    app.flash_ok(format!("saved {}", path.display()));
+    app.reload_ao_config();
 }
 
 fn stop_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {

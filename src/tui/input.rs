@@ -91,6 +91,18 @@ fn handle_key_config(app: &mut App, key: KeyEvent) {
     }
 
     match (key.code, key.modifiers) {
+        // Save: gate behind a y/N confirm because the writeback strips
+        // comments. No-op when the form has no changes to write.
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+            if let Some(orig) = app.ao_config.as_ref() {
+                if form.is_dirty(orig) {
+                    app.confirm = Some(Confirm::SaveAoConfig);
+                } else {
+                    app.flash_ok("no changes to save");
+                }
+            }
+        }
+
         // Navigation between form fields. Tab/Down + Shift+Tab/Up are
         // standard for forms; j/k stay reserved for vim users.
         (KeyCode::Tab | KeyCode::Down | KeyCode::Char('j'), _) => {
@@ -158,6 +170,7 @@ pub(super) fn handle_key_confirm(app: &mut App, key: KeyEvent) {
         match pending {
             Confirm::KillSession(id) => app.push_command(Command::KillSession(id)),
             Confirm::StopAo => app.push_command(Command::StopAo),
+            Confirm::SaveAoConfig => app.push_command(Command::SaveAoConfig),
         }
     } else {
         app.flash_ok("cancelled");
