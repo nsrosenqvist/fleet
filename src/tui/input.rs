@@ -192,34 +192,35 @@ pub(super) fn handle_key_confirm(app: &mut App, key: KeyEvent) {
 /// scroll surprised users who expected the wheel to be inert.
 /// Clicks outside any tracked rect are no-ops.
 pub(super) fn handle_mouse_normal(app: &mut App, me: MouseEvent) {
-    match me.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            // Borrow the rect buffer in a tight scope so it's released
-            // before we mutate `app` further.
-            let hit = {
-                let rects = app.sidebar_item_rects.borrow();
-                hit_test(&rects, me.column, me.row)
-            };
-            let Some(idx) = hit else { return };
-            let target = ClickTarget::SidebarItem(idx);
-            match app.resolve_click(target) {
-                ClickKind::Select => app.select_at(idx),
-                ClickKind::Activate => {
-                    // Make sure the activation runs against the row we
-                    // just clicked, even if a stale selection still
-                    // points elsewhere.
-                    app.select_at(idx);
-                    if app.is_sentinel_selected() {
-                        app.open_spawn_prompt();
-                    } else if app.is_orchestrator_selected() {
-                        // Read-only — see handle_key_normal.
-                    } else {
-                        app.push_command(Command::AttachSelected);
-                    }
-                }
+    // Only react to left-button down. Scroll-wheel + right-click +
+    // motion events are intentional no-ops; an early-return keeps
+    // the body flat instead of wrapping it in an outer match.
+    if me.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+    // Borrow the rect buffer in a tight scope so it's released
+    // before we mutate `app` further.
+    let hit = {
+        let rects = app.sidebar_item_rects.borrow();
+        hit_test(&rects, me.column, me.row)
+    };
+    let Some(idx) = hit else { return };
+    let target = ClickTarget::SidebarItem(idx);
+    match app.resolve_click(target) {
+        ClickKind::Select => app.select_at(idx),
+        ClickKind::Activate => {
+            // Make sure the activation runs against the row we
+            // just clicked, even if a stale selection still
+            // points elsewhere.
+            app.select_at(idx);
+            if app.is_sentinel_selected() {
+                app.open_spawn_prompt();
+            } else if app.is_orchestrator_selected() {
+                // Read-only — see handle_key_normal.
+            } else {
+                app.push_command(Command::AttachSelected);
             }
         }
-        _ => {}
     }
 }
 

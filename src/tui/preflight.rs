@@ -314,8 +314,14 @@ mod tests {
 
     #[test]
     fn ok_when_host_and_vm_running_with_no_ao_yaml() {
-        // No yaml → tracker phase is a no-op → Ok.
-        let result = check_with(|_| true, || VmStatus::Running, |_| true);
+        // No yaml in the isolated XDG → both workspace + tracker
+        // phases are no-ops → Ok. Without the isolation, this test
+        // would read whatever AO yaml the developer has in their
+        // real ~/.config/fleet/ and trip the new workspace gate.
+        let xdg = tmp_xdg();
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(|_| true, || VmStatus::Running, |_| true)
+        });
         assert!(matches!(result, Preflight::Ok));
     }
 
