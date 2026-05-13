@@ -33,6 +33,13 @@ use super::refresh::{self, RefreshCommand, RefreshUpdate};
 /// and mouse don't accidentally activate when re-clicking to re-select.
 pub(super) const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
+/// How long a purely informational success flash sticks around before the
+/// event loop wipes it. Errors stay until the next keystroke (they're
+/// load-bearing); success messages have nothing for the user to act on, so
+/// they shouldn't camp on the status bar while the user is watching AO
+/// progress unrelated to the action that produced the flash.
+pub(super) const INFO_FLASH_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// Identifier for a mouse-clickable region. Stored in `last_click` so a
 /// double-click only fires when the *same* target is clicked twice — a
 /// click on row 2 followed by a click on row 5 within 400 ms is a select,
@@ -284,6 +291,10 @@ pub struct App {
     /// moment the user starts driving the UI again.
     pub(super) action_error: Option<String>,
     pub(super) last_info: Option<String>,
+    /// When the current `last_info` was set. Shadow of `last_info`: written
+    /// in lockstep with it so the event loop can age the flash out after
+    /// [`INFO_FLASH_TIMEOUT`] without the user having to touch the keyboard.
+    pub(super) last_info_at: Option<Instant>,
 
     /// Active "spawn session" modal, or `None` when the prompt isn't
     /// open. Renders as a centred overlay; while present, all key
@@ -385,6 +396,7 @@ impl App {
             refresh_error: None,
             action_error: None,
             last_info: None,
+            last_info_at: None,
             spawn_prompt: None,
             secret_setup: None,
             register_project: None,
@@ -746,6 +758,7 @@ impl App {
     /// user action doesn't make the AO probe magically recover.
     pub(super) fn flash_ok(&mut self, msg: impl Into<String>) {
         self.last_info = Some(msg.into());
+        self.last_info_at = Some(Instant::now());
         self.action_error = None;
     }
 
@@ -754,6 +767,7 @@ impl App {
     pub(super) fn flash_err(&mut self, msg: impl Into<String>) {
         self.action_error = Some(msg.into());
         self.last_info = None;
+        self.last_info_at = None;
     }
 
     /// Drop the current action-flash. The event loop calls this on
@@ -766,7 +780,22 @@ impl App {
     /// complete (see [`Self::drain_ao_task`]).
     pub(super) fn dismiss_flash(&mut self) {
         self.last_info = None;
+        self.last_info_at = None;
         self.action_error = None;
+    }
+
+    /// Wipe `last_info` once it has lived past [`INFO_FLASH_TIMEOUT`].
+    /// Called from the event loop on every tick so a green flash fades
+    /// after ~4 s without needing a keypress. Errors and refresh failures
+    /// are left alone — they're load-bearing and stay until the next user
+    /// input or successful probe.
+    pub(super) fn expire_stale_info(&mut self) {
+        if let Some(at) = self.last_info_at
+            && at.elapsed() >= INFO_FLASH_TIMEOUT
+        {
+            self.last_info = None;
+            self.last_info_at = None;
+        }
     }
 
     /// Open the spawn-session prompt. Kicks off a background fetch
@@ -1187,6 +1216,39 @@ mod tests {
         app.flash_ok("killed sb-1");
         assert_eq!(app.last_info.as_deref(), Some("killed sb-1"));
         assert!(app.action_error.is_none());
+    }
+
+    #[test]
+    fn expire_stale_info_clears_old_flash() {
+        let mut app = app_with(0);
+        app.flash_ok("registered as foo");
+        // Backdate the flash past the timeout so we don't have to sleep
+        // in the test.
+        app.last_info_at = Some(
+            Instant::now()
+                .checked_sub(INFO_FLASH_TIMEOUT + Duration::from_millis(1))
+                .expect("Instant should support backdating in tests"),
+        );
+        app.expire_stale_info();
+        assert!(app.last_info.is_none());
+        assert!(app.last_info_at.is_none());
+    }
+
+    #[test]
+    fn expire_stale_info_preserves_fresh_flash() {
+        let mut app = app_with(0);
+        app.flash_ok("registered as foo");
+        app.expire_stale_info();
+        assert_eq!(app.last_info.as_deref(), Some("registered as foo"));
+        assert!(app.last_info_at.is_some());
+    }
+
+    #[test]
+    fn expire_stale_info_leaves_action_error_alone() {
+        let mut app = app_with(0);
+        app.flash_err("kill failed");
+        app.expire_stale_info();
+        assert_eq!(app.action_error.as_deref(), Some("kill failed"));
     }
 
     #[test]

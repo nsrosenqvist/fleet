@@ -338,6 +338,10 @@ fn drive(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
         app.drain_updates();
         app.drain_spawn_fetch();
         app.drain_ao_task();
+        // Age out any stale informational flash before painting so the
+        // green-check overlay doesn't outlive its welcome while the user
+        // is idle. Errors stay sticky — see App::expire_stale_info.
+        app.expire_stale_info();
 
         // 2. Paint.
         term.draw(|f| ui::render(app, f))?;
