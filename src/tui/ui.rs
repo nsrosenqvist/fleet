@@ -552,7 +552,7 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
     match &prompt.issues {
         IssuesState::Loading => {
             lines.push(Line::from(Span::styled(
-                "loading issues from git-bug…",
+                "loading issues from tracker…",
                 muted.add_modifier(Modifier::ITALIC),
             )));
         }
@@ -568,7 +568,7 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
         }
         IssuesState::Error(msg) => {
             lines.push(Line::from(vec![
-                Span::styled("git-bug error: ", Style::default().fg(ERR)),
+                Span::styled("tracker error: ", Style::default().fg(ERR)),
                 Span::styled(
                     truncate(msg, 80),
                     Style::default().fg(ERR).add_modifier(Modifier::ITALIC),

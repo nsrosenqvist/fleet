@@ -432,40 +432,32 @@ impl App {
     /// Open the spawn-session prompt. Kicks off a background fetch
     /// of tracker issues so the picker is populated by the time the
     /// user has typed their filter (or sooner). The tracker plugin
-    /// comes from the AO config entry for the current project; an
-    /// unconfigured / unrecognised plugin falls back to free-text
+    /// comes from the AO config entry for the current project;
+    /// unconfigured / unrecognised plugins fall back to free-text
     /// entry without a list.
     pub(super) fn open_spawn_prompt(&mut self) {
-        let plugin = self
+        let plugin: Option<String> = self
             .current_project_key
             .as_ref()
             .and_then(|key| self.ao_config.as_ref()?.projects.get(key))
             .and_then(|p| p.tracker.as_ref())
             .map(|t| t.plugin.clone());
 
-        let (issues, rx) = match plugin.as_deref() {
-            Some("git-bug") => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let repo_root = self.repo_root.clone();
-                std::thread::spawn(move || {
-                    let result = crate::ao::tracker::list_git_bug_issues(&repo_root)
-                        .map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(result);
-                });
-                (IssuesState::Loading, Some(rx))
-            }
-            Some(other) => (
-                IssuesState::Unsupported {
-                    plugin: other.to_string(),
-                },
-                None,
-            ),
-            None => (
-                IssuesState::Unsupported {
-                    plugin: "(none configured)".to_string(),
-                },
-                None,
-            ),
+        let (issues, rx) = if let Some(tracker) =
+            plugin.as_deref().and_then(crate::ao::tracker::build)
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let repo_root = self.repo_root.clone();
+            std::thread::spawn(move || {
+                let result = tracker
+                    .list_issues(&repo_root)
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(result);
+            });
+            (IssuesState::Loading, Some(rx))
+        } else {
+            let label = plugin.unwrap_or_else(|| "(none configured)".to_string());
+            (IssuesState::Unsupported { plugin: label }, None)
         };
 
         self.spawn_prompt = Some(SpawnPrompt {
