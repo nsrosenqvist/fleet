@@ -96,6 +96,17 @@ fn settle_preflight(
                 Ok(false) => return PreflightOutcome::Quit(1),
                 Err(e) => return PreflightOutcome::Err(e),
             },
+            Preflight::WorkspaceUnsafe { current } => {
+                match run_workspace_unsafe_modal(term, current.as_deref()) {
+                    Ok(HostBinsAction::EditConfig) => {
+                        if let Err(e) = edit_ao_yaml(term, repo_root) {
+                            return PreflightOutcome::Err(e);
+                        }
+                    }
+                    Ok(HostBinsAction::Quit) => return PreflightOutcome::Quit(1),
+                    Err(e) => return PreflightOutcome::Err(e),
+                }
+            }
             Preflight::TrackerWarnings(warnings) => {
                 // No prompt — tracker tools are fleet's responsibility
                 // since fleet manages the VM. Run the install with a
@@ -134,6 +145,27 @@ fn run_host_bins_modal(
 ) -> Result<HostBinsAction> {
     loop {
         term.draw(|f| ui::render_preflight(f, failures))?;
+        if event::poll(TICK_INTERVAL)?
+            && let event::Event::Key(k) = event::read()?
+            && k.kind == event::KeyEventKind::Press
+        {
+            return Ok(match k.code {
+                event::KeyCode::Char('c' | 'C') => HostBinsAction::EditConfig,
+                _ => HostBinsAction::Quit,
+            });
+        }
+    }
+}
+
+/// Workspace-unsafe modal. Same key model as the host-bins one
+/// (`c` → edit yaml, anything else → quit), so the user has a fast
+/// remediation path without leaving the alt screen.
+fn run_workspace_unsafe_modal(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    current: Option<&str>,
+) -> Result<HostBinsAction> {
+    loop {
+        term.draw(|f| ui::render_workspace_unsafe(f, current))?;
         if event::poll(TICK_INTERVAL)?
             && let event::Event::Key(k) = event::read()?
             && k.kind == event::KeyEventKind::Press
@@ -197,17 +229,11 @@ fn edit_ao_yaml(
     if let Some(parent) = yaml_path.parent()
         && !parent.exists()
     {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("mkdir {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     suspend_around(term, || {
-        crate::process::run_interactive(
-            &editor,
-            &[yaml_path.display().to_string()],
-            &[],
-            &[],
-        )
-        .map(|_| ())
+        crate::process::run_interactive(&editor, &[yaml_path.display().to_string()], &[], &[])
+            .map(|_| ())
     })?;
     Ok(())
 }
@@ -252,10 +278,7 @@ fn prompt_vm_action(
 /// re-check VM status — if limactl returned non-zero or the VM still
 /// isn't running, the next iteration shows the relevant modal again
 /// rather than blindly proceeding into a broken TUI.
-fn bring_up_vm(
-    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    mode: BringUpMode,
-) -> Result<()> {
+fn bring_up_vm(term: &mut Terminal<CrosstermBackend<io::Stdout>>, mode: BringUpMode) -> Result<()> {
     let mut bringup = BringUp::spawn(mode)?;
     loop {
         bringup.tick();
@@ -657,10 +680,7 @@ fn start_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
 /// the daemon is up but no orchestrator exists. Destructive (kills
 /// dashboard + any running workers); only invoked after a y/N
 /// confirm in [`start_ao`].
-fn restart_ao_for_orchestrator(
-    app: &mut App,
-    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
-) {
+fn restart_ao_for_orchestrator(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     if !ensure_oauth_token_configured(app) {
         return;
     }
@@ -669,12 +689,9 @@ fn restart_ao_for_orchestrator(
         // `ao stop --all` releases the lock and frees the
         // dashboard's port so the subsequent `ao start` doesn't
         // hit the "already running" check.
-        crate::cli::passthrough::run(
-            &repo_root,
-            &["stop".to_string(), "--all".to_string()],
-        )
-        .map(|_| ())
-        .and_then(|()| crate::cli::spawn::run_start(&repo_root, false, false).map(|_| ()))
+        crate::cli::passthrough::run(&repo_root, &["stop".to_string(), "--all".to_string()])
+            .map(|_| ())
+            .and_then(|()| crate::cli::spawn::run_start(&repo_root, false, false).map(|_| ()))
     });
     app.flash_if_err(res);
     app.request_refresh();
@@ -703,12 +720,8 @@ fn open_web(app: &mut App) {
 fn kill_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>, id: String) {
     let repo_root = app.repo_root.clone();
     let res = suspend_around(term, || {
-        crate::cli::passthrough::run_with_prefix(
-            &repo_root,
-            "session",
-            &["kill".to_string(), id],
-        )
-        .map(|_| ())
+        crate::cli::passthrough::run_with_prefix(&repo_root, "session", &["kill".to_string(), id])
+            .map(|_| ())
     });
     app.flash_if_err(res);
     app.request_refresh();
@@ -720,11 +733,7 @@ fn kill_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>
 /// the user sees AO's output stream — and any failure surface — in
 /// the terminal directly. On success we kick a refresh so the new
 /// session appears in the sidebar without waiting for the next tick.
-fn spawn_session(
-    app: &mut App,
-    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    issue: &str,
-) {
+fn spawn_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>, issue: &str) {
     if !ensure_oauth_token_configured(app) {
         return;
     }
@@ -802,8 +811,7 @@ fn append_keychain_secret_to_config(service: &str) -> Result<()> {
     let path = crate::config::Config::xdg_path()
         .context("no HOME / XDG_CONFIG_HOME — can't resolve fleet config path")?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("mkdir {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     if existing.contains("[secrets.claude_code_oauth_token]") {

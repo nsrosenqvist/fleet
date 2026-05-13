@@ -14,6 +14,8 @@ mod config;
 mod lima;
 mod process;
 mod secrets;
+#[cfg(test)]
+mod test_env;
 mod tmux;
 mod tui;
 

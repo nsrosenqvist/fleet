@@ -62,11 +62,36 @@ pub fn run_batch_spawn(repo_root: &Path, issues: &[String]) -> Result<i32> {
 }
 
 fn run_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
+    ensure_worktree_workspace()?;
     let cfg = Config::load(repo_root)?;
     match cfg.agent_auth().resolve(repo_root) {
         ResolvedAuthMode::ClaudeOauth => run_claude_oauth(ao_argv, &cfg),
         ResolvedAuthMode::Passthrough => run_passthrough(ao_argv),
     }
+}
+
+/// Refuse to hand off to AO when `defaults.workspace` in the AO yaml
+/// isn't `worktree`. The TUI's preflight catches this for `fleet ui`,
+/// but `fleet spawn` / `fleet start` / `fleet batch-spawn` from a
+/// shell bypass preflight entirely — this guard is the only thing
+/// preventing AO from running the agent inside the host checkout.
+///
+/// `Ok(())` (no-op) when the AO yaml doesn't exist yet — the caller
+/// will produce a more specific error about the missing config when
+/// it tries to qualify the issue.
+fn ensure_worktree_workspace() -> Result<()> {
+    let Some((_, ao)) = crate::ao::config::AoConfig::load()? else {
+        return Ok(());
+    };
+    if ao.defaults.workspace_is_worktree() {
+        return Ok(());
+    }
+    bail!(
+        "agent-orchestrator.yaml has defaults.workspace = {} (must be `worktree`).\n\
+         Spawning would let the agent run inside the host repo's working tree.\n\
+         Edit ~/.config/fleet/agent-orchestrator.yaml and set:\n\n  defaults:\n    workspace: worktree",
+        ao.defaults.workspace.as_deref().unwrap_or("(unset)")
+    );
 }
 
 /// Like [`crate::ao::config::AoConfig::workdir`] but bails with a

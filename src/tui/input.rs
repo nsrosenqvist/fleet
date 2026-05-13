@@ -44,6 +44,16 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
         }
 
         (KeyCode::Char('K') | KeyCode::Delete, _) => {
+            // Killing the orchestrator standalone leaves the daemon
+            // up with no orchestrator — a degraded state with no
+            // recovery path inside AO. Force users through Shift+X
+            // (stops the whole daemon cleanly) or Shift+S (rebuilds
+            // it) instead. The status-bar legend hides the `K kill`
+            // chip when the orchestrator row is selected, so this
+            // branch is mostly defence-in-depth for the keystroke.
+            if app.is_orchestrator_selected() {
+                return;
+            }
             if let Some(id) = app.selected_session_id() {
                 app.confirm = Some(Confirm::KillSession(id));
             }
@@ -232,7 +242,12 @@ mod tests {
     use super::*;
 
     fn r(x: u16, y: u16, w: u16, h: u16) -> Rect {
-        Rect { x, y, width: w, height: h }
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
     }
 
     #[test]

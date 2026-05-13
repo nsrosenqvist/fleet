@@ -104,14 +104,8 @@ impl BringUp {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawn `limactl {}`", args.join(" ")))?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("limactl child has no stdout")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("limactl child has no stderr")?;
+        let stdout = child.stdout.take().context("limactl child has no stdout")?;
+        let stderr = child.stderr.take().context("limactl child has no stderr")?;
 
         let join = thread::spawn(move || drive_child(child, stdout, stderr, &tx, template_tmp));
 

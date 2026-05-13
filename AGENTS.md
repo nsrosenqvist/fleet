@@ -14,6 +14,14 @@ This file is **not** the rule sheet AO worker sessions read when they're spawned
 
 The repo also contains one Node package: `packages/tracker-git-bug/`. It's a [git-bug](https://github.com/git-bug/git-bug) tracker plugin AO loads as an ESM module at runtime. That's the only TypeScript code here; the plugin contract (`@aoagents/ao-core`'s `Tracker` interface) forces it to be TS, so it lives in its own package with its own tooling (oxc, vitest, tsc).
 
+## Workspace model
+
+The host repo is never an agent's cwd. Every AO worker session runs inside a dedicated git worktree on a dedicated branch (`agent/<issue-id>`), created by AO when the session is spawned.
+
+Worktrees live at `~/.agent-orchestrator/projects/<project>/worktrees/<session-id>` inside the VM. Lima bind-mounts the host home into the VM at the same path, so you can `cd` into a worktree from your normal host shell and inspect what an agent is doing.
+
+The contract is gated by `defaults.workspace: worktree` in `~/.config/fleet/agent-orchestrator.yaml`. If that line is missing or set to anything else, AO can pick a workspace plugin that runs the agent against the host checkout's working tree — so fleet refuses to launch the TUI (preflight modal) and refuses to `fleet spawn` / `fleet start` from the shell. The validator is [`Defaults::workspace_is_worktree`](./src/ao/config.rs) and its enforcement points are `tui::preflight::check` + `cli::spawn::ensure_worktree_workspace`.
+
 ## Layout
 
 ```

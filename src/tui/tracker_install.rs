@@ -23,7 +23,10 @@ enum InstallEvent {
     Line(String),
     /// One tool finished; carries the tool name and exit status so
     /// the renderer can show "✓ git-bug" / "✗ gh" between installs.
-    StepDone { tool: String, code: i32 },
+    StepDone {
+        tool: String,
+        code: i32,
+    },
     /// Supervisor thread finished all installs.
     Finished(Result<()>),
 }
@@ -179,9 +182,7 @@ fn forward_streams(
     let tx_err = tx.clone();
     let h_out = thread::spawn(move || forward_lines(stdout, &tx_out));
     let h_err = thread::spawn(move || forward_lines(stderr, &tx_err));
-    let status = child
-        .wait()
-        .context("wait on `limactl shell` child")?;
+    let status = child.wait().context("wait on `limactl shell` child")?;
     let _ = h_out.join();
     let _ = h_err.join();
     Ok(status.code().unwrap_or(-1))

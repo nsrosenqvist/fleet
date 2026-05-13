@@ -271,7 +271,9 @@ fn sort_open_first(issues: &mut [Issue]) {
     issues.sort_by(|a, b| {
         let a_open = a.status == "open";
         let b_open = b.status == "open";
-        b_open.cmp(&a_open).then_with(|| a.human_id.cmp(&b.human_id))
+        b_open
+            .cmp(&a_open)
+            .then_with(|| a.human_id.cmp(&b.human_id))
     });
 }
 

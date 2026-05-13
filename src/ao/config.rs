@@ -43,6 +43,22 @@ pub struct AoConfig {
     pub extra: BTreeMap<String, serde_yml::Value>,
 }
 
+/// Catalog-wide defaults that AO applies to every project unless the
+/// project block overrides them. The `workspace` field is **load-bearing
+/// for host-repo isolation**: it's the single signal AO uses to pick
+/// between the `worktree` plugin (creates a dedicated git worktree per
+/// session inside the VM, leaving the host checkout untouched) and any
+/// other plugin (some of which run the agent inside the project root).
+///
+/// Fleet treats anything other than the literal string `"worktree"` as
+/// unsafe. The check fires from two places:
+///
+/// - [`crate::tui::preflight::check`] blocks the TUI from booting.
+/// - [`crate::cli::spawn::run_with_token`] (via
+///   [`crate::cli::spawn::ensure_worktree_workspace`]) refuses to hand
+///   off to AO even when fleet is invoked outside the TUI.
+///
+/// See [`Defaults::workspace_is_worktree`] for the literal-match rule.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Defaults {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,15 +71,38 @@ pub struct Defaults {
     pub notifiers: Vec<String>,
 }
 
+impl Defaults {
+    /// `true` when `workspace` is the literal string `"worktree"` —
+    /// the only value fleet considers safe. `None`, the empty
+    /// string, capitalisation variants (`"Worktree"`), and any other
+    /// plugin name all return `false` because we can't be smarter
+    /// than AO about which plugins isolate the host checkout.
+    pub fn workspace_is_worktree(&self) -> bool {
+        self.workspace.as_deref() == Some("worktree")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Project {
     pub name: String,
-    #[serde(rename = "sessionPrefix", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "sessionPrefix",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub session_prefix: Option<String>,
     pub path: PathBuf,
-    #[serde(rename = "defaultBranch", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "defaultBranch",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_branch: Option<String>,
-    #[serde(rename = "agentRulesFile", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "agentRulesFile",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub agent_rules_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -137,10 +176,10 @@ impl AoConfig {
         let Some(path) = Self::resolve_path() else {
             return Ok(None);
         };
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
-        let parsed: Self = serde_yml::from_str(&text)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let parsed: Self =
+            serde_yml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         Ok(Some((path, parsed)))
     }
 
@@ -249,24 +288,50 @@ reactions:
         let sandbox = cfg.projects.get("sandbox").expect("sandbox project");
         assert_eq!(sandbox.name, "sandbox");
         assert_eq!(sandbox.session_prefix.as_deref(), Some("sb"));
-        assert_eq!(sandbox.tracker.as_ref().map(|t| t.plugin.as_str()), Some("git-bug"));
+        assert_eq!(
+            sandbox.tracker.as_ref().map(|t| t.plugin.as_str()),
+            Some("git-bug")
+        );
         // Unknown top-level key preserved.
         assert!(cfg.extra.contains_key("reactions"));
     }
 
     #[test]
+    fn workspace_is_worktree_literal_only() {
+        let mk = |w: Option<&str>| Defaults {
+            workspace: w.map(str::to_string),
+            ..Defaults::default()
+        };
+        assert!(mk(Some("worktree")).workspace_is_worktree());
+        assert!(!mk(None).workspace_is_worktree());
+        assert!(!mk(Some("")).workspace_is_worktree());
+        assert!(!mk(Some("Worktree")).workspace_is_worktree());
+        assert!(!mk(Some("worktrees")).workspace_is_worktree());
+        assert!(!mk(Some("docker")).workspace_is_worktree());
+    }
+
+    #[test]
     fn auth_mode_hint_claude_code() {
-        assert_eq!(auth_mode_for_agent(Some("claude-code")), AuthModeHint::ClaudeOauth);
+        assert_eq!(
+            auth_mode_for_agent(Some("claude-code")),
+            AuthModeHint::ClaudeOauth
+        );
     }
 
     #[test]
     fn auth_mode_hint_codex_is_passthrough() {
-        assert_eq!(auth_mode_for_agent(Some("codex")), AuthModeHint::Passthrough);
+        assert_eq!(
+            auth_mode_for_agent(Some("codex")),
+            AuthModeHint::Passthrough
+        );
     }
 
     #[test]
     fn auth_mode_hint_aider_is_passthrough() {
-        assert_eq!(auth_mode_for_agent(Some("aider")), AuthModeHint::Passthrough);
+        assert_eq!(
+            auth_mode_for_agent(Some("aider")),
+            AuthModeHint::Passthrough
+        );
     }
 
     #[test]

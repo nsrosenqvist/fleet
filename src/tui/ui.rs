@@ -20,7 +20,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 
 use crate::ao::SessionInfo;
 use crate::lima::VmStatus;
@@ -73,10 +75,7 @@ fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .constraints([Constraint::Min(0), Constraint::Length(18)])
         .split(area);
 
-    let project_chip = app
-        .current_project_key
-        .as_deref()
-        .unwrap_or("(unscoped)");
+    let project_chip = app.current_project_key.as_deref().unwrap_or("(unscoped)");
     let chain: Vec<Span<'_>> = app.selected_session().map_or_else(
         || {
             vec![
@@ -125,7 +124,7 @@ fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, area: Rect) {
 fn draw_body(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(24), Constraint::Min(0)])
+        .constraints([Constraint::Length(32), Constraint::Min(0)])
         .split(area);
 
     draw_sessions_list(app, frame, cols[0]);
@@ -230,6 +229,7 @@ fn draw_sidebar_group(
     let list = List::new(items)
         .block(framed_block(title))
         .highlight_symbol("▸ ")
+        .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(
             Style::default()
                 .fg(Color::Indexed(255))
@@ -312,6 +312,8 @@ fn build_session_kv_lines(s: &SessionInfo) -> Vec<Line<'static>> {
     push("branch", s.branch.as_deref());
     push("ticket", s.issue_id.as_deref());
     push("project", s.project_id.as_deref());
+    let worktree = s.workspace_path.as_deref().map(shorten_worktree);
+    push("worktree", worktree.as_deref());
     push("activity", s.activity.as_deref());
     push("last", s.last_activity.as_deref());
     push(
@@ -325,6 +327,25 @@ fn build_session_kv_lines(s: &SessionInfo) -> Vec<Line<'static>> {
         )));
     }
     lines
+}
+
+/// Elide the homedir + `.agent-orchestrator/` prefix on a worktree
+/// path so the session-id tail (the part the user actually scans
+/// for) survives in a narrow details column. Falls back to a plain
+/// char-count truncation if the path doesn't match the expected
+/// shape — defensive, so a future AO release that relocates worktrees
+/// still renders something legible. Truncating instead of wrapping
+/// matters: the details panel sizes its height by logical-line count
+/// (see `info_h` in [`draw_body`]), so a wrapped row would clip its
+/// continuation against the bottom border.
+fn shorten_worktree(path: &str) -> String {
+    path.find("/.agent-orchestrator/").map_or_else(
+        || truncate(path, 56),
+        |idx| {
+            let tail = &path[idx + "/.agent-orchestrator".len()..];
+            format!("…{tail}")
+        },
+    )
 }
 
 /// State-aware "what do I do next?" panel. Three cases:
@@ -351,10 +372,7 @@ fn build_welcome_lines(app: &App) -> Vec<Line<'static>> {
             Line::from(vec![
                 Span::styled("  Press ", muted),
                 Span::styled("c", bold_key),
-                Span::styled(
-                    "  to edit agent-orchestrator.yaml and add a `path:`",
-                    muted,
-                ),
+                Span::styled("  to edit agent-orchestrator.yaml and add a `path:`", muted),
             ]),
             Line::from(Span::styled(
                 "  entry that points at this directory, then press ",
@@ -378,28 +396,19 @@ fn build_welcome_lines(app: &App) -> Vec<Line<'static>> {
             Line::from(vec![
                 Span::styled("  ", muted),
                 Span::styled("S", bold_key),
-                Span::styled(
-                    "       start the orchestrator inside the VM",
-                    muted,
-                ),
+                Span::styled("       start the orchestrator inside the VM", muted),
             ]),
             Line::raw(""),
             Line::from(Span::styled("  Once it's up:", muted)),
             Line::from(vec![
                 Span::styled("  ", muted),
                 Span::styled("n", bold_key),
-                Span::styled(
-                    "       spawn a session on an issue",
-                    muted,
-                ),
+                Span::styled("       spawn a session on an issue", muted),
             ]),
             Line::from(vec![
                 Span::styled("  ", muted),
                 Span::styled("t", bold_key),
-                Span::styled(
-                    "       open the tracker (git-bug) to create one",
-                    muted,
-                ),
+                Span::styled("       open the tracker (git-bug) to create one", muted),
             ]),
         ];
     }
@@ -413,18 +422,12 @@ fn build_welcome_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("  ", muted),
             Span::styled("n", bold_key),
-            Span::styled(
-                "       spawn a session on an issue",
-                muted,
-            ),
+            Span::styled("       spawn a session on an issue", muted),
         ]),
         Line::from(vec![
             Span::styled("  ", muted),
             Span::styled("t", bold_key),
-            Span::styled(
-                "       open the tracker to browse / create issues",
-                muted,
-            ),
+            Span::styled("       open the tracker to browse / create issues", muted),
         ]),
         Line::raw(""),
         Line::from(Span::styled(
@@ -457,16 +460,11 @@ fn details_title(session: Option<&SessionInfo>) -> Line<'static> {
         .unwrap_or_else(|| "session".into());
     Line::from(vec![
         Span::raw(" "),
-        Span::styled(
-            id,
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(id, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(
             tag,
-            Style::default()
-                .fg(MUTED)
-                .add_modifier(Modifier::ITALIC),
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         ),
         Span::raw(" "),
     ])
@@ -515,11 +513,12 @@ fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Style::default().fg(MUTED)
     };
     frame.render_widget(
-        Paragraph::new(lines).style(style).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .style(style)
+            .wrap(Wrap { trim: false }),
         inner,
     );
 }
-
 
 /// System-wide event ticker pinned to the bottom of the UI. Polled
 /// from `ao events list --since 1h --json` on a slower cadence than
@@ -528,7 +527,7 @@ fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// recent rows first — AO already returns the log sorted descending.
 fn draw_events_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let title = format!(" events ({}) ", app.events.len());
-    let block = framed_block(&title);
+    let block = framed_block(&title).padding(Padding::horizontal(2));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -554,12 +553,11 @@ fn draw_events_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// The level drives the foreground colour of the summary so an error
 /// row reads as red without needing a separate icon column.
 fn event_line(e: &crate::ao::EventInfo) -> Line<'static> {
-    let time = e
-        .ts
-        .as_deref()
-        .and_then(|s| s.split('T').nth(1))
-        .and_then(|after_t| after_t.split('.').next())
-        .unwrap_or("--:--:--");
+    let time =
+        e.ts.as_deref()
+            .and_then(|s| s.split('T').nth(1))
+            .and_then(|after_t| after_t.split('.').next())
+            .unwrap_or("--:--:--");
     let kind = e.kind.as_deref().unwrap_or("?");
     let session = e.session_id.as_deref().unwrap_or("—");
     let summary = e.summary.as_deref().unwrap_or("");
@@ -569,7 +567,9 @@ fn event_line(e: &crate::ao::EventInfo) -> Line<'static> {
         _ => MUTED,
     };
     let summary_style = if matches!(e.level.as_deref(), Some("error" | "warn")) {
-        Style::default().fg(level_color).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(level_color)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -632,21 +632,31 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // Capital letters mean shift-modified bindings (S = Shift+S, K =
     // Shift+K, …). No ⇧ glyph anywhere in the legend — the case
     // already carries the meaning and the arrow added visual noise.
+    // The orchestrator row is read-only from fleet's perspective:
+    // `Enter` is a silent no-op (no attach), `Shift+K` is blocked
+    // (would leave the daemon orphaned — see input.rs). Hide both
+    // chips so the legend never advertises an action it won't
+    // perform; lifecycle for the orchestrator goes through
+    // `Shift+S` / `Shift+X` instead.
+    let orchestrator_selected = app.is_orchestrator_selected();
+
     let mut spans: Vec<Span<'_>> = vec![
         chip("[fleet]", ACCENT),
         sep(),
         key("↑/↓"),
         Span::raw(" nav"),
-        sep(),
-        key("enter"),
-        Span::raw(" attach"),
+    ];
+    if !orchestrator_selected {
+        spans.extend([sep(), key("enter"), Span::raw(" attach")]);
+    }
+    spans.extend([
         sep(),
         key("n"),
         Span::raw(" new"),
         sep(),
         key("t"),
         Span::raw(" tracker"),
-    ];
+    ]);
     if app.current_tracker_has_web() {
         spans.push(sep());
         spans.push(key("T"));
@@ -654,13 +664,11 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         // `W` (AO dashboard) below.
         spans.push(Span::raw(" tracker web"));
     }
+    spans.extend([sep(), key("c"), Span::raw(" edit config")]);
+    if !orchestrator_selected {
+        spans.extend([sep(), key("K"), Span::raw(" kill")]);
+    }
     spans.extend([
-        sep(),
-        key("c"),
-        Span::raw(" edit config"),
-        sep(),
-        key("K"),
-        Span::raw(" kill"),
         sep(),
         key("S"),
         Span::raw("/"),
@@ -795,11 +803,7 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
     // for the explanatory copy and the masked-dots row with its
     // `(N chars)` tally, without overflowing narrow terminals.
     let area = frame.area();
-    let pinned = area
-        .width
-        .saturating_mul(3)
-        .saturating_div(5)
-        .clamp(60, 80);
+    let pinned = area.width.saturating_mul(3).saturating_div(5).clamp(60, 80);
     draw_modal_sized(
         frame,
         " configure claude oauth token ",
@@ -822,10 +826,7 @@ fn ao_down_warning_lines() -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("⚠ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
             Span::styled("AO daemon not running — ", Style::default().fg(WARN)),
-            Span::styled(
-                "lifecycle tracking will be off for the new session.",
-                muted,
-            ),
+            Span::styled("lifecycle tracking will be off for the new session.", muted),
         ]),
         Line::from(vec![
             Span::styled("  start it with ", muted),
@@ -854,10 +855,7 @@ fn spawn_issue_lines(prompt: &SpawnPrompt) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled("tracker `", muted),
                 Span::styled(plugin.clone(), Style::default().fg(WARN)),
-                Span::styled(
-                    "` — listing not supported; type the issue id.",
-                    muted,
-                ),
+                Span::styled("` — listing not supported; type the issue id.", muted),
             ]));
         }
         IssuesState::Error(msg) => {
@@ -1017,6 +1015,77 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// Host-repo isolation gate: `defaults.workspace` in the AO yaml is
+/// missing or set to something other than `worktree`. Dead-end modal
+/// (no retry/continue) — the user has to edit the yaml to proceed.
+/// Reuses the preflight footer pattern: `c` opens `$EDITOR`, any
+/// other key quits.
+pub(super) fn render_workspace_unsafe(frame: &mut Frame<'_>, current: Option<&str>) {
+    let muted = Style::default().fg(MUTED);
+    let bold_accent = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let displayed = current.unwrap_or("(unset)");
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("✗ ", Style::default().fg(ERR).add_modifier(Modifier::BOLD)),
+            Span::styled("defaults.workspace", bold_accent),
+        ]),
+        Line::from(Span::styled(
+            "  must be `worktree` so AO agents never run inside the host",
+            muted,
+        )),
+        Line::from(Span::styled("  repo's working tree.", muted)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  current   ", muted),
+            Span::styled(
+                displayed.to_string(),
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Edit ~/.config/fleet/agent-orchestrator.yaml and set:",
+            muted,
+        )),
+        Line::raw(""),
+        Line::from(Span::styled("    defaults:", bold_accent)),
+        Line::from(vec![
+            Span::styled("      workspace: ", bold_accent),
+            Span::styled(
+                "worktree",
+                Style::default().fg(OK).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Why: AO's worktree plugin creates a dedicated git worktree",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  per session inside the VM. Any other value (or no value at",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  all) can let an agent run git / rm / edits against your",
+            muted,
+        )),
+        Line::from(Span::styled("  host checkout.", muted)),
+    ];
+    draw_modal(
+        frame,
+        " host-repo isolation ",
+        ERR,
+        lines,
+        &[Line::from(vec![
+            modal_key("c"),
+            Span::styled(" edit agent-orchestrator.yaml   ", muted),
+            modal_key("any other key"),
+            Span::styled(" quit", muted),
+        ])],
+    );
+}
+
 pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -1026,10 +1095,7 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
     lines.push(Line::raw(""));
     for f in failures {
         lines.push(Line::from(vec![
-            Span::styled(
-                "✗ ",
-                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("✗ ", Style::default().fg(ERR).add_modifier(Modifier::BOLD)),
             Span::styled(
                 f.name.to_string(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1061,7 +1127,10 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
         lines,
         &[Line::from(vec![
             modal_key("c"),
-            Span::styled(" edit agent-orchestrator.yaml   ", Style::default().fg(MUTED)),
+            Span::styled(
+                " edit agent-orchestrator.yaml   ",
+                Style::default().fg(MUTED),
+            ),
             modal_key("any other key"),
             Span::styled(" quit", Style::default().fg(MUTED)),
         ])],
@@ -1103,19 +1172,13 @@ pub(super) fn render_tracker_install(
         match outcome {
             Some(s) if s.code == 0 => {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "✓ ",
-                        Style::default().fg(OK).add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled("✓ ", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
                     Span::styled(tool.clone(), bold_key),
                 ]));
             }
             Some(s) => {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "✗ ",
-                        Style::default().fg(ERR).add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled("✗ ", Style::default().fg(ERR).add_modifier(Modifier::BOLD)),
                     Span::styled(tool.clone(), bold_key),
                     Span::raw("  "),
                     Span::styled(format!("(exit {})", s.code), muted),
@@ -1123,20 +1186,14 @@ pub(super) fn render_tracker_install(
             }
             None => {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{spinner} "),
-                        Style::default().fg(ACCENT),
-                    ),
+                    Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
                     Span::styled(tool.clone(), bold_key),
                 ]));
             }
         }
     }
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "output (most recent):",
-        muted,
-    )));
+    lines.push(Line::from(Span::styled("output (most recent):", muted)));
     let mut had_any = false;
     for raw in install.tail_lines() {
         had_any = true;
@@ -1177,10 +1234,7 @@ pub(super) fn render_tracker_warnings(
     lines.push(Line::raw(""));
     for w in warnings {
         lines.push(Line::from(vec![
-            Span::styled(
-                "✗ ",
-                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("✗ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
             Span::styled(
                 w.plugin.clone(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1234,19 +1288,13 @@ pub(super) fn render_tracker_warnings(
 pub(super) fn render_vm_missing(frame: &mut Frame<'_>) {
     let lines = vec![
         Line::from(vec![
-            Span::styled(
-                "✗ ",
-                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("✗ ", Style::default().fg(ERR).add_modifier(Modifier::BOLD)),
             Span::styled(
                 "fleet-vm",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(
-                "Lima instance does not exist",
-                Style::default().fg(MUTED),
-            ),
+            Span::styled("Lima instance does not exist", Style::default().fg(MUTED)),
         ]),
         Line::raw(""),
         Line::from(Span::styled(
@@ -1275,10 +1323,7 @@ pub(super) fn render_vm_missing(frame: &mut Frame<'_>) {
 pub(super) fn render_vm_stopped(frame: &mut Frame<'_>) {
     let lines = vec![
         Line::from(vec![
-            Span::styled(
-                "○ ",
-                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("○ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
             Span::styled(
                 "fleet-vm",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1291,10 +1336,7 @@ pub(super) fn render_vm_stopped(frame: &mut Frame<'_>) {
             "Fleet can't reach the ao orchestrator until the VM",
             Style::default().fg(MUTED),
         )),
-        Line::from(Span::styled(
-            "is running.",
-            Style::default().fg(MUTED),
-        )),
+        Line::from(Span::styled("is running.", Style::default().fg(MUTED))),
     ];
     draw_modal(frame, " vm setup ", WARN, lines, &footer_yn("start"));
 }
@@ -1392,7 +1434,14 @@ fn draw_modal(
     body: Vec<Line<'static>>,
     footer: &[Line<'static>],
 ) {
-    draw_modal_sized(frame, title_text, title_color, body, footer, ModalWidth::Auto);
+    draw_modal_sized(
+        frame,
+        title_text,
+        title_color,
+        body,
+        footer,
+        ModalWidth::Auto,
+    );
 }
 
 /// How a modal picks its column width when laid out.
@@ -1459,5 +1508,26 @@ fn center_rect(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shorten_worktree;
+
+    #[test]
+    fn shorten_worktree_elides_homedir_prefix() {
+        let input = "/home/niklas.guest/.agent-orchestrator/projects/sandbox/worktrees/sb-1";
+        assert_eq!(shorten_worktree(input), "…/projects/sandbox/worktrees/sb-1");
+    }
+
+    #[test]
+    fn shorten_worktree_falls_back_to_truncate_for_unexpected_shape() {
+        // Path doesn't contain the expected marker → don't try to
+        // be clever, just truncate at the char cap.
+        let input = "/some/other/place/where/ao/might/store/work";
+        let out = shorten_worktree(input);
+        assert!(out.starts_with("/some/other/place"));
+        assert!(out.chars().count() <= 56);
     }
 }

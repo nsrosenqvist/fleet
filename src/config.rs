@@ -150,9 +150,12 @@ mod tests {
     }
 
     // NB: env tests in this module set `XDG_CONFIG_HOME` which is a
-    // process-global; tests in this module must not run in parallel against
-    // each other. cargo test serializes within a single test binary's
-    // failures, but to be safe we use distinct values per test.
+    // process-global. `cargo test` runs unit tests in parallel by
+    // default, so every test that mutates the env must hold the
+    // shared lock from `crate::test_env::xdg_lock` for the duration
+    // of its set / read / restore sequence (see `with_isolated_xdg`
+    // below). Tests that only mutate XDG inline acquire the lock
+    // explicitly.
 
     #[test]
     fn merges_repo_overlay_onto_xdg() {
@@ -179,7 +182,10 @@ mod tests {
             "#,
         );
 
-        // SAFETY: env mutation is process-global; restored before return.
+        // SAFETY: env mutation is process-global; restored before
+        // return. Lock held across the read so a parallel test can't
+        // clobber the value mid-load.
+        let guard = crate::test_env::xdg_lock();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", &xdg);
         }
@@ -187,6 +193,7 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
         }
+        drop(guard);
         let backend = cfg
             .secrets
             .get("claude_code_oauth_token")
@@ -212,10 +219,13 @@ mod tests {
     /// other XDG-mutating tests.
     fn with_isolated_xdg(tmp: &std::path::Path, body: impl FnOnce()) {
         std::fs::create_dir_all(tmp.join("fleet")).expect("mkdir fleet");
+        // Lock guards against parallel XDG mutations from other tests.
         // SAFETY: env mutation is process-global; restored before return.
+        let guard = crate::test_env::xdg_lock();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp) };
         body();
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        drop(guard);
     }
 
     /// Write an AO yaml into the canonical XDG location under `tmp`.
@@ -299,6 +309,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         // Point XDG at an empty dir; repo has no .fleet.local.toml either.
         // SAFETY: env mutation is process-global; restored before return.
+        let guard = crate::test_env::xdg_lock();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", tmp.path());
         }
@@ -306,6 +317,7 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
         }
+        drop(guard);
         assert!(cfg.secrets.is_empty());
     }
 }

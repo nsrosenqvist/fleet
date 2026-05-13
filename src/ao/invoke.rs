@@ -83,7 +83,10 @@ impl<'a> Ao<'a> {
             )
         })?;
         let parsed: EventsResponse = serde_json::from_str(&raw[start..]).with_context(|| {
-            format!("parsing ao events list --json: {}", error_preview(&raw[start..]))
+            format!(
+                "parsing ao events list --json: {}",
+                error_preview(&raw[start..])
+            )
         })?;
         Ok(parsed.events)
     }

@@ -7,7 +7,12 @@
 //! 1. `limactl` on `$PATH` (hard fail — nothing else works without it).
 //! 2. `fleet-vm` Lima instance exists.
 //! 3. The instance is running.
-//! 4. Tracker tools (`git-bug` inside the VM, `gh` on the host) match the
+//! 4. `defaults.workspace: worktree` is set in the AO yaml. **Hard
+//!    fail** — without it, AO may run an agent against the host
+//!    checkout's working tree, which is the exact scenario fleet
+//!    exists to prevent. Surfaced as a dead-end modal until the user
+//!    edits the yaml.
+//! 5. Tracker tools (`git-bug` inside the VM, `gh` on the host) match the
 //!    plugins configured in `agent-orchestrator.yaml`. **Advisory** — the
 //!    rest of the TUI works without these; only the spawn picker breaks
 //!    for that one project. Surfaced as a continue-able warning so the
@@ -28,14 +33,22 @@ use crate::process::RealProcessInvoker;
 pub(super) const VM_NAME: &str = "fleet-vm";
 
 /// Outcome of [`check`]. Hard failures (`HostBinsMissing`, `VmMissing`,
-/// `VmStopped`) short-circuit later phases. `TrackerWarnings` only
-/// arrives after the hard phases pass — the spawn picker is broken
-/// but the rest of the TUI works, so the modal is continue-able.
+/// `VmStopped`, `WorkspaceUnsafe`) short-circuit later phases.
+/// `TrackerWarnings` only arrives after the hard phases pass — the
+/// spawn picker is broken but the rest of the TUI works, so the modal
+/// is continue-able.
 pub enum Preflight {
     Ok,
     HostBinsMissing(Vec<MissingDep>),
     VmMissing,
     VmStopped,
+    /// `defaults.workspace` in the AO yaml is missing or set to
+    /// something other than `"worktree"`. `current` carries the
+    /// observed value (or `None` when the key is absent) so the
+    /// modal can show exactly what's wrong.
+    WorkspaceUnsafe {
+        current: Option<String>,
+    },
     TrackerWarnings(Vec<MissingTracker>),
 }
 
@@ -98,14 +111,23 @@ fn check_with(
         VmStatus::Running => {}
     }
 
-    // Phase 4: tracker tools. Loading the AO yaml is best-effort — if
-    // it doesn't parse, the spawn picker will report the error later;
-    // we just skip the tracker check rather than blocking on it.
+    // Phase 4 + 5: AO yaml-driven checks. Loading is best-effort — if
+    // it doesn't parse / doesn't exist, we skip both checks; the
+    // spawn flow will surface the underlying error later.
     let ao = crate::ao::config::AoConfig::load()
         .ok()
         .flatten()
         .map(|(_, cfg)| cfg);
     if let Some(cfg) = ao {
+        // Phase 4: workspace isolation gate. Hard fail — fleet exists
+        // to keep agents off the host checkout, so anything other
+        // than `worktree` blocks the TUI until the user fixes it.
+        if !cfg.defaults.workspace_is_worktree() {
+            return Preflight::WorkspaceUnsafe {
+                current: cfg.defaults.workspace,
+            };
+        }
+        // Phase 5: tracker tools.
         let warnings = check_trackers(&cfg, &has_bin, &in_vm);
         if !warnings.is_empty() {
             return Preflight::TrackerWarnings(warnings);
@@ -259,12 +281,27 @@ mod tests {
     }
 
     /// Write an `agent-orchestrator.yaml` into `<xdg>/fleet/` so the
-    /// `AoConfig` loader picks it up via `default_xdg_path`. Caller is
-    /// responsible for setting `XDG_CONFIG_HOME=<xdg>` around the
-    /// `check_with` call.
+    /// `AoConfig` loader picks it up via `default_xdg_path`. Pair
+    /// with [`with_isolated_xdg`] to actually scope the load to the
+    /// tempdir.
     fn write_ao_yaml(xdg: &Path, body: &str) {
         std::fs::write(xdg.join("fleet").join("agent-orchestrator.yaml"), body)
             .expect("write agent-orchestrator.yaml");
+    }
+
+    /// Point `XDG_CONFIG_HOME` at `xdg` while `body` runs and restore
+    /// before return. Holds [`crate::test_env::xdg_lock`] so parallel
+    /// XDG-mutating tests don't clobber each other — the env var is
+    /// process-global and cargo runs unit tests in parallel by
+    /// default.
+    fn with_isolated_xdg<R>(xdg: &Path, body: impl FnOnce() -> R) -> R {
+        let guard = crate::test_env::xdg_lock();
+        // SAFETY: env mutation is process-global; restored before return.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg) };
+        let result = body();
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        drop(guard);
+        result
     }
 
     #[test]
@@ -300,6 +337,8 @@ mod tests {
         write_ao_yaml(
             &xdg,
             r"
+defaults:
+  workspace: worktree
 projects:
   sandbox:
     name: sandbox
@@ -309,11 +348,10 @@ projects:
 ",
         );
         // Override XDG so the loader doesn't pick up the dev's real
-        // ~/.config/fleet/agent-orchestrator.yaml. SAFETY: env mutation
-        // is process-global; restored before return.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
-        let result = check_with(|_| true, || VmStatus::Running, |tool| tool != "git-bug");
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        // ~/.config/fleet/agent-orchestrator.yaml.
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(|_| true, || VmStatus::Running, |tool| tool != "git-bug")
+        });
         match result {
             Preflight::TrackerWarnings(w) => {
                 assert_eq!(w.len(), 1);
@@ -334,6 +372,8 @@ projects:
         write_ao_yaml(
             &xdg,
             r"
+defaults:
+  workspace: worktree
 projects:
   webapp:
     name: webapp
@@ -342,13 +382,13 @@ projects:
       plugin: github
 ",
         );
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
-        let result = check_with(
-            |_| true,
-            || VmStatus::Running,
-            |tool| tool != "gh", // gh is what's missing in the guest
-        );
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(
+                |_| true,
+                || VmStatus::Running,
+                |tool| tool != "gh", // gh is what's missing in the guest
+            )
+        });
         match result {
             Preflight::TrackerWarnings(w) => {
                 assert_eq!(w.len(), 1);
@@ -372,6 +412,8 @@ projects:
         write_ao_yaml(
             &xdg,
             r"
+defaults:
+  workspace: worktree
 projects:
   sandbox:
     name: sandbox
@@ -380,9 +422,9 @@ projects:
       plugin: git-bug
 ",
         );
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
-        let result = check_with(|_| true, || VmStatus::Running, |_| true);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(|_| true, || VmStatus::Running, |_| true)
+        });
         assert!(matches!(result, Preflight::Ok));
     }
 
@@ -395,6 +437,8 @@ projects:
         write_ao_yaml(
             &xdg,
             r"
+defaults:
+  workspace: worktree
 projects:
   webapp:
     name: webapp
@@ -403,9 +447,9 @@ projects:
       plugin: linear
 ",
         );
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
-        let result = check_with(|_| true, || VmStatus::Running, |_| false);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(|_| true, || VmStatus::Running, |_| false)
+        });
         assert!(matches!(result, Preflight::Ok));
     }
 
@@ -425,7 +469,74 @@ projects:
             Preflight::HostBinsMissing(_) => "HostBinsMissing",
             Preflight::VmMissing => "VmMissing",
             Preflight::VmStopped => "VmStopped",
+            Preflight::WorkspaceUnsafe { .. } => "WorkspaceUnsafe",
             Preflight::TrackerWarnings(_) => "TrackerWarnings",
         }
+    }
+
+    #[test]
+    fn workspace_unsafe_when_default_missing() {
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
+            r"
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/sandbox
+",
+        );
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(|_| true, || VmStatus::Running, |_| true)
+        });
+        match result {
+            Preflight::WorkspaceUnsafe { current } => assert!(current.is_none()),
+            other => panic!("expected WorkspaceUnsafe, got {}", other_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn workspace_unsafe_when_wrong_value() {
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
+            r"
+defaults:
+  workspace: docker
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/sandbox
+",
+        );
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(|_| true, || VmStatus::Running, |_| true)
+        });
+        match result {
+            Preflight::WorkspaceUnsafe { current } => {
+                assert_eq!(current.as_deref(), Some("docker"));
+            }
+            other => panic!("expected WorkspaceUnsafe, got {}", other_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn workspace_ok_when_worktree_set() {
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
+            r"
+defaults:
+  workspace: worktree
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/sandbox
+",
+        );
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(|_| true, || VmStatus::Running, |_| true)
+        });
+        assert!(matches!(result, Preflight::Ok));
     }
 }

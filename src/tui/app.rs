@@ -50,7 +50,6 @@ pub(super) enum ClickKind {
     Activate,
 }
 
-
 /// State of the issue list inside the spawn prompt. Async — the
 /// fetch runs on a background thread so the TUI stays responsive
 /// during the (typically 100–500 ms) `git-bug` round-trip.
@@ -99,7 +98,8 @@ pub(super) struct SpawnPrompt {
     /// Result channel from the background fetch. `None` once the
     /// state has transitioned (Loading → Loaded / Error / Unsupported)
     /// so we don't keep polling a dead receiver.
-    pub(super) rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::ao::tracker::Issue>, String>>>,
+    pub(super) rx:
+        Option<std::sync::mpsc::Receiver<Result<Vec<crate::ao::tracker::Issue>, String>>>,
 }
 
 impl SpawnPrompt {
@@ -273,8 +273,7 @@ impl App {
         // parse error here is non-fatal — fleet just operates in
         // "(unscoped)" mode and the user can fix the yaml via `c`.
         let loaded = crate::ao::config::AoConfig::load().ok().flatten();
-        let (ao_config_path, ao_config) = loaded
-            .map_or((None, None), |(p, c)| (Some(p), Some(c)));
+        let (ao_config_path, ao_config) = loaded.map_or((None, None), |(p, c)| (Some(p), Some(c)));
         let current_project_key = ao_config
             .as_ref()
             .and_then(|c| c.project_for_cwd(repo_root).map(String::from));
@@ -537,9 +536,9 @@ impl App {
     /// Activation resets the timer so a triple-click doesn't re-activate.
     pub(super) fn resolve_click(&mut self, target: ClickTarget) -> ClickKind {
         let now = Instant::now();
-        let activate = self
-            .last_click
-            .is_some_and(|(t, prev)| prev == target && now.duration_since(t) <= DOUBLE_CLICK_WINDOW);
+        let activate = self.last_click.is_some_and(|(t, prev)| {
+            prev == target && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
+        });
         if activate {
             self.last_click = None;
             ClickKind::Activate
@@ -620,22 +619,21 @@ impl App {
             .and_then(|p| p.tracker.as_ref())
             .map(|t| t.plugin.clone());
 
-        let (issues, rx) = if let Some(tracker) =
-            plugin.as_deref().and_then(crate::ao::tracker::build)
-        {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let repo_root = self.repo_root.clone();
-            std::thread::spawn(move || {
-                let result = tracker
-                    .list_issues(&repo_root)
-                    .map_err(|e| format!("{e:#}"));
-                let _ = tx.send(result);
-            });
-            (IssuesState::Loading, Some(rx))
-        } else {
-            let label = plugin.unwrap_or_else(|| "(none configured)".to_string());
-            (IssuesState::Unsupported { plugin: label }, None)
-        };
+        let (issues, rx) =
+            if let Some(tracker) = plugin.as_deref().and_then(crate::ao::tracker::build) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let repo_root = self.repo_root.clone();
+                std::thread::spawn(move || {
+                    let result = tracker
+                        .list_issues(&repo_root)
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(result);
+                });
+                (IssuesState::Loading, Some(rx))
+            } else {
+                let label = plugin.unwrap_or_else(|| "(none configured)".to_string());
+                (IssuesState::Unsupported { plugin: label }, None)
+            };
 
         self.spawn_prompt = Some(SpawnPrompt {
             buffer: String::new(),
@@ -694,13 +692,7 @@ impl App {
     /// require action (errors) or are otherwise non-obvious.
     pub(super) fn flash_if_err(&mut self, res: anyhow::Result<()>) {
         if let Err(e) = res {
-            self.flash_err(
-                format!("{e:#}")
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .to_string(),
-            );
+            self.flash_err(format!("{e:#}").lines().next().unwrap_or("").to_string());
         }
     }
 
@@ -768,7 +760,10 @@ mod tests {
         assert_eq!(app.selected, 3, "next stop is the sentinel row");
         assert!(app.is_sentinel_selected());
         app.nav_down();
-        assert_eq!(app.selected, 0, "wraps from sentinel back to the first session");
+        assert_eq!(
+            app.selected, 0,
+            "wraps from sentinel back to the first session"
+        );
     }
 
     #[test]
@@ -834,7 +829,11 @@ mod tests {
         .unwrap();
         app.drain_updates();
         assert_eq!(app.sessions.len(), 2, "only alpha's sessions remain");
-        assert!(app.sessions.iter().all(|s| s.project_id.as_deref() == Some("alpha")));
+        assert!(
+            app.sessions
+                .iter()
+                .all(|s| s.project_id.as_deref() == Some("alpha"))
+        );
     }
 
     #[test]
@@ -914,7 +913,8 @@ mod tests {
         app.flash_err("no secret configured");
         let (tx, rx) = mpsc::channel();
         app.refresh_update_rx = Some(rx);
-        tx.send(RefreshUpdate::Sessions(vec![session("sb-1")])).unwrap();
+        tx.send(RefreshUpdate::Sessions(vec![session("sb-1")]))
+            .unwrap();
         app.drain_updates();
         assert_eq!(app.action_error.as_deref(), Some("no secret configured"));
     }
@@ -927,7 +927,8 @@ mod tests {
         app.refresh_error = Some("stale probe failure".into());
         let (tx, rx) = mpsc::channel();
         app.refresh_update_rx = Some(rx);
-        tx.send(RefreshUpdate::Sessions(vec![session("sb-1")])).unwrap();
+        tx.send(RefreshUpdate::Sessions(vec![session("sb-1")]))
+            .unwrap();
         app.drain_updates();
         assert!(app.refresh_error.is_none());
     }
@@ -977,7 +978,10 @@ mod tests {
         let mut app = app_with(2);
         app.selected = 1;
         app.select_at(5);
-        assert_eq!(app.selected, 1, "out-of-range index must not move selection");
+        assert_eq!(
+            app.selected, 1,
+            "out-of-range index must not move selection"
+        );
     }
 
     #[test]
