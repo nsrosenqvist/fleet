@@ -567,29 +567,42 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
     let muted = Style::default().fg(MUTED);
     let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
 
+    // Name the platform-native credential store so the user knows
+    // exactly where their token's going. macOS Keychain / Linux
+    // Secret Service (GNOME Keyring / KWallet / etc.) / Windows
+    // Credential Manager all flow through the `keyring` crate.
+    let keychain_name = match std::env::consts::OS {
+        "macos" => "macOS Keychain",
+        "windows" => "Windows Credential Manager",
+        // Linux + freebsd + others go through the Secret Service
+        // DBus protocol; name the well-known providers rather than
+        // saying "Linux Secret Service" which is jargon.
+        _ => "GNOME Keyring / KWallet (Secret Service)",
+    };
+
     let mut lines = vec![
         Line::from(Span::styled(
-            "Fleet needs your Claude OAuth token to spawn agent",
+            "Fleet needs your Claude Pro / Max OAuth token to spawn",
             muted,
         )),
         Line::from(Span::styled(
-            "sessions. It's stored in your OS keychain — the same",
+            "claude-code sessions inside the VM. Paste the value of",
             muted,
         )),
         Line::from(Span::styled(
-            "place GNOME Keyring / KWallet / Keychain put other",
+            "the `accessToken` field from ~/.claude/.credentials.json",
             muted,
         )),
         Line::from(Span::styled(
-            "credentials.",
+            "(written by `claude` after you `/login`).",
             muted,
         )),
         Line::raw(""),
         Line::from(vec![
             Span::styled("token       ", muted),
-            // Masked rendering — show one `•` per input char so the
-            // user can see length without leaking the value into a
-            // terminal scrollback buffer.
+            // Masked rendering — one `•` per input char. Lets the
+            // user see length / detect a missed paste char without
+            // the token landing in terminal scrollback.
             Span::styled(
                 "•".repeat(setup.buffer.chars().count()),
                 Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
@@ -609,9 +622,22 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "Get a token from claude.ai → Settings → Developer.",
+        "Quick extract:",
         muted.add_modifier(Modifier::ITALIC),
     )));
+    lines.push(Line::from(vec![
+        Span::styled("  ", muted),
+        Span::styled(
+            "jq -r '.claudeAiOauth.accessToken' ~/.claude/.credentials.json",
+            Style::default().fg(ACCENT),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Stored in ", muted),
+        Span::styled(keychain_name, Style::default().fg(ACCENT)),
+        Span::styled(".", muted),
+    ]));
 
     let footer = vec![Line::from(vec![
         Span::styled("[Enter]", bold_key),
