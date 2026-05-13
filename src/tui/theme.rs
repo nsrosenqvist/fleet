@@ -12,7 +12,12 @@ use ratatui::widgets::{Block, BorderType, Borders};
 
 /// Primary accent — section titles, the leading chip in the breadcrumb /
 /// status bar, the highlight colour for the selected list row.
-pub const ACCENT: Color = Color::Cyan;
+///
+/// 256-colour index 108 is a desaturated sage green. Picked to move
+/// away from the cyan that made fleet read like a keel clone, while
+/// staying clearly distinct from `OK`'s bright `Color::Green` so a
+/// running-status badge and an accented title never blur together.
+pub const ACCENT: Color = Color::Indexed(108);
 
 /// Muted foreground for secondary text and panel borders. Reads as "less
 /// important than the surrounding content" without disappearing entirely.
