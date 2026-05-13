@@ -3,7 +3,9 @@
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
-use super::state::{AoResponse, EventInfo, EventsResponse, SessionInfo};
+use std::collections::HashMap;
+
+use super::state::{AoResponse, EventInfo, EventsResponse, SessionInfo, SessionMeta};
 use crate::lima::Lima;
 
 pub struct Ao<'a> {
@@ -57,6 +59,45 @@ impl<'a> Ao<'a> {
         parse_response(&raw).context("parsing ao session ls --all --json")
     }
 
+    /// Per-session lifecycle metadata read in bulk from the VM's AO
+    /// state directory. Returns a map keyed by session id (matches
+    /// [`SessionInfo::id`]) containing the fields the sidebar wants
+    /// to badge on: agent's self-reported state, lifecycle session
+    /// state, runtime state + reason.
+    ///
+    /// These live in per-session JSON files (one per session) under
+    /// `~/.agent-orchestrator/projects/<project>/sessions/` inside
+    /// the VM. The host can't read them directly — Lima doesn't
+    /// expose the guest's `$HOME` — so we run a small node script
+    /// inside the VM that walks every project's `sessions/` dir and
+    /// emits a single JSON map. One limactl roundtrip regardless of
+    /// session count.
+    ///
+    /// Tolerant of missing pieces: an empty / missing
+    /// `.agent-orchestrator/projects` directory returns an empty map
+    /// (a fresh VM with no AO state yet). Sessions whose JSON fails
+    /// to parse are skipped silently.
+    pub fn session_meta_bulk(&self) -> Result<HashMap<String, SessionMeta>> {
+        let raw = self.lima.shell(
+            self.workdir,
+            vec!["node".to_string(), "-e".to_string(), META_NODE_SCRIPT.to_string()],
+        )?;
+        let start = find_json_start(&raw).with_context(|| {
+            format!(
+                "no JSON object in session_meta_bulk output: {}",
+                error_preview(&raw)
+            )
+        })?;
+        let map: HashMap<String, SessionMeta> = serde_json::from_str(&raw[start..])
+            .with_context(|| {
+                format!(
+                    "parsing session_meta_bulk JSON: {}",
+                    error_preview(&raw[start..])
+                )
+            })?;
+        Ok(map)
+    }
+
     /// `ao events list --since <window> -n <limit> --json` — recent
     /// activity events (spawns, kills, lifecycle transitions, CI
     /// failures, review events). Drives the bottom-pane ticker;
@@ -91,6 +132,49 @@ impl<'a> Ao<'a> {
         Ok(parsed.events)
     }
 }
+
+/// Node script (passed via `node -e`) that walks every per-project
+/// `sessions/` directory under `~/.agent-orchestrator/projects/`,
+/// reads each session JSON, and prints a single JSON map keyed by
+/// session id. Each value carries the subset of lifecycle fields the
+/// sidebar badges on.
+///
+/// Single quotes (`'`) are avoided because the script is sent via
+/// `bash -c "node -e '...'"` further upstream in some flows; the
+/// double-quoted JS form keeps that escape-free. The script is also
+/// tolerant of missing dirs (empty AO state → empty map) and bad
+/// JSON (skip that session silently — one corrupt record shouldn't
+/// blank every badge).
+const META_NODE_SCRIPT: &str = r#"
+const fs = require("fs");
+const path = require("path");
+const root = process.env.HOME + "/.agent-orchestrator/projects";
+const out = {};
+try {
+  for (const proj of fs.readdirSync(root)) {
+    const sessDir = path.join(root, proj, "sessions");
+    let entries;
+    try { entries = fs.readdirSync(sessDir); } catch (e) { continue; }
+    for (const f of entries) {
+      if (!f.endsWith(".json")) continue;
+      const sid = f.slice(0, -5);
+      try {
+        const j = JSON.parse(fs.readFileSync(path.join(sessDir, f), "utf8"));
+        const sess = (j.lifecycle && j.lifecycle.session) || {};
+        const rt = (j.lifecycle && j.lifecycle.runtime) || {};
+        out[sid] = {
+          agentReportedState: j.agentReportedState || null,
+          sessionState: sess.state || null,
+          sessionReason: sess.reason || null,
+          runtimeState: rt.state || null,
+          runtimeReason: rt.reason || null,
+        };
+      } catch (e) { /* skip unreadable session */ }
+    }
+  }
+} catch (e) { /* no projects dir yet */ }
+process.stdout.write(JSON.stringify(out));
+"#;
 
 /// AO prefixes `--json` output with one or more notifier-warning lines like
 /// `[notifier-discord] No webhookUrl configured.` (plus indented continuation

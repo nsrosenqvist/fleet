@@ -78,3 +78,51 @@ pub fn run_interactive(
         .with_context(|| format!("failed to spawn `{program}`"))?;
     Ok(status.code().unwrap_or(-1))
 }
+
+/// Fully-resolved invocation for a subprocess: program path, argv, and
+/// env mutations. Built by the `cli::spawn` and `cli::passthrough`
+/// `build_*_spec` helpers and consumed both by the foreground CLI path
+/// ([`run_interactive_spec`]) and by the in-TUI background path
+/// ([`crate::tui::ao_task::AoTask`], which pipes stdio instead of
+/// inheriting it).
+///
+/// Secret values (the Claude OAuth token, today) live in `env_set` as
+/// plain `String`s — already past `ExposeSecret`. The spec is therefore
+/// sensitive and short-lived: build it immediately before spawning, and
+/// never log, serialise, or persist it.
+pub struct CommandSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env_set: Vec<(String, String)>,
+    pub env_unset: Vec<String>,
+}
+
+impl CommandSpec {
+    /// Borrowed view of `env_set` matching [`run_interactive`]'s
+    /// `&[(&str, &str)]` parameter shape.
+    #[must_use]
+    pub fn env_set_refs(&self) -> Vec<(&str, &str)> {
+        self.env_set
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    /// Borrowed view of `env_unset` matching [`run_interactive`]'s
+    /// `&[&str]` parameter shape.
+    #[must_use]
+    pub fn env_unset_refs(&self) -> Vec<&str> {
+        self.env_unset.iter().map(String::as_str).collect()
+    }
+}
+
+/// Run a [`CommandSpec`] in foreground mode (inherited stdio). Thin
+/// wrapper around [`run_interactive`] used by the CLI path.
+pub fn run_interactive_spec(spec: &CommandSpec) -> anyhow::Result<i32> {
+    run_interactive(
+        &spec.program,
+        &spec.args,
+        &spec.env_set_refs(),
+        &spec.env_unset_refs(),
+    )
+}

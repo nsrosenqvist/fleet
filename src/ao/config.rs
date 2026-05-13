@@ -54,7 +54,7 @@ pub struct AoConfig {
 /// unsafe. The check fires from two places:
 ///
 /// - [`crate::tui::preflight::check`] blocks the TUI from booting.
-/// - [`crate::cli::spawn::run_with_token`] (via
+/// - [`crate::cli::spawn::build_with_token`] (via
 ///   [`crate::cli::spawn::ensure_worktree_workspace`]) refuses to hand
 ///   off to AO even when fleet is invoked outside the TUI.
 ///

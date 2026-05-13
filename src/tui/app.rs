@@ -20,10 +20,11 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::ao::SessionInfo;
+use crate::ao::{SessionInfo, SessionMeta};
 use crate::lima::VmStatus;
 use crate::process::{ProcessInvoker, RealProcessInvoker};
 
+use super::ao_task::AoTask;
 use super::refresh::{self, RefreshCommand, RefreshUpdate};
 
 /// Maximum gap between two clicks on the same target to count as a
@@ -240,10 +241,26 @@ pub struct App {
     pub(super) ao_up: bool,
     pub(super) vm_status: VmStatus,
     pub(super) confirm: Option<Confirm>,
+
+    /// Active AO subprocess (kill / stop / start / spawn / restart-for-
+    /// orchestrator) running in the background with captured stdio.
+    /// Rendered as a spinner + label in the status bar; replaced by
+    /// the usual flash on completion (see [`Self::drain_ao_task`]).
+    /// `None` between actions. While `Some`, the command dispatcher
+    /// rejects a second AO action with an "another action in progress"
+    /// flash rather than queueing — see [`Self::ao_task_busy`].
+    pub(super) in_flight_ao: Option<AoTask>,
     /// Most recent tmux pane capture per session, keyed by session id.
     /// Populated by the background refresh thread; rendered in the output
     /// panel.
     pub(super) pane_outputs: std::collections::HashMap<String, String>,
+
+    /// Per-session lifecycle/agent state, keyed by session id. Populated
+    /// by the bulk meta probe in the refresh thread. Drives the sidebar's
+    /// `✓ done` (agent self-reported completed) and `crashed` (runtime
+    /// died unexpectedly) badges. Stale entries are evicted when their
+    /// session disappears from `self.sessions`.
+    pub(super) session_meta: std::collections::HashMap<String, SessionMeta>,
 
     pub(super) should_quit: bool,
 
@@ -294,7 +311,9 @@ impl App {
             ao_up: false,
             vm_status: VmStatus::Missing,
             confirm: None,
+            in_flight_ao: None,
             pane_outputs: std::collections::HashMap::new(),
+            session_meta: std::collections::HashMap::new(),
             should_quit: false,
             refresh_cmd_tx: None,
             refresh_update_rx: None,
@@ -353,12 +372,14 @@ impl App {
                             .collect(),
                         None => all,
                     };
-                    // Drop pane captures whose session is no longer in
-                    // our visible set — frees memory for sessions that
-                    // either vanished from AO or moved out of scope.
+                    // Drop pane captures + meta whose session is no
+                    // longer in our visible set — frees memory for
+                    // sessions that either vanished from AO or moved
+                    // out of scope.
                     let alive: std::collections::HashSet<String> =
                         s.iter().filter_map(|s| s.id.clone()).collect();
                     self.pane_outputs.retain(|k, _| alive.contains(k));
+                    self.session_meta.retain(|k, _| alive.contains(k));
                     self.sessions = s;
                     // A successful refresh clears only the refresh-channel
                     // error. Action errors stay until the next user
@@ -384,6 +405,13 @@ impl App {
                 RefreshUpdate::Events(events) => {
                     self.events = events;
                 }
+                RefreshUpdate::SessionMeta(map) => {
+                    // Replace wholesale — the probe is bulk, so any
+                    // entries missing from the new map are genuinely
+                    // absent on the guest (a session record was
+                    // deleted between ticks). No partial merge.
+                    self.session_meta = map;
+                }
             }
         }
     }
@@ -392,6 +420,55 @@ impl App {
         if let Some(tx) = &self.refresh_cmd_tx {
             let _ = tx.send(RefreshCommand::ForceRefresh);
         }
+    }
+
+    /// True while a background AO subprocess is mid-flight. Used by
+    /// the command dispatcher to reject overlapping actions with a
+    /// flash rather than queue them — a second `Shift+K` while the
+    /// first kill is still running would otherwise pile up.
+    pub(super) fn ao_task_busy(&self) -> bool {
+        self.in_flight_ao.is_some()
+    }
+
+    /// Drain the active AO task's output channel and, on completion,
+    /// convert the outcome into the normal status-bar flash and
+    /// request a refresh so the sidebar picks up the new state
+    /// immediately (instead of waiting for the next tick).
+    pub(super) fn drain_ao_task(&mut self) {
+        let Some(task) = self.in_flight_ao.as_mut() else {
+            return;
+        };
+        task.tick();
+        if !task.is_finished() {
+            return;
+        }
+        // Take ownership so we can move the outcome out without
+        // re-borrowing self while consulting `task.label()` etc.
+        let task = self.in_flight_ao.take().expect("checked above");
+        let label = task.label().to_string();
+        match task.outcome() {
+            Some(Ok(0)) => self.flash_ok(format!("{label} ok")),
+            Some(Ok(code)) => {
+                let hint = task.failure_hint().unwrap_or("");
+                if hint.is_empty() {
+                    self.flash_err(format!("{label} failed (exit {code})"));
+                } else {
+                    self.flash_err(format!("{label} failed: {hint}"));
+                }
+            }
+            Some(Err(e)) => {
+                let msg = format!("{e:#}");
+                let first = msg.lines().next().unwrap_or("");
+                self.flash_err(format!("{label} failed: {first}"));
+            }
+            None => {
+                // is_finished() is true → outcome must be Some; this
+                // arm is unreachable in practice but keeps the match
+                // exhaustive.
+                self.flash_err(format!("{label} ended without an outcome"));
+            }
+        }
+        self.request_refresh();
     }
 
     /// Re-read `agent-orchestrator.yaml`. Called when the user toggles
@@ -600,6 +677,9 @@ impl App {
     /// the moment the user starts driving the UI again — staying out
     /// of the way without making them dismiss anything explicitly.
     /// Refresh errors are left alone; they reflect live probe state.
+    /// An in-flight AO task's spinner is also left alone — the user
+    /// can't dismiss work that's still happening, only watch it
+    /// complete (see [`Self::drain_ao_task`]).
     pub(super) fn dismiss_flash(&mut self) {
         self.last_info = None;
         self.action_error = None;
@@ -1011,6 +1091,86 @@ mod tests {
             app.resolve_click(ClickTarget::SidebarItem(1)),
             ClickKind::Select,
         ));
+    }
+
+    #[test]
+    fn drain_ao_task_flashes_ok_on_zero_exit() {
+        let mut app = app_with(0);
+        let task = super::super::ao_task::AoTask::spawn(
+            "killing sb-1",
+            vec![super::super::ao_task::TaskPhase {
+                program: "sh".into(),
+                args: vec!["-c".into(), "exit 0".into()],
+                env_set: Vec::new(),
+                env_unset: Vec::new(),
+                label: None,
+            }],
+        )
+        .expect("spawn");
+        app.in_flight_ao = Some(task);
+        // Poll until the supervisor exits — a 0-exit `sh -c "exit 0"`
+        // typically returns within 10 ms.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.in_flight_ao.is_some() && Instant::now() < deadline {
+            app.drain_ao_task();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.in_flight_ao.is_none(), "task should have been drained");
+        assert_eq!(app.last_info.as_deref(), Some("killing sb-1 ok"));
+        assert!(app.action_error.is_none());
+    }
+
+    #[test]
+    fn drain_ao_task_flashes_err_on_non_zero_exit() {
+        let mut app = app_with(0);
+        let task = super::super::ao_task::AoTask::spawn(
+            "stopping AO",
+            vec![super::super::ao_task::TaskPhase {
+                program: "sh".into(),
+                args: vec!["-c".into(), "echo boom >&2; exit 4".into()],
+                env_set: Vec::new(),
+                env_unset: Vec::new(),
+                label: None,
+            }],
+        )
+        .expect("spawn");
+        app.in_flight_ao = Some(task);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.in_flight_ao.is_some() && Instant::now() < deadline {
+            app.drain_ao_task();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.in_flight_ao.is_none());
+        assert!(app.last_info.is_none());
+        let err = app.action_error.as_deref().expect("expected an error flash");
+        assert!(err.contains("stopping AO failed"), "got: {err}");
+        assert!(err.contains("boom"), "stderr tail should surface in flash: {err}");
+    }
+
+    #[test]
+    fn ao_task_busy_tracks_in_flight_field() {
+        let mut app = app_with(0);
+        assert!(!app.ao_task_busy());
+        let task = super::super::ao_task::AoTask::spawn(
+            "spinning",
+            vec![super::super::ao_task::TaskPhase {
+                program: "sh".into(),
+                args: vec!["-c".into(), "sleep 0.5".into()],
+                env_set: Vec::new(),
+                env_unset: Vec::new(),
+                label: None,
+            }],
+        )
+        .expect("spawn");
+        app.in_flight_ao = Some(task);
+        assert!(app.ao_task_busy());
+        // Wait for the child to exit, then drain — busy goes false.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.in_flight_ao.is_some() && Instant::now() < deadline {
+            app.drain_ao_task();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!app.ao_task_busy());
     }
 
     #[test]

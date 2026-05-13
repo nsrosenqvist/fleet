@@ -13,7 +13,9 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::ao::{Ao, EventInfo, SessionInfo};
+use std::collections::HashMap;
+
+use crate::ao::{Ao, EventInfo, SessionInfo, SessionMeta};
 use crate::lima::{Lima, VmStatus};
 use crate::process::ProcessInvoker;
 
@@ -25,6 +27,25 @@ const VM_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// events arrive in bursts (spawn, transition, CI signal) and the
 /// bottom-pane ticker doesn't need sub-second freshness.
 const EVENTS_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// Per-session lifecycle/agent-state probe cadence. Reads from JSON
+/// files on the guest's disk (one bulk roundtrip per tick), so the
+/// floor cost is comparable to the events probe. Drives the sidebar
+/// `✓ done` / `crashed` badges, which don't need sub-second freshness
+/// — the underlying state only changes when an agent reports or a
+/// runtime dies.
+const META_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the background crash-session sweep runs. AO doesn't reap
+/// session records on its own, so without periodic cleanup the
+/// per-project `sessions/` and `worktrees/` dirs grow unboundedly.
+/// Half-hour cadence keeps the disk drag bounded without firing
+/// often enough to surprise an attached user.
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Minimum time-since-termination before a crashed session is
+/// eligible for sweep. Gives the user a window to attach to a
+/// crashed runtime and salvage state before fleet captures it and
+/// hands it to `ao session kill`. 10 minutes is generous enough
+/// that an "I'm AFK" pause doesn't lose an investigation.
+const CLEANUP_MIN_AGE_SECS: u64 = 10 * 60;
 /// Time window passed to `ao events list --since`. An hour catches
 /// "what just happened" without the panel scrolling back to last
 /// week's noise.
@@ -42,6 +63,11 @@ pub enum RefreshUpdate {
     AoUp(bool),
     VmUp(VmStatus),
     Events(Vec<EventInfo>),
+    /// Bulk per-session lifecycle/agent state, keyed by session id.
+    /// Sourced from the VM's `~/.agent-orchestrator/projects/<p>/sessions/<id>.json`
+    /// files (one bulk read per tick), drives the sidebar badges
+    /// (`✓ done` / `crashed`).
+    SessionMeta(HashMap<String, SessionMeta>),
 }
 
 /// Messages sent from the UI to the refresh thread.
@@ -92,10 +118,16 @@ fn refresh_loop(
     let mut next_ao_probe = Instant::now();
     let mut next_vm_probe = Instant::now();
     let mut next_events_probe = Instant::now();
+    let mut next_meta_probe = Instant::now();
+    // Cleanup fires immediately on startup (so accumulated litter
+    // settles before the user sees the sidebar) and then on
+    // CLEANUP_INTERVAL. ForceRefresh deliberately doesn't bump it
+    // — destructive ops shouldn't ride user-driven refreshes.
+    let mut next_cleanup = Instant::now();
 
     loop {
         let now = Instant::now();
-        let wait_for = [next_status, next_ao_probe, next_vm_probe, next_events_probe]
+        let wait_for = [next_status, next_ao_probe, next_vm_probe, next_events_probe, next_meta_probe, next_cleanup]
             .into_iter()
             .map(|t| t.saturating_duration_since(now))
             .min()
@@ -108,53 +140,15 @@ fn refresh_loop(
                 next_ao_probe = Instant::now();
                 next_vm_probe = Instant::now();
                 next_events_probe = Instant::now();
+                next_meta_probe = Instant::now();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
         let now = Instant::now();
         if now >= next_status {
-            let ao = Ao::new(&lima, &ao_workdir);
-            // `session ls --all --json` includes both worker and
-            // orchestrator entries so the sidebar can group them
-            // separately. `ao status --json` skips orchestrators
-            // (they show only in the human-readable banner).
-            match ao.session_ls_all() {
-                Ok(r) => {
-                    // Send Sessions first so the UI sees the structure
-                    // immediately, then capture each pane sequentially and
-                    // send incremental PaneCapture updates as they finish.
-                    let session_ids: Vec<String> =
-                        r.data.iter().filter_map(|s| s.id.clone()).collect();
-                    if updates.send(RefreshUpdate::Sessions(r.data)).is_err() {
-                        return;
-                    }
-                    for id in session_ids {
-                        // 200 lines of scrollback is enough to fill any
-                        // realistic output panel. tmux capture inside the VM
-                        // is fast (~30 ms); we tail at render time.
-                        if let Ok(out) = crate::tmux::capture_pane(&lima, &ao_workdir, &id, 200)
-                            && updates
-                                .send(RefreshUpdate::PaneCapture {
-                                    session_id: id,
-                                    output: out,
-                                })
-                                .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if updates
-                        .send(RefreshUpdate::Error(
-                            format!("{e:#}").lines().next().unwrap_or("").to_string(),
-                        ))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
+            if run_status_probe(&lima, &ao_workdir, updates).is_err() {
+                return;
             }
             next_status = now + REFRESH_INTERVAL;
         }
@@ -196,5 +190,120 @@ fn refresh_loop(
             }
             next_events_probe = now + EVENTS_PROBE_INTERVAL;
         }
+
+        if now >= next_meta_probe {
+            if run_meta_probe(&lima, &ao_workdir, updates).is_err() {
+                return;
+            }
+            next_meta_probe = now + META_PROBE_INTERVAL;
+        }
+
+        if now >= next_cleanup {
+            if run_cleanup_tick(&ao_workdir, updates).is_err() {
+                return;
+            }
+            next_cleanup = Instant::now() + CLEANUP_INTERVAL;
+        }
     }
+}
+
+/// `ao session ls --all --json` plus a per-session tmux pane capture
+/// for each result. Sends `Sessions` first so the sidebar's structure
+/// snaps in immediately, then streams `PaneCapture` updates as each
+/// capture lands. Failures land in the refresh-error channel as a
+/// single-line message. `--all` includes orchestrator entries that
+/// plain `ao status --json` would skip.
+///
+/// Returns `Err(())` only when the updates channel has been dropped.
+fn run_status_probe(
+    lima: &Lima,
+    ao_workdir: &std::path::Path,
+    updates: &mpsc::Sender<RefreshUpdate>,
+) -> std::result::Result<(), ()> {
+    let ao = Ao::new(lima, ao_workdir);
+    match ao.session_ls_all() {
+        Ok(r) => {
+            let session_ids: Vec<String> = r.data.iter().filter_map(|s| s.id.clone()).collect();
+            if updates.send(RefreshUpdate::Sessions(r.data)).is_err() {
+                return Err(());
+            }
+            for id in session_ids {
+                // 200 lines of scrollback is enough to fill any
+                // realistic output panel. tmux capture inside the VM
+                // is fast (~30 ms); we tail at render time.
+                if let Ok(out) = crate::tmux::capture_pane(lima, ao_workdir, &id, 200)
+                    && updates
+                        .send(RefreshUpdate::PaneCapture {
+                            session_id: id,
+                            output: out,
+                        })
+                        .is_err()
+                {
+                    return Err(());
+                }
+            }
+        }
+        Err(e) => {
+            let msg = format!("{e:#}").lines().next().unwrap_or("").to_string();
+            if updates.send(RefreshUpdate::Error(msg)).is_err() {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One per-session meta probe — bulk read of lifecycle JSON inside
+/// the VM, parsed to a map keyed by session id. Failures are quiet
+/// (badges are nice-to-have; a fluky node spawn shouldn't drown the
+/// status bar in errors alongside the actual session probe).
+///
+/// Returns `Err(())` only when the updates channel has been dropped.
+fn run_meta_probe(
+    lima: &Lima,
+    ao_workdir: &std::path::Path,
+    updates: &mpsc::Sender<RefreshUpdate>,
+) -> std::result::Result<(), ()> {
+    let ao = Ao::new(lima, ao_workdir);
+    let Ok(map) = ao.session_meta_bulk() else {
+        return Ok(());
+    };
+    if updates.send(RefreshUpdate::SessionMeta(map)).is_err() {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// One cleanup pass — re-reads the AO config (so projects added via
+/// `c` get picked up without a fleet restart), iterates projects,
+/// invokes [`super::cleanup::sweep`] for each. Per-project errors are
+/// surfaced via the normal error channel rather than fatal so a
+/// permission glitch on one repo doesn't kill the refresh thread.
+///
+/// Returns `Err(())` only when the updates channel has been dropped —
+/// the caller uses that as a signal to exit the refresh loop.
+fn run_cleanup_tick(
+    ao_workdir: &std::path::Path,
+    updates: &mpsc::Sender<RefreshUpdate>,
+) -> std::result::Result<(), ()> {
+    let Ok(Some((_, cfg))) = crate::ao::config::AoConfig::load() else {
+        return Ok(());
+    };
+    for (project_key, project) in &cfg.projects {
+        if let Err(e) = super::cleanup::sweep(
+            &project.path,
+            ao_workdir,
+            project_key,
+            CLEANUP_MIN_AGE_SECS,
+        ) {
+            let msg = format!(
+                "cleanup({project_key}): {}",
+                format!("{e:#}").lines().next().unwrap_or("")
+            );
+            if updates.send(RefreshUpdate::Error(msg)).is_err() {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
 }

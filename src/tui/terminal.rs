@@ -15,6 +15,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::ao_task::{AoTask, TaskPhase};
 use super::app::{App, Command};
 use super::bringup::{BringUp, BringUpMode};
 use super::input;
@@ -336,6 +337,7 @@ fn drive(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
         // 1. Fold any state updates from the refresh thread.
         app.drain_updates();
         app.drain_spawn_fetch();
+        app.drain_ao_task();
 
         // 2. Paint.
         term.draw(|f| ui::render(app, f))?;
@@ -401,18 +403,36 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
 }
 
 fn run_command(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>, cmd: Command) {
+    // Reject overlapping AO actions with a flash rather than queueing.
+    // The five AO-touching commands all spawn an `AoTask`; a second
+    // dispatched while the first is mid-flight would either get lost
+    // (if we overwrote `app.in_flight_ao`) or pile up. Spawning,
+    // killing, and stopping in rapid succession isn't a real flow —
+    // bouncing it back is clearer than silently dropping it.
+    if matches!(
+        cmd,
+        Command::KillSession(_)
+            | Command::StopAo
+            | Command::StartAo
+            | Command::RestartAoForOrchestrator
+            | Command::Spawn(_)
+    ) && app.ao_task_busy()
+    {
+        app.flash_err("another AO action is in progress");
+        return;
+    }
     match cmd {
         Command::AttachSelected => attach_selected(app, term),
         Command::EditConfig => edit_config(app, term),
         Command::TrackerPreview => tracker_preview(app, term),
         Command::TrackerWeb => tracker_web(app),
-        Command::StartAo => start_ao(app, term),
-        Command::RestartAoForOrchestrator => restart_ao_for_orchestrator(app, term),
+        Command::StartAo => start_ao(app),
+        Command::RestartAoForOrchestrator => restart_ao_for_orchestrator(app),
         Command::OpenWeb => open_web(app),
-        Command::KillSession(id) => kill_session(app, term, id),
-        Command::StopAo => stop_ao(app, term),
+        Command::KillSession(id) => kill_session(app, id),
+        Command::StopAo => stop_ao(app),
         Command::RequestRefresh => app.request_refresh(),
-        Command::Spawn(issue) => spawn_session(app, term, &issue),
+        Command::Spawn(issue) => spawn_session(app, &issue),
         Command::SaveOauthToken(token) => save_oauth_token(app, &token),
     }
 }
@@ -647,12 +667,12 @@ fn github_issues_url_for(project_path: &std::path::Path) -> Result<String> {
 /// the user into AO's interactive "already running" menu. The
 /// branches below keep the TUI in charge:
 ///
-/// - AO down: `ao start` as before (creates dashboard + orchestrator).
+/// - AO down: spawn an `ao start` `AoTask` (creates dashboard + orchestrator).
 /// - AO up + orchestrator present: silent flash, no subprocess.
 /// - AO up, no orchestrator: open a confirm modal offering to
 ///   restart the daemon. The actual restart runs from `Command::
 ///   RestartAoForOrchestrator` after the user accepts.
-fn start_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+fn start_ao(app: &mut App) {
     if !ensure_oauth_token_configured(app) {
         return;
     }
@@ -668,11 +688,22 @@ fn start_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
         return;
     }
     let repo_root = app.repo_root.clone();
-    let res = suspend_around(term, || {
-        crate::cli::spawn::run_start(&repo_root, false, false).map(|_| ())
-    });
-    app.flash_if_err(res);
-    app.request_refresh();
+    let start_phase = match build_start_phase(&repo_root, None) {
+        Ok(p) => p,
+        Err(e) => {
+            app.flash_err(format!("starting AO: {e:#}").lines().next().unwrap_or("").to_string());
+            return;
+        }
+    };
+    let mut phases: Vec<TaskPhase> = Vec::with_capacity(2);
+    if let Some(p) = purge_stale_orchestrator_phase(app) {
+        phases.push(p);
+    }
+    phases.push(start_phase);
+    match AoTask::spawn("starting AO", phases) {
+        Ok(task) => app.in_flight_ao = Some(task),
+        Err(e) => app.flash_err(format!("spawn AO task: {e:#}")),
+    }
 }
 
 /// Tear AO down and start it fresh against the current project.
@@ -680,21 +711,131 @@ fn start_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
 /// the daemon is up but no orchestrator exists. Destructive (kills
 /// dashboard + any running workers); only invoked after a y/N
 /// confirm in [`start_ao`].
-fn restart_ao_for_orchestrator(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+fn restart_ao_for_orchestrator(app: &mut App) {
     if !ensure_oauth_token_configured(app) {
         return;
     }
     let repo_root = app.repo_root.clone();
-    let res = suspend_around(term, || {
-        // `ao stop --all` releases the lock and frees the
-        // dashboard's port so the subsequent `ao start` doesn't
-        // hit the "already running" check.
-        crate::cli::passthrough::run(&repo_root, &["stop".to_string(), "--all".to_string()])
-            .map(|_| ())
-            .and_then(|()| crate::cli::spawn::run_start(&repo_root, false, false).map(|_| ()))
-    });
-    app.flash_if_err(res);
-    app.request_refresh();
+    // `ao stop --all` releases the lock and frees the dashboard's
+    // port so the subsequent `ao start` doesn't hit the "already
+    // running" check.
+    let stop_phase = match crate::cli::passthrough::build_spec(&[
+        "stop".to_string(),
+        "--all".to_string(),
+    ]) {
+        Ok(spec) => spec_to_phase(spec, Some("stopping AO")),
+        Err(e) => {
+            app.flash_err(format!("restart AO: {e:#}").lines().next().unwrap_or("").to_string());
+            return;
+        }
+    };
+    let start_phase = match build_start_phase(&repo_root, Some("starting AO")) {
+        Ok(phase) => phase,
+        Err(e) => {
+            app.flash_err(format!("restart AO: {e:#}").lines().next().unwrap_or("").to_string());
+            return;
+        }
+    };
+    let mut phases: Vec<TaskPhase> = Vec::with_capacity(3);
+    phases.push(stop_phase);
+    if let Some(p) = purge_stale_orchestrator_phase(app) {
+        phases.push(p);
+    }
+    phases.push(start_phase);
+    match AoTask::spawn("restarting AO", phases) {
+        Ok(task) => app.in_flight_ao = Some(task),
+        Err(e) => app.flash_err(format!("spawn AO task: {e:#}")),
+    }
+}
+
+/// Build the `ao start` `TaskPhase`. `phase_label` becomes the
+/// spinner sub-label for multi-phase tasks (restart-for-orchestrator
+/// uses "starting AO"); `None` lets the task-wide label own the
+/// spinner for single-phase starts.
+fn build_start_phase(repo_root: &std::path::Path, phase_label: Option<&str>) -> Result<TaskPhase> {
+    let spec = crate::cli::spawn::build_start_spec(repo_root, false, false)?;
+    Ok(spec_to_phase(spec, phase_label))
+}
+
+/// Pre-`ao start` phase that purges a stale terminated orchestrator
+/// session record left behind by a previous run.
+///
+/// Background: when `ao stop --all` (or a manual kill) terminates an
+/// orchestrator, AO writes the session record to
+/// `~/.agent-orchestrator/projects/<project>/sessions/<prefix>-orchestrator.json`
+/// with `state: "terminated"` and leaves it on disk. On the next `ao
+/// start`, AO sees that record and routes to the *restore* path —
+/// but `claude-code.getRestoreCommand` returns `null` for terminated
+/// sessions, so orchestrator setup fails and exits 1. Empirically
+/// reproducible (see commit history); recovery requires deleting the
+/// record + worktree by hand.
+///
+/// This phase makes restart-for-orchestrator and start-from-down
+/// self-healing: if the stale record is present, drop it (plus the
+/// worktree directory and its host-side `.git/worktrees/<id>` pointer)
+/// before invoking `ao start`. No-op when the record is absent or
+/// when the project's `sessionPrefix` isn't known — in those cases
+/// there's nothing to clean up.
+fn purge_stale_orchestrator_phase(app: &App) -> Option<TaskPhase> {
+    let project_key = app.current_project_key.as_deref()?;
+    let cfg = app.ao_config.as_ref()?;
+    let project = cfg.projects.get(project_key)?;
+    let prefix = project.session_prefix.as_deref()?;
+    let orch_id = format!("{prefix}-orchestrator");
+    let host_repo = project.path.display().to_string();
+    let workdir = crate::ao::config::AoConfig::workdir()?;
+
+    let project_q = crate::cli::spawn::shell_quote_single(project_key);
+    let orch_q = crate::cli::spawn::shell_quote_single(&orch_id);
+    let host_q = crate::cli::spawn::shell_quote_single(&host_repo);
+    let script = format!(
+        r#"set -e
+PROJECT={project_q}
+ORCH_ID={orch_q}
+HOST_REPO={host_q}
+SESSION_FILE="$HOME/.agent-orchestrator/projects/$PROJECT/sessions/$ORCH_ID.json"
+WORKTREE_DIR="$HOME/.agent-orchestrator/projects/$PROJECT/worktrees/$ORCH_ID"
+HOST_WT_POINTER="$HOST_REPO/.git/worktrees/$ORCH_ID"
+if [ -f "$SESSION_FILE" ] && grep -q '"state":[[:space:]]*"terminated"' "$SESSION_FILE"; then
+    echo "fleet: purging stale terminated orchestrator record ($ORCH_ID)"
+    rm -f "$SESSION_FILE"
+    rm -rf "$WORKTREE_DIR"
+    rm -rf "$HOST_WT_POINTER" 2>/dev/null || true
+fi
+"#
+    );
+
+    Some(TaskPhase {
+        program: "limactl".into(),
+        args: vec![
+            "shell".into(),
+            "--workdir".into(),
+            workdir.display().to_string(),
+            "fleet-vm".into(),
+            "bash".into(),
+            "-c".into(),
+            script,
+        ],
+        env_set: Vec::new(),
+        env_unset: Vec::new(),
+        label: Some("clearing stale orchestrator record".into()),
+    })
+}
+
+/// Adapter from [`crate::process::CommandSpec`] (the per-action
+/// invocation built by `cli::spawn` / `cli::passthrough`) to the
+/// `TaskPhase` shape [`AoTask`] consumes.
+fn spec_to_phase(
+    spec: crate::process::CommandSpec,
+    label: Option<&str>,
+) -> TaskPhase {
+    TaskPhase {
+        program: spec.program,
+        args: spec.args,
+        env_set: spec.env_set,
+        env_unset: spec.env_unset,
+        label: label.map(str::to_string),
+    }
 }
 
 fn open_web(app: &mut App) {
@@ -717,33 +858,46 @@ fn open_web(app: &mut App) {
     }
 }
 
-fn kill_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>, id: String) {
-    let repo_root = app.repo_root.clone();
-    let res = suspend_around(term, || {
-        crate::cli::passthrough::run_with_prefix(&repo_root, "session", &["kill".to_string(), id])
-            .map(|_| ())
-    });
-    app.flash_if_err(res);
-    app.request_refresh();
+fn kill_session(app: &mut App, id: String) {
+    let label = format!("killing {id}");
+    let spec = match crate::cli::passthrough::build_spec_with_prefix(
+        "session",
+        &["kill".to_string(), id],
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            app.flash_err(format!("{label}: {e:#}").lines().next().unwrap_or("").to_string());
+            return;
+        }
+    };
+    match AoTask::spawn(label, vec![spec_to_phase(spec, None)]) {
+        Ok(task) => app.in_flight_ao = Some(task),
+        Err(e) => app.flash_err(format!("spawn AO task: {e:#}")),
+    }
 }
 
-/// Spawn an AO worker session against the given issue id. Hands off
-/// to `cli::spawn::run_spawn` (which carries the full OAuth handoff +
-/// limactl shell + token-injection wrapper) via `suspend_around`, so
-/// the user sees AO's output stream — and any failure surface — in
-/// the terminal directly. On success we kick a refresh so the new
-/// session appears in the sidebar without waiting for the next tick.
-fn spawn_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>, issue: &str) {
+/// Spawn an AO worker session against the given issue id. Builds the
+/// full OAuth-handoff `limactl shell …` spec via
+/// [`crate::cli::spawn::build_spawn_spec`] and runs it as a captured
+/// background [`AoTask`]. The status bar shows a spinner while AO
+/// dispatches the worker, and the sidebar refreshes on completion so
+/// the new session appears without waiting for the next tick.
+fn spawn_session(app: &mut App, issue: &str) {
     if !ensure_oauth_token_configured(app) {
         return;
     }
-    let repo_root = app.repo_root.clone();
-    let issue_owned = issue.to_string();
-    let res = suspend_around(term, || {
-        crate::cli::spawn::run_spawn(&repo_root, &issue_owned, None, None).map(|_| ())
-    });
-    app.flash_if_err(res);
-    app.request_refresh();
+    let label = format!("spawning {issue}");
+    let spec = match crate::cli::spawn::build_spawn_spec(&app.repo_root, issue, None, None) {
+        Ok(s) => s,
+        Err(e) => {
+            app.flash_err(format!("{label}: {e:#}").lines().next().unwrap_or("").to_string());
+            return;
+        }
+    };
+    match AoTask::spawn(label, vec![spec_to_phase(spec, None)]) {
+        Ok(task) => app.in_flight_ao = Some(task),
+        Err(e) => app.flash_err(format!("spawn AO task: {e:#}")),
+    }
 }
 
 /// Gate for any action that needs the Claude OAuth token (Shift+S
@@ -839,11 +993,17 @@ fn append_keychain_secret_to_config(service: &str) -> Result<()> {
     Ok(())
 }
 
-fn stop_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
-    let repo_root = app.repo_root.clone();
-    let res = suspend_around(term, || {
-        crate::cli::passthrough::run(&repo_root, &["stop".to_string()]).map(|_| ())
-    });
-    app.flash_if_err(res);
-    app.request_refresh();
+fn stop_ao(app: &mut App) {
+    let label = "stopping AO";
+    let spec = match crate::cli::passthrough::build_spec(&["stop".to_string()]) {
+        Ok(s) => s,
+        Err(e) => {
+            app.flash_err(format!("{label}: {e:#}").lines().next().unwrap_or("").to_string());
+            return;
+        }
+    };
+    match AoTask::spawn(label, vec![spec_to_phase(spec, None)]) {
+        Ok(task) => app.in_flight_ao = Some(task),
+        Err(e) => app.flash_err(format!("spawn AO task: {e:#}")),
+    }
 }

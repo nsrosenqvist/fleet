@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::lima::{Lima, VmStatus};
-use crate::process::{RealProcessInvoker, run_interactive};
+use crate::process::{CommandSpec, RealProcessInvoker, run_interactive_spec};
 
 /// Pass `ao <args…>` to AO inside the VM. AO discovers its config from
 /// cwd only, so we always run from the canonical XDG dir — the same
@@ -14,6 +14,23 @@ use crate::process::{RealProcessInvoker, run_interactive};
 /// gets the registered projects regardless of which directory fleet
 /// was launched from.
 pub fn run(_repo_root: &Path, ao_args: &[String]) -> Result<i32> {
+    let spec = build_spec(ao_args)?;
+    run_interactive_spec(&spec)
+}
+
+/// Pass `ao <prefix> <args…>` (e.g. `ao session ls`).
+pub fn run_with_prefix(repo_root: &Path, prefix: &str, args: &[String]) -> Result<i32> {
+    let mut full = vec![prefix.to_string()];
+    full.extend(args.iter().cloned());
+    run(repo_root, &full)
+}
+
+/// Build the `limactl shell --workdir <dir> fleet-vm ao <args…>` spec
+/// without spawning. Used by the in-TUI background path
+/// ([`crate::tui::ao_task::AoTask`]) which pipes stdio rather than
+/// inheriting it. No env vars — passthrough operations like
+/// `session kill` / `stop` don't read host environment.
+pub fn build_spec(ao_args: &[String]) -> Result<CommandSpec> {
     let invoker = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker, "fleet-vm");
     match lima.status() {
@@ -23,20 +40,26 @@ pub fn run(_repo_root: &Path, ao_args: &[String]) -> Result<i32> {
     }
     let workdir = crate::ao::config::AoConfig::workdir()
         .context("no $HOME / $XDG_CONFIG_HOME — can't resolve AO workdir")?;
-    let mut argv = vec![
+    let mut args = vec![
         "shell".to_string(),
         "--workdir".to_string(),
         workdir.display().to_string(),
         lima.vm_name().to_string(),
         "ao".to_string(),
     ];
-    argv.extend(ao_args.iter().cloned());
-    run_interactive("limactl", &argv, &[], &[])
+    args.extend(ao_args.iter().cloned());
+    Ok(CommandSpec {
+        program: "limactl".to_string(),
+        args,
+        env_set: Vec::new(),
+        env_unset: Vec::new(),
+    })
 }
 
-/// Pass `ao <prefix> <args…>` (e.g. `ao session ls`).
-pub fn run_with_prefix(repo_root: &Path, prefix: &str, args: &[String]) -> Result<i32> {
+/// Convenience wrapper around [`build_spec`] for the `<prefix> <args>`
+/// pattern (mirrors [`run_with_prefix`] but returns a spec).
+pub fn build_spec_with_prefix(prefix: &str, args: &[String]) -> Result<CommandSpec> {
     let mut full = vec![prefix.to_string()];
     full.extend(args.iter().cloned());
-    run(repo_root, &full)
+    build_spec(&full)
 }

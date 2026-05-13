@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::config::{Config, ResolvedAuthMode};
 use crate::lima::{Lima, VmStatus};
-use crate::process::{RealProcessInvoker, run_interactive};
+use crate::process::{CommandSpec, RealProcessInvoker, run_interactive_spec};
 use crate::secrets::{self, SecretBackendConfig};
 
 const SECRET_KEY: &str = "claude_code_oauth_token";
@@ -24,14 +24,8 @@ const PASSTHROUGH_ENV_ALLOW: &str =
     "ANTHROPIC_API_KEY,OPENAI_API_KEY,GEMINI_API_KEY,GOOGLE_API_KEY,COMPOSIO_API_KEY";
 
 pub fn run_start(repo_root: &Path, no_dashboard: bool, no_orchestrator: bool) -> Result<i32> {
-    let mut argv = vec!["start".to_string()];
-    if no_dashboard {
-        argv.push("--no-dashboard".to_string());
-    }
-    if no_orchestrator {
-        argv.push("--no-orchestrator".to_string());
-    }
-    run_with_token(repo_root, &argv)
+    let spec = build_start_spec(repo_root, no_dashboard, no_orchestrator)?;
+    run_interactive_spec(&spec)
 }
 
 pub fn run_spawn(
@@ -40,6 +34,40 @@ pub fn run_spawn(
     prompt: Option<&str>,
     agent: Option<&str>,
 ) -> Result<i32> {
+    let spec = build_spawn_spec(repo_root, issue, prompt, agent)?;
+    run_interactive_spec(&spec)
+}
+
+pub fn run_batch_spawn(repo_root: &Path, issues: &[String]) -> Result<i32> {
+    let spec = build_batch_spawn_spec(repo_root, issues)?;
+    run_interactive_spec(&spec)
+}
+
+/// Build the spec for `ao start [--no-dashboard] [--no-orchestrator]`.
+/// Includes the full OAuth credentials-write bootstrap when the
+/// resolved auth mode is `claude-oauth`.
+pub fn build_start_spec(
+    repo_root: &Path,
+    no_dashboard: bool,
+    no_orchestrator: bool,
+) -> Result<CommandSpec> {
+    let mut argv = vec!["start".to_string()];
+    if no_dashboard {
+        argv.push("--no-dashboard".to_string());
+    }
+    if no_orchestrator {
+        argv.push("--no-orchestrator".to_string());
+    }
+    build_with_token(repo_root, &argv)
+}
+
+/// Build the spec for `ao spawn <qualified-issue> [--prompt …] [--agent …]`.
+pub fn build_spawn_spec(
+    repo_root: &Path,
+    issue: &str,
+    prompt: Option<&str>,
+    agent: Option<&str>,
+) -> Result<CommandSpec> {
     let qualified = qualify_issue(repo_root, issue)?;
     let mut argv = vec!["spawn".to_string(), qualified];
     if let Some(p) = prompt {
@@ -50,23 +78,24 @@ pub fn run_spawn(
         argv.push("--agent".to_string());
         argv.push(a.to_string());
     }
-    run_with_token(repo_root, &argv)
+    build_with_token(repo_root, &argv)
 }
 
-pub fn run_batch_spawn(repo_root: &Path, issues: &[String]) -> Result<i32> {
+/// Build the spec for `ao batch-spawn <qualified-issue> …`.
+pub fn build_batch_spawn_spec(repo_root: &Path, issues: &[String]) -> Result<CommandSpec> {
     let mut argv = vec!["batch-spawn".to_string()];
     for issue in issues {
         argv.push(qualify_issue(repo_root, issue)?);
     }
-    run_with_token(repo_root, &argv)
+    build_with_token(repo_root, &argv)
 }
 
-fn run_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
+fn build_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<CommandSpec> {
     ensure_worktree_workspace()?;
     let cfg = Config::load(repo_root)?;
     match cfg.agent_auth().resolve(repo_root) {
-        ResolvedAuthMode::ClaudeOauth => run_claude_oauth(ao_argv, &cfg),
-        ResolvedAuthMode::Passthrough => run_passthrough(ao_argv),
+        ResolvedAuthMode::ClaudeOauth => build_claude_oauth_spec(ao_argv, &cfg),
+        ResolvedAuthMode::Passthrough => build_passthrough_spec(ao_argv),
     }
 }
 
@@ -165,7 +194,7 @@ fn qualify_issue(repo_root: &Path, issue: &str) -> Result<String> {
 /// is set in the shell — that var would make claude prefer API auth
 /// over the OAuth credential we just wrote and silently bypass the
 /// handoff.
-fn run_claude_oauth(ao_argv: &[String], cfg: &Config) -> Result<i32> {
+fn build_claude_oauth_spec(ao_argv: &[String], cfg: &Config) -> Result<CommandSpec> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker.clone(), "fleet-vm");
     ensure_vm_running(&lima)?;
@@ -220,7 +249,7 @@ fn run_claude_oauth(ao_argv: &[String], cfg: &Config) -> Result<i32> {
         .join(" ");
     let bash_script = BOOTSTRAP_SCRIPT.replace("__AO_CMD__", &ao_cmd);
 
-    let limactl_argv = vec![
+    let args = vec![
         "shell".to_string(),
         "--preserve-env".to_string(),
         "--workdir".to_string(),
@@ -231,22 +260,25 @@ fn run_claude_oauth(ao_argv: &[String], cfg: &Config) -> Result<i32> {
         bash_script,
     ];
 
-    let token_str = token.expose_secret();
-    run_interactive(
-        "limactl",
-        &limactl_argv,
-        &[
-            ("CLAUDE_CODE_OAUTH_TOKEN", token_str),
-            ("LIMA_SHELLENV_ALLOW", "CLAUDE_CODE_OAUTH_TOKEN"),
+    let token_str = token.expose_secret().to_string();
+    Ok(CommandSpec {
+        program: "limactl".to_string(),
+        args,
+        env_set: vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token_str),
+            (
+                "LIMA_SHELLENV_ALLOW".to_string(),
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            ),
             // The Ubuntu 24.04 VM doesn't carry terminfo for newer host
             // terminals (`xterm-ghostty`, `wezterm`, …); tmux bails with
             // "missing or unsuitable terminal". Force a widely-known TERM
             // for the in-VM bash + tmux server. Worker panes are unaffected
             // — tmux still sets `screen-256color` inside its panes.
-            ("TERM", "xterm-256color"),
+            ("TERM".to_string(), "xterm-256color".to_string()),
         ],
-        &["ANTHROPIC_API_KEY"],
-    )
+        env_unset: vec!["ANTHROPIC_API_KEY".to_string()],
+    })
 }
 
 /// Pre-`ao start` flow for non-Claude agents (Codex, Aider, …) — no
@@ -254,7 +286,7 @@ fn run_claude_oauth(ao_argv: &[String], cfg: &Config) -> Result<i32> {
 /// provider env vars into the VM and run `ao` directly. Lima's
 /// `--preserve-env` carries the env over; `LIMA_SHELLENV_ALLOW` opts
 /// each var into the guest shell.
-fn run_passthrough(ao_argv: &[String]) -> Result<i32> {
+fn build_passthrough_spec(ao_argv: &[String]) -> Result<CommandSpec> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker, "fleet-vm");
     ensure_vm_running(&lima)?;
@@ -266,9 +298,9 @@ fn run_passthrough(ao_argv: &[String]) -> Result<i32> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    run_interactive(
-        "limactl",
-        &[
+    Ok(CommandSpec {
+        program: "limactl".to_string(),
+        args: vec![
             "shell".to_string(),
             "--preserve-env".to_string(),
             "--workdir".to_string(),
@@ -278,12 +310,15 @@ fn run_passthrough(ao_argv: &[String]) -> Result<i32> {
             "-c".to_string(),
             format!("ao {ao_cmd}"),
         ],
-        &[
-            ("LIMA_SHELLENV_ALLOW", PASSTHROUGH_ENV_ALLOW),
-            ("TERM", "xterm-256color"),
+        env_set: vec![
+            (
+                "LIMA_SHELLENV_ALLOW".to_string(),
+                PASSTHROUGH_ENV_ALLOW.to_string(),
+            ),
+            ("TERM".to_string(), "xterm-256color".to_string()),
         ],
-        &[],
-    )
+        env_unset: Vec::new(),
+    })
 }
 
 fn ensure_vm_running(lima: &Lima) -> Result<()> {
@@ -302,7 +337,7 @@ fn ensure_vm_running(lima: &Lima) -> Result<()> {
 
 /// In-VM bootstrap: write claude's credentials file + onboarding marker,
 /// scrub the OAuth env, anchor a tmux server, then run `ao __AO_CMD__`.
-/// `__AO_CMD__` is replaced by [`run_with_token`] with the shell-escaped
+/// `__AO_CMD__` is replaced by [`build_claude_oauth_spec`] with the shell-escaped
 /// argv to pass to `ao`. We intentionally use a sentinel rather than
 /// `format!()` so the JSON / printf / Node literals don't need brace
 /// escaping.

@@ -100,6 +100,58 @@ pub struct SessionInfo {
     pub reports: Vec<serde_json::Value>,
 }
 
+/// Per-session lifecycle/agent state read from
+/// `~/.agent-orchestrator/projects/<project>/sessions/<id>.json`.
+/// Populated by [`super::invoke::Ao::session_meta_bulk`] from inside
+/// the VM (the JSON files live on the guest filesystem, the host can't
+/// read them directly).
+///
+/// Surfaces fields that `ao session ls --json` doesn't expose but the
+/// sidebar wants to badge on:
+///
+/// - `agent_reported_state` is what the agent last self-declared via
+///   `ao report …` (most often `"completed"` for the "done" badge).
+/// - `runtime_state` / `runtime_reason` reveal an unexpectedly-dead
+///   tmux pane (`runtime.state == "missing"` with a reason other
+///   than `"manual_kill_requested"` — the same criterion the crash
+///   sweep uses, minus the age threshold).
+#[derive(Debug, Clone, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMeta {
+    #[serde(default)]
+    pub agent_reported_state: Option<String>,
+    #[serde(default)]
+    pub session_state: Option<String>,
+    #[serde(default)]
+    pub session_reason: Option<String>,
+    #[serde(default)]
+    pub runtime_state: Option<String>,
+    #[serde(default)]
+    pub runtime_reason: Option<String>,
+}
+
+impl SessionMeta {
+    /// True when the agent has self-reported `"completed"`. Drives the
+    /// green `✓ done` chip in the sidebar.
+    #[must_use]
+    pub fn agent_done(&self) -> bool {
+        self.agent_reported_state.as_deref() == Some("completed")
+    }
+
+    /// True when the session's runtime has died unexpectedly — i.e.
+    /// the tmux pane is gone but the user didn't `ao session kill` it.
+    /// Drives the red `crashed` chip. Mirrors the eligibility filter
+    /// in [`crate::tui::cleanup`] minus the age threshold (the badge
+    /// should appear immediately, before the sweep would consider
+    /// reaping).
+    #[must_use]
+    pub fn runtime_crashed(&self) -> bool {
+        self.runtime_state.as_deref() == Some("missing")
+            && self.runtime_reason.as_deref() != Some("manual_kill_requested")
+            && self.session_reason.as_deref() != Some("manually_killed")
+    }
+}
+
 /// Wrapper for `ao events list --json`. The top-level shape uses
 /// `events` (not `data`), so we can't reuse [`AoResponse`].
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -292,6 +344,68 @@ mod tests {
         assert_eq!(r.events[0].level.as_deref(), Some("info"));
         assert_eq!(r.events[0].session_id.as_deref(), Some("fl-2"));
         assert_eq!(r.events[1].summary.as_deref(), Some("spawned: fl-2"));
+    }
+
+    #[test]
+    fn session_meta_agent_done_only_on_completed() {
+        let mut m = SessionMeta::default();
+        assert!(!m.agent_done(), "default empty meta isn't done");
+        m.agent_reported_state = Some("working".into());
+        assert!(!m.agent_done());
+        m.agent_reported_state = Some("completed".into());
+        assert!(m.agent_done());
+    }
+
+    #[test]
+    fn session_meta_runtime_crashed_excludes_manual_kills() {
+        // Definition of a crash: runtime is missing AND the user
+        // didn't ask for it (the kill path sets reason
+        // "manual_kill_requested" / sessionReason "manually_killed").
+        let mut m = SessionMeta {
+            runtime_state: Some("missing".into()),
+            runtime_reason: Some("tmux_pane_died".into()),
+            session_reason: Some("runtime_crashed".into()),
+            ..Default::default()
+        };
+        assert!(m.runtime_crashed(), "tmux pane death is a crash");
+
+        m.runtime_reason = Some("manual_kill_requested".into());
+        assert!(
+            !m.runtime_crashed(),
+            "manually-killed runtime must not register as a crash",
+        );
+
+        m.runtime_reason = Some("tmux_pane_died".into());
+        m.session_reason = Some("manually_killed".into());
+        assert!(
+            !m.runtime_crashed(),
+            "manually-killed session must not register as a crash",
+        );
+
+        m.session_reason = Some("runtime_crashed".into());
+        m.runtime_state = Some("alive".into());
+        assert!(!m.runtime_crashed(), "alive runtime can't be crashed");
+    }
+
+    #[test]
+    fn session_meta_round_trips_through_bulk_shape() {
+        // The shape emitted by the META_NODE_SCRIPT — verify our serde
+        // attributes line up with the camelCase keys it produces.
+        let raw = r#"{
+            "agentReportedState": "completed",
+            "sessionState": "idle",
+            "sessionReason": "research_complete",
+            "runtimeState": "missing",
+            "runtimeReason": "tmux_pane_died"
+        }"#;
+        let m: SessionMeta = serde_json::from_str(raw).expect("parse");
+        assert_eq!(m.agent_reported_state.as_deref(), Some("completed"));
+        assert_eq!(m.session_state.as_deref(), Some("idle"));
+        assert_eq!(m.session_reason.as_deref(), Some("research_complete"));
+        assert_eq!(m.runtime_state.as_deref(), Some("missing"));
+        assert_eq!(m.runtime_reason.as_deref(), Some("tmux_pane_died"));
+        assert!(m.agent_done());
+        assert!(m.runtime_crashed());
     }
 
     #[test]

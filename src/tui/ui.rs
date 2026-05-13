@@ -216,6 +216,23 @@ fn draw_sidebar_group(
                         Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                     ));
                 }
+                // Sidebar badges from the per-session meta probe. Crash
+                // takes priority over "done" — a runtime that died
+                // unexpectedly is more urgent than a self-reported
+                // completion, and in practice they don't co-occur.
+                if let Some(meta) = s.id.as_ref().and_then(|id| app.session_meta.get(id)) {
+                    if meta.runtime_crashed() {
+                        spans.push(Span::styled(
+                            "crashed ",
+                            Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+                        ));
+                    } else if meta.agent_done() {
+                        spans.push(Span::styled(
+                            "✓ done ",
+                            Style::default().fg(OK).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
                 spans.push(Span::styled(activity, Style::default().fg(MUTED)));
                 ListItem::new(Line::from(spans))
             }
@@ -581,6 +598,34 @@ fn event_line(e: &crate::ao::EventInfo) -> Line<'static> {
     ])
 }
 
+/// Status-bar overlay for an active AO background task. Renders the
+/// braille spinner cycling with elapsed time, the task-wide label
+/// (`killing sb-42`, `starting AO`, …), an optional sub-phase label
+/// for multi-phase tasks like restart-for-orchestrator, and the
+/// elapsed seconds in muted grey.
+fn draw_in_flight_ao(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(task) = &app.in_flight_ao else {
+        return;
+    };
+    let frame_idx = (task.elapsed().as_millis() / 100) as usize % SPINNER_FRAMES.len();
+    let spinner_glyph = SPINNER_FRAMES[frame_idx];
+    let badge_text = format!(" {spinner_glyph} ");
+    let mut spans: Vec<Span<'_>> = vec![
+        badge(&badge_text, ACCENT),
+        Span::raw(" "),
+        Span::styled(task.label().to_string(), Style::default().fg(ACCENT)),
+    ];
+    if let Some(phase) = task.phase_label() {
+        spans.push(Span::styled(" — ", Style::default().fg(MUTED)));
+        spans.push(Span::styled(phase.to_string(), Style::default().fg(MUTED)));
+    }
+    spans.push(Span::styled(
+        format!(" ({}s)", task.elapsed().as_secs()),
+        Style::default().fg(MUTED),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // Three overlays replace the legend rather than appending to it: a
     // pending confirm, an error flash, an info flash. Match keel's pattern
@@ -595,6 +640,16 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(c.prompt(), Style::default().fg(WARN)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    // In-flight AO subprocess (kill / stop / start / spawn / restart):
+    // spinner + task label, optional sub-phase label for multi-phase
+    // tasks, elapsed seconds. Slots in above the action-flash overlays
+    // because while a task is running there's no flash to show yet —
+    // completion replaces the spinner with a flash via
+    // `App::drain_ao_task`.
+    if app.in_flight_ao.is_some() {
+        draw_in_flight_ao(app, frame, area);
         return;
     }
     // Action-driven flashes (success + failure from user input) stay

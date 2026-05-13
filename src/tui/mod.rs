@@ -13,8 +13,10 @@
 //! Aesthetic inspiration: keel — dark background, rounded borders, section
 //! titles inline on the border, dot-separated status bar at the bottom.
 
+mod ao_task;
 mod app;
 mod bringup;
+mod cleanup;
 mod input;
 mod preflight;
 mod refresh;
