@@ -262,7 +262,7 @@ fn build_session_kv_lines(s: &SessionInfo) -> Vec<Line<'static>> {
 /// has to consult the legend to figure out what to press first.
 fn build_welcome_lines(app: &App) -> Vec<Line<'static>> {
     let muted = Style::default().fg(MUTED);
-    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
 
     if app.current_project_key.is_none() {
         return vec![
@@ -300,9 +300,9 @@ fn build_welcome_lines(app: &App) -> Vec<Line<'static>> {
             Line::raw(""),
             Line::from(vec![
                 Span::styled("  ", muted),
-                Span::styled("⇧S", bold_key),
+                Span::styled("S", bold_key),
                 Span::styled(
-                    "      start the orchestrator inside the VM",
+                    "       start the orchestrator inside the VM",
                     muted,
                 ),
             ]),
@@ -492,13 +492,16 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         return;
     }
 
+    // Capital letters mean shift-modified bindings (S = Shift+S, K =
+    // Shift+K, …). No ⇧ glyph anywhere in the legend — the case
+    // already carries the meaning and the arrow added visual noise.
     let mut spans: Vec<Span<'_>> = vec![
         chip("[fleet]", ACCENT),
         sep(),
         key("↑/↓"),
         Span::raw(" nav"),
         sep(),
-        key("Enter"),
+        key("enter"),
         Span::raw(" attach"),
         sep(),
         key("n"),
@@ -507,14 +510,11 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         key("t"),
         Span::raw(" tracker"),
     ];
-    // Shift+T only advertised for plugins with a remote web view —
-    // showing it on a git-bug project would just promise something
-    // that flashes "no remote site" when pressed.
     if app.current_tracker_has_web() {
         spans.push(sep());
-        spans.push(key("⇧T"));
+        spans.push(key("T"));
         // "tracker web" rather than just "web" to disambiguate from
-        // `⇧W` (AO dashboard) below.
+        // `W` (AO dashboard) below.
         spans.push(Span::raw(" tracker web"));
     }
     spans.extend([
@@ -525,10 +525,12 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         key("K"),
         Span::raw(" kill"),
         sep(),
-        key("⇧S"),
-        Span::raw("/⇧X start/stop"),
+        key("S"),
+        Span::raw("/"),
+        key("X"),
+        Span::raw(" start/stop"),
         sep(),
-        key("⇧W"),
+        key("W"),
         Span::raw(" web"),
         sep(),
         key("r"),
@@ -565,7 +567,7 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// (keychain unreachable, config not writable, etc.).
 pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
     let muted = Style::default().fg(MUTED);
-    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
 
     // Name the platform-native credential store so the user knows
     // exactly where their token's going. macOS Keychain / Linux
@@ -611,7 +613,7 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
             // the token landing in terminal scrollback.
             Span::styled(
                 "•".repeat(setup.buffer.chars().count()),
-                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled("█", Style::default().fg(KEY_FG)),
         ]),
@@ -634,9 +636,9 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
     ]));
 
     let footer = vec![Line::from(vec![
-        Span::styled("[Enter]", bold_key),
+        Span::styled("enter", bold_key),
         Span::styled(" save to keychain   ", muted),
-        Span::styled("[Esc]", bold_key),
+        Span::styled("esc", bold_key),
         Span::styled(" cancel", muted),
     ])];
     draw_modal(
@@ -652,7 +654,7 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
     const MAX_ROWS: usize = 12;
 
     let muted = Style::default().fg(MUTED);
-    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Filter input with block caret.
@@ -731,11 +733,11 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
     }
 
     let footer = vec![Line::from(vec![
-        Span::styled("[↑↓]", bold_key),
+        Span::styled("↑↓", bold_key),
         Span::styled(" pick    ", muted),
-        Span::styled("[Enter]", bold_key),
+        Span::styled("enter", bold_key),
         Span::styled(" submit    ", muted),
-        Span::styled("[Esc]", bold_key),
+        Span::styled("esc", bold_key),
         Span::styled(" cancel", muted),
     ])];
     // Pin the modal width so it doesn't shrink as the user narrows
@@ -771,7 +773,7 @@ fn issue_line(issue: &crate::ao::tracker::Issue, focused: bool) -> Line<'static>
         Style::default().fg(KEY_FG)
     };
     let title_style = if focused {
-        Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD)
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -841,7 +843,7 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
             ),
             Span::styled(
                 f.name.to_string(),
-                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -863,16 +865,16 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
         }
         lines.push(Line::raw(""));
     }
-    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     draw_modal(
         frame,
         " preflight failed ",
         ERR,
         lines,
         &[Line::from(vec![
-            Span::styled("[c]", bold_key),
+            Span::styled("c", bold_key),
             Span::styled(" edit agent-orchestrator.yaml   ", Style::default().fg(MUTED)),
-            Span::styled("[any other key]", bold_key),
+            Span::styled("any other key", bold_key),
             Span::styled(" quit", Style::default().fg(MUTED)),
         ])],
     );
@@ -888,7 +890,7 @@ pub(super) fn render_tracker_install(
     install: &crate::tui::tracker_install::TrackerInstall,
 ) {
     let muted = Style::default().fg(MUTED);
-    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     let n = SPINNER_FRAMES.len() as u64;
     let frame_idx = usize::try_from(install.elapsed_secs() % n).unwrap_or(0);
     let spinner = SPINNER_FRAMES[frame_idx];
@@ -978,7 +980,7 @@ pub(super) fn render_tracker_warnings(
     warnings: &[crate::tui::preflight::MissingTracker],
 ) {
     let muted = Style::default().fg(MUTED);
-    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -994,7 +996,7 @@ pub(super) fn render_tracker_warnings(
             ),
             Span::styled(
                 w.plugin.clone(),
-                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(
@@ -1026,13 +1028,13 @@ pub(super) fn render_tracker_warnings(
         WARN,
         lines,
         &[Line::from(vec![
-            Span::styled("[y]", bold_key),
+            Span::styled("y", bold_key),
             Span::styled(" install in VM   ", muted),
-            Span::styled("[c]", bold_key),
+            Span::styled("c", bold_key),
             Span::styled(" edit config   ", muted),
-            Span::styled("[Enter]", bold_key),
+            Span::styled("enter", bold_key),
             Span::styled(" continue   ", muted),
-            Span::styled("[q]", bold_key),
+            Span::styled("q", bold_key),
             Span::styled(" quit", muted),
         ])],
     );
@@ -1051,7 +1053,7 @@ pub(super) fn render_vm_missing(frame: &mut Frame<'_>) {
             ),
             Span::styled(
                 "fleet-vm",
-                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(
@@ -1092,7 +1094,7 @@ pub(super) fn render_vm_stopped(frame: &mut Frame<'_>) {
             ),
             Span::styled(
                 "fleet-vm",
-                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled("Lima instance is stopped", Style::default().fg(MUTED)),
@@ -1126,7 +1128,7 @@ pub(super) fn render_vm_bringup(frame: &mut Frame<'_>, bringup: &BringUp) {
         ),
         Span::styled(
             "Bringing up fleet-vm",
-            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::styled(
@@ -1184,15 +1186,15 @@ fn truncate_for_modal(s: &str, max: usize) -> String {
 fn footer_yn(verb: &str) -> Vec<Line<'static>> {
     vec![Line::from(vec![
         Span::styled(
-            "[y]",
-            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            "y",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(verb.to_string(), Style::default().fg(MUTED)),
         Span::raw("   "),
         Span::styled(
-            "[q]",
-            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            "q",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled("quit", Style::default().fg(MUTED)),

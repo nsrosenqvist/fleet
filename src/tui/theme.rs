@@ -90,10 +90,20 @@ pub fn sep() -> Span<'static> {
     Span::styled("  ·  ", Style::default().fg(MUTED))
 }
 
-/// Hotkey glyph (`↑`, `Enter`, `K`, …) rendered bold-white.
+/// Hotkey glyph (`↑`, `enter`, `K`, …) rendered bold-accent.
+///
+/// Convention across fleet:
+/// - Shift-modified keys render as the capitalised letter alone (`S`
+///   for Shift-S, `T` for Shift-T) — no `⇧` glyph, since the capital
+///   letter is unambiguous and the arrow added noise.
+/// - Named keys are lowercase (`enter`, `esc`, `tab`) so they read
+///   as words rather than buttons, and don't compete visually with
+///   the single-letter chords.
+/// - Color is the ACCENT colour so hotkeys pop against the muted
+///   status-bar body without using a separate "key colour".
 pub fn key(k: &str) -> Span<'_> {
     Span::styled(
         k.to_string(),
-        Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )
 }
