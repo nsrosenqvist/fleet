@@ -333,11 +333,14 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    // Action errors take priority over refresh errors: a fresh "Shift+S
-    // failed" needs to be visible even if a stale "ao probe timed out"
-    // is also pending. Refresh errors only surface when nothing else
-    // demands the row.
-    if let Some(e) = app.action_error.as_ref().or(app.refresh_error.as_ref()) {
+    // Action-driven flashes (success + failure from user input) fade
+    // after `FLASH_TTL` so the legend returns to the row — without
+    // this, a "edited /path/..." message from `c` hides the keybind
+    // legend forever. Refresh errors are tied to live state (the AO
+    // probe is currently failing) so they keep showing until the next
+    // successful refresh clears them.
+    let flash_live = app.flash_visible();
+    if flash_live && let Some(e) = &app.action_error {
         let line = Line::from(vec![
             badge(" ! ", ERR),
             Span::raw(" "),
@@ -346,11 +349,20 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    if let Some(m) = &app.last_info {
+    if flash_live && let Some(m) = &app.last_info {
         let line = Line::from(vec![
             badge(" ✓ ", OK),
             Span::raw(" "),
             Span::styled(m.clone(), Style::default().fg(OK)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if let Some(e) = &app.refresh_error {
+        let line = Line::from(vec![
+            badge(" ! ", ERR),
+            Span::raw(" "),
+            Span::styled(e.clone(), Style::default().fg(ERR)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;

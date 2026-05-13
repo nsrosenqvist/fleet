@@ -31,6 +31,13 @@ use super::refresh::{self, RefreshCommand, RefreshUpdate};
 /// and mouse don't accidentally activate when re-clicking to re-select.
 pub(super) const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
+/// How long a user-action flash (info or action-error) stays on the
+/// status bar before the legend takes the row back. Long enough to read
+/// a typical message ("edited /path/...") without forcing the user to
+/// dismiss anything; short enough that a stale flash doesn't keep the
+/// keybind legend hidden when the user is browsing.
+pub(super) const FLASH_TTL: Duration = Duration::from_secs(4);
+
 /// Identifier for a mouse-clickable region. Stored in `last_click` so a
 /// double-click only fires when the *same* target is clicked twice — a
 /// click on row 2 followed by a click on row 5 within 400 ms is a select,
@@ -113,14 +120,15 @@ pub struct App {
     /// again without user action.
     pub(super) refresh_error: Option<String>,
     /// Most recent error from a user-triggered action (Shift+S, kill,
-    /// etc.). Sticky until the next user action either succeeds (which
-    /// sets `last_info`) or fails (which overwrites this). Refresh
-    /// ticks must NOT clear this — otherwise an error from `Shift+S`
-    /// flashes for ~1.5s and then disappears when the next sessions
-    /// snapshot lands, which is exactly what users described as the
-    /// "flash and vanish" bug.
+    /// etc.). Survives across refresh ticks (so a brief failure doesn't
+    /// vanish before the user reads it) but fades after `FLASH_TTL` —
+    /// `flashed_at` carries the timestamp and the renderer checks the
+    /// elapsed window before painting.
     pub(super) action_error: Option<String>,
     pub(super) last_info: Option<String>,
+    /// When the current `action_error` / `last_info` was set. Drives
+    /// the fade — see [`Self::flash_visible`].
+    pub(super) flashed_at: Option<Instant>,
     pub(super) ao_up: bool,
     pub(super) vm_status: VmStatus,
     pub(super) confirm: Option<Confirm>,
@@ -173,6 +181,7 @@ impl App {
             refresh_error: None,
             action_error: None,
             last_info: None,
+            flashed_at: None,
             ao_up: false,
             vm_status: VmStatus::Missing,
             confirm: None,
@@ -339,13 +348,23 @@ impl App {
     pub(super) fn flash_ok(&mut self, msg: impl Into<String>) {
         self.last_info = Some(msg.into());
         self.action_error = None;
+        self.flashed_at = Some(Instant::now());
     }
 
-    /// Record an error from a user-triggered action. Sticky until the
-    /// next action overwrites it; see the doc on `action_error`.
+    /// Record an error from a user-triggered action. Visible for
+    /// `FLASH_TTL` then fades back to the keybind legend.
     pub(super) fn flash_err(&mut self, msg: impl Into<String>) {
         self.action_error = Some(msg.into());
         self.last_info = None;
+        self.flashed_at = Some(Instant::now());
+    }
+
+    /// True when the current action-flash is still inside its TTL.
+    /// Once it expires the status bar swaps back to the keybind legend,
+    /// even though the underlying `last_info` / `action_error` strings
+    /// stay set (a subsequent action overwrites them naturally).
+    pub(super) fn flash_visible(&self) -> bool {
+        self.flashed_at.is_some_and(|t| t.elapsed() < FLASH_TTL)
     }
 
     /// Fold an action's `Result` into the flash slot. On error keeps the
