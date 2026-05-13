@@ -55,7 +55,7 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
     if let Some(setup) = &app.secret_setup {
         render_secret_setup(frame, setup);
     } else if let Some(prompt) = &app.spawn_prompt {
-        render_spawn_prompt(frame, prompt);
+        render_spawn_prompt(frame, prompt, app.ao_up);
     }
 }
 
@@ -673,22 +673,39 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
     );
 }
 
-pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
-    const MAX_ROWS: usize = 12;
-
+/// Soft warning lines for "AO daemon down" rendered above the issue
+/// picker inside the spawn modal. Not a gate — AO creates sessions
+/// fine without the daemon, only lifecycle polling (state transitions,
+/// PR status, CI signals) is inactive. Surface it so the user
+/// notices before spawning and knows the remediation (`Shift+S`).
+fn ao_down_warning_lines() -> Vec<Line<'static>> {
     let muted = Style::default().fg(MUTED);
-    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("⚠ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+            Span::styled("AO daemon not running — ", Style::default().fg(WARN)),
+            Span::styled(
+                "lifecycle tracking will be off for the new session.",
+                muted,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  start it with ", muted),
+            key("S"),
+            Span::styled(" before spawn, or proceed without tracking.", muted),
+        ]),
+    ]
+}
 
+/// Body of the spawn modal: the per-state rendering of the issue list
+/// (loading / unsupported tracker / error / loaded). Returns the lines
+/// to insert under the filter input; the caller composes them with
+/// chrome, the AO-down warning, and the footer.
+fn spawn_issue_lines(prompt: &SpawnPrompt) -> Vec<Line<'static>> {
+    const MAX_ROWS: usize = 12;
+    let muted = Style::default().fg(MUTED);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Filter input with block caret.
-    lines.push(Line::from(vec![
-        Span::styled("filter      ", muted),
-        Span::styled(prompt.buffer.clone(), bold_key),
-        Span::styled("█", Style::default().fg(KEY_FG)),
-    ]));
-    lines.push(Line::raw(""));
-
-    // Body: depends on the issue-fetch state.
     match &prompt.issues {
         IssuesState::Loading => {
             lines.push(Line::from(Span::styled(
@@ -720,13 +737,9 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
                 muted,
             )));
         }
-        IssuesState::Loaded(_) => {
-            // Build the filtered window with selection chrome.
+        IssuesState::Loaded(all) => {
             let filtered = prompt.filtered();
-            let total = match &prompt.issues {
-                IssuesState::Loaded(all) => all.len(),
-                _ => 0,
-            };
+            let total = all.len();
             if filtered.is_empty() {
                 lines.push(Line::from(Span::styled(
                     if total == 0 {
@@ -739,11 +752,8 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
             } else {
                 let selected = prompt.selected_idx.min(filtered.len() - 1);
                 let window = scroll_window(filtered.len(), selected, MAX_ROWS);
-                for (offset, idx) in window.clone().enumerate() {
-                    let issue = filtered[idx];
-                    let focused = idx == selected;
-                    lines.push(issue_line(issue, focused));
-                    let _ = offset;
+                for idx in window.clone() {
+                    lines.push(issue_line(filtered[idx], idx == selected));
                 }
                 lines.push(Line::raw(""));
                 let shown = window.end - window.start;
@@ -754,6 +764,25 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
             }
         }
     }
+    lines
+}
+
+pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt, ao_up: bool) {
+    let muted = Style::default().fg(MUTED);
+    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Filter input with block caret.
+    lines.push(Line::from(vec![
+        Span::styled("filter      ", muted),
+        Span::styled(prompt.buffer.clone(), bold_key),
+        Span::styled("█", Style::default().fg(KEY_FG)),
+    ]));
+    if !ao_up {
+        lines.extend(ao_down_warning_lines());
+    }
+    lines.push(Line::raw(""));
+    lines.extend(spawn_issue_lines(prompt));
 
     let footer = vec![Line::from(vec![
         modal_key("↑↓"),
