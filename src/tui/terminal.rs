@@ -445,14 +445,29 @@ fn tracker_preview(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdou
     };
 
     let argv: Vec<String> = match plugin.as_str() {
-        "git-bug" => vec![
-            "shell".into(),
-            "--workdir".into(),
-            project_path.display().to_string(),
-            "fleet-vm".into(),
-            "git-bug".into(),
-            "termui".into(),
-        ],
+        "git-bug" => {
+            // git-bug refuses to start without an identity, and the
+            // standard `git-bug user new` is interactive — bad fit for
+            // the suspend-and-attach flow. Bootstrap one from the host
+            // git config (the user already set name/email there for
+            // their normal git commits) inline so termui just works.
+            let script = match git_bug_bootstrap_script(&project_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    app.flash_err(format!("git-bug identity: {e:#}"));
+                    return;
+                }
+            };
+            vec![
+                "shell".into(),
+                "--workdir".into(),
+                project_path.display().to_string(),
+                "fleet-vm".into(),
+                "bash".into(),
+                "-c".into(),
+                script,
+            ]
+        }
         "github" => vec![
             "shell".into(),
             "--workdir".into(),
@@ -513,6 +528,54 @@ fn current_project_tracker(app: &App) -> Option<(std::path::PathBuf, String)> {
     let project = cfg.projects.get(key)?;
     let plugin = project.tracker.as_ref()?.plugin.clone();
     Some((project.path.clone(), plugin))
+}
+
+/// Bash one-liner that opens `git-bug termui` for `project_path`,
+/// auto-creating a git-bug identity from the host's `git config`
+/// user.name / user.email when none exists yet. Without this the
+/// user has to drop to a shell and run `git-bug user new` before
+/// they can use the tracker, which defeats the point of the
+/// keybind.
+fn git_bug_bootstrap_script(project_path: &std::path::Path) -> Result<String> {
+    let name = host_git_config(project_path, "user.name")?;
+    let email = host_git_config(project_path, "user.email")?;
+    let name_q = crate::cli::spawn::shell_quote_single(&name);
+    let email_q = crate::cli::spawn::shell_quote_single(&email);
+    // The `git-bug user ls | grep -q .` check returns 1 when the
+    // repo has no users yet (output is empty); we only create on
+    // that path. `git-bug user new --non-interactive` is the silent
+    // form added in git-bug v0.10+.
+    Ok(format!(
+        "if ! git-bug user ls 2>/dev/null | grep -q .; then \
+            git-bug user new --non-interactive --name {name_q} --email {email_q} >/dev/null || exit 1; \
+         fi; \
+         exec git-bug termui"
+    ))
+}
+
+/// Read a `git config` value from the project's checkout. Falls back
+/// to the global / system config when the local repo doesn't override
+/// — git's normal precedence.
+fn host_git_config(project_path: &std::path::Path, key: &str) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(["config", "--get", key])
+        .output()
+        .with_context(|| format!("git -C <path> config --get {key}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git config `{key}` is unset on the host — run `git config --global {key} '...'` first"
+        );
+    }
+    let value = String::from_utf8(out.stdout)
+        .context("non-UTF-8 git config value")?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        anyhow::bail!("git config `{key}` is empty");
+    }
+    Ok(value)
 }
 
 /// Derive `https://github.com/<owner>/<name>/issues` from a project's

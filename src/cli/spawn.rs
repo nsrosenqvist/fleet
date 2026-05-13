@@ -266,7 +266,7 @@ ao __AO_CMD__
 
 /// Quote a string for inclusion in a single-quoted bash word.
 /// Each embedded `'` becomes `'\''` (close, escaped quote, reopen).
-fn shell_quote_single(s: &str) -> String {
+pub fn shell_quote_single(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
