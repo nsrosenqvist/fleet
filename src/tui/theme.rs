@@ -13,11 +13,11 @@ use ratatui::widgets::{Block, BorderType, Borders};
 /// Primary accent — section titles, the leading chip in the breadcrumb /
 /// status bar, the highlight colour for the selected list row.
 ///
-/// 256-colour index 46 is the classic phosphor "matrix green" (#00FF00).
-/// Distinct from `OK`'s ANSI `Color::Green` (which most terminals render
-/// as a darker mid-green like #00AA00), so running-status badges and
-/// accented titles still read as separate signals.
-pub const ACCENT: Color = Color::Indexed(46);
+/// 256-colour index 141 is a soft violet/lavender. Picked because the
+/// status palette already claims red/green/yellow and cyan made fleet
+/// read as a keel clone — violet leaves every status colour visually
+/// distinct from the accent and gives the UI its own identity.
+pub const ACCENT: Color = Color::Indexed(141);
 
 /// Muted foreground for secondary text and panel borders. Reads as "less
 /// important than the surrounding content" without disappearing entirely.
