@@ -21,6 +21,7 @@ mod refresh;
 pub mod subprocess;
 mod terminal;
 mod theme;
+mod tracker_install;
 mod ui;
 
 use anyhow::Result;

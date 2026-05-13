@@ -18,7 +18,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
@@ -159,10 +159,21 @@ fn draw_sessions_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     ))));
 
     let title = format!(" sessions ({}) ", app.sessions.len());
+    // Selected-row highlight needs a contrasting background — fg-only
+    // (accent+bold) was invisible against the sentinel's accent-italic
+    // styling, so the user couldn't tell anything was "focused" on a
+    // fresh start. Subtle dim-grey bg + bright-white fg lifts the
+    // focused row off the panel regardless of what colour the row's
+    // own spans use.
     let list = List::new(items)
         .block(framed_block(&title))
         .highlight_symbol("▸ ")
-        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+        .highlight_style(
+            Style::default()
+                .fg(KEY_FG)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
     let mut state = ListState::default();
     state.select(Some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
@@ -745,10 +756,101 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
     );
 }
 
-/// Soft-fail preflight: required tracker tools aren't installed for
-/// one or more configured plugins. The rest of the TUI works — only
-/// the spawn picker breaks for those projects — so the modal offers
-/// `c` (fix the AO yaml), Enter (continue anyway), or `q` (quit).
+/// Live progress modal painted while a tracker-install supervisor
+/// is running. Spinner + tool tickmarks + tail of subprocess output.
+/// Replaces the earlier "warnings + y/N prompt" flow — installing
+/// tracker tools is fleet's job (we provision the VM), so the modal
+/// shows progress without asking permission.
+pub(super) fn render_tracker_install(
+    frame: &mut Frame<'_>,
+    install: &crate::tui::tracker_install::TrackerInstall,
+) {
+    let muted = Style::default().fg(MUTED);
+    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+    let n = SPINNER_FRAMES.len() as u64;
+    let frame_idx = usize::try_from(install.elapsed_secs() % n).unwrap_or(0);
+    let spinner = SPINNER_FRAMES[frame_idx];
+
+    let header = Line::from(vec![
+        Span::styled(
+            format!("{spinner} "),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("Installing tracker tools", bold_key),
+        Span::raw("   "),
+        Span::styled(format!("{}s", install.elapsed_secs()), muted),
+    ]);
+
+    let mut lines = vec![header, Line::raw("")];
+
+    // Step rows: one per tool. Already-finished steps show ✓ / ✗
+    // based on exit code; in-flight tool shows a spinner.
+    let steps = install.steps();
+    for tool in install.tools() {
+        let outcome = steps.iter().find(|s| &s.tool == tool);
+        match outcome {
+            Some(s) if s.code == 0 => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "✓ ",
+                        Style::default().fg(OK).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(tool.clone(), bold_key),
+                ]));
+            }
+            Some(s) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "✗ ",
+                        Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(tool.clone(), bold_key),
+                    Span::raw("  "),
+                    Span::styled(format!("(exit {})", s.code), muted),
+                ]));
+            }
+            None => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{spinner} "),
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled(tool.clone(), bold_key),
+                ]));
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "output (most recent):",
+        muted,
+    )));
+    let mut had_any = false;
+    for raw in install.tail_lines() {
+        had_any = true;
+        let truncated = truncate(raw, 80);
+        lines.push(Line::from(vec![
+            Span::styled("  ", muted),
+            Span::styled(truncated, muted),
+        ]));
+    }
+    if !had_any {
+        lines.push(Line::from(Span::styled(
+            "  (starting…)",
+            muted.add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    let footer = vec![Line::from(Span::styled(
+        "fleet manages tracker tools inside the VM — this completes automatically.",
+        muted.add_modifier(Modifier::ITALIC),
+    ))];
+    draw_modal(frame, " tracker setup ", ACCENT, lines, &footer);
+}
+
+// Kept (unused for now) for the future case where we need a
+// continue-or-quit preflight warning that *isn't* auto-remediated.
+#[allow(dead_code)]
 pub(super) fn render_tracker_warnings(
     frame: &mut Frame<'_>,
     warnings: &[crate::tui::preflight::MissingTracker],

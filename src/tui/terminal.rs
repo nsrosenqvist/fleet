@@ -20,6 +20,7 @@ use super::bringup::{BringUp, BringUpMode};
 use super::input;
 use super::preflight::{self, MissingDep, MissingTracker, Preflight};
 use super::subprocess::suspend_around;
+use super::tracker_install::TrackerInstall;
 use super::ui;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(50);
@@ -96,20 +97,15 @@ fn settle_preflight(
                 Err(e) => return PreflightOutcome::Err(e),
             },
             Preflight::TrackerWarnings(warnings) => {
-                match run_tracker_warnings_modal(term, &warnings) {
-                    Ok(TrackerAction::Continue) => return PreflightOutcome::Proceed,
-                    Ok(TrackerAction::EditConfig) => {
-                        if let Err(e) = edit_ao_yaml(term, repo_root) {
-                            return PreflightOutcome::Err(e);
-                        }
-                    }
-                    Ok(TrackerAction::InstallInVm) => {
-                        if let Err(e) = install_trackers_in_vm(term, &warnings) {
-                            return PreflightOutcome::Err(e);
-                        }
-                    }
-                    Ok(TrackerAction::Quit) => return PreflightOutcome::Quit(1),
-                    Err(e) => return PreflightOutcome::Err(e),
+                // No prompt — tracker tools are fleet's responsibility
+                // since fleet manages the VM. Run the install with a
+                // small in-TUI progress modal (so the screen doesn't
+                // look frozen for 10–30s) and re-preflight; if a
+                // residual error remains the user sees the spawn
+                // picker's "tracker error" message rather than a
+                // startup roadblock.
+                if let Err(e) = run_tracker_install(term, &warnings) {
+                    return PreflightOutcome::Err(e);
                 }
             }
         }
@@ -132,18 +128,6 @@ enum HostBinsAction {
     Quit,
 }
 
-enum TrackerAction {
-    /// Install the missing tools inside the VM via `limactl shell …`.
-    /// Suspends the alt screen so the user can see apt / curl output
-    /// directly, then re-runs preflight.
-    InstallInVm,
-    /// Proceed into the main TUI; the missing tracker tools only
-    /// break the spawn picker for those plugins.
-    Continue,
-    EditConfig,
-    Quit,
-}
-
 fn run_host_bins_modal(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     failures: &[MissingDep],
@@ -162,62 +146,39 @@ fn run_host_bins_modal(
     }
 }
 
-fn run_tracker_warnings_modal(
-    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    warnings: &[MissingTracker],
-) -> Result<TrackerAction> {
-    loop {
-        term.draw(|f| ui::render_tracker_warnings(f, warnings))?;
-        if event::poll(TICK_INTERVAL)?
-            && let event::Event::Key(k) = event::read()?
-            && k.kind == event::KeyEventKind::Press
-        {
-            return Ok(match k.code {
-                event::KeyCode::Char('y' | 'Y') => TrackerAction::InstallInVm,
-                event::KeyCode::Char('c' | 'C') => TrackerAction::EditConfig,
-                event::KeyCode::Char('q' | 'Q') | event::KeyCode::Esc => TrackerAction::Quit,
-                // Any other key (including Enter) continues into the TUI.
-                _ => TrackerAction::Continue,
-            });
-        }
-    }
-}
-
-/// Install each missing tracker tool inside the VM via `limactl
-/// shell fleet-vm -- bash -c '...'`, suspending the alt screen so
-/// the user sees apt / curl output directly. After every tool runs
-/// (or fails), control returns to the preflight loop which probes
-/// again — a successful install converges on `Preflight::Ok` without
-/// extra work.
-fn install_trackers_in_vm(
+/// Auto-install missing tracker tools inside the VM, rendering a
+/// streaming progress modal until the supervisor reports done. No
+/// user input — fleet manages the VM, so the tools are fleet's
+/// responsibility to provision, not the user's chore. After the
+/// modal closes, control returns to `settle_preflight` which probes
+/// again; any residual error advances to the main TUI as a normal
+/// status-bar flash rather than a startup-blocking modal.
+fn run_tracker_install(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     warnings: &[MissingTracker],
 ) -> Result<()> {
-    suspend_around(term, || {
-        for w in warnings {
-            let Some(script) = preflight::install_command(w.tool) else {
-                eprintln!("fleet: no install command registered for `{}`", w.tool);
-                continue;
-            };
-            eprintln!("\n── installing `{}` inside fleet-vm ──", w.tool);
-            let status = crate::process::run_interactive(
-                "limactl",
-                &[
-                    "shell".to_string(),
-                    "fleet-vm".to_string(),
-                    "bash".to_string(),
-                    "-c".to_string(),
-                    script.to_string(),
-                ],
-                &[],
-                &[],
-            )?;
-            if status != 0 {
-                eprintln!("fleet: install of `{}` exited with status {status}", w.tool);
-            }
+    let tools: Vec<String> = warnings.iter().map(|w| w.tool.to_string()).collect();
+    if tools.is_empty() {
+        return Ok(());
+    }
+    let mut install = TrackerInstall::spawn(tools);
+    loop {
+        install.tick();
+        term.draw(|f| ui::render_tracker_install(f, &install))?;
+        if install.is_finished() {
+            // One last drain so any final lines that arrived in the
+            // same tick window land in the displayed tail.
+            install.tick();
+            term.draw(|f| ui::render_tracker_install(f, &install))?;
+            return Ok(());
         }
-        Ok(())
-    })
+        // Tracker installs don't accept user input (no [y]/[n] gate),
+        // but we still drain crossterm events so the queue doesn't
+        // accumulate while we wait.
+        if event::poll(TICK_INTERVAL)? {
+            let _ = event::read();
+        }
+    }
 }
 
 /// Suspend the alt screen, open the AO yaml in `$EDITOR`, return so
