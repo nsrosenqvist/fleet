@@ -80,7 +80,11 @@ impl<'a> Ao<'a> {
     pub fn session_meta_bulk(&self) -> Result<HashMap<String, SessionMeta>> {
         let raw = self.lima.shell(
             self.workdir,
-            vec!["node".to_string(), "-e".to_string(), META_NODE_SCRIPT.to_string()],
+            vec![
+                "node".to_string(),
+                "-e".to_string(),
+                META_NODE_SCRIPT.to_string(),
+            ],
         )?;
         let start = find_json_start(&raw).with_context(|| {
             format!(
@@ -88,8 +92,8 @@ impl<'a> Ao<'a> {
                 error_preview(&raw)
             )
         })?;
-        let map: HashMap<String, SessionMeta> = serde_json::from_str(&raw[start..])
-            .with_context(|| {
+        let map: HashMap<String, SessionMeta> =
+            serde_json::from_str(&raw[start..]).with_context(|| {
                 format!(
                     "parsing session_meta_bulk JSON: {}",
                     error_preview(&raw[start..])

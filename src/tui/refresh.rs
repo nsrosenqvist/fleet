@@ -58,7 +58,10 @@ const EVENTS_LIMIT: u32 = 100;
 /// Messages sent from the background thread back to the UI.
 pub enum RefreshUpdate {
     Sessions(Vec<SessionInfo>),
-    PaneCapture { session_id: String, output: String },
+    PaneCapture {
+        session_id: String,
+        output: String,
+    },
     Error(String),
     AoUp(bool),
     VmUp(VmStatus),
@@ -127,11 +130,18 @@ fn refresh_loop(
 
     loop {
         let now = Instant::now();
-        let wait_for = [next_status, next_ao_probe, next_vm_probe, next_events_probe, next_meta_probe, next_cleanup]
-            .into_iter()
-            .map(|t| t.saturating_duration_since(now))
-            .min()
-            .unwrap_or(Duration::from_millis(100));
+        let wait_for = [
+            next_status,
+            next_ao_probe,
+            next_vm_probe,
+            next_events_probe,
+            next_meta_probe,
+            next_cleanup,
+        ]
+        .into_iter()
+        .map(|t| t.saturating_duration_since(now))
+        .min()
+        .unwrap_or(Duration::from_millis(100));
 
         match cmds.recv_timeout(wait_for) {
             Ok(RefreshCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -290,12 +300,9 @@ fn run_cleanup_tick(
         return Ok(());
     };
     for (project_key, project) in &cfg.projects {
-        if let Err(e) = super::cleanup::sweep(
-            &project.path,
-            ao_workdir,
-            project_key,
-            CLEANUP_MIN_AGE_SECS,
-        ) {
+        if let Err(e) =
+            super::cleanup::sweep(&project.path, ao_workdir, project_key, CLEANUP_MIN_AGE_SECS)
+        {
             let msg = format!(
                 "cleanup({project_key}): {}",
                 format!("{e:#}").lines().next().unwrap_or("")

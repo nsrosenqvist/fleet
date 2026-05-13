@@ -27,7 +27,7 @@ use ratatui::widgets::{
 use crate::ao::SessionInfo;
 use crate::lima::VmStatus;
 
-use super::app::{App, IssuesState, SecretSetup, SpawnPrompt};
+use super::app::{App, IssuesState, RegisterField, RegisterProject, SecretSetup, SpawnPrompt};
 use super::bringup::BringUp;
 use super::preflight::MissingDep;
 use super::theme::{
@@ -58,10 +58,12 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
     draw_status_bar(app, frame, layout[3]);
 
     // Overlay modals — painted last so they sit on top of the normal
-    // layout. Priority matches input dispatch: secret setup wins
-    // over spawn prompt (one is text-input, the other is text+list,
-    // and they shouldn't both be visible at once anyway).
-    if let Some(setup) = &app.secret_setup {
+    // layout. Priority matches input dispatch: register-project >
+    // secret setup > spawn prompt. None of these are designed to
+    // co-exist; only one can be `Some` at a time in practice.
+    if let Some(rp) = &app.register_project {
+        render_register_project(frame, rp);
+    } else if let Some(setup) = &app.secret_setup {
         render_secret_setup(frame, setup);
     } else if let Some(prompt) = &app.spawn_prompt {
         render_spawn_prompt(frame, prompt, app.ao_up);
@@ -387,18 +389,14 @@ fn build_welcome_lines(app: &App) -> Vec<Line<'static>> {
             )),
             Line::raw(""),
             Line::from(vec![
-                Span::styled("  Press ", muted),
-                Span::styled("c", bold_key),
-                Span::styled("  to edit agent-orchestrator.yaml and add a `path:`", muted),
+                Span::styled("  ", muted),
+                Span::styled("A", bold_key),
+                Span::styled("  to register this directory as a project", muted),
             ]),
-            Line::from(Span::styled(
-                "  entry that points at this directory, then press ",
-                muted,
-            )),
             Line::from(vec![
                 Span::styled("  ", muted),
-                Span::styled("r", bold_key),
-                Span::styled("  to reload.", muted),
+                Span::styled("c", bold_key),
+                Span::styled("  to edit agent-orchestrator.yaml manually", muted),
             ]),
         ];
     }
@@ -761,6 +759,83 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// below (filtered by the buffer), and footer key hints. Enter
 /// submits the highlighted row or, if there's no list / no match,
 /// the raw buffer. Esc cancels.
+/// "Register this directory as a fleet project" modal. Painted when
+/// the user invokes `Shift+A` from the welcome screen. Shows the
+/// (non-editable) absolute cwd plus two editable text fields,
+/// `name` and `sessionPrefix`. Tab toggles between them; the cursor
+/// `█` glyph marks which field receives keystrokes. On save the
+/// modal closes and the welcome screen vanishes — see
+/// `crate::tui::terminal::save_register_project`.
+pub(super) fn render_register_project(frame: &mut Frame<'_>, rp: &RegisterProject) {
+    let muted = Style::default().fg(MUTED);
+    let bold_accent = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let cursor_style = Style::default().fg(KEY_FG);
+
+    // Build one field row. The cursor glyph rides at the end of the
+    // active field so the user has a visual anchor for where their
+    // next keystroke lands.
+    let field_row = |label: &str, value: &str, focused: bool| -> Line<'static> {
+        let value_style = if focused {
+            bold_accent
+        } else {
+            Style::default()
+        };
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(format!("  {label:<12}"), muted),
+            Span::styled(value.to_string(), value_style),
+        ];
+        if focused {
+            spans.push(Span::styled("█", cursor_style));
+        }
+        Line::from(spans)
+    };
+
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            "Add this directory as a fleet project.",
+            muted,
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  path        ", muted),
+            // Path isn't editable but rendering it muted/dim makes
+            // that legible — the eye reads the two editable rows
+            // below as "the live values" by contrast.
+            Span::styled(rp.path.display().to_string(), muted),
+        ]),
+        field_row("name", &rp.name, rp.focus == RegisterField::Name),
+        field_row("prefix", &rp.prefix, rp.focus == RegisterField::Prefix),
+    ];
+    if let Some(err) = &rp.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("  error       ", Style::default().fg(ERR)),
+            Span::styled(
+                err.clone(),
+                Style::default().fg(ERR).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
+
+    let footer = vec![Line::from(vec![
+        modal_key("enter"),
+        Span::styled(" save   ", muted),
+        modal_key("tab"),
+        Span::styled(" switch field   ", muted),
+        modal_key("esc"),
+        Span::styled(" cancel", muted),
+    ])];
+
+    draw_modal_sized(
+        frame,
+        " register project ",
+        ACCENT,
+        lines,
+        &footer,
+        ModalWidth::Fixed(72),
+    );
+}
+
 /// "Configure Claude OAuth token" modal. Painted when a user
 /// action that needs the token finds none configured. Single text
 /// field, masked rendering, in-modal error row for save failures

@@ -8,7 +8,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use super::app::{App, ClickKind, ClickTarget, Command, Confirm};
+use super::app::{App, ClickKind, ClickTarget, Command, Confirm, RegisterField};
 
 /// Default mode: navigation + action keys. Falls through to no-op on
 /// unknown keys so e.g. `Shift+F1` doesn't accidentally fire an action.
@@ -67,6 +67,16 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
             app.confirm = Some(Confirm::StopAo);
         }
         (KeyCode::Char('W'), _) => app.push_command(Command::OpenWeb),
+
+        // Shift+A — open the "register this directory as a fleet
+        // project" modal. Gated on the welcome state so it can't
+        // accidentally fire when the user is already scoped to a
+        // project (and the keymap legend doesn't advertise it then
+        // either — see `build_welcome_lines` for the welcome-only
+        // hint).
+        (KeyCode::Char('A'), _) if app.current_project_key.is_none() => {
+            app.open_register_project();
+        }
         _ => {}
     }
 }
@@ -162,6 +172,110 @@ pub(super) fn handle_key_secret_setup(app: &mut App, key: KeyEvent) {
         KeyCode::Char(c) if !c.is_control() => {
             setup.buffer.push(c);
             setup.error = None;
+        }
+        _ => {}
+    }
+}
+
+/// Register-project mode: two-field form (name + sessionPrefix).
+/// Tab toggles which field receives keystrokes. Enter validates
+/// non-empty inputs and emits `Command::SaveRegisterProject`; Esc
+/// dismisses with no flash (the user cancelled deliberately).
+///
+/// While the user types in the name field, the prefix re-derives on
+/// every keystroke unless the user has already started editing the
+/// prefix manually — `prefix_touched` latches that intent so the
+/// auto-suggestion doesn't trample a deliberate choice. The prefix
+/// field itself accepts only `[a-z0-9]` (anything else is silently
+/// ignored) because AO uses the prefix as a path segment.
+pub(super) fn handle_key_register_project(app: &mut App, key: KeyEvent) {
+    if app.register_project.is_none() {
+        return;
+    }
+    match key.code {
+        KeyCode::Enter => {
+            // Snapshot the buffers, run validation, then either set
+            // an inline error or push the save command. The save
+            // handler closes the modal on success / writes the error
+            // back on failure.
+            let rp = app.register_project.as_mut().expect("checked above");
+            let name = rp.name.trim().to_string();
+            let prefix = rp.prefix.trim().to_string();
+            if name.is_empty() {
+                rp.error = Some("name is empty".to_string());
+                return;
+            }
+            if prefix.is_empty() {
+                rp.error = Some("prefix is empty".to_string());
+                return;
+            }
+            let path = rp.path.clone();
+            // The yaml key matches the name verbatim — AO is
+            // case-sensitive on project keys and the user already
+            // sees this value in the modal, so no surprise lower-casing.
+            app.push_command(Command::SaveRegisterProject {
+                key: name.clone(),
+                name,
+                prefix,
+                path,
+            });
+        }
+        KeyCode::Esc => {
+            app.register_project = None;
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            let rp = app.register_project.as_mut().expect("checked above");
+            rp.focus = match rp.focus {
+                RegisterField::Name => RegisterField::Prefix,
+                RegisterField::Prefix => RegisterField::Name,
+            };
+            rp.error = None;
+        }
+        KeyCode::Backspace => {
+            let (need_refresh, focus) = {
+                let rp = app.register_project.as_mut().expect("checked above");
+                rp.error = None;
+                match rp.focus {
+                    RegisterField::Name => {
+                        rp.name.pop();
+                        (!rp.prefix_touched, RegisterField::Name)
+                    }
+                    RegisterField::Prefix => {
+                        rp.prefix.pop();
+                        (false, RegisterField::Prefix)
+                    }
+                }
+            };
+            let _ = focus;
+            if need_refresh {
+                app.refresh_register_prefix();
+            }
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            let need_refresh = {
+                let rp = app.register_project.as_mut().expect("checked above");
+                rp.error = None;
+                match rp.focus {
+                    RegisterField::Name => {
+                        rp.name.push(c);
+                        !rp.prefix_touched
+                    }
+                    RegisterField::Prefix => {
+                        // Prefix is part of git branch / path
+                        // segments downstream; constrain to safe
+                        // chars rather than letting `agent/<id>`
+                        // pick up arbitrary unicode.
+                        if c.is_ascii_alphanumeric() {
+                            rp.prefix.push(c.to_ascii_lowercase());
+                            rp.prefix_touched = true;
+                        }
+                        false
+                    }
+                }
+            };
+            if need_refresh {
+                app.refresh_register_prefix();
+            }
         }
         _ => {}
     }

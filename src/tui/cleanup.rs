@@ -175,7 +175,12 @@ fi
 /// output; a non-zero exit returns an error containing the trimmed
 /// stderr so the refresh thread can surface it through the normal
 /// error channel.
-pub fn sweep(host_repo: &Path, ao_workdir: &Path, project_key: &str, min_age_secs: u64) -> Result<()> {
+pub fn sweep(
+    host_repo: &Path,
+    ao_workdir: &Path,
+    project_key: &str,
+    min_age_secs: u64,
+) -> Result<()> {
     let args = [
         "shell".to_string(),
         "--workdir".to_string(),
@@ -209,7 +214,10 @@ pub fn sweep(host_repo: &Path, ao_workdir: &Path, project_key: &str, min_age_sec
         .context("wait on cleanup subprocess")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let code = out.status.code().map_or_else(|| "signal".into(), |c| c.to_string());
+        let code = out
+            .status
+            .code()
+            .map_or_else(|| "signal".into(), |c| c.to_string());
         anyhow::bail!("crash sweep exited {code}: {stderr}");
     }
     Ok(())

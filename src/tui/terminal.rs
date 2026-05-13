@@ -12,7 +12,7 @@ use crossterm::{event, execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::ao_task::{AoTask, TaskPhase};
@@ -375,10 +375,14 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
             // someone hit when an error vanished as they reached for
             // the trackpad to drag-select the message.
             app.dismiss_flash();
-            // Mode-first dispatch. Order of precedence: spawn modal
-            // (text input intercepts everything) → confirm (y/N gate)
-            // → normal view keys.
-            if app.secret_setup.is_some() {
+            // Mode-first dispatch. Order of precedence: register
+            // project (text-input, mutates persistent yaml — top
+            // priority so a stray keystroke can't fall through) →
+            // secret setup (token input) → spawn modal → confirm
+            // (y/N gate) → normal view keys.
+            if app.register_project.is_some() {
+                input::handle_key_register_project(app, *k);
+            } else if app.secret_setup.is_some() {
                 input::handle_key_secret_setup(app, *k);
             } else if app.spawn_prompt.is_some() {
                 input::handle_key_spawn_prompt(app, *k);
@@ -390,11 +394,13 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
         }
         // Mouse is ignored while any modal is pending — keyboard-
         // only resolution avoids accidentally killing a session or
-        // dismissing a spawn / token prompt with a stray click.
+        // dismissing a spawn / token / register prompt with a stray
+        // click.
         event::Event::Mouse(m)
             if app.confirm.is_none()
                 && app.spawn_prompt.is_none()
-                && app.secret_setup.is_none() =>
+                && app.secret_setup.is_none()
+                && app.register_project.is_none() =>
         {
             input::handle_mouse_normal(app, *m);
         }
@@ -434,6 +440,12 @@ fn run_command(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>,
         Command::RequestRefresh => app.request_refresh(),
         Command::Spawn(issue) => spawn_session(app, &issue),
         Command::SaveOauthToken(token) => save_oauth_token(app, &token),
+        Command::SaveRegisterProject {
+            key,
+            name,
+            prefix,
+            path,
+        } => save_register_project(app, &key, &name, &prefix, &path),
     }
 }
 
@@ -691,7 +703,13 @@ fn start_ao(app: &mut App) {
     let start_phase = match build_start_phase(&repo_root, None) {
         Ok(p) => p,
         Err(e) => {
-            app.flash_err(format!("starting AO: {e:#}").lines().next().unwrap_or("").to_string());
+            app.flash_err(
+                format!("starting AO: {e:#}")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            );
             return;
         }
     };
@@ -719,20 +737,30 @@ fn restart_ao_for_orchestrator(app: &mut App) {
     // `ao stop --all` releases the lock and frees the dashboard's
     // port so the subsequent `ao start` doesn't hit the "already
     // running" check.
-    let stop_phase = match crate::cli::passthrough::build_spec(&[
-        "stop".to_string(),
-        "--all".to_string(),
-    ]) {
-        Ok(spec) => spec_to_phase(spec, Some("stopping AO")),
-        Err(e) => {
-            app.flash_err(format!("restart AO: {e:#}").lines().next().unwrap_or("").to_string());
-            return;
-        }
-    };
+    let stop_phase =
+        match crate::cli::passthrough::build_spec(&["stop".to_string(), "--all".to_string()]) {
+            Ok(spec) => spec_to_phase(spec, Some("stopping AO")),
+            Err(e) => {
+                app.flash_err(
+                    format!("restart AO: {e:#}")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                return;
+            }
+        };
     let start_phase = match build_start_phase(&repo_root, Some("starting AO")) {
         Ok(phase) => phase,
         Err(e) => {
-            app.flash_err(format!("restart AO: {e:#}").lines().next().unwrap_or("").to_string());
+            app.flash_err(
+                format!("restart AO: {e:#}")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            );
             return;
         }
     };
@@ -825,10 +853,7 @@ fi
 /// Adapter from [`crate::process::CommandSpec`] (the per-action
 /// invocation built by `cli::spawn` / `cli::passthrough`) to the
 /// `TaskPhase` shape [`AoTask`] consumes.
-fn spec_to_phase(
-    spec: crate::process::CommandSpec,
-    label: Option<&str>,
-) -> TaskPhase {
+fn spec_to_phase(spec: crate::process::CommandSpec, label: Option<&str>) -> TaskPhase {
     TaskPhase {
         program: spec.program,
         args: spec.args,
@@ -860,16 +885,21 @@ fn open_web(app: &mut App) {
 
 fn kill_session(app: &mut App, id: String) {
     let label = format!("killing {id}");
-    let spec = match crate::cli::passthrough::build_spec_with_prefix(
-        "session",
-        &["kill".to_string(), id],
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            app.flash_err(format!("{label}: {e:#}").lines().next().unwrap_or("").to_string());
-            return;
-        }
-    };
+    let spec =
+        match crate::cli::passthrough::build_spec_with_prefix("session", &["kill".to_string(), id])
+        {
+            Ok(s) => s,
+            Err(e) => {
+                app.flash_err(
+                    format!("{label}: {e:#}")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                return;
+            }
+        };
     match AoTask::spawn(label, vec![spec_to_phase(spec, None)]) {
         Ok(task) => app.in_flight_ao = Some(task),
         Err(e) => app.flash_err(format!("spawn AO task: {e:#}")),
@@ -890,7 +920,13 @@ fn spawn_session(app: &mut App, issue: &str) {
     let spec = match crate::cli::spawn::build_spawn_spec(&app.repo_root, issue, None, None) {
         Ok(s) => s,
         Err(e) => {
-            app.flash_err(format!("{label}: {e:#}").lines().next().unwrap_or("").to_string());
+            app.flash_err(
+                format!("{label}: {e:#}")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            );
             return;
         }
     };
@@ -993,12 +1029,52 @@ fn append_keychain_secret_to_config(service: &str) -> Result<()> {
     Ok(())
 }
 
+/// Append a new `projects.<key>:` block to the AO yaml from the
+/// register-project modal. On success closes the modal, reloads the
+/// cached `AoConfig` (so `current_project_key` flips and the welcome
+/// screen vanishes), and flashes confirmation. On failure leaves
+/// the modal open and surfaces the error inline.
+fn save_register_project(app: &mut App, key: &str, name: &str, prefix: &str, path: &Path) {
+    let Some(yaml_path) = crate::ao::config::AoConfig::default_xdg_path() else {
+        if let Some(rp) = app.register_project.as_mut() {
+            rp.error = Some("no $HOME / $XDG_CONFIG_HOME".to_string());
+        }
+        return;
+    };
+    if let Err(e) =
+        crate::tui::register::append_project_to_ao_yaml(&yaml_path, key, name, prefix, path)
+    {
+        if let Some(rp) = app.register_project.as_mut() {
+            // Single-line so a tall multi-line anyhow chain doesn't
+            // overflow the modal — the head sentence carries the
+            // user-facing remediation.
+            let msg = format!("{e:#}")
+                .lines()
+                .next()
+                .unwrap_or("save failed")
+                .to_string();
+            rp.error = Some(msg);
+        }
+        return;
+    }
+    app.register_project = None;
+    app.reload_ao_config();
+    app.flash_ok(format!("registered as {key}"));
+    app.request_refresh();
+}
+
 fn stop_ao(app: &mut App) {
     let label = "stopping AO";
     let spec = match crate::cli::passthrough::build_spec(&["stop".to_string()]) {
         Ok(s) => s,
         Err(e) => {
-            app.flash_err(format!("{label}: {e:#}").lines().next().unwrap_or("").to_string());
+            app.flash_err(
+                format!("{label}: {e:#}")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            );
             return;
         }
     };

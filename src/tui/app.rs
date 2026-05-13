@@ -83,6 +83,39 @@ pub(super) struct SecretSetup {
     pub(super) error: Option<String>,
 }
 
+/// Which text field the register-project modal currently routes
+/// keystrokes to. Tab cycles between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RegisterField {
+    Name,
+    Prefix,
+}
+
+/// In-progress "register this directory as a fleet project" prompt.
+/// Surfaces from the welcome screen via `Shift+A` when fleet is
+/// launched in a directory not covered by any `projects.*.path:` in
+/// `agent-orchestrator.yaml`. On Enter, the contents are written as
+/// a fresh `projects.<key>:` block via [`crate::tui::register`]; on
+/// success the welcome screen vanishes because `current_project_key`
+/// flips to `Some(<key>)` after the cached config reloads.
+#[derive(Debug, Clone)]
+pub(super) struct RegisterProject {
+    /// Absolute cwd that becomes the project's `path:`. Not editable
+    /// — fleet only registers the directory it was launched from.
+    pub(super) path: PathBuf,
+    pub(super) name: String,
+    pub(super) prefix: String,
+    pub(super) focus: RegisterField,
+    /// Once the user has typed in the prefix field, name edits stop
+    /// auto-overwriting it. Tracks intent so the auto-derivation
+    /// stays helpful without trampling deliberate choices.
+    pub(super) prefix_touched: bool,
+    /// Inline error (e.g. "project key already exists") rendered
+    /// inside the modal so it's not hidden by the overlay. Cleared
+    /// on every keystroke.
+    pub(super) error: Option<String>,
+}
+
 /// In-progress "spawn session" prompt. While `Some`, all keyboard
 /// input is intercepted by the prompt handler so accidental
 /// keystrokes can't fire a different action.
@@ -187,6 +220,16 @@ pub(super) enum Command {
     /// OS keychain (keyring crate) and append the matching
     /// `[secrets.claude_code_oauth_token]` block to the fleet config.
     SaveOauthToken(String),
+    /// Submit the values collected in `register_project`: append a
+    /// new `projects.<key>:` block to the AO yaml and reload the
+    /// cached config so the breadcrumb + sidebar reflect the new
+    /// scope on the next frame.
+    SaveRegisterProject {
+        key: String,
+        name: String,
+        prefix: String,
+        path: PathBuf,
+    },
 }
 
 pub struct App {
@@ -238,6 +281,13 @@ pub struct App {
     /// priority (above spawn prompt and confirm) so it can't be
     /// dismissed by accident while the user is typing the token.
     pub(super) secret_setup: Option<SecretSetup>,
+
+    /// Active "register this directory as a project" modal. Same
+    /// intercept-everything contract as `secret_setup`; sits even
+    /// above it in the input-priority chain (see
+    /// [`crate::tui::terminal::dispatch_event`]) so a stray `Shift+A`
+    /// while another modal is open can't re-enter this flow.
+    pub(super) register_project: Option<RegisterProject>,
     pub(super) ao_up: bool,
     pub(super) vm_status: VmStatus,
     pub(super) confirm: Option<Confirm>,
@@ -308,6 +358,7 @@ impl App {
             last_info: None,
             spawn_prompt: None,
             secret_setup: None,
+            register_project: None,
             ao_up: false,
             vm_status: VmStatus::Missing,
             confirm: None,
@@ -723,6 +774,51 @@ impl App {
         });
     }
 
+    /// Open the "register this directory as a fleet project" modal.
+    /// Pre-fills `name` from the cwd's basename, derives a 2-char
+    /// `sessionPrefix` from that name, and resolves any prefix
+    /// collision with the loaded `AoConfig` by appending an
+    /// incrementing digit (`fo`, `fo2`, …). No-op if a modal is
+    /// already open — the caller is expected to gate on
+    /// `current_project_key.is_none()` before invoking.
+    pub(super) fn open_register_project(&mut self) {
+        let name = self
+            .repo_root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        let prefix = derive_prefix(&name, self.ao_config.as_ref());
+        self.register_project = Some(RegisterProject {
+            path: self.repo_root.clone(),
+            name,
+            prefix,
+            focus: RegisterField::Name,
+            prefix_touched: false,
+            error: None,
+        });
+    }
+
+    /// Recompute `prefix` from the current `name` buffer in the
+    /// register-project modal, *only* when the user hasn't yet
+    /// touched the prefix field. Called from the input handler on
+    /// every name keystroke so the derived value stays in sync as
+    /// the user edits.
+    pub(super) fn refresh_register_prefix(&mut self) {
+        // Two-step borrow: derive uses `&self.ao_config`, write
+        // needs `&mut self.register_project`. Pull the name into an
+        // owned string first so the immutable borrow ends before the
+        // mutable one starts.
+        let name = match self.register_project.as_ref() {
+            Some(rp) if !rp.prefix_touched => rp.name.clone(),
+            _ => return,
+        };
+        let prefix = derive_prefix(&name, self.ao_config.as_ref());
+        if let Some(rp) = self.register_project.as_mut() {
+            rp.prefix = prefix;
+        }
+    }
+
     /// Non-blocking poll of the spawn-prompt's issue fetcher channel.
     /// Called from the main loop's `drain_updates` so the prompt
     /// transitions Loading → Loaded / Error without the user having
@@ -783,6 +879,44 @@ impl App {
     pub(super) fn drain_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.pending_commands)
     }
+}
+
+/// Derive a non-colliding `sessionPrefix` from `name`.
+///
+/// Strategy: lowercase + filter to `[a-z0-9]`, take the first two
+/// characters (fallback `"px"` if fewer survive). If `cfg` already
+/// has a project with that prefix, append `2`, `3`, … until unique.
+/// Used by both the initial `open_register_project` pre-fill and the
+/// live re-derivation in `refresh_register_prefix`, so the same
+/// collision logic applies whether the user accepts the suggestion
+/// or watches it update as they edit the name field.
+pub(super) fn derive_prefix(name: &str, cfg: Option<&crate::ao::config::AoConfig>) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .filter(char::is_ascii_alphanumeric)
+        .take(2)
+        .collect();
+    let base = if stem.is_empty() {
+        "px".to_string()
+    } else {
+        stem
+    };
+    let taken: std::collections::HashSet<&str> = cfg
+        .iter()
+        .flat_map(|c| c.projects.values())
+        .filter_map(|p| p.session_prefix.as_deref())
+        .collect();
+    if !taken.contains(base.as_str()) {
+        return base;
+    }
+    for n in 2u32..1000 {
+        let candidate = format!("{base}{n}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    base
 }
 
 #[cfg(test)]
@@ -1142,9 +1276,15 @@ mod tests {
         }
         assert!(app.in_flight_ao.is_none());
         assert!(app.last_info.is_none());
-        let err = app.action_error.as_deref().expect("expected an error flash");
+        let err = app
+            .action_error
+            .as_deref()
+            .expect("expected an error flash");
         assert!(err.contains("stopping AO failed"), "got: {err}");
-        assert!(err.contains("boom"), "stderr tail should surface in flash: {err}");
+        assert!(
+            err.contains("boom"),
+            "stderr tail should surface in flash: {err}"
+        );
     }
 
     #[test]
@@ -1186,5 +1326,58 @@ mod tests {
             app.drain_commands().is_empty(),
             "second drain should be empty"
         );
+    }
+
+    fn ao_config_with_prefixes(prefixes: &[&str]) -> crate::ao::config::AoConfig {
+        use crate::ao::config::{AoConfig, Defaults, Project};
+        use std::collections::BTreeMap;
+        let mut projects = BTreeMap::new();
+        for (i, p) in prefixes.iter().enumerate() {
+            projects.insert(
+                format!("k{i}"),
+                Project {
+                    name: format!("k{i}"),
+                    session_prefix: Some((*p).to_string()),
+                    path: std::path::PathBuf::from("/tmp"),
+                    default_branch: None,
+                    agent_rules_file: None,
+                    agent: None,
+                    tracker: None,
+                    post_create: Vec::new(),
+                    extra: BTreeMap::new(),
+                },
+            );
+        }
+        AoConfig {
+            schema: None,
+            port: None,
+            defaults: Defaults::default(),
+            projects,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn derive_prefix_takes_first_two_alpha_chars_lowercased() {
+        assert_eq!(derive_prefix("Foo-Bar", None), "fo");
+        assert_eq!(derive_prefix("dev-wrap", None), "de");
+    }
+
+    #[test]
+    fn derive_prefix_falls_back_when_name_has_no_alphanum() {
+        assert_eq!(derive_prefix("---", None), "px");
+        assert_eq!(derive_prefix("", None), "px");
+    }
+
+    #[test]
+    fn derive_prefix_skips_taken_with_incrementing_digit() {
+        let cfg = ao_config_with_prefixes(&["de", "de2"]);
+        assert_eq!(derive_prefix("dev-wrap", Some(&cfg)), "de3");
+    }
+
+    #[test]
+    fn derive_prefix_returns_base_when_no_collision() {
+        let cfg = ao_config_with_prefixes(&["xx"]);
+        assert_eq!(derive_prefix("foo", Some(&cfg)), "fo");
     }
 }

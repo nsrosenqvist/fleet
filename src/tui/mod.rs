@@ -20,6 +20,7 @@ mod cleanup;
 mod input;
 mod preflight;
 mod refresh;
+mod register;
 pub mod subprocess;
 mod terminal;
 mod theme;

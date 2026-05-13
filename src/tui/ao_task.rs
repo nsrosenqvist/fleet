@@ -274,7 +274,10 @@ mod tests {
             "multi-line",
             vec![TaskPhase {
                 program: "sh".into(),
-                args: vec!["-c".into(), "echo first; echo middle; echo last; exit 9".into()],
+                args: vec![
+                    "-c".into(),
+                    "echo first; echo middle; echo last; exit 9".into(),
+                ],
                 env_set: Vec::new(),
                 env_unset: Vec::new(),
                 label: None,
