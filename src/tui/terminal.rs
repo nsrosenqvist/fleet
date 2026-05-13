@@ -384,6 +384,7 @@ fn run_command(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>,
         Command::TrackerPreview => tracker_preview(app, term),
         Command::TrackerWeb => tracker_web(app),
         Command::StartAo => start_ao(app, term),
+        Command::RestartAoForOrchestrator => restart_ao_for_orchestrator(app, term),
         Command::OpenWeb => open_web(app),
         Command::KillSession(id) => kill_session(app, term, id),
         Command::StopAo => stop_ao(app, term),
@@ -616,13 +617,64 @@ fn github_issues_url_for(project_path: &std::path::Path) -> Result<String> {
     Ok(format!("https://github.com/{path}/issues"))
 }
 
+/// `Shift+S` handler. AO's lifecycle is more involved than "start
+/// when down, no-op when up" — the daemon can be running with no
+/// orchestrator (the dashboard survives, the project's claude
+/// session was killed), and running `ao start` in that state drops
+/// the user into AO's interactive "already running" menu. The
+/// branches below keep the TUI in charge:
+///
+/// - AO down: `ao start` as before (creates dashboard + orchestrator).
+/// - AO up + orchestrator present: silent flash, no subprocess.
+/// - AO up, no orchestrator: open a confirm modal offering to
+///   restart the daemon. The actual restart runs from `Command::
+///   RestartAoForOrchestrator` after the user accepts.
 fn start_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     if !ensure_oauth_token_configured(app) {
+        return;
+    }
+    if app.ao_up {
+        if app.has_orchestrator() {
+            // Already in the state the user wants.
+            return;
+        }
+        // Daemon up, orchestrator missing: prompt before destroying
+        // the daemon (kills the dashboard and any worker sessions
+        // along with it).
+        app.confirm = Some(crate::tui::app::Confirm::RestartAoForOrchestrator);
         return;
     }
     let repo_root = app.repo_root.clone();
     let res = suspend_around(term, || {
         crate::cli::spawn::run_start(&repo_root, false, false).map(|_| ())
+    });
+    app.flash_if_err(res);
+    app.request_refresh();
+}
+
+/// Tear AO down and start it fresh against the current project.
+/// Bypasses `ao start`'s "already running" interactive menu when
+/// the daemon is up but no orchestrator exists. Destructive (kills
+/// dashboard + any running workers); only invoked after a y/N
+/// confirm in [`start_ao`].
+fn restart_ao_for_orchestrator(
+    app: &mut App,
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) {
+    if !ensure_oauth_token_configured(app) {
+        return;
+    }
+    let repo_root = app.repo_root.clone();
+    let res = suspend_around(term, || {
+        // `ao stop --all` releases the lock and frees the
+        // dashboard's port so the subsequent `ao start` doesn't
+        // hit the "already running" check.
+        crate::cli::passthrough::run(
+            &repo_root,
+            &["stop".to_string(), "--all".to_string()],
+        )
+        .map(|_| ())
+        .and_then(|()| crate::cli::spawn::run_start(&repo_root, false, false).map(|_| ()))
     });
     app.flash_if_err(res);
     app.request_refresh();

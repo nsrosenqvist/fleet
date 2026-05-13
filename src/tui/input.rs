@@ -171,6 +171,9 @@ pub(super) fn handle_key_confirm(app: &mut App, key: KeyEvent) {
         match pending {
             Confirm::KillSession(id) => app.push_command(Command::KillSession(id)),
             Confirm::StopAo => app.push_command(Command::StopAo),
+            Confirm::RestartAoForOrchestrator => {
+                app.push_command(Command::RestartAoForOrchestrator);
+            }
         }
     }
     // Cancel path is silent — the user explicitly pressed a non-y

@@ -133,6 +133,12 @@ pub(super) enum SidebarRow<'a> {
 pub(super) enum Confirm {
     KillSession(String),
     StopAo,
+    /// AO daemon is up but no orchestrator exists for the current
+    /// project. `ao start` would just open the interactive
+    /// "already running" menu, so fleet offers to restart cleanly
+    /// — kills the dashboard + any running workers + spawns a
+    /// fresh orchestrator.
+    RestartAoForOrchestrator,
 }
 
 impl Confirm {
@@ -140,6 +146,10 @@ impl Confirm {
         match self {
             Self::KillSession(id) => format!("Kill session {id}? [y/N]"),
             Self::StopAo => "Stop AO orchestrator + dashboard? [y/N]".to_string(),
+            Self::RestartAoForOrchestrator => {
+                "No orchestrator running. Restart AO to spawn one? Kills any running workers. [y/N]"
+                    .to_string()
+            }
         }
     }
 }
@@ -162,6 +172,11 @@ pub(super) enum Command {
     /// flashes a no-op for plugins without one (git-bug).
     TrackerWeb,
     StartAo,
+    /// `ao stop --all` followed by `ao start <project>`. Used when
+    /// the daemon is up but no orchestrator exists — bypasses AO's
+    /// interactive "already running" menu by tearing the daemon
+    /// down first.
+    RestartAoForOrchestrator,
     OpenWeb,
     KillSession(String),
     StopAo,
@@ -423,6 +438,17 @@ impl App {
         }
         rows.push(SidebarRow::Sentinel);
         rows
+    }
+
+    /// True when at least one orchestrator session is live for any
+    /// project fleet can see. Drives the smart `Shift+S` handler:
+    /// if AO is up but no orchestrator exists, fleet offers to
+    /// restart the daemon to spawn one instead of dropping the user
+    /// into `ao start`'s interactive "already running" menu.
+    pub(super) fn has_orchestrator(&self) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.role.as_deref() == Some("orchestrator"))
     }
 
     /// How many orchestrator entries are currently in the sidebar —
