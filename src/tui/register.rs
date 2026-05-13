@@ -13,6 +13,7 @@
 //! left to manual editing.
 
 use anyhow::{Context, Result, bail};
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// Append a new `projects.<key>:` entry to the AO yaml at `yaml_path`.
@@ -20,12 +21,22 @@ use std::path::Path;
 /// `projects:` top-level key if missing. Returns an error if a
 /// project with the same `key` already exists or if the projects
 /// block uses tab indentation we can't safely match.
+///
+/// `agent_rules_file`, when provided, is written as an absolute
+/// `agentRulesFile: <path>` line on the new entry. The intended
+/// value is fleet's XDG worker-rules path
+/// (`<XDG_CONFIG_HOME>/fleet/templates/AGENTS.md`) so newly-registered
+/// projects pick up the canonical lifecycle rules without the user
+/// having to drop an AGENTS.md into each repo. Pass `None` to omit
+/// the line (in which case the worker will use whatever AO's
+/// default fallback is — usually no rules file at all).
 pub fn append_project_to_ao_yaml(
     yaml_path: &Path,
     key: &str,
     name: &str,
     prefix: &str,
     cwd: &Path,
+    agent_rules_file: Option<&Path>,
 ) -> Result<()> {
     if let Some(parent) = yaml_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
@@ -40,7 +51,7 @@ pub fn append_project_to_ao_yaml(
         );
     }
 
-    let entry = build_entry_text(key, name, prefix, cwd);
+    let entry = build_entry_text(key, name, prefix, cwd, agent_rules_file);
 
     let new_text = match summary.kind {
         ProjectsKind::Absent => append_projects_block_at_eof(&existing, &entry),
@@ -171,14 +182,28 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
 }
 
 /// Build the 2-space-indented yaml block for a new project entry.
-/// `path` is always quoted-when-needed so a directory containing
-/// spaces / colons / yaml-special chars round-trips through `serde_yml`.
-fn build_entry_text(key: &str, name: &str, prefix: &str, cwd: &Path) -> String {
+/// `path` and `agent_rules_file` are quoted-when-needed so paths
+/// containing spaces / colons / yaml-special chars round-trip through
+/// `serde_yml`.
+fn build_entry_text(
+    key: &str,
+    name: &str,
+    prefix: &str,
+    cwd: &Path,
+    agent_rules_file: Option<&Path>,
+) -> String {
     let key_q = yaml_quote_scalar(key);
     let name_q = yaml_quote_scalar(name);
     let prefix_q = yaml_quote_scalar(prefix);
     let path_q = yaml_quote_scalar(&cwd.to_string_lossy());
-    format!("  {key_q}:\n    name: {name_q}\n    path: {path_q}\n    sessionPrefix: {prefix_q}\n")
+    let mut out = format!(
+        "  {key_q}:\n    name: {name_q}\n    path: {path_q}\n    sessionPrefix: {prefix_q}\n"
+    );
+    if let Some(rules) = agent_rules_file {
+        let rules_q = yaml_quote_scalar(&rules.to_string_lossy());
+        let _ = writeln!(out, "    agentRulesFile: {rules_q}");
+    }
+    out
 }
 
 /// Returns `s` unchanged when it's a yaml "plain scalar" (no
@@ -269,7 +294,8 @@ mod tests {
         if let Some(body) = initial {
             std::fs::write(&path, body).unwrap();
         }
-        append_project_to_ao_yaml(&path, key, name, prefix, Path::new(cwd)).expect("append ok");
+        append_project_to_ao_yaml(&path, key, name, prefix, Path::new(cwd), None)
+            .expect("append ok");
         let out = std::fs::read_to_string(&path).unwrap();
         (tmp, out)
     }
@@ -350,7 +376,7 @@ projects:
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("agent-orchestrator.yaml");
         std::fs::write(&path, initial).unwrap();
-        let err = append_project_to_ao_yaml(&path, "foo", "foo", "fo", Path::new("/tmp/foo"))
+        let err = append_project_to_ao_yaml(&path, "foo", "foo", "fo", Path::new("/tmp/foo"), None)
             .expect_err("duplicate must error");
         assert!(format!("{err:#}").contains("already exists"));
         // File untouched.
@@ -374,9 +400,39 @@ projects:
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("agent-orchestrator.yaml");
         std::fs::write(&path, initial).unwrap();
-        let err = append_project_to_ao_yaml(&path, "bar", "bar", "ba", Path::new("/tmp/bar"))
+        let err = append_project_to_ao_yaml(&path, "bar", "bar", "ba", Path::new("/tmp/bar"), None)
             .expect_err("tab indent must error");
         assert!(format!("{err:#}").contains("tab indent"));
+    }
+
+    #[test]
+    fn appends_agent_rules_file_when_provided() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("agent-orchestrator.yaml");
+        append_project_to_ao_yaml(
+            &path,
+            "foo",
+            "foo",
+            "fo",
+            Path::new("/tmp/foo"),
+            Some(Path::new("/home/u/.config/fleet/templates/AGENTS.md")),
+        )
+        .expect("append ok");
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.contains("    agentRulesFile: /home/u/.config/fleet/templates/AGENTS.md\n"),
+            "rules-file line missing:\n{out}"
+        );
+        assert_parses_as_ao_config(&out);
+    }
+
+    #[test]
+    fn omits_agent_rules_file_when_absent() {
+        let (_t, out) = write_and_append(None, "foo", "foo", "fo", "/tmp/foo");
+        assert!(
+            !out.contains("agentRulesFile"),
+            "rules-file line must be absent when not requested:\n{out}"
+        );
     }
 
     #[test]

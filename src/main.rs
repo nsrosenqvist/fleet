@@ -14,6 +14,7 @@ mod config;
 mod lima;
 mod process;
 mod secrets;
+mod templates_sync;
 #[cfg(test)]
 mod test_env;
 mod tmux;

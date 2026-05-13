@@ -143,6 +143,13 @@ fn ao_workdir_or_bail() -> Result<PathBuf> {
             yaml.display()
         );
     }
+    // Materialize the worker AGENTS.md alongside the AO yaml so
+    // `agentRulesFile: <xdg>/templates/AGENTS.md` entries resolve on
+    // every code path that talks to AO, not just the ones the TUI
+    // walked through. Non-fatal — log and continue.
+    if let Err(e) = crate::templates_sync::ensure_worker_agents_md() {
+        tracing::warn!(error = ?e, "failed to materialize worker AGENTS.md");
+    }
     Ok(dir)
 }
 

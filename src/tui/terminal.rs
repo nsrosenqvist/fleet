@@ -470,9 +470,7 @@ fn attach_selected(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdou
     // panel and Claude Code's TUI re-renders broken on the next tick.
     // Cached dims come from the last `draw_output`; if we somehow
     // haven't rendered the panel yet, skip — there's nothing to pin to.
-    let packed = app
-        .pane_size
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let packed = app.pane_size.load(std::sync::atomic::Ordering::Relaxed);
     if packed != 0
         && let Some(workdir) = crate::ao::config::AoConfig::workdir()
     {
@@ -1060,9 +1058,19 @@ fn save_register_project(app: &mut App, key: &str, name: &str, prefix: &str, pat
         }
         return;
     };
-    if let Err(e) =
-        crate::tui::register::append_project_to_ao_yaml(&yaml_path, key, name, prefix, path)
-    {
+    // New project entries should pick up the canonical worker rules
+    // automatically. Use fleet's XDG-materialized AGENTS.md (see
+    // [`crate::templates_sync`]) when available; otherwise omit the
+    // line and let AO fall back to its own default.
+    let agent_rules = crate::templates_sync::worker_agents_md_path();
+    if let Err(e) = crate::tui::register::append_project_to_ao_yaml(
+        &yaml_path,
+        key,
+        name,
+        prefix,
+        path,
+        agent_rules.as_deref(),
+    ) {
         if let Some(rp) = app.register_project.as_mut() {
             // Single-line so a tall multi-line anyhow chain doesn't
             // overflow the modal — the head sentence carries the

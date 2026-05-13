@@ -111,6 +111,14 @@ fn check_with(
         VmStatus::Running => {}
     }
 
+    // Materialize the worker AGENTS.md to its XDG path before any AO
+    // call. Non-fatal: if the XDG dir can't be resolved or the write
+    // fails, log and continue — workers may still receive rules via a
+    // per-project override.
+    if let Err(e) = crate::templates_sync::ensure_worker_agents_md() {
+        tracing::warn!(error = ?e, "failed to materialize worker AGENTS.md");
+    }
+
     // Phase 4 + 5: AO yaml-driven checks. Loading is best-effort — if
     // it doesn't parse / doesn't exist, we skip both checks; the
     // spawn flow will surface the underlying error later.

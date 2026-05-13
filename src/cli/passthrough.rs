@@ -40,6 +40,14 @@ pub fn build_spec(ao_args: &[String]) -> Result<CommandSpec> {
     }
     let workdir = crate::ao::config::AoConfig::workdir()
         .context("no $HOME / $XDG_CONFIG_HOME — can't resolve AO workdir")?;
+    // Materialize the worker AGENTS.md to its XDG location before any
+    // `ao` call. Non-fatal — pass-through commands like `ao status`
+    // don't depend on the worker rules file existing, but spawn flows
+    // chained off these (`ao session ls` -> attach -> follow-up spawn)
+    // do, so syncing here keeps the file fresh on every entry point.
+    if let Err(e) = crate::templates_sync::ensure_worker_agents_md() {
+        tracing::warn!(error = ?e, "failed to materialize worker AGENTS.md");
+    }
     let mut args = vec![
         "shell".to_string(),
         "--workdir".to_string(),

@@ -72,11 +72,8 @@ pub fn resize_window(
         "tmux set-option -t {s} window-size manual >/dev/null 2>&1 || true; \
          tmux resize-window -t {s} -x {width} -y {height} >/dev/null 2>&1 || true"
     );
-    lima.shell(
-        workdir,
-        vec!["bash".to_string(), "-c".to_string(), script],
-    )
-    .map(|_| ())
+    lima.shell(workdir, vec!["bash".to_string(), "-c".to_string(), script])
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -143,8 +140,7 @@ mod tests {
                 // can't escape the surrounding bash. `shell_quote_single`
                 // turns `fl-4; rm -rf /` into `'fl-4; rm -rf /'`.
                 let script = args.last().map_or("", String::as_str);
-                script.contains("'fl-4; rm -rf /'")
-                    && !script.contains(" fl-4; rm -rf / ")
+                script.contains("'fl-4; rm -rf /'") && !script.contains(" fl-4; rm -rf / ")
             })
             .returning(|_, _| Ok(String::new()));
         let lima = Lima::new(Arc::new(mock), "fleet-vm");

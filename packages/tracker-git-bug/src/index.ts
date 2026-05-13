@@ -136,13 +136,23 @@ function createGitBugTracker(): Tracker {
       if (issue.description.length > 0) {
         lines.push("## Description", "", issue.description);
       }
+      const branch = `agent/${issue.id}`;
       lines.push(
         "",
         "The issue context above was fetched via `git-bug bug show`. You can re-fetch with `git-bug bug show " +
           issue.id +
           "` if you need to inspect raw fields, but the orchestrator-supplied context is current.",
         "",
-        "Implement the change described above. Commit using Conventional Commits and open a PR per AGENTS.md.",
+        "Lifecycle (the session stays on `working` until the PR is opened and reported):",
+        "  1. `ao acknowledge` after reading this prompt.",
+        "  2. `ao report working` before you start changing code.",
+        "  3. Implement the change; commit with Conventional Commits; run the project's verify suite (see AGENTS.md).",
+        `  4. \`git push -u origin ${branch}\``,
+        `  5. \`gh pr create --base "$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')" --title '<type>(<scope>): <summary>' --body "Closes git-bug:${issue.id}\\n\\n<why>"\``,
+        '  6. `ao report pr-created --pr-url "$(gh pr view --json url -q .url)"`',
+        "  7. After CI is green: `ao report ready-for-review`.",
+        "",
+        "AGENTS.md (mounted via agentRulesFile) is the source of truth for verification gates, conventions, and do-not-touch paths.",
       );
       return lines.join("\n");
     },

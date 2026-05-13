@@ -234,6 +234,20 @@ fn draw_sidebar_group(
                             "✓ done ",
                             Style::default().fg(OK).add_modifier(Modifier::BOLD),
                         ));
+                        // Pair the "done" badge with PR state — the gap
+                        // between agent-reported completion and an
+                        // actually-opened PR is the most common cause
+                        // of a session stuck on `working` in the AO
+                        // dashboard. Surface it next to the badge so
+                        // the user sees the failure mode from fleet.
+                        match s.pr_number {
+                            Some(n) => spans
+                                .push(Span::styled(format!("PR#{n} "), Style::default().fg(MUTED))),
+                            None => spans.push(Span::styled(
+                                "PR? ",
+                                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                            )),
+                        }
                     }
                 }
                 spans.push(Span::styled(activity, Style::default().fg(MUTED)));
@@ -334,6 +348,8 @@ fn build_session_kv_lines(s: &SessionInfo) -> Vec<Line<'static>> {
     push("project", s.project_id.as_deref());
     let worktree = s.workspace_path.as_deref().map(shorten_worktree);
     push("worktree", worktree.as_deref());
+    let pr = format_pr_cell(s);
+    push("pr", pr.as_deref());
     push("activity", s.activity.as_deref());
     push("last", s.last_activity.as_deref());
     push(
@@ -347,6 +363,45 @@ fn build_session_kv_lines(s: &SessionInfo) -> Vec<Line<'static>> {
         )));
     }
     lines
+}
+
+/// Render the details-panel `pr` row from the session's PR state.
+/// Returns `None` when no PR data is present — the kv builder
+/// suppresses empty rows, so we don't render an empty cell. The
+/// sidebar chip handles the "agent done but no PR" warning case
+/// (see [`draw_sidebar_group`]); this row's job is just to show the
+/// number / URL when a PR exists.
+///
+/// AO's `pr` field shape varies (raw `serde_json::Value` on purpose,
+/// see [`crate::ao::state::SessionInfo`]). Pull a URL out of the
+/// common shapes (`{ "url": "…" }`, `{ "html_url": "…" }`, or a bare
+/// string); fall back to just the number when no URL is recoverable.
+fn format_pr_cell(s: &SessionInfo) -> Option<String> {
+    let url = pr_url(s.pr.as_ref());
+    match (s.pr_number, url) {
+        (Some(n), Some(u)) => Some(format!("#{n}  {u}")),
+        (Some(n), None) => Some(format!("#{n}")),
+        (None, Some(u)) => Some(u),
+        (None, None) => None,
+    }
+}
+
+/// Pick a URL out of AO's permissive `pr` shape. Common variants
+/// observed in the wild: `{ "url": "…" }`, `{ "html_url": "…" }`, or
+/// a bare string. Anything else returns `None`.
+fn pr_url(value: Option<&serde_json::Value>) -> Option<String> {
+    let v = value?;
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(obj) = v.as_object() {
+        for key in ["url", "html_url", "htmlUrl"] {
+            if let Some(s) = obj.get(key).and_then(serde_json::Value::as_str) {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Elide the homedir + `.agent-orchestrator/` prefix on a worktree
@@ -1654,7 +1709,7 @@ fn center_rect(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::shorten_worktree;
+    use super::{SessionInfo, format_pr_cell, pr_url, shorten_worktree};
 
     #[test]
     fn shorten_worktree_elides_homedir_prefix() {
@@ -1670,5 +1725,80 @@ mod tests {
         let out = shorten_worktree(input);
         assert!(out.starts_with("/some/other/place"));
         assert!(out.chars().count() <= 56);
+    }
+
+    #[test]
+    fn pr_url_picks_url_from_object() {
+        let v = serde_json::json!({ "url": "https://github.com/o/r/pull/1" });
+        assert_eq!(
+            pr_url(Some(&v)).as_deref(),
+            Some("https://github.com/o/r/pull/1")
+        );
+    }
+
+    #[test]
+    fn pr_url_falls_back_to_html_url() {
+        let v = serde_json::json!({ "html_url": "https://github.com/o/r/pull/2" });
+        assert_eq!(
+            pr_url(Some(&v)).as_deref(),
+            Some("https://github.com/o/r/pull/2")
+        );
+        let v_camel = serde_json::json!({ "htmlUrl": "https://github.com/o/r/pull/3" });
+        assert_eq!(
+            pr_url(Some(&v_camel)).as_deref(),
+            Some("https://github.com/o/r/pull/3")
+        );
+    }
+
+    #[test]
+    fn pr_url_accepts_bare_string() {
+        let v = serde_json::json!("https://github.com/o/r/pull/4");
+        assert_eq!(
+            pr_url(Some(&v)).as_deref(),
+            Some("https://github.com/o/r/pull/4")
+        );
+    }
+
+    #[test]
+    fn pr_url_returns_none_for_unknown_shape() {
+        let v = serde_json::json!({ "merged": true });
+        assert!(pr_url(Some(&v)).is_none());
+        assert!(pr_url(None).is_none());
+    }
+
+    #[test]
+    fn format_pr_cell_combines_number_and_url() {
+        let s = SessionInfo {
+            pr_number: Some(42),
+            pr: Some(serde_json::json!({ "url": "https://x/pr/42" })),
+            ..Default::default()
+        };
+        assert_eq!(format_pr_cell(&s).as_deref(), Some("#42  https://x/pr/42"));
+    }
+
+    #[test]
+    fn format_pr_cell_number_only_when_url_absent() {
+        let s = SessionInfo {
+            pr_number: Some(7),
+            pr: None,
+            ..Default::default()
+        };
+        assert_eq!(format_pr_cell(&s).as_deref(), Some("#7"));
+    }
+
+    #[test]
+    fn format_pr_cell_url_only_when_number_absent() {
+        let s = SessionInfo {
+            pr_number: None,
+            pr: Some(serde_json::json!("https://x/pr/9")),
+            ..Default::default()
+        };
+        assert_eq!(format_pr_cell(&s).as_deref(), Some("https://x/pr/9"));
+    }
+
+    #[test]
+    fn format_pr_cell_none_when_no_pr_data() {
+        let s = SessionInfo::default();
+        assert!(format_pr_cell(&s).is_none());
     }
 }
