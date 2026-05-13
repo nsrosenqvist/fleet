@@ -145,64 +145,90 @@ fn draw_body(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_sessions_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    // Sidebar layout: each row is either a section header
-    // (orchestrator / workers — non-selectable, styled in muted
-    // bold), a real session row, or the trailing "+ new session"
-    // sentinel. Selection skips headers; the rect buffer still
-    // tracks every row index so the mouse handler can resolve
-    // clicks on header rows to no-ops via `select_at`.
+    // Stack two framed blocks vertically: "orchestrator (n)" on top
+    // (omitted entirely when no orchestrator sessions exist) and
+    // "workers (n)" below. The workers block hosts the trailing
+    // "+ new session" sentinel. Selection is a single flat index
+    // across the visible rows in both blocks; whichever block
+    // contains the selected row applies the highlight.
+    let orch_count = app.orchestrator_count();
+    let worker_count = app.worker_count();
+    let worker_block_rows = worker_count + 1; // +1 for the sentinel
+
+    let (orch_area, workers_area) = if orch_count == 0 {
+        (None, area)
+    } else {
+        // Frame chrome eats 2 rows (top + bottom border) per block.
+        // Cap the orchestrator block's height at its content size +
+        // 2 so the workers block gets the rest of the column.
+        let orch_h = u16::try_from(orch_count + 2).unwrap_or(3);
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(orch_h), Constraint::Min(0)])
+            .split(area);
+        (Some(split[0]), split[1])
+    };
+
+    if let Some(rect) = orch_area {
+        draw_sidebar_group(
+            app,
+            frame,
+            rect,
+            &format!(" orchestrator ({orch_count}) "),
+            0..orch_count,
+        );
+    }
+    draw_sidebar_group(
+        app,
+        frame,
+        workers_area,
+        &format!(" workers ({worker_count}) "),
+        orch_count..orch_count + worker_block_rows,
+    );
+
+    record_sidebar_rects(app, orch_area, workers_area);
+}
+
+/// Render one bordered sidebar section (orchestrator or workers).
+/// `range` is the slice of `app.sidebar_rows()` this block displays;
+/// the row at the end of the worker range is the sentinel and is
+/// distinguishable in the row itself, not from a flag here. The
+/// block applies the selection highlight only when `app.selected`
+/// falls inside `range`.
+fn draw_sidebar_group(
+    app: &App,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    range: std::ops::Range<usize>,
+) {
     let rows = app.sidebar_rows();
-    let items: Vec<ListItem<'_>> = rows
+    let items: Vec<ListItem<'_>> = rows[range.clone()]
         .iter()
         .map(|row| match row {
-            crate::tui::app::SidebarRow::Header { label, count } => ListItem::new(Line::from(
-                vec![
-                    Span::styled(
-                        format!("{label} "),
-                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(format!("({count})"), Style::default().fg(MUTED)),
-                ],
-            )),
             crate::tui::app::SidebarRow::Session(s) => {
                 let id = s.id.clone().unwrap_or_else(|| "?".into());
                 let activity = s.activity.clone().unwrap_or_default();
                 let is_orch = s.role.as_deref() == Some("orchestrator");
-                let mut spans = vec![Span::raw(format!("  {id:<10}"))];
+                let mut spans = vec![Span::raw(format!("{id:<10}"))];
                 if is_orch {
-                    // Tag the orchestrator row so the user knows
-                    // Enter won't drop into it — fleet treats this
-                    // session as read-only.
                     spans.push(Span::styled(
-                        "(read-only)",
+                        "(read-only) ",
                         Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                     ));
-                    spans.push(Span::raw(" "));
                 }
                 spans.push(Span::styled(activity, Style::default().fg(MUTED)));
                 ListItem::new(Line::from(spans))
             }
             crate::tui::app::SidebarRow::Sentinel => ListItem::new(Line::from(Span::styled(
-                "  + new session",
+                "+ new session",
                 Style::default().fg(ACCENT).add_modifier(Modifier::ITALIC),
             ))),
         })
         .collect();
 
-    let worker_count = app
-        .sessions
-        .iter()
-        .filter(|s| s.role.as_deref() != Some("orchestrator"))
-        .count();
-    let title = format!(" sessions ({worker_count}) ");
-    // Selected-row highlight: indexed 238 (subtle dim grey) bg +
-    // indexed 255 (bright white) fg + BOLD. Same palette keel uses —
-    // pairs with any row text colour without washing it out, and
-    // lifts the focused row off the panel by tone rather than by
-    // recolouring the foreground (so the sentinel's accent + italic
-    // stays readable when selected).
     let list = List::new(items)
-        .block(framed_block(&title))
+        .block(framed_block(title))
         .highlight_symbol("▸ ")
         .highlight_style(
             Style::default()
@@ -211,38 +237,56 @@ fn draw_sessions_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
     let mut state = ListState::default();
-    state.select(Some(app.selected));
+    if range.contains(&app.selected) {
+        state.select(Some(app.selected - range.start));
+    }
     frame.render_stateful_widget(list, area, &mut state);
-
-    record_sidebar_rects(app, area);
 }
 
-/// Compute the per-row rect for each session in the sidebar list so the
-/// mouse handler can hit-test wheel/click events against rows. Mirrors the
-/// list's internal geometry (1-row border on each side, height 1 per row);
-/// rows that overflow the visible area get `Rect::default()` and so can
-/// never match a click.
-fn record_sidebar_rects(app: &App, area: Rect) {
+/// Compute per-row rects for each selectable sidebar entry across
+/// the (optional) orchestrator block + the workers block, so the
+/// mouse handler can hit-test wheel/click events against rows.
+/// Rect indices map 1:1 with the flat ordering used by
+/// `App::sidebar_rows()`: orchestrator entries first, then workers,
+/// then the trailing sentinel. Rows that overflow the visible area
+/// get `Rect::default()` and so can never match a click.
+fn record_sidebar_rects(app: &App, orch_area: Option<Rect>, workers_area: Rect) {
     let mut rects = app.sidebar_item_rects.borrow_mut();
     rects.clear();
-    if area.height < 2 || area.width < 2 {
+    rects.resize(app.sidebar_row_count(), Rect::default());
+
+    let orch_count = app.orchestrator_count();
+    let mut flat_idx = 0usize;
+    if let Some(area) = orch_area {
+        record_block_rects(&mut rects, area, flat_idx, orch_count);
+        flat_idx += orch_count;
+    }
+    let worker_rows = app.worker_count() + 1; // workers + sentinel
+    record_block_rects(&mut rects, workers_area, flat_idx, worker_rows);
+}
+
+/// Fill in `rects[start..start+count]` with one-row rectangles
+/// inside `block_area`'s framed interior. Rects that fall outside
+/// the visible interior stay at `Rect::default()`.
+fn record_block_rects(rects: &mut [Rect], block_area: Rect, start: usize, count: usize) {
+    if block_area.height < 2 || block_area.width < 2 || count == 0 {
         return;
     }
-    let inner_x = area.x.saturating_add(1);
-    let inner_y = area.y.saturating_add(1);
-    let inner_w = area.width.saturating_sub(2);
-    let inner_h = area.height.saturating_sub(2);
-    // Include the sentinel row so it's clickable.
-    let total_rows = app.sidebar_row_count();
-    rects.resize(total_rows, Rect::default());
-    let visible = inner_h.min(u16::try_from(total_rows).unwrap_or(u16::MAX));
+    let inner_x = block_area.x.saturating_add(1);
+    let inner_y = block_area.y.saturating_add(1);
+    let inner_w = block_area.width.saturating_sub(2);
+    let inner_h = block_area.height.saturating_sub(2);
+    let visible = inner_h.min(u16::try_from(count).unwrap_or(u16::MAX));
     for row in 0..visible {
-        rects[row as usize] = Rect {
-            x: inner_x,
-            y: inner_y + row,
-            width: inner_w,
-            height: 1,
-        };
+        let flat = start + row as usize;
+        if let Some(slot) = rects.get_mut(flat) {
+            *slot = Rect {
+                x: inner_x,
+                y: inner_y + row,
+                width: inner_w,
+                height: 1,
+            };
+        }
     }
 }
 
