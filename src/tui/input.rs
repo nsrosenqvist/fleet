@@ -30,7 +30,14 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('k'), m) if !m.contains(KeyModifiers::SHIFT) => app.nav_up(),
 
         (KeyCode::Char('r'), _) => app.push_command(Command::RequestRefresh),
-        (KeyCode::Enter, _) => app.push_command(Command::AttachSelected),
+        (KeyCode::Enter, _) => {
+            // Sentinel row → open the spawn modal instead of attaching.
+            if app.is_sentinel_selected() {
+                app.spawn_prompt = Some(SpawnPrompt::default());
+            } else {
+                app.push_command(Command::AttachSelected);
+            }
+        }
 
         (KeyCode::Char('K') | KeyCode::Delete, _) => {
             if let Some(id) = app.selected_session_id() {
@@ -116,11 +123,15 @@ pub(super) fn handle_mouse_normal(app: &mut App, me: MouseEvent) {
             match app.resolve_click(target) {
                 ClickKind::Select => app.select_at(idx),
                 ClickKind::Activate => {
-                    // Make sure the attach runs against the row we just
-                    // clicked, even if a stale selection still points
-                    // elsewhere.
+                    // Make sure the activation runs against the row we
+                    // just clicked, even if a stale selection still
+                    // points elsewhere.
                     app.select_at(idx);
-                    app.push_command(Command::AttachSelected);
+                    if app.is_sentinel_selected() {
+                        app.spawn_prompt = Some(SpawnPrompt::default());
+                    } else {
+                        app.push_command(Command::AttachSelected);
+                    }
                 }
             }
         }

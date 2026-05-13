@@ -135,37 +135,36 @@ fn draw_body(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_sessions_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let items: Vec<ListItem<'_>> = if app.sessions.is_empty() {
-        let empty = app.current_project_key.as_ref().map_or_else(
-            || "(no sessions)".to_string(),
-            |key| format!("(no sessions for `{key}`)"),
-        );
-        vec![ListItem::new(Line::from(Span::styled(
-            empty,
-            Style::default().fg(MUTED),
-        )))]
-    } else {
-        app.sessions
-            .iter()
-            .map(|s| {
-                let id = s.id.clone().unwrap_or_else(|| "?".into());
-                let activity = s.activity.clone().unwrap_or_default();
-                ListItem::new(Line::from(vec![
-                    Span::raw(format!("{id:<8}")),
-                    Span::styled(activity, Style::default().fg(MUTED)),
-                ]))
-            })
-            .collect()
-    };
+    // Real session rows + trailing "+ new session" sentinel. The
+    // sentinel renders italic-accent and is always selectable, so an
+    // empty list is never a dead-end — pressing Enter on the only
+    // visible row spawns.
+    let mut items: Vec<ListItem<'_>> = app
+        .sessions
+        .iter()
+        .map(|s| {
+            let id = s.id.clone().unwrap_or_else(|| "?".into());
+            let activity = s.activity.clone().unwrap_or_default();
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{id:<8}")),
+                Span::styled(activity, Style::default().fg(MUTED)),
+            ]))
+        })
+        .collect();
+    items.push(ListItem::new(Line::from(Span::styled(
+        "+ new session",
+        Style::default()
+            .fg(ACCENT)
+            .add_modifier(Modifier::ITALIC),
+    ))));
+
     let title = format!(" sessions ({}) ", app.sessions.len());
     let list = List::new(items)
         .block(framed_block(&title))
         .highlight_symbol("▸ ")
         .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
     let mut state = ListState::default();
-    if !app.sessions.is_empty() {
-        state.select(Some(app.selected));
-    }
+    state.select(Some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
 
     record_sidebar_rects(app, area);
@@ -179,18 +178,17 @@ fn draw_sessions_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
 fn record_sidebar_rects(app: &App, area: Rect) {
     let mut rects = app.sidebar_item_rects.borrow_mut();
     rects.clear();
-    if app.sessions.is_empty() || area.height < 2 || area.width < 2 {
+    if area.height < 2 || area.width < 2 {
         return;
     }
     let inner_x = area.x.saturating_add(1);
     let inner_y = area.y.saturating_add(1);
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2);
-    rects.resize(app.sessions.len(), Rect::default());
-    // Cap the visible rows at the smaller of (sessions, inner_h, u16::MAX).
-    // Anything past the cap stays as `Rect::default()` so a click can never
-    // hit an off-screen row.
-    let visible = inner_h.min(u16::try_from(rects.len()).unwrap_or(u16::MAX));
+    // Include the sentinel row so it's clickable.
+    let total_rows = app.sidebar_row_count();
+    rects.resize(total_rows, Rect::default());
+    let visible = inner_h.min(u16::try_from(total_rows).unwrap_or(u16::MAX));
     for row in 0..visible {
         rects[row as usize] = Rect {
             x: inner_x,

@@ -249,8 +249,13 @@ impl App {
                     // resulting error, and watching it vanish 1.5s later
                     // makes the failure look like a glitch.
                     self.refresh_error = None;
-                    if !self.sessions.is_empty() && self.selected >= self.sessions.len() {
-                        self.selected = self.sessions.len() - 1;
+                    // Clamp the cursor to the new row count
+                    // (sessions + sentinel). When sessions shrink
+                    // out from under the cursor, the sentinel is
+                    // always a safe landing place.
+                    let max = self.sidebar_row_count() - 1;
+                    if self.selected > max {
+                        self.selected = max;
                     }
                 }
                 RefreshUpdate::PaneCapture { session_id, output } => {
@@ -295,27 +300,40 @@ impl App {
         }
     }
 
+    /// Number of navigable rows in the sessions sidebar — every real
+    /// session plus the trailing sentinel "+ new session" row that
+    /// opens the spawn prompt. Always ≥ 1, so the list is never empty
+    /// and the user always has something to do.
+    pub(super) fn sidebar_row_count(&self) -> usize {
+        self.sessions.len() + 1
+    }
+
+    /// True when the selected row is the trailing "+ new session"
+    /// sentinel rather than an actual session. Drives both
+    /// session-selected rendering (which falls through to the welcome
+    /// panel) and Enter / double-click activation (which opens the
+    /// spawn prompt instead of attaching).
+    pub(super) fn is_sentinel_selected(&self) -> bool {
+        self.selected == self.sessions.len()
+    }
+
     pub(super) fn nav_down(&mut self) {
-        if !self.sessions.is_empty() {
-            self.selected = (self.selected + 1) % self.sessions.len();
-        }
+        let n = self.sidebar_row_count();
+        self.selected = (self.selected + 1) % n;
     }
 
     pub(super) fn nav_up(&mut self) {
-        if !self.sessions.is_empty() {
-            self.selected = self
-                .selected
-                .checked_sub(1)
-                .unwrap_or(self.sessions.len() - 1);
-        }
+        let n = self.sidebar_row_count();
+        self.selected = (self.selected + n - 1) % n;
     }
 
     /// Move selection to an explicit index. Guards against stale rects —
     /// a click that hit-tested against the previous frame's rects might
     /// point at an index that no longer exists if the session list shrunk
-    /// in the same draw cycle.
+    /// in the same draw cycle. The sentinel row at `sessions.len()` is
+    /// a valid target.
     pub(super) fn select_at(&mut self, idx: usize) {
-        if idx < self.sessions.len() {
+        if idx <= self.sessions.len() {
             self.selected = idx;
         }
     }
@@ -431,32 +449,45 @@ mod tests {
     }
 
     #[test]
-    fn nav_down_wraps_at_end() {
+    fn nav_down_walks_sessions_then_sentinel_then_wraps() {
+        // 3 sessions + trailing "+ new session" sentinel = 4 rows.
         let mut app = app_with(3);
         app.nav_down();
         app.nav_down();
         assert_eq!(app.selected, 2);
         app.nav_down();
-        assert_eq!(app.selected, 0, "should wrap from last back to first");
+        assert_eq!(app.selected, 3, "next stop is the sentinel row");
+        assert!(app.is_sentinel_selected());
+        app.nav_down();
+        assert_eq!(app.selected, 0, "wraps from sentinel back to first session");
     }
 
     #[test]
-    fn nav_up_wraps_from_zero() {
+    fn nav_up_wraps_to_sentinel() {
         let mut app = app_with(3);
         app.nav_up();
-        assert_eq!(app.selected, 2, "should wrap from 0 to last");
+        assert_eq!(app.selected, 3, "wraps from 0 to the sentinel (last row)");
+        assert!(app.is_sentinel_selected());
     }
 
     #[test]
-    fn nav_is_a_noop_on_empty_list() {
+    fn empty_session_list_keeps_sentinel_selectable() {
+        // No real sessions → only the sentinel exists, so nav is a
+        // no-op cycle but the selection stays valid.
         let mut app = app_with(0);
+        assert_eq!(app.sidebar_row_count(), 1);
+        assert!(app.is_sentinel_selected());
         app.nav_down();
         app.nav_up();
         assert_eq!(app.selected, 0);
+        assert!(app.is_sentinel_selected());
     }
 
     #[test]
-    fn drain_updates_replaces_sessions_and_clamps_selection() {
+    fn drain_updates_clamps_cursor_to_new_row_count() {
+        // Selected sb-3 (idx 2). Sessions shrink to one entry → row
+        // count becomes 2 (sb-only + sentinel). Cursor clamps to 1
+        // (the sentinel), since the row it was pointing at is gone.
         let mut app = app_with(3);
         app.selected = 2;
         let (tx, rx) = mpsc::channel();
@@ -465,7 +496,11 @@ mod tests {
             .unwrap();
         app.drain_updates();
         assert_eq!(app.sessions.len(), 1);
-        assert_eq!(app.selected, 0, "selection should clamp to new length");
+        assert_eq!(
+            app.selected, 1,
+            "stale cursor lands on the sentinel rather than past-end",
+        );
+        assert!(app.is_sentinel_selected());
     }
 
     #[test]
