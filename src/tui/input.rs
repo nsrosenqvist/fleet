@@ -90,8 +90,11 @@ pub(super) fn handle_key_spawn_prompt(app: &mut App, key: KeyEvent) {
             app.push_command(Command::Spawn(issue));
         }
         KeyCode::Esc => {
+            // Just dismiss; no "cancelled" flash — the user pressed
+            // Esc themselves, they know the prompt closed, and a
+            // flash would just hide the legend until they pressed
+            // another key.
             app.spawn_prompt = None;
-            app.flash_ok("cancelled");
         }
         KeyCode::Down | KeyCode::Tab => {
             let n = prompt.filtered().len();
@@ -128,9 +131,9 @@ pub(super) fn handle_key_confirm(app: &mut App, key: KeyEvent) {
             Confirm::KillSession(id) => app.push_command(Command::KillSession(id)),
             Confirm::StopAo => app.push_command(Command::StopAo),
         }
-    } else {
-        app.flash_ok("cancelled");
     }
+    // Cancel path is silent — the user explicitly pressed a non-y
+    // key to back out, so a confirmation flash would just be noise.
 }
 
 /// Normal-mode mouse handler. Left-click on a sidebar row selects it;

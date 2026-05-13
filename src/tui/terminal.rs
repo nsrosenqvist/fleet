@@ -424,7 +424,7 @@ fn edit_config(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>)
         crate::process::run_interactive(&editor, &[yaml_path.display().to_string()], &[], &[])
             .map(|_| ())
     });
-    app.flash_result(format!("edited {}", yaml_path.display()), res);
+    app.flash_if_err(res);
     // Pick up any changes the user made (added projects, renamed,
     // moved paths, …) so the breadcrumb chip + cwd-scoped filter
     // reflect them immediately.
@@ -487,7 +487,7 @@ fn tracker_preview(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdou
         crate::process::run_interactive("limactl", &argv, &[("TERM", "xterm-256color")], &[])
             .map(|_| ())
     });
-    app.flash_result("closed tracker preview".to_string(), res);
+    app.flash_if_err(res);
 }
 
 /// `Shift+T`: open the tracker's web view in the host browser.
@@ -504,10 +504,11 @@ fn tracker_web(app: &mut App) {
     };
     match plugin.as_str() {
         "github" => match github_issues_url_for(&project_path) {
-            Ok(url) => match webbrowser::open(&url) {
-                Ok(()) => app.flash_ok(format!("opened {url}")),
-                Err(e) => app.flash_err(format!("open browser: {e}")),
-            },
+            Ok(url) => {
+                if let Err(e) = webbrowser::open(&url) {
+                    app.flash_err(format!("open browser: {e}"));
+                }
+            }
             Err(e) => app.flash_err(format!("github tracker: {e:#}")),
         },
         "git-bug" => {
@@ -609,7 +610,7 @@ fn start_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let res = suspend_around(term, || {
         crate::cli::spawn::run_start(&repo_root, false, false).map(|_| ())
     });
-    app.flash_result("started AO".to_string(), res);
+    app.flash_if_err(res);
     app.request_refresh();
 }
 
@@ -628,15 +629,13 @@ fn open_web(app: &mut App) {
         ));
         return;
     }
-    match webbrowser::open(&url) {
-        Ok(()) => app.flash_ok(format!("opened {url}")),
-        Err(e) => app.flash_err(format!("open: {e}")),
+    if let Err(e) = webbrowser::open(&url) {
+        app.flash_err(format!("open: {e}"));
     }
 }
 
 fn kill_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>, id: String) {
     let repo_root = app.repo_root.clone();
-    let killed_id = id.clone();
     let res = suspend_around(term, || {
         crate::cli::passthrough::run_with_prefix(
             &repo_root,
@@ -645,7 +644,7 @@ fn kill_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>
         )
         .map(|_| ())
     });
-    app.flash_result(format!("killed {killed_id}"), res);
+    app.flash_if_err(res);
     app.request_refresh();
 }
 
@@ -665,7 +664,7 @@ fn spawn_session(
     let res = suspend_around(term, || {
         crate::cli::spawn::run_spawn(&repo_root, &issue_owned, None, None).map(|_| ())
     });
-    app.flash_result(format!("spawned session for `{issue}`"), res);
+    app.flash_if_err(res);
     app.request_refresh();
 }
 
@@ -674,6 +673,6 @@ fn stop_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let res = suspend_around(term, || {
         crate::cli::passthrough::run(&repo_root, &["stop".to_string()]).map(|_| ())
     });
-    app.flash_result("stopped AO".to_string(), res);
+    app.flash_if_err(res);
     app.request_refresh();
 }

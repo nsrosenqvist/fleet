@@ -535,19 +535,22 @@ impl App {
         }
     }
 
-    /// Fold an action's `Result` into the flash slot. On error keeps the
-    /// first line of the rendered chain — the status bar is one row, so
-    /// multi-line `{e:#}` would either truncate poorly or wrap.
-    pub(super) fn flash_result(&mut self, ok_msg: String, res: anyhow::Result<()>) {
-        match res {
-            Ok(()) => self.flash_ok(ok_msg),
-            Err(e) => self.flash_err(
+    /// Fold an action's `Result` into the status bar: nothing on
+    /// success, a single-line error flash on failure. Success
+    /// "edited /path", "closed tracker preview", etc. notifications
+    /// were just noise — the user already saw the action's output
+    /// or its effect, and the flash hid the keybind legend until
+    /// the next keystroke dismissed it. Keep only signals that
+    /// require action (errors) or are otherwise non-obvious.
+    pub(super) fn flash_if_err(&mut self, res: anyhow::Result<()>) {
+        if let Err(e) = res {
+            self.flash_err(
                 format!("{e:#}")
                     .lines()
                     .next()
                     .unwrap_or("")
                     .to_string(),
-            ),
+            );
         }
     }
 
