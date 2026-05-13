@@ -10,10 +10,6 @@ use ratatui::layout::Rect;
 
 use super::app::{App, ClickKind, ClickTarget, Command, Confirm};
 
-/// Lines moved per scroll-wheel notch. Three matches the j/k cadence
-/// closely enough that mixing keyboard and wheel doesn't feel jumpy.
-const WHEEL_LINES: usize = 3;
-
 /// Default mode: navigation + action keys. Falls through to no-op on
 /// unknown keys so e.g. `Shift+F1` doesn't accidentally fire an action.
 pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
@@ -182,7 +178,8 @@ pub(super) fn handle_key_confirm(app: &mut App, key: KeyEvent) {
 
 /// Normal-mode mouse handler. Left-click on a sidebar row selects it;
 /// double-click within `DOUBLE_CLICK_WINDOW` attaches (same effect as
-/// Enter). Scroll wheel moves the selection at the keyboard cadence.
+/// Enter). Scroll wheel events are ignored — moving the selection on
+/// scroll surprised users who expected the wheel to be inert.
 /// Clicks outside any tracked rect are no-ops.
 pub(super) fn handle_mouse_normal(app: &mut App, me: MouseEvent) {
     match me.kind {
@@ -210,16 +207,6 @@ pub(super) fn handle_mouse_normal(app: &mut App, me: MouseEvent) {
                         app.push_command(Command::AttachSelected);
                     }
                 }
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            for _ in 0..WHEEL_LINES {
-                app.nav_down();
-            }
-        }
-        MouseEventKind::ScrollUp => {
-            for _ in 0..WHEEL_LINES {
-                app.nav_up();
             }
         }
         _ => {}
