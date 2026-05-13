@@ -7,8 +7,10 @@
 //! state snapshots back. The UI drains updates between draws via
 //! [`crate::tui::app::App::drain_updates`].
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -81,9 +83,17 @@ pub enum RefreshCommand {
 
 /// Spawn the refresh thread. Returns the two endpoints + join handle the
 /// caller stores on `App` for the lifetime of the session.
+///
+/// `pane_size` carries the output pane's current inner dimensions (packed
+/// `(w << 16) | h`, zero = no render yet) so the refresh thread can pin
+/// each newly-observed session's tmux window to the panel width on its
+/// first capture. Crucial for the orchestrator session, which AO spawns
+/// before fleet runs and which would otherwise stay at AO's default
+/// width forever.
 pub fn spawn(
     repo_root: PathBuf,
     invoker: Arc<dyn ProcessInvoker>,
+    pane_size: Arc<AtomicU32>,
 ) -> (
     mpsc::Sender<RefreshCommand>,
     mpsc::Receiver<RefreshUpdate>,
@@ -91,7 +101,8 @@ pub fn spawn(
 ) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (update_tx, update_rx) = mpsc::channel();
-    let handle = thread::spawn(move || refresh_loop(repo_root, invoker, cmd_rx, &update_tx));
+    let handle =
+        thread::spawn(move || refresh_loop(repo_root, invoker, pane_size, cmd_rx, &update_tx));
     (cmd_tx, update_rx, handle)
 }
 
@@ -101,6 +112,7 @@ pub fn spawn(
 fn refresh_loop(
     _repo_root: PathBuf,
     invoker: Arc<dyn ProcessInvoker>,
+    pane_size: Arc<AtomicU32>,
     cmds: mpsc::Receiver<RefreshCommand>,
     updates: &mpsc::Sender<RefreshUpdate>,
 ) {
@@ -122,6 +134,21 @@ fn refresh_loop(
     let mut next_vm_probe = Instant::now();
     let mut next_events_probe = Instant::now();
     let mut next_meta_probe = Instant::now();
+    // Sessions we've already pinned to the panel width this run. The
+    // orchestrator session (and any AO worker that existed before we
+    // started) gets resized on its first capture; subsequent captures
+    // skip the resize so we don't burn a `limactl shell` round-trip per
+    // tick per session. Stale ids are evicted when their session
+    // disappears from AO's listing. After an attach the size will drift
+    // up, but the attach handler issues its own resize on detach.
+    let mut resized: HashSet<String> = HashSet::new();
+    // Packed `pane_size` value the entries in `resized` are pinned to.
+    // When the UI's `pane_size` atomic changes (host terminal resize,
+    // pane reflow), we clear `resized` so the next status pass re-pins
+    // every session to the new dims. Cheaper than checking each
+    // session's own size — a single atomic load + compare per tick, no
+    // tmux round-trip unless the value actually drifts.
+    let mut last_resize_size: u32 = 0;
     // Cleanup fires immediately on startup (so accumulated litter
     // settles before the user sees the sidebar) and then on
     // CLEANUP_INTERVAL. ForceRefresh deliberately doesn't bump it
@@ -157,7 +184,15 @@ fn refresh_loop(
 
         let now = Instant::now();
         if now >= next_status {
-            if run_status_probe(&lima, &ao_workdir, updates).is_err() {
+            // Snapshot pane_size once per tick; if it's drifted since
+            // we last pinned, invalidate the per-session cache so the
+            // probe re-resizes every session to the new dims.
+            let packed = pane_size.load(Ordering::Relaxed);
+            if packed != last_resize_size {
+                resized.clear();
+                last_resize_size = packed;
+            }
+            if run_status_probe(&lima, &ao_workdir, packed, &mut resized, updates).is_err() {
                 return;
             }
             next_status = now + REFRESH_INTERVAL;
@@ -228,16 +263,34 @@ fn refresh_loop(
 fn run_status_probe(
     lima: &Lima,
     ao_workdir: &std::path::Path,
+    pane_size: u32,
+    resized: &mut HashSet<String>,
     updates: &mpsc::Sender<RefreshUpdate>,
 ) -> std::result::Result<(), ()> {
     let ao = Ao::new(lima, ao_workdir);
     match ao.session_ls_all() {
         Ok(r) => {
             let session_ids: Vec<String> = r.data.iter().filter_map(|s| s.id.clone()).collect();
+            // Drop stale resize markers so a recycled session id gets
+            // pinned again on its next first observation.
+            resized.retain(|id| session_ids.iter().any(|s| s == id));
             if updates.send(RefreshUpdate::Sessions(r.data)).is_err() {
                 return Err(());
             }
+            let packed = pane_size;
             for id in session_ids {
+                // First time we see this session id, pin its tmux window
+                // to the output pane's width. AO created the session at
+                // whatever default it picked; without this the
+                // orchestrator pane would never fit. Skip when pane_size
+                // is zero (UI hasn't rendered yet — happens for a tick
+                // or two at startup; we'll catch up on the next pass).
+                if packed != 0 && !resized.contains(&id) {
+                    let w = u16::try_from(packed >> 16).unwrap_or(0);
+                    let h = u16::try_from(packed & 0xFFFF).unwrap_or(0);
+                    let _ = crate::tmux::resize_window(lima, ao_workdir, &id, w, h);
+                    resized.insert(id.clone());
+                }
                 // 200 lines of scrollback is enough to fill any
                 // realistic output panel. tmux capture inside the VM
                 // is fast (~30 ms); we tail at render time.

@@ -16,10 +16,11 @@
 //! No state mutation here. Anything that wants to react to a click or key
 //! mutates state via the input layer, which the next draw reflects.
 
+use ansi_to_tui::IntoText;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
@@ -499,40 +500,50 @@ fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let selected_id = app.selected_session_id();
-    let body = selected_id.as_deref().map_or_else(
-        || "(no session selected)".to_string(),
-        |id| match app.pane_outputs.get(id) {
-            Some(pane) if !pane.is_empty() => pane.clone(),
-            _ => "(no output captured yet — first refresh after spawn takes ~1.5s)".to_string(),
-        },
-    );
+    // Stash the inner dims so the attach handler can pin the tmux
+    // window back to this size after detach, and the refresh thread
+    // can size each newly-observed session on first capture (see
+    // `attach_selected` and `refresh_loop`). Packed as `(w << 16) | h`.
+    let packed = (u32::from(inner.width) << 16) | u32::from(inner.height);
+    app.pane_size
+        .store(packed, std::sync::atomic::Ordering::Relaxed);
 
-    // Tail the captured pane so the most recent activity is visible. tmux
-    // capture-pane gives plain text; the last `area.height` lines fit. If
-    // the body is shorter, just render as is.
-    let line_count = body.lines().count();
-    let take = inner.height as usize;
-    let lines: Vec<Line<'_>> = body
-        .lines()
-        .skip(line_count.saturating_sub(take))
-        .map(Line::raw)
-        .collect();
-    let style = if selected_id
+    let selected_id = app.selected_session_id();
+    let captured = selected_id
         .as_deref()
         .and_then(|id| app.pane_outputs.get(id))
-        .is_some_and(|s| !s.is_empty())
-    {
-        Style::default()
+        .filter(|s| !s.is_empty());
+
+    if let Some(body) = captured {
+        // Parse ANSI SGR escapes (preserved by `tmux capture-pane -e`)
+        // into styled spans so Claude Code's colors come through. On
+        // parse failure, fall back to plain text — a malformed capture
+        // should never blank the pane.
+        let text: Text<'_> = body
+            .as_str()
+            .into_text()
+            .unwrap_or_else(|_| Text::raw(body.clone()));
+        let line_count = text.lines.len();
+        let take = inner.height as usize;
+        let tail: Vec<Line<'_>> = text
+            .lines
+            .into_iter()
+            .skip(line_count.saturating_sub(take))
+            .collect();
+        frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), inner);
     } else {
-        Style::default().fg(MUTED)
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(style)
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
+        let placeholder = if selected_id.is_some() {
+            "(no output captured yet — first refresh after spawn takes ~1.5s)"
+        } else {
+            "(no session selected)"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::raw(placeholder))
+                .style(Style::default().fg(MUTED))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
 }
 
 /// System-wide event ticker pinned to the bottom of the UI. Polled

@@ -456,13 +456,32 @@ fn attach_selected(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdou
         return;
     };
     let repo_root: PathBuf = app.repo_root.clone();
+    let target_for_attach = target.clone();
     let res = suspend_around(term, move || {
-        crate::cli::attach::run(&repo_root, &target).map(|_| ())
+        crate::cli::attach::run(&repo_root, &target_for_attach).map(|_| ())
     });
-    // Re-render on resume. State refreshes on the next tick anyway.
     if let Err(e) = res {
         app.flash_err(format!("attach failed: {e:#}"));
+        return;
     }
+    // Pin the tmux session back to the output pane's width. While we
+    // were attached, tmux sized the window to the host terminal — if
+    // we leave it at that, `capture-pane` returns lines wider than the
+    // panel and Claude Code's TUI re-renders broken on the next tick.
+    // Cached dims come from the last `draw_output`; if we somehow
+    // haven't rendered the panel yet, skip — there's nothing to pin to.
+    let packed = app
+        .pane_size
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if packed != 0
+        && let Some(workdir) = crate::ao::config::AoConfig::workdir()
+    {
+        let w = u16::try_from(packed >> 16).unwrap_or(0);
+        let h = u16::try_from(packed & 0xFFFF).unwrap_or(0);
+        let lima = crate::lima::Lima::new(app.invoker.clone(), "fleet-vm");
+        let _ = crate::tmux::resize_window(&lima, &workdir, &target, w, h);
+    }
+    // Re-render on resume. State refreshes on the next tick anyway.
 }
 
 /// Hand the AO catalog yaml to `$EDITOR` (suspending the alt screen)

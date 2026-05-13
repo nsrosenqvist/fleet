@@ -16,6 +16,7 @@ use ratatui::layout::Rect;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -325,6 +326,22 @@ pub struct App {
     /// a click can never match a row the layout couldn't fit.
     pub(super) sidebar_item_rects: RefCell<Vec<Rect>>,
 
+    /// Inner dimensions of the output pane from the last render, packed
+    /// as `(width as u32) << 16 | height as u32`. Zero means "no render
+    /// yet". Read from two threads:
+    /// - The attach handler, to pin the tmux window back to the panel
+    ///   width after detach (otherwise tmux retains the host terminal
+    ///   width and capture-pane returns wide lines that break Claude
+    ///   Code's TUI in the panel).
+    /// - The refresh thread, to resize each newly-observed session once
+    ///   on first capture — important for the orchestrator session,
+    ///   which AO created before fleet ran and which would otherwise
+    ///   never get sized to the panel.
+    ///
+    /// Atomic instead of `RefCell` because the refresh thread needs
+    /// concurrent read access.
+    pub(super) pane_size: Arc<AtomicU32>,
+
     /// Last mouse-click timestamp + target, used by `resolve_click` to
     /// detect a double-click within `DOUBLE_CLICK_WINDOW`.
     last_click: Option<(Instant, ClickTarget)>,
@@ -370,6 +387,7 @@ impl App {
             refresh_update_rx: None,
             refresh_handle: None,
             sidebar_item_rects: RefCell::new(Vec::new()),
+            pane_size: Arc::new(AtomicU32::new(0)),
             last_click: None,
             pending_commands: Vec::new(),
         };
@@ -381,8 +399,11 @@ impl App {
     }
 
     pub(super) fn spawn_refresh_thread(&mut self) {
-        let (cmd_tx, update_rx, handle) =
-            refresh::spawn(self.repo_root.clone(), self.invoker.clone());
+        let (cmd_tx, update_rx, handle) = refresh::spawn(
+            self.repo_root.clone(),
+            self.invoker.clone(),
+            self.pane_size.clone(),
+        );
         self.refresh_cmd_tx = Some(cmd_tx);
         self.refresh_update_rx = Some(update_rx);
         self.refresh_handle = Some(handle);
