@@ -13,4 +13,4 @@ pub mod tracker;
 #[allow(unused_imports)]
 pub use invoke::Ao;
 #[allow(unused_imports)]
-pub use state::{AoMeta, AoResponse, SessionInfo};
+pub use state::{AoMeta, AoResponse, EventInfo, SessionInfo};

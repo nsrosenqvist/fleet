@@ -1,4 +1,5 @@
-//! Serde types modeling `ao status --json` and `ao session ls --json` outputs.
+//! Serde types modeling `ao status --json`, `ao session ls --json`, and
+//! `ao events list --json` outputs.
 //!
 //! Both endpoints return `{ "data": [..], "meta": { ... } }`. The per-session
 //! shapes overlap but are not identical. `SessionInfo` is the union of both,
@@ -97,6 +98,50 @@ pub struct SessionInfo {
     /// Per-session agent reports. Raw for now; can be modeled when needed.
     #[serde(default)]
     pub reports: Vec<serde_json::Value>,
+}
+
+/// Wrapper for `ao events list --json`. The top-level shape uses
+/// `events` (not `data`), so we can't reuse [`AoResponse`].
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct EventsResponse {
+    #[serde(default = "Vec::new")]
+    pub events: Vec<EventInfo>,
+}
+
+/// One row from the AO event log. Captures session spawns/kills,
+/// lifecycle transitions, CI failures, review events, etc. Used by
+/// fleet's bottom-pane ticker for system-wide situational awareness.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventInfo {
+    /// Sequential id, monotonic per-project. Useful as a `selected`
+    /// anchor and for de-duping when the log is re-fetched.
+    #[serde(default)]
+    pub id: u64,
+
+    /// ISO-8601 timestamp; we display the local time-of-day portion.
+    #[serde(default)]
+    pub ts: Option<String>,
+
+    #[serde(default)]
+    pub project_id: Option<String>,
+
+    /// Empty for project-wide events (spawn-failed before a session
+    /// was created, etc.).
+    #[serde(default)]
+    pub session_id: Option<String>,
+
+    /// `session.spawned`, `session.killed`, `lifecycle.transition`,
+    /// `ci.failed`, `review.requested`, etc. Free-form per AO's roadmap.
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    /// `info`, `warn`, `error`, `debug`. Drives the row's foreground colour.
+    #[serde(default)]
+    pub level: Option<String>,
+
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[cfg(test)]
@@ -204,5 +249,61 @@ mod tests {
         "#;
         let r: AoResponse<SessionInfo> = serde_json::from_str(json).expect("parse ok");
         assert_eq!(r.data[0].id.as_deref(), Some("x"));
+    }
+
+    /// Captured live from `ao events list --json` against the fleet
+    /// project after a spawn+kill cycle. Holds the real shape of the
+    /// top-level wrapper (`events`, not `data`) and the per-event
+    /// rows fleet's bottom-pane ticker renders.
+    const EVENTS_JSON: &str = r#"{
+      "version": 1,
+      "meta": { "resultCount": 2 },
+      "events": [
+        {
+          "id": 10,
+          "tsEpoch": 1778674371946,
+          "ts": "2026-05-13T12:12:51.946Z",
+          "projectId": "fleet",
+          "sessionId": "fl-2",
+          "source": "session-manager",
+          "kind": "session.killed",
+          "level": "info",
+          "summary": "killed: fl-2",
+          "data": { "reason": "manually_killed" }
+        },
+        {
+          "id": 9,
+          "ts": "2026-05-13T12:12:41.412Z",
+          "projectId": "fleet",
+          "sessionId": "fl-2",
+          "kind": "session.spawned",
+          "level": "info",
+          "summary": "spawned: fl-2"
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn deserializes_events_json() {
+        let r: EventsResponse = serde_json::from_str(EVENTS_JSON).expect("parse ok");
+        assert_eq!(r.events.len(), 2);
+        assert_eq!(r.events[0].id, 10);
+        assert_eq!(r.events[0].kind.as_deref(), Some("session.killed"));
+        assert_eq!(r.events[0].level.as_deref(), Some("info"));
+        assert_eq!(r.events[0].session_id.as_deref(), Some("fl-2"));
+        assert_eq!(r.events[1].summary.as_deref(), Some("spawned: fl-2"));
+    }
+
+    #[test]
+    fn deserializes_events_with_missing_optional_fields() {
+        // Defensive: a future AO build might drop or rename
+        // optional fields. As long as the top-level `events` array
+        // is present, the response should parse and the unknown
+        // bits land as `None`.
+        let json = r#"{ "events": [ { "id": 1 } ] }"#;
+        let r: EventsResponse = serde_json::from_str(json).expect("parse ok");
+        assert_eq!(r.events.len(), 1);
+        assert!(r.events[0].kind.is_none());
+        assert!(r.events[0].summary.is_none());
     }
 }

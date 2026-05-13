@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
-use super::state::{AoResponse, SessionInfo};
+use super::state::{AoResponse, EventInfo, EventsResponse, SessionInfo};
 use crate::lima::Lima;
 
 pub struct Ao<'a> {
@@ -55,6 +55,37 @@ impl<'a> Ao<'a> {
             ],
         )?;
         parse_response(&raw).context("parsing ao session ls --all --json")
+    }
+
+    /// `ao events list --since <window> -n <limit> --json` — recent
+    /// activity events (spawns, kills, lifecycle transitions, CI
+    /// failures, review events). Drives the bottom-pane ticker;
+    /// caller picks a sensible time window since the log is
+    /// otherwise unbounded.
+    pub fn events_list(&self, since: &str, limit: u32) -> Result<Vec<EventInfo>> {
+        let raw = self.lima.shell(
+            self.workdir,
+            vec![
+                "ao".to_string(),
+                "events".to_string(),
+                "list".to_string(),
+                "--since".to_string(),
+                since.to_string(),
+                "-n".to_string(),
+                limit.to_string(),
+                "--json".to_string(),
+            ],
+        )?;
+        let start = find_json_start(&raw).with_context(|| {
+            format!(
+                "no JSON object found in ao events output: {}",
+                error_preview(&raw)
+            )
+        })?;
+        let parsed: EventsResponse = serde_json::from_str(&raw[start..]).with_context(|| {
+            format!("parsing ao events list --json: {}", error_preview(&raw[start..]))
+        })?;
+        Ok(parsed.events)
     }
 }
 

@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::ao::{Ao, SessionInfo};
+use crate::ao::{Ao, EventInfo, SessionInfo};
 use crate::lima::{Lima, VmStatus};
 use crate::process::ProcessInvoker;
 
@@ -21,6 +21,18 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const VM_NAME: &str = "fleet-vm";
 const AO_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const VM_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+/// Event log polling cadence. Slower than per-session refresh —
+/// events arrive in bursts (spawn, transition, CI signal) and the
+/// bottom-pane ticker doesn't need sub-second freshness.
+const EVENTS_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// Time window passed to `ao events list --since`. An hour catches
+/// "what just happened" without the panel scrolling back to last
+/// week's noise.
+const EVENTS_SINCE_WINDOW: &str = "1h";
+/// `ao events list -n` limit. 100 rows easily fills the visible
+/// 6-line strip, and keeps the lima→ao roundtrip bounded if AO
+/// has been chatty.
+const EVENTS_LIMIT: u32 = 100;
 
 /// Messages sent from the background thread back to the UI.
 pub enum RefreshUpdate {
@@ -29,6 +41,7 @@ pub enum RefreshUpdate {
     Error(String),
     AoUp(bool),
     VmUp(VmStatus),
+    Events(Vec<EventInfo>),
 }
 
 /// Messages sent from the UI to the refresh thread.
@@ -78,10 +91,11 @@ fn refresh_loop(
     let mut next_status = Instant::now();
     let mut next_ao_probe = Instant::now();
     let mut next_vm_probe = Instant::now();
+    let mut next_events_probe = Instant::now();
 
     loop {
         let now = Instant::now();
-        let wait_for = [next_status, next_ao_probe, next_vm_probe]
+        let wait_for = [next_status, next_ao_probe, next_vm_probe, next_events_probe]
             .into_iter()
             .map(|t| t.saturating_duration_since(now))
             .min()
@@ -93,6 +107,7 @@ fn refresh_loop(
                 next_status = Instant::now();
                 next_ao_probe = Instant::now();
                 next_vm_probe = Instant::now();
+                next_events_probe = Instant::now();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -165,6 +180,21 @@ fn refresh_loop(
                 return;
             }
             next_vm_probe = now + VM_PROBE_INTERVAL;
+        }
+
+        if now >= next_events_probe {
+            // Event log: spawns, kills, lifecycle transitions, CI
+            // failures, review activity. Errors here are quiet —
+            // events are nice-to-have for the bottom-pane ticker;
+            // a failed probe shouldn't drown the status bar in
+            // refresh-error flashes alongside the session probe.
+            let ao = Ao::new(&lima, &ao_workdir);
+            if let Ok(events) = ao.events_list(EVENTS_SINCE_WINDOW, EVENTS_LIMIT)
+                && updates.send(RefreshUpdate::Events(events)).is_err()
+            {
+                return;
+            }
+            next_events_probe = now + EVENTS_PROBE_INTERVAL;
         }
     }
 }

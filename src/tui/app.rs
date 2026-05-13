@@ -215,6 +215,11 @@ pub struct App {
 
     pub(super) sessions: Vec<SessionInfo>,
     pub(super) selected: usize,
+    /// Recent AO event log entries (spawns / kills / lifecycle
+    /// transitions / CI / review activity) rendered in the bottom
+    /// pane. Replaced wholesale each refresh tick — the underlying
+    /// query already returns the most-recent N, sorted descending.
+    pub(super) events: Vec<crate::ao::EventInfo>,
     /// Most recent error from the background refresh thread (probe
     /// failure, etc.). Cleared automatically the next time `Sessions`
     /// arrives successfully — refresh errors are by their nature
@@ -286,6 +291,7 @@ impl App {
             current_project_key,
             sessions: Vec::new(),
             selected: 0,
+            events: Vec::new(),
             refresh_error: None,
             action_error: None,
             last_info: None,
@@ -383,6 +389,9 @@ impl App {
                 }
                 RefreshUpdate::AoUp(up) => self.ao_up = up,
                 RefreshUpdate::VmUp(s) => self.vm_status = s,
+                RefreshUpdate::Events(events) => {
+                    self.events = events;
+                }
             }
         }
     }

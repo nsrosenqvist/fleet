@@ -33,20 +33,27 @@ use super::theme::{
     kv_line, modal_key, sep,
 };
 
+/// Fixed event-pane height. Title row + four event rows + bottom
+/// border = 6 lines. Wide enough to read what just happened
+/// without eating the body's vertical space.
+const EVENTS_PANE_HEIGHT: u16 = 6;
+
 pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
     let area = frame.area();
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // breadcrumb
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // status bar
+            Constraint::Length(1),                  // breadcrumb
+            Constraint::Min(0),                     // body
+            Constraint::Length(EVENTS_PANE_HEIGHT), // events strip
+            Constraint::Length(1),                  // status bar
         ])
         .split(area);
 
     draw_breadcrumb(app, frame, layout[0]);
     draw_body(app, frame, layout[1]);
-    draw_status_bar(app, frame, layout[2]);
+    draw_events_pane(app, frame, layout[2]);
+    draw_status_bar(app, frame, layout[3]);
 
     // Overlay modals — painted last so they sit on top of the normal
     // layout. Priority matches input dispatch: secret setup wins
@@ -469,6 +476,66 @@ fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+
+/// System-wide event ticker pinned to the bottom of the UI. Polled
+/// from `ao events list --since 1h --json` on a slower cadence than
+/// per-session refresh (events are sparse). Rows are colored by
+/// level: errors red, warnings yellow, info plain. Shows the most
+/// recent rows first — AO already returns the log sorted descending.
+fn draw_events_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let title = format!(" events ({}) ", app.events.len());
+    let block = framed_block(&title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.events.is_empty() {
+        let line = Line::from(Span::styled(
+            "(no recent activity)",
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        ));
+        frame.render_widget(Paragraph::new(line), inner);
+        return;
+    }
+
+    let rows: Vec<Line<'_>> = app
+        .events
+        .iter()
+        .take(inner.height as usize)
+        .map(event_line)
+        .collect();
+    frame.render_widget(Paragraph::new(rows), inner);
+}
+
+/// One row in the event ticker. Format: `HH:MM:SS  kind  [session]  summary`.
+/// The level drives the foreground colour of the summary so an error
+/// row reads as red without needing a separate icon column.
+fn event_line(e: &crate::ao::EventInfo) -> Line<'static> {
+    let time = e
+        .ts
+        .as_deref()
+        .and_then(|s| s.split('T').nth(1))
+        .and_then(|after_t| after_t.split('.').next())
+        .unwrap_or("--:--:--");
+    let kind = e.kind.as_deref().unwrap_or("?");
+    let session = e.session_id.as_deref().unwrap_or("—");
+    let summary = e.summary.as_deref().unwrap_or("");
+    let level_color = match e.level.as_deref() {
+        Some("error") => ERR,
+        Some("warn") => WARN,
+        _ => MUTED,
+    };
+    let summary_style = if matches!(e.level.as_deref(), Some("error" | "warn")) {
+        Style::default().fg(level_color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(format!("{time}  "), Style::default().fg(MUTED)),
+        Span::styled(format!("{kind:<24}"), Style::default().fg(level_color)),
+        Span::styled(format!("  {session:<8}  "), Style::default().fg(MUTED)),
+        Span::styled(summary.to_string(), summary_style),
+    ])
+}
 
 fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // Three overlays replace the legend rather than appending to it: a
