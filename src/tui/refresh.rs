@@ -100,7 +100,11 @@ fn refresh_loop(
         let now = Instant::now();
         if now >= next_status {
             let ao = Ao::new(&lima, &ao_workdir);
-            match ao.status() {
+            // `session ls --all --json` includes both worker and
+            // orchestrator entries so the sidebar can group them
+            // separately. `ao status --json` skips orchestrators
+            // (they show only in the human-readable banner).
+            match ao.session_ls_all() {
                 Ok(r) => {
                     // Send Sessions first so the UI sees the structure
                     // immediately, then capture each pane sequentially and

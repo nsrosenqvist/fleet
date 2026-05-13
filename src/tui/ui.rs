@@ -138,30 +138,56 @@ fn draw_body(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_sessions_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    // Real session rows + trailing "+ new session" sentinel. The
-    // sentinel renders italic-accent and is always selectable, so an
-    // empty list is never a dead-end — pressing Enter on the only
-    // visible row spawns.
-    let mut items: Vec<ListItem<'_>> = app
-        .sessions
+    // Sidebar layout: each row is either a section header
+    // (orchestrator / workers — non-selectable, styled in muted
+    // bold), a real session row, or the trailing "+ new session"
+    // sentinel. Selection skips headers; the rect buffer still
+    // tracks every row index so the mouse handler can resolve
+    // clicks on header rows to no-ops via `select_at`.
+    let rows = app.sidebar_rows();
+    let items: Vec<ListItem<'_>> = rows
         .iter()
-        .map(|s| {
-            let id = s.id.clone().unwrap_or_else(|| "?".into());
-            let activity = s.activity.clone().unwrap_or_default();
-            ListItem::new(Line::from(vec![
-                Span::raw(format!("{id:<8}")),
-                Span::styled(activity, Style::default().fg(MUTED)),
-            ]))
+        .map(|row| match row {
+            crate::tui::app::SidebarRow::Header { label, count } => ListItem::new(Line::from(
+                vec![
+                    Span::styled(
+                        format!("{label} "),
+                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("({count})"), Style::default().fg(MUTED)),
+                ],
+            )),
+            crate::tui::app::SidebarRow::Session(s) => {
+                let id = s.id.clone().unwrap_or_else(|| "?".into());
+                let activity = s.activity.clone().unwrap_or_default();
+                let is_orch = s.role.as_deref() == Some("orchestrator");
+                let mut spans = vec![Span::raw(format!("  {id:<10}"))];
+                if is_orch {
+                    // Tag the orchestrator row so the user knows
+                    // Enter won't drop into it — fleet treats this
+                    // session as read-only.
+                    spans.push(Span::styled(
+                        "(read-only)",
+                        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                    ));
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(activity, Style::default().fg(MUTED)));
+                ListItem::new(Line::from(spans))
+            }
+            crate::tui::app::SidebarRow::Sentinel => ListItem::new(Line::from(Span::styled(
+                "  + new session",
+                Style::default().fg(ACCENT).add_modifier(Modifier::ITALIC),
+            ))),
         })
         .collect();
-    items.push(ListItem::new(Line::from(Span::styled(
-        "+ new session",
-        Style::default()
-            .fg(ACCENT)
-            .add_modifier(Modifier::ITALIC),
-    ))));
 
-    let title = format!(" sessions ({}) ", app.sessions.len());
+    let worker_count = app
+        .sessions
+        .iter()
+        .filter(|s| s.role.as_deref() != Some("orchestrator"))
+        .count();
+    let title = format!(" sessions ({worker_count}) ");
     // Selected-row highlight: indexed 238 (subtle dim grey) bg +
     // indexed 255 (bright white) fg + BOLD. Same palette keel uses —
     // pairs with any row text colour without washing it out, and

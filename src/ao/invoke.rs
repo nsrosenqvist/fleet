@@ -38,6 +38,24 @@ impl<'a> Ao<'a> {
         )?;
         parse_response(&raw).context("parsing ao session ls --json")
     }
+
+    /// `ao session ls --all --json` — same as [`Self::session_ls`] but
+    /// includes orchestrator sessions (`role: "orchestrator"`) alongside
+    /// workers. Required for fleet's grouped sidebar; the plain
+    /// `ao status --json` omits orchestrators.
+    pub fn session_ls_all(&self) -> Result<AoResponse<SessionInfo>> {
+        let raw = self.lima.shell(
+            self.workdir,
+            vec![
+                "ao".to_string(),
+                "session".to_string(),
+                "ls".to_string(),
+                "--all".to_string(),
+                "--json".to_string(),
+            ],
+        )?;
+        parse_response(&raw).context("parsing ao session ls --all --json")
+    }
 }
 
 /// AO prefixes `--json` output with one or more notifier-warning lines like

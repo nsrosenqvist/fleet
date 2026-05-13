@@ -115,6 +115,39 @@ impl SpawnPrompt {
     }
 }
 
+/// One visible row in the grouped sidebar. Headers render as
+/// styled non-selectable labels (orange + count, à la keel);
+/// sessions and the trailing sentinel are selectable. The layout
+/// gets rebuilt each frame from `App::sessions` so freshly
+/// arrived orchestrator entries promote themselves automatically.
+#[derive(Debug)]
+pub(super) enum SidebarRow<'a> {
+    Header { label: &'static str, count: usize },
+    Session(&'a SessionInfo),
+    Sentinel,
+}
+
+/// Walk `step` rows forward (`step = 1`) or backward (`step = n-1`,
+/// the wrap-equivalent of `-1`) from `start`, skipping over any
+/// `SidebarRow::Header`. Returns the new selection index. Falls
+/// back to `start` if the row list contains no selectable rows
+/// (theoretically impossible since the sentinel is always present,
+/// but the guard keeps the helper total).
+fn next_selectable(rows: &[SidebarRow<'_>], start: usize, step: usize) -> usize {
+    let n = rows.len();
+    if n == 0 {
+        return start;
+    }
+    let mut idx = (start + step) % n;
+    for _ in 0..n {
+        if !matches!(rows[idx], SidebarRow::Header { .. }) {
+            return idx;
+        }
+        idx = (idx + step) % n;
+    }
+    start
+}
+
 /// Pending destructive action awaiting a y/N confirmation in the status bar.
 #[derive(Debug, Clone)]
 pub(super) enum Confirm {
@@ -245,7 +278,7 @@ impl App {
         let current_project_key = ao_config
             .as_ref()
             .and_then(|c| c.project_for_cwd(repo_root).map(String::from));
-        Ok(Self {
+        let mut app = Self {
             repo_root: repo_root.to_path_buf(),
             invoker: Arc::new(RealProcessInvoker),
             ao_config,
@@ -269,7 +302,13 @@ impl App {
             sidebar_item_rects: RefCell::new(Vec::new()),
             last_click: None,
             pending_commands: Vec::new(),
-        })
+        };
+        // Snap past the leading "workers" header so the initial
+        // cursor lands on the sentinel (the only selectable row
+        // before any sessions arrive). Without this, a fresh `App`
+        // would point at a section label.
+        app.snap_selected_to_selectable();
+        Ok(app)
     }
 
     pub(super) fn spawn_refresh_thread(&mut self) {
@@ -290,10 +329,17 @@ impl App {
     }
 
     pub(super) fn drain_updates(&mut self) {
-        let Some(rx) = &self.refresh_update_rx else {
-            return;
-        };
-        while let Ok(update) = rx.try_recv() {
+        // Take messages one at a time with a transient borrow on
+        // `refresh_update_rx`, so the body can call methods that
+        // need `&mut self` (e.g. `snap_selected_to_selectable`).
+        loop {
+            let update = match self.refresh_update_rx.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(u) => u,
+                    Err(_) => return,
+                },
+                None => return,
+            };
             match update {
                 RefreshUpdate::Sessions(all) => {
                     // Scope to the project this fleet instance is
@@ -321,14 +367,13 @@ impl App {
                     // resulting error, and watching it vanish 1.5s later
                     // makes the failure look like a glitch.
                     self.refresh_error = None;
-                    // Clamp the cursor to the new row count
-                    // (sessions + sentinel). When sessions shrink
-                    // out from under the cursor, the sentinel is
-                    // always a safe landing place.
-                    let max = self.sidebar_row_count() - 1;
-                    if self.selected > max {
-                        self.selected = max;
-                    }
+                    // Snap the cursor to the closest selectable row.
+                    // Sessions may have shrunk out from under the
+                    // cursor, OR a new orchestrator entry may have
+                    // arrived and rearranged the headers — either way
+                    // the cursor must end up on a session or the
+                    // sentinel, never on a header.
+                    self.snap_selected_to_selectable();
                 }
                 RefreshUpdate::PaneCapture { session_id, output } => {
                     self.pane_outputs.insert(session_id, output);
@@ -372,12 +417,46 @@ impl App {
         }
     }
 
-    /// Number of navigable rows in the sessions sidebar — every real
-    /// session plus the trailing sentinel "+ new session" row that
-    /// opens the spawn prompt. Always ≥ 1, so the list is never empty
-    /// and the user always has something to do.
+    /// Visible row in the grouped sidebar. Headers render as styled
+    /// non-selectable labels; sessions / sentinel are selectable.
+    /// Built fresh each frame from `self.sessions` so a freshly
+    /// arrived orchestrator entry shows up the next paint.
+    pub(super) fn sidebar_rows(&self) -> Vec<SidebarRow<'_>> {
+        // Partition by role. Orchestrator entries cluster on top
+        // (mirrors AO's `ao status` banner layout — the orchestrator
+        // is the coordinator, workers are what it spawns).
+        let (orchestrators, workers): (Vec<_>, Vec<_>) = self
+            .sessions
+            .iter()
+            .partition(|s| s.role.as_deref() == Some("orchestrator"));
+
+        let mut rows: Vec<SidebarRow<'_>> = Vec::new();
+        if !orchestrators.is_empty() {
+            rows.push(SidebarRow::Header {
+                label: "orchestrator",
+                count: orchestrators.len(),
+            });
+            for o in orchestrators {
+                rows.push(SidebarRow::Session(o));
+            }
+        }
+        rows.push(SidebarRow::Header {
+            label: "workers",
+            count: workers.len(),
+        });
+        for w in workers {
+            rows.push(SidebarRow::Session(w));
+        }
+        rows.push(SidebarRow::Sentinel);
+        rows
+    }
+
+    /// Number of rows in the sidebar (headers + sessions + sentinel).
+    /// Headers count, so the row index in `self.selected` stays aligned
+    /// with the rendered list — navigation skips header rows but
+    /// hit-testing and rect placement uses this full count.
     pub(super) fn sidebar_row_count(&self) -> usize {
-        self.sessions.len() + 1
+        self.sidebar_rows().len()
     }
 
     /// True when the selected row is the trailing "+ new session"
@@ -386,26 +465,71 @@ impl App {
     /// panel) and Enter / double-click activation (which opens the
     /// spawn prompt instead of attaching).
     pub(super) fn is_sentinel_selected(&self) -> bool {
-        self.selected == self.sessions.len()
+        matches!(
+            self.sidebar_rows().get(self.selected),
+            Some(SidebarRow::Sentinel)
+        )
+    }
+
+    /// True when the selected row is an orchestrator entry. Used by
+    /// the input layer to short-circuit attach (orchestrator stays
+    /// read-only in fleet — its pane shows the coordinator's claude
+    /// transcript, but Enter doesn't drop into it).
+    pub(super) fn is_orchestrator_selected(&self) -> bool {
+        matches!(
+            self.sidebar_rows().get(self.selected),
+            Some(SidebarRow::Session(s)) if s.role.as_deref() == Some("orchestrator"),
+        )
+    }
+
+    /// Re-anchor `self.selected` to the first selectable row at or
+    /// after its current position. Used after `self.sessions` changes
+    /// (`App::new`, `drain_updates`) so the cursor never gets stranded
+    /// on a section header that arrived (or disappeared) with the new
+    /// session list.
+    pub(super) fn snap_selected_to_selectable(&mut self) {
+        // Resolve the target index, then drop the borrowed row
+        // references before mutating `self.selected` — the row vec
+        // holds `&SessionInfo` borrowed from `self`, so reassigning
+        // a field on `self` while it's alive trips the borrow checker.
+        let target = {
+            let rows = self.sidebar_rows();
+            if rows.is_empty() {
+                return;
+            }
+            let start = self.selected.min(rows.len() - 1);
+            if matches!(rows[start], SidebarRow::Header { .. }) {
+                next_selectable(&rows, start, 1)
+            } else {
+                start
+            }
+        };
+        self.selected = target;
     }
 
     pub(super) fn nav_down(&mut self) {
-        let n = self.sidebar_row_count();
-        self.selected = (self.selected + 1) % n;
+        let rows = self.sidebar_rows();
+        self.selected = next_selectable(&rows, self.selected, 1);
     }
 
     pub(super) fn nav_up(&mut self) {
-        let n = self.sidebar_row_count();
-        self.selected = (self.selected + n - 1) % n;
+        let rows = self.sidebar_rows();
+        // Wrap-around traversal in the negative direction. Using
+        // `rows.len() - 1` (equivalent to -1 mod n) keeps the helper
+        // symmetric with `nav_down`.
+        self.selected = next_selectable(&rows, self.selected, rows.len().saturating_sub(1));
     }
 
-    /// Move selection to an explicit index. Guards against stale rects —
-    /// a click that hit-tested against the previous frame's rects might
-    /// point at an index that no longer exists if the session list shrunk
-    /// in the same draw cycle. The sentinel row at `sessions.len()` is
-    /// a valid target.
+    /// Move selection to an explicit row index. No-op if the row is a
+    /// header (mouse clicks on a header label shouldn't move the
+    /// cursor onto it) or if the index is out of range — guards
+    /// against stale rects from a previous draw cycle.
     pub(super) fn select_at(&mut self, idx: usize) {
-        if idx <= self.sessions.len() {
+        let rows = self.sidebar_rows();
+        if rows
+            .get(idx)
+            .is_some_and(|r| !matches!(r, SidebarRow::Header { .. }))
+        {
             self.selected = idx;
         }
     }
@@ -428,7 +552,10 @@ impl App {
     }
 
     pub(super) fn selected_session(&self) -> Option<&SessionInfo> {
-        self.sessions.get(self.selected)
+        match self.sidebar_rows().get(self.selected)? {
+            SidebarRow::Session(s) => Some(*s),
+            SidebarRow::Header { .. } | SidebarRow::Sentinel => None,
+        }
     }
 
     /// True when the current project's tracker has a remote web
@@ -614,56 +741,76 @@ mod tests {
     }
 
     #[test]
-    fn initial_state_has_no_selection_marker_but_index_zero() {
+    fn initial_state_lands_on_the_sentinel() {
+        // No sessions yet → rows = [Header "workers (0)", Sentinel].
+        // `App::new` snaps past the leading header so the cursor
+        // starts on the sentinel; that way a fresh user can press
+        // Enter immediately to open the spawn modal.
         let app = App::new(std::path::Path::new(".")).expect("ok");
         assert!(app.sessions.is_empty());
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected, 1);
+        assert!(app.is_sentinel_selected());
         assert!(!app.should_quit);
         assert!(app.confirm.is_none());
     }
 
     #[test]
     fn nav_down_walks_sessions_then_sentinel_then_wraps() {
-        // 3 sessions + trailing "+ new session" sentinel = 4 rows.
+        // Layout for 3 workers:
+        //   row 0: Header "workers"
+        //   rows 1..=3: sb-1, sb-2, sb-3
+        //   row 4: Sentinel
+        // Initial snap lands on row 1 (first session).
         let mut app = app_with(3);
+        assert_eq!(app.selected, 1, "initial snap lands on first session");
         app.nav_down();
         app.nav_down();
-        assert_eq!(app.selected, 2);
+        assert_eq!(app.selected, 3, "walked to sb-3");
         app.nav_down();
-        assert_eq!(app.selected, 3, "next stop is the sentinel row");
+        assert_eq!(app.selected, 4, "next stop is the sentinel row");
         assert!(app.is_sentinel_selected());
         app.nav_down();
-        assert_eq!(app.selected, 0, "wraps from sentinel back to first session");
+        assert_eq!(
+            app.selected, 1,
+            "wraps past the header back to the first session"
+        );
     }
 
     #[test]
     fn nav_up_wraps_to_sentinel() {
         let mut app = app_with(3);
+        // Initial snap puts us on row 1 (first session).
         app.nav_up();
-        assert_eq!(app.selected, 3, "wraps from 0 to the sentinel (last row)");
+        assert_eq!(
+            app.selected, 4,
+            "wraps backward past the workers header onto the sentinel"
+        );
         assert!(app.is_sentinel_selected());
     }
 
     #[test]
     fn empty_session_list_keeps_sentinel_selectable() {
-        // No real sessions → only the sentinel exists, so nav is a
-        // no-op cycle but the selection stays valid.
+        // No real sessions → rows = [Header "workers (0)", Sentinel].
+        // Header is skipped by snap; the sentinel is the only
+        // selectable row, so nav is a no-op cycle.
         let mut app = app_with(0);
-        assert_eq!(app.sidebar_row_count(), 1);
+        assert_eq!(app.sidebar_row_count(), 2);
         assert!(app.is_sentinel_selected());
+        let pos = app.selected;
         app.nav_down();
         app.nav_up();
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected, pos);
         assert!(app.is_sentinel_selected());
     }
 
     #[test]
     fn drain_updates_clamps_cursor_to_new_row_count() {
-        // Selected sb-3 (idx 2). Sessions shrink to one entry → row
-        // count becomes 2 (sb-only + sentinel). Cursor clamps to 1
-        // (the sentinel), since the row it was pointing at is gone.
+        // Selected sb-3 at row 3 (header at row 0). Sessions shrink
+        // to one entry → new row layout: [Header, Session("only"),
+        // Sentinel] (3 rows). Cursor snaps to the sentinel since
+        // the row it was pointing at is gone.
         let mut app = app_with(3);
-        app.selected = 2;
+        app.selected = 3;
         let (tx, rx) = mpsc::channel();
         app.refresh_update_rx = Some(rx);
         tx.send(RefreshUpdate::Sessions(vec![session("only")]))
@@ -671,7 +818,7 @@ mod tests {
         app.drain_updates();
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(
-            app.selected, 1,
+            app.selected, 2,
             "stale cursor lands on the sentinel rather than past-end",
         );
         assert!(app.is_sentinel_selected());
@@ -828,9 +975,13 @@ mod tests {
 
     #[test]
     fn select_at_clamps_against_empty_session_list() {
+        // No sessions → rows = [Header, Sentinel]; snap puts cursor
+        // on row 1 (the sentinel). A click on a non-existent row 3
+        // is a no-op — cursor stays on the sentinel.
         let mut app = app_with(0);
+        let initial = app.selected;
         app.select_at(3);
-        assert_eq!(app.selected, 0, "no-op on empty list");
+        assert_eq!(app.selected, initial, "no-op on empty list");
     }
 
     #[test]
