@@ -281,13 +281,16 @@ pub(super) fn handle_key_register_project(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Confirm mode: `y`/`Y` resolves to the pending action, anything else
-/// cancels. Always returns to Normal mode (by clearing `app.confirm`).
+/// Confirm mode: `Enter` or `y`/`Y` resolves to the pending action;
+/// `Esc` / `n` / `N` (or any other key) cancels. Enter is the default
+/// so users can power through the dialog without reaching for `y`.
+/// Always returns to Normal mode by clearing `app.confirm`.
 pub(super) fn handle_key_confirm(app: &mut App, key: KeyEvent) {
     let Some(pending) = app.confirm.take() else {
         return;
     };
-    if let KeyCode::Char('y' | 'Y') = key.code {
+    let confirmed = matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'Y'));
+    if confirmed {
         match pending {
             Confirm::KillSession(id) => app.push_command(Command::KillSession(id)),
             Confirm::StopAo => app.push_command(Command::StopAo),
@@ -296,7 +299,7 @@ pub(super) fn handle_key_confirm(app: &mut App, key: KeyEvent) {
             }
         }
     }
-    // Cancel path is silent — the user explicitly pressed a non-y
+    // Cancel path is silent — the user explicitly pressed a non-confirm
     // key to back out, so a confirmation flash would just be noise.
 }
 

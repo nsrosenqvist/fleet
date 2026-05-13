@@ -163,7 +163,7 @@ pub(super) enum SidebarRow<'a> {
     Sentinel,
 }
 
-/// Pending destructive action awaiting a y/N confirmation in the status bar.
+/// Pending destructive action awaiting a y/N confirmation in a modal.
 #[derive(Debug, Clone)]
 pub(super) enum Confirm {
     KillSession(String),
@@ -177,14 +177,26 @@ pub(super) enum Confirm {
 }
 
 impl Confirm {
-    pub(super) fn prompt(&self) -> String {
+    /// Short title shown at the top of the confirm modal.
+    pub(super) fn title(&self) -> &'static str {
         match self {
-            Self::KillSession(id) => format!("Kill session {id}? [y/N]"),
-            Self::StopAo => "Stop AO orchestrator + dashboard? [y/N]".to_string(),
-            Self::RestartAoForOrchestrator => {
-                "No orchestrator running. Restart AO to spawn one? Kills any running workers. [y/N]"
-                    .to_string()
-            }
+            Self::KillSession(_) => " kill session ",
+            Self::StopAo => " stop ao ",
+            Self::RestartAoForOrchestrator => " restart ao ",
+        }
+    }
+
+    /// Body lines for the confirm modal. The first line is the
+    /// primary question; subsequent lines (if any) flesh out the
+    /// consequences so the default-Yes choice isn't a footgun.
+    pub(super) fn prompt(&self) -> Vec<String> {
+        match self {
+            Self::KillSession(id) => vec![format!("Kill session {id}?")],
+            Self::StopAo => vec!["Stop AO orchestrator + dashboard?".to_string()],
+            Self::RestartAoForOrchestrator => vec![
+                "No orchestrator running. Restart AO to spawn one?".to_string(),
+                "Kills any running workers.".to_string(),
+            ],
         }
     }
 }
@@ -1192,11 +1204,12 @@ mod tests {
     #[test]
     fn confirm_prompts_name_the_action() {
         let kill = Confirm::KillSession("sb-1".into());
-        assert!(kill.prompt().contains("sb-1"));
-        assert!(kill.prompt().contains("Kill"));
+        let kill_body = kill.prompt().join(" ");
+        assert!(kill_body.contains("sb-1"));
+        assert!(kill_body.contains("Kill"));
 
         let stop = Confirm::StopAo;
-        assert!(stop.prompt().contains("Stop AO"));
+        assert!(stop.prompt().join(" ").contains("Stop AO"));
     }
 
     #[test]

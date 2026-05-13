@@ -60,15 +60,62 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
 
     // Overlay modals — painted last so they sit on top of the normal
     // layout. Priority matches input dispatch: register-project >
-    // secret setup > spawn prompt. None of these are designed to
-    // co-exist; only one can be `Some` at a time in practice.
+    // secret setup > spawn prompt > confirm. None of these are
+    // designed to co-exist; only one can be `Some` at a time in
+    // practice. Confirm sits at the bottom of this branch only
+    // because the other modals own input exclusively while open —
+    // you can't open a confirm dialog from inside them.
     if let Some(rp) = &app.register_project {
         render_register_project(frame, rp);
     } else if let Some(setup) = &app.secret_setup {
         render_secret_setup(frame, setup);
     } else if let Some(prompt) = &app.spawn_prompt {
         render_spawn_prompt(frame, prompt, app.ao_up);
+    } else if let Some(c) = &app.confirm {
+        render_confirm(frame, c);
     }
+}
+
+/// Destructive-action confirmation modal. Painted while
+/// [`crate::tui::app::App::confirm`] is `Some`. Enter is the default
+/// (Yes); `y`/`Y` also confirm. Esc, `n`/`N`, or any other key cancels.
+pub(super) fn render_confirm(frame: &mut Frame<'_>, c: &super::app::Confirm) {
+    let muted = Style::default().fg(MUTED);
+
+    let prompt_lines = c.prompt();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(prompt_lines.len());
+    let mut prompt_iter = prompt_lines.into_iter();
+    if let Some(first) = prompt_iter.next() {
+        lines.push(Line::from(Span::styled(
+            first,
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )));
+    }
+    for extra in prompt_iter {
+        lines.push(Line::from(Span::styled(extra, muted)));
+    }
+
+    // Footer lists the default first so the eye lands on it. The
+    // `Yes` chip is highlighted to reinforce that Enter triggers it
+    // — defaulting to "yes" on a destructive action is deliberate
+    // and the visual should match.
+    let footer = vec![Line::from(vec![
+        modal_key("enter"),
+        Span::styled(" ", muted),
+        Span::styled(
+            "Yes",
+            Style::default().fg(OK).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   ", muted),
+        modal_key("y"),
+        Span::styled(" confirm   ", muted),
+        modal_key("n"),
+        Span::styled(" / ", muted),
+        modal_key("esc"),
+        Span::styled(" cancel", muted),
+    ])];
+
+    draw_modal(frame, c.title(), WARN, lines, &footer);
 }
 
 fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -691,21 +738,15 @@ fn draw_in_flight_ao(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    // Three overlays replace the legend rather than appending to it: a
-    // pending confirm, an error flash, an info flash. Match keel's pattern
-    // — appending was fine while messages stayed short, but a real shell
-    // error ("failed to spawn `limactl`: No such file or directory") runs
-    // past the right edge of a typical terminal and chops off the relevant
-    // text. Anything load-bearing belongs on the left.
-    if let Some(c) = &app.confirm {
-        let line = Line::from(vec![
-            badge(" ? ", WARN),
-            Span::raw(" "),
-            Span::styled(c.prompt(), Style::default().fg(WARN)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
+    // Two overlays replace the legend rather than appending to it: an
+    // error flash and an info flash. Pending confirms are now their
+    // own centred modal (see `render_confirm`) so the status bar can
+    // keep showing the legend behind the dim overlay. Match keel's
+    // pattern — appending was fine while messages stayed short, but
+    // a real shell error ("failed to spawn `limactl`: No such file
+    // or directory") runs past the right edge of a typical terminal
+    // and chops off the relevant text. Anything load-bearing belongs
+    // on the left.
     // In-flight AO subprocess (kill / stop / start / spawn / restart):
     // spinner + task label, optional sub-phase label for multi-phase
     // tasks, elapsed seconds. Slots in above the action-flash overlays
