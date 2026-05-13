@@ -646,7 +646,25 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
         Span::styled("[Esc]", bold_key),
         Span::styled(" cancel", muted),
     ])];
-    draw_modal(frame, " spawn session ", ACCENT, lines, &footer);
+    // Pin the modal width so it doesn't shrink as the user narrows
+    // the filter — a resizing target while you're typing is hard to
+    // read. Picks `min(area * 0.75, 100 cols)` so the picker is
+    // comfortable on a typical terminal but never overflows a
+    // narrow one.
+    let area = frame.area();
+    let pinned = area
+        .width
+        .saturating_mul(3)
+        .saturating_div(4)
+        .clamp(60, 100);
+    draw_modal_sized(
+        frame,
+        " spawn session ",
+        ACCENT,
+        lines,
+        &footer,
+        ModalWidth::Fixed(pinned),
+    );
 }
 
 /// One filtered issue row. Layout: gutter `▶`/space, `human_id`
@@ -1099,18 +1117,44 @@ fn draw_modal(
     body: Vec<Line<'static>>,
     footer: &[Line<'static>],
 ) {
+    draw_modal_sized(frame, title_text, title_color, body, footer, ModalWidth::Auto);
+}
+
+/// How a modal picks its column width when laid out.
+///
+/// `Auto` sizes to the longest content line — fine for modals whose
+/// content is stable across frames. `Fixed` pins the width to a
+/// caller-chosen column count, which the spawn picker needs so the
+/// modal doesn't shrink/grow as the user filters the issue list.
+#[derive(Clone, Copy)]
+enum ModalWidth {
+    Auto,
+    Fixed(u16),
+}
+
+fn draw_modal_sized(
+    frame: &mut Frame<'_>,
+    title_text: &str,
+    title_color: ratatui::style::Color,
+    body: Vec<Line<'static>>,
+    footer: &[Line<'static>],
+    width: ModalWidth,
+) {
     let mut lines = body;
     if !footer.is_empty() {
         lines.push(Line::raw(""));
         lines.extend(footer.iter().cloned());
     }
-    let width = lines
-        .iter()
-        .map(Line::width)
-        .max()
-        .unwrap_or(40)
-        .max(40)
-        .saturating_add(6); // 2 borders + 4 horizontal padding
+    let width = match width {
+        ModalWidth::Auto => lines
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap_or(40)
+            .max(40)
+            .saturating_add(6), // 2 borders + 4 horizontal padding
+        ModalWidth::Fixed(w) => usize::from(w),
+    };
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2); // borders only; padding is horizontal-only

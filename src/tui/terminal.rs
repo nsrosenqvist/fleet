@@ -343,6 +343,12 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
             // the handler runs so a key that itself sets a fresh
             // flash (e.g. `c` → "edited /path/...") overrides cleanly
             // rather than getting wiped a tick later.
+            //
+            // Mouse events do *not* dismiss — a stray hover or scroll
+            // would wipe an error before the user could read it (or
+            // select-to-copy from it), which is exactly the bug
+            // someone hit when an error vanished as they reached for
+            // the trackpad to drag-select the message.
             app.dismiss_flash();
             // Mode-first dispatch. Order of precedence: spawn modal
             // (text input intercepts everything) → confirm (y/N gate)
@@ -359,7 +365,6 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
         // only resolution avoids accidentally killing a session or
         // dismissing a spawn prompt with a stray click.
         event::Event::Mouse(m) if app.confirm.is_none() && app.spawn_prompt.is_none() => {
-            app.dismiss_flash();
             input::handle_mouse_normal(app, *m);
         }
         _ => {}
