@@ -353,7 +353,9 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
             // Mode-first dispatch. Order of precedence: spawn modal
             // (text input intercepts everything) → confirm (y/N gate)
             // → normal view keys.
-            if app.spawn_prompt.is_some() {
+            if app.secret_setup.is_some() {
+                input::handle_key_secret_setup(app, *k);
+            } else if app.spawn_prompt.is_some() {
                 input::handle_key_spawn_prompt(app, *k);
             } else if app.confirm.is_some() {
                 input::handle_key_confirm(app, *k);
@@ -361,10 +363,14 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
                 input::handle_key_normal(app, *k);
             }
         }
-        // Mouse is ignored while either modal is pending — keyboard-
+        // Mouse is ignored while any modal is pending — keyboard-
         // only resolution avoids accidentally killing a session or
-        // dismissing a spawn prompt with a stray click.
-        event::Event::Mouse(m) if app.confirm.is_none() && app.spawn_prompt.is_none() => {
+        // dismissing a spawn / token prompt with a stray click.
+        event::Event::Mouse(m)
+            if app.confirm.is_none()
+                && app.spawn_prompt.is_none()
+                && app.secret_setup.is_none() =>
+        {
             input::handle_mouse_normal(app, *m);
         }
         _ => {}
@@ -383,6 +389,7 @@ fn run_command(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>,
         Command::StopAo => stop_ao(app, term),
         Command::RequestRefresh => app.request_refresh(),
         Command::Spawn(issue) => spawn_session(app, term, &issue),
+        Command::SaveOauthToken(token) => save_oauth_token(app, &token),
     }
 }
 
@@ -611,6 +618,9 @@ fn github_issues_url_for(project_path: &std::path::Path) -> Result<String> {
 }
 
 fn start_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+    if !ensure_oauth_token_configured(app) {
+        return;
+    }
     let repo_root = app.repo_root.clone();
     let res = suspend_around(term, || {
         crate::cli::spawn::run_start(&repo_root, false, false).map(|_| ())
@@ -664,6 +674,9 @@ fn spawn_session(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     issue: &str,
 ) {
+    if !ensure_oauth_token_configured(app) {
+        return;
+    }
     let repo_root = app.repo_root.clone();
     let issue_owned = issue.to_string();
     let res = suspend_around(term, || {
@@ -671,6 +684,100 @@ fn spawn_session(
     });
     app.flash_if_err(res);
     app.request_refresh();
+}
+
+/// Gate for any action that needs the Claude OAuth token (Shift+S
+/// → start AO, n → spawn). Returns `true` when the action can
+/// proceed; `false` after opening the in-TUI setup modal so the
+/// user can configure the token without dropping to a shell. The
+/// passthrough auth mode short-circuits to `true` since it doesn't
+/// touch fleet's `claude_code_oauth_token` secret.
+fn ensure_oauth_token_configured(app: &mut App) -> bool {
+    let cfg = crate::config::Config::load(&app.repo_root).unwrap_or_default();
+    if cfg.agent_auth().resolve(&app.repo_root) != crate::config::ResolvedAuthMode::ClaudeOauth {
+        return true;
+    }
+    if cfg.secrets.contains_key("claude_code_oauth_token") {
+        return true;
+    }
+    app.secret_setup = Some(crate::tui::app::SecretSetup::default());
+    false
+}
+
+/// Save the user-provided OAuth token from the secret-setup modal
+/// into the OS keychain (via the `keyring` crate, same backend the
+/// existing `KeychainBackend` reads from at spawn time) and append
+/// the matching config entry to the XDG fleet config so the next
+/// run resolves it without prompting again.
+fn save_oauth_token(app: &mut App, token: &str) {
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
+    let service = "claude-code-oauth-token";
+
+    // 1. Store the token via keyring.
+    let entry = match keyring::Entry::new(service, &user) {
+        Ok(e) => e,
+        Err(e) => {
+            if let Some(s) = app.secret_setup.as_mut() {
+                s.error = Some(format!("open OS keyring: {e}"));
+            }
+            return;
+        }
+    };
+    if let Err(e) = entry.set_password(token) {
+        if let Some(s) = app.secret_setup.as_mut() {
+            s.error = Some(format!("save to keyring: {e}"));
+        }
+        return;
+    }
+
+    // 2. Append a `[secrets.claude_code_oauth_token]` block to the
+    //    fleet config so it resolves on the next run without
+    //    re-prompting. We append-as-text to preserve any existing
+    //    keys + comments — round-tripping via serde would strip
+    //    them.
+    if let Err(e) = append_keychain_secret_to_config(service) {
+        if let Some(s) = app.secret_setup.as_mut() {
+            s.error = Some(format!("write fleet config: {e:#}"));
+        }
+        return;
+    }
+
+    // Success: close the modal. No flash — the user just typed the
+    // token, they know it succeeded when the modal vanishes.
+    app.secret_setup = None;
+}
+
+fn append_keychain_secret_to_config(service: &str) -> Result<()> {
+    let path = crate::config::Config::xdg_path()
+        .context("no HOME / XDG_CONFIG_HOME — can't resolve fleet config path")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.contains("[secrets.claude_code_oauth_token]") {
+        // The precheck shouldn't have opened the modal if this
+        // existed — but if it did (race against an external edit),
+        // refuse to clobber.
+        anyhow::bail!(
+            "{} already has a `claude_code_oauth_token` entry; \
+             edit it manually with `c` if you want to change backends",
+            path.display()
+        );
+    }
+    let separator = if existing.is_empty() || existing.ends_with("\n\n") {
+        ""
+    } else if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let new_section = format!(
+        "{separator}[secrets.claude_code_oauth_token]\nbackend = \"keychain\"\nservice = \"{service}\"\n",
+    );
+    let combined = format!("{existing}{new_section}");
+    std::fs::write(&path, combined).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 fn stop_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {

@@ -68,6 +68,21 @@ pub(super) enum IssuesState {
     Error(String),
 }
 
+/// In-progress "Configure Claude OAuth token" prompt. Surfaces when
+/// the user triggers an action (Shift+S, n) that needs the token
+/// but fleet's secrets config has no `claude_code_oauth_token`
+/// entry. The buffer collects the token (rendered masked); Enter
+/// stores it in the OS keychain via the `keyring` crate and appends
+/// the matching `[secrets.…]` block to the XDG fleet config.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SecretSetup {
+    pub(super) buffer: String,
+    /// Set on a save failure so the renderer can surface what went
+    /// wrong inline (the user's flash overlay would be hidden by
+    /// the modal). Cleared on every keystroke.
+    pub(super) error: Option<String>,
+}
+
 /// In-progress "spawn session" prompt. While `Some`, all keyboard
 /// input is intercepted by the prompt handler so accidental
 /// keystrokes can't fire a different action.
@@ -139,6 +154,10 @@ pub(super) enum Command {
     StopAo,
     RequestRefresh,
     Spawn(String),
+    /// Submit the token collected in `secret_setup`: store via the
+    /// OS keychain (keyring crate) and append the matching
+    /// `[secrets.claude_code_oauth_token]` block to the fleet config.
+    SaveOauthToken(String),
 }
 
 pub struct App {
@@ -180,6 +199,11 @@ pub struct App {
     /// open. Renders as a centred overlay; while present, all key
     /// input goes to the prompt handler.
     pub(super) spawn_prompt: Option<SpawnPrompt>,
+
+    /// Active "Configure Claude OAuth token" modal. Highest input
+    /// priority (above spawn prompt and confirm) so it can't be
+    /// dismissed by accident while the user is typing the token.
+    pub(super) secret_setup: Option<SecretSetup>,
     pub(super) ao_up: bool,
     pub(super) vm_status: VmStatus,
     pub(super) confirm: Option<Confirm>,
@@ -233,6 +257,7 @@ impl App {
             action_error: None,
             last_info: None,
             spawn_prompt: None,
+            secret_setup: None,
             ao_up: false,
             vm_status: VmStatus::Missing,
             confirm: None,

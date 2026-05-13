@@ -25,7 +25,7 @@ use ratatui::widgets::{Clear, List, ListItem, ListState, Padding, Paragraph, Wra
 use crate::ao::SessionInfo;
 use crate::lima::VmStatus;
 
-use super::app::{App, IssuesState, SpawnPrompt};
+use super::app::{App, IssuesState, SecretSetup, SpawnPrompt};
 use super::bringup::BringUp;
 use super::preflight::MissingDep;
 use super::theme::{
@@ -49,9 +49,12 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
     draw_status_bar(app, frame, layout[2]);
 
     // Overlay modals — painted last so they sit on top of the normal
-    // layout. The spawn prompt punches a `Clear` through the frame so
-    // background content can't leak through.
-    if let Some(prompt) = &app.spawn_prompt {
+    // layout. Priority matches input dispatch: secret setup wins
+    // over spawn prompt (one is text-input, the other is text+list,
+    // and they shouldn't both be visible at once anyway).
+    if let Some(setup) = &app.secret_setup {
+        render_secret_setup(frame, setup);
+    } else if let Some(prompt) = &app.spawn_prompt {
         render_spawn_prompt(frame, prompt);
     }
 }
@@ -556,6 +559,75 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// below (filtered by the buffer), and footer key hints. Enter
 /// submits the highlighted row or, if there's no list / no match,
 /// the raw buffer. Esc cancels.
+/// "Configure Claude OAuth token" modal. Painted when a user
+/// action that needs the token finds none configured. Single text
+/// field, masked rendering, in-modal error row for save failures
+/// (keychain unreachable, config not writable, etc.).
+pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
+    let muted = Style::default().fg(MUTED);
+    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Fleet needs your Claude OAuth token to spawn agent",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "sessions. It's stored in your OS keychain — the same",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "place GNOME Keyring / KWallet / Keychain put other",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "credentials.",
+            muted,
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("token       ", muted),
+            // Masked rendering — show one `•` per input char so the
+            // user can see length without leaking the value into a
+            // terminal scrollback buffer.
+            Span::styled(
+                "•".repeat(setup.buffer.chars().count()),
+                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("█", Style::default().fg(KEY_FG)),
+        ]),
+    ];
+    if let Some(err) = &setup.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("error  ", Style::default().fg(ERR)),
+            Span::styled(
+                truncate(err, 70),
+                Style::default().fg(ERR).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Get a token from claude.ai → Settings → Developer.",
+        muted.add_modifier(Modifier::ITALIC),
+    )));
+
+    let footer = vec![Line::from(vec![
+        Span::styled("[Enter]", bold_key),
+        Span::styled(" save to keychain   ", muted),
+        Span::styled("[Esc]", bold_key),
+        Span::styled(" cancel", muted),
+    ])];
+    draw_modal(
+        frame,
+        " configure claude oauth token ",
+        ACCENT,
+        lines,
+        &footer,
+    );
+}
+
 pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
     const MAX_ROWS: usize = 12;
 

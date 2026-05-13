@@ -120,6 +120,39 @@ pub(super) fn handle_key_spawn_prompt(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Secret-setup mode: collect the user's Claude OAuth token in a
+/// masked buffer. Enter submits to the keychain + config writer
+/// (via `Command::SaveOauthToken`); Esc cancels. Other keys editing
+/// the buffer also clear any in-modal error so the user sees they
+/// recovered.
+pub(super) fn handle_key_secret_setup(app: &mut App, key: KeyEvent) {
+    let Some(setup) = app.secret_setup.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Enter => {
+            let token = setup.buffer.trim().to_string();
+            if token.is_empty() {
+                setup.error = Some("token is empty".to_string());
+                return;
+            }
+            app.push_command(Command::SaveOauthToken(token));
+        }
+        KeyCode::Esc => {
+            app.secret_setup = None;
+        }
+        KeyCode::Backspace => {
+            setup.buffer.pop();
+            setup.error = None;
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            setup.buffer.push(c);
+            setup.error = None;
+        }
+        _ => {}
+    }
+}
+
 /// Confirm mode: `y`/`Y` resolves to the pending action, anything else
 /// cancels. Always returns to Normal mode (by clearing `app.confirm`).
 pub(super) fn handle_key_confirm(app: &mut App, key: KeyEvent) {
