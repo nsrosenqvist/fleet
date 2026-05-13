@@ -87,7 +87,7 @@ pub fn badge(text: &str, color: Color) -> Span<'_> {
 
 /// Dot separator between hotkey groups in the status bar.
 pub fn sep() -> Span<'static> {
-    Span::styled("  ·  ", Style::default().fg(MUTED))
+    Span::styled(" · ", Style::default().fg(MUTED))
 }
 
 /// Hotkey glyph (`↑`, `enter`, `K`, …) rendered bold-accent.
