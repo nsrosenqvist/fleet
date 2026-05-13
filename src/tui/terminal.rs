@@ -7,7 +7,7 @@
 //! (attach, edit config, …) live here so the input layer never sees the
 //! terminal handle.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{event, execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -18,7 +18,7 @@ use std::time::Duration;
 use super::app::{App, Command};
 use super::bringup::{BringUp, BringUpMode};
 use super::input;
-use super::preflight::{self, MissingDep, Preflight};
+use super::preflight::{self, MissingDep, MissingTracker, Preflight};
 use super::subprocess::suspend_around;
 use super::ui;
 
@@ -33,9 +33,14 @@ const TICK_INTERVAL: Duration = Duration::from_millis(50);
 /// stopped (rare but possible if start failed mid-cloud-init).
 pub(super) fn run(app: &mut App) -> Result<i32> {
     let mut term = enter_terminal()?;
-    let outcome = settle_preflight(&mut term);
+    let outcome = settle_preflight(&mut term, &app.repo_root);
     let result = match outcome {
         PreflightOutcome::Proceed => {
+            // Pick up any AO yaml edits the user made via the
+            // preflight "edit config" action — App was constructed
+            // before the modal loop ran, so its cached config is
+            // potentially stale.
+            app.reload_ao_config();
             app.spawn_refresh_thread();
             let res = drive(app, &mut term);
             app.shutdown_refresh_thread();
@@ -55,22 +60,28 @@ enum PreflightOutcome {
 }
 
 /// Loop preflight → modal → remediation until the user either lands in
-/// an `Ok` state or quits. Remediation runs `limactl start fleet-vm`
-/// suspended; any keystroke other than `y` in a VM-setup modal is a
-/// quit, matching the existing kill/stop confirm convention.
-fn settle_preflight(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> PreflightOutcome {
+/// an `Ok` state or quits. Each modal offers `c` (open the AO yaml in
+/// `$EDITOR`) so a misconfigured project / tracker plugin can be fixed
+/// without exiting fleet first.
+fn settle_preflight(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    repo_root: &std::path::Path,
+) -> PreflightOutcome {
     loop {
-        match preflight::check() {
+        match preflight::check(repo_root) {
             Preflight::Ok => return PreflightOutcome::Proceed,
-            Preflight::HostBinsMissing(deps) => {
-                return match run_preflight_modal(term, &deps) {
-                    Ok(code) => PreflightOutcome::Quit(code),
-                    Err(e) => PreflightOutcome::Err(e),
-                };
-            }
+            Preflight::HostBinsMissing(deps) => match run_host_bins_modal(term, &deps) {
+                Ok(HostBinsAction::EditConfig) => {
+                    if let Err(e) = edit_ao_yaml(term, repo_root) {
+                        return PreflightOutcome::Err(e);
+                    }
+                }
+                Ok(HostBinsAction::Quit) => return PreflightOutcome::Quit(1),
+                Err(e) => return PreflightOutcome::Err(e),
+            },
             Preflight::VmMissing => match prompt_vm_action(term, VmAction::Create) {
                 Ok(true) => match bring_up_vm(term, BringUpMode::Create) {
-                    Ok(()) => {} // re-check
+                    Ok(()) => {}
                     Err(e) => return PreflightOutcome::Err(e),
                 },
                 Ok(false) => return PreflightOutcome::Quit(1),
@@ -78,12 +89,24 @@ fn settle_preflight(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Prefli
             },
             Preflight::VmStopped => match prompt_vm_action(term, VmAction::Start) {
                 Ok(true) => match bring_up_vm(term, BringUpMode::StartExisting) {
-                    Ok(()) => {} // re-check
+                    Ok(()) => {}
                     Err(e) => return PreflightOutcome::Err(e),
                 },
                 Ok(false) => return PreflightOutcome::Quit(1),
                 Err(e) => return PreflightOutcome::Err(e),
             },
+            Preflight::TrackerWarnings(warnings) => {
+                match run_tracker_warnings_modal(term, &warnings) {
+                    Ok(TrackerAction::Continue) => return PreflightOutcome::Proceed,
+                    Ok(TrackerAction::EditConfig) => {
+                        if let Err(e) = edit_ao_yaml(term, repo_root) {
+                            return PreflightOutcome::Err(e);
+                        }
+                    }
+                    Ok(TrackerAction::Quit) => return PreflightOutcome::Quit(1),
+                    Err(e) => return PreflightOutcome::Err(e),
+                }
+            }
         }
     }
 }
@@ -94,22 +117,92 @@ enum VmAction {
     Start,
 }
 
-/// Block on the host-bins modal until the user dismisses it. Exit code 1
-/// so calling shells / CI can tell a preflight-failed run apart from a
-/// clean quit.
-fn run_preflight_modal(
+/// User's choice from the host-bins modal. Edit-config loops back
+/// through preflight after `$EDITOR` exits (in case the user dropped
+/// or replaced a misconfigured project that depended on the missing
+/// host bin — unlikely for `limactl` itself, but handy when the host
+/// bins list grows).
+enum HostBinsAction {
+    EditConfig,
+    Quit,
+}
+
+enum TrackerAction {
+    /// Proceed into the main TUI; the missing tracker tools only
+    /// break the spawn picker for those plugins. The user has been
+    /// warned and chose to continue.
+    Continue,
+    EditConfig,
+    Quit,
+}
+
+fn run_host_bins_modal(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     failures: &[MissingDep],
-) -> Result<i32> {
+) -> Result<HostBinsAction> {
     loop {
         term.draw(|f| ui::render_preflight(f, failures))?;
         if event::poll(TICK_INTERVAL)?
             && let event::Event::Key(k) = event::read()?
             && k.kind == event::KeyEventKind::Press
         {
-            return Ok(1);
+            return Ok(match k.code {
+                event::KeyCode::Char('c' | 'C') => HostBinsAction::EditConfig,
+                _ => HostBinsAction::Quit,
+            });
         }
     }
+}
+
+fn run_tracker_warnings_modal(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    warnings: &[MissingTracker],
+) -> Result<TrackerAction> {
+    loop {
+        term.draw(|f| ui::render_tracker_warnings(f, warnings))?;
+        if event::poll(TICK_INTERVAL)?
+            && let event::Event::Key(k) = event::read()?
+            && k.kind == event::KeyEventKind::Press
+        {
+            return Ok(match k.code {
+                event::KeyCode::Char('c' | 'C') => TrackerAction::EditConfig,
+                event::KeyCode::Char('q' | 'Q') | event::KeyCode::Esc => TrackerAction::Quit,
+                // Any other key (including Enter) continues into the TUI.
+                _ => TrackerAction::Continue,
+            });
+        }
+    }
+}
+
+/// Suspend the alt screen, open the AO yaml in `$EDITOR`, return so
+/// the preflight loop re-runs against the (possibly edited) file.
+/// Targets the file the running config was loaded from when one
+/// exists; otherwise the XDG default so new users land in the central
+/// catalog by default. Same shape as the in-TUI `c` keybind.
+fn edit_ao_yaml(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    repo_root: &std::path::Path,
+) -> Result<()> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let yaml_path = crate::ao::config::AoConfig::resolve_path(repo_root)
+        .or_else(crate::ao::config::AoConfig::default_xdg_path)
+        .unwrap_or_else(|| repo_root.join("agent-orchestrator.yaml"));
+    if let Some(parent) = yaml_path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    suspend_around(term, || {
+        crate::process::run_interactive(
+            &editor,
+            &[yaml_path.display().to_string()],
+            &[],
+            &[],
+        )
+        .map(|_| ())
+    })?;
+    Ok(())
 }
 
 /// Draw the VM-setup modal (missing or stopped variant) and wait for a

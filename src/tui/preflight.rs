@@ -2,23 +2,23 @@
 //!
 //! Fleet has no degraded mode — every host-side operation funnels through
 //! `limactl shell <vm> …`, so running the TUI when prerequisites are wrong
-//! just produces noisy mid-session failures. The preflight runs three
-//! checks, each at most one cheap subprocess:
+//! just produces noisy mid-session failures. Phases:
 //!
-//! 1. Is `limactl` on `$PATH`?
-//! 2. Does the `fleet-vm` Lima instance exist?
-//! 3. Is it running?
-//!
-//! Each negative answer maps to one [`Preflight`] variant the terminal
-//! layer drives: the missing-host-binary case is a dead-end modal (quit
-//! only); the VM cases are actionable modals that suspend the TUI and
-//! invoke `limactl start fleet-vm` to remediate, then loop back through
-//! preflight.
+//! 1. `limactl` on `$PATH` (hard fail — nothing else works without it).
+//! 2. `fleet-vm` Lima instance exists.
+//! 3. The instance is running.
+//! 4. Tracker tools (`git-bug` inside the VM, `gh` on the host) match the
+//!    plugins configured in `agent-orchestrator.yaml`. **Advisory** — the
+//!    rest of the TUI works without these; only the spawn picker breaks
+//!    for that one project. Surfaced as a continue-able warning so the
+//!    user can fix the AO yaml or install the tool without blocking
+//!    everything else.
 //!
 //! Tmux is intentionally not probed here. Every tmux call in fleet runs
 //! through `limactl shell <vm> … tmux …`, so tmux's availability is a
 //! property of the Lima guest image, not the host.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
@@ -28,14 +28,16 @@ use crate::process::RealProcessInvoker;
 /// The Lima instance fleet expects. Mirrors `cli::vm::VM_NAME`.
 pub(super) const VM_NAME: &str = "fleet-vm";
 
-/// Outcome of [`check`]. The first failure short-circuits — checking VM
-/// status when `limactl` itself is missing would just be a confusing
-/// "command not found" error wrapped in a missing-VM message.
+/// Outcome of [`check`]. Hard failures (`HostBinsMissing`, `VmMissing`,
+/// `VmStopped`) short-circuit later phases. `TrackerWarnings` only
+/// arrives after the hard phases pass — the spawn picker is broken
+/// but the rest of the TUI works, so the modal is continue-able.
 pub enum Preflight {
     Ok,
     HostBinsMissing(Vec<MissingDep>),
     VmMissing,
     VmStopped,
+    TrackerWarnings(Vec<MissingTracker>),
 }
 
 /// One missing host binary, ready to display in the preflight modal.
@@ -50,17 +52,38 @@ pub struct MissingDep {
     pub docs: Option<&'static str>,
 }
 
-/// Run the preflight probes. See module docs for the order.
-pub fn check() -> Preflight {
-    check_with(default_has_bin, default_vm_status)
+/// One tracker plugin whose required tool isn't installed. `location`
+/// distinguishes host-side tools (gh) from in-VM tools (git-bug). `used_by`
+/// lists the project keys that configure this plugin so the user can
+/// see exactly which projects' spawn pickers will break.
+pub struct MissingTracker {
+    pub plugin: String,
+    pub tool: &'static str,
+    pub location: &'static str,
+    pub install: &'static str,
+    pub used_by: Vec<String>,
 }
 
-/// Inner form with the two probe functions injected — keeps [`check`]
-/// trivially testable without mocking subprocess invocations.
+/// Run the preflight probes against the project rooted at `repo_root`
+/// (used to load the AO yaml for phase 4). See module docs for ordering.
+pub fn check(repo_root: &Path) -> Preflight {
+    check_with(
+        default_has_bin,
+        default_vm_status,
+        default_in_vm,
+        repo_root,
+    )
+}
+
+/// Inner form with probe functions injected so tests can drive any
+/// branch without spawning subprocesses.
 fn check_with(
     has_bin: impl Fn(&str) -> bool,
     vm_status: impl FnOnce() -> VmStatus,
+    in_vm: impl Fn(&str) -> bool,
+    repo_root: &Path,
 ) -> Preflight {
+    // Phase 1: host bins.
     let mut host = Vec::new();
     if !has_bin("limactl") {
         host.push(MissingDep {
@@ -73,17 +96,85 @@ fn check_with(
     if !host.is_empty() {
         return Preflight::HostBinsMissing(host);
     }
+
+    // Phase 2 + 3: VM lifecycle.
     match vm_status() {
-        VmStatus::Running => Preflight::Ok,
-        VmStatus::Stopped => Preflight::VmStopped,
-        VmStatus::Missing => Preflight::VmMissing,
+        VmStatus::Missing => return Preflight::VmMissing,
+        VmStatus::Stopped => return Preflight::VmStopped,
+        VmStatus::Running => {}
     }
+
+    // Phase 4: tracker tools. Loading the AO yaml is best-effort — if
+    // it doesn't parse, the spawn picker will report the error later;
+    // we just skip the tracker check rather than blocking on it.
+    let ao = crate::ao::config::AoConfig::load(repo_root)
+        .ok()
+        .flatten()
+        .map(|(_, cfg)| cfg);
+    if let Some(cfg) = ao {
+        let warnings = check_trackers(&cfg, &has_bin, &in_vm);
+        if !warnings.is_empty() {
+            return Preflight::TrackerWarnings(warnings);
+        }
+    }
+
+    Preflight::Ok
+}
+
+/// Group project tracker plugins by name (so multiple projects sharing
+/// a plugin produce one row), probe the required tool for each, and
+/// return a `MissingTracker` per missing plugin. Unknown plugins are
+/// skipped — fleet doesn't know what tool to look for and the
+/// per-project spawn picker will surface the actual error.
+fn check_trackers(
+    cfg: &crate::ao::config::AoConfig,
+    has_bin: &impl Fn(&str) -> bool,
+    in_vm: &impl Fn(&str) -> bool,
+) -> Vec<MissingTracker> {
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, project) in &cfg.projects {
+        if let Some(tracker) = &project.tracker {
+            grouped
+                .entry(tracker.plugin.clone())
+                .or_default()
+                .push(key.clone());
+        }
+    }
+
+    let mut missing = Vec::new();
+    for (plugin, used_by) in grouped {
+        let probe = match plugin.as_str() {
+            "git-bug" => Some(("git-bug", "the fleet-vm guest", true)),
+            "github" => Some(("gh", "the host", false)),
+            _ => None,
+        };
+        let Some((tool, location, in_guest)) = probe else {
+            continue;
+        };
+        let available = if in_guest { in_vm(tool) } else { has_bin(tool) };
+        if available {
+            continue;
+        }
+        let install: &'static str = match plugin.as_str() {
+            // `git-bug` upstream binaries: `go install` or pull a
+            // release. The Lima default Ubuntu doesn't package it.
+            "git-bug" => "limactl shell fleet-vm -- sudo bash -c 'curl -L https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_amd64 -o /usr/local/bin/git-bug && chmod +x /usr/local/bin/git-bug'",
+            "github" => "sudo dnf install gh   #   sudo apt install gh   |   brew install gh",
+            _ => "",
+        };
+        missing.push(MissingTracker {
+            plugin,
+            tool,
+            location,
+            install,
+            used_by,
+        });
+    }
+    missing
 }
 
 fn default_has_bin(name: &str) -> bool {
-    // Subprocess to `which` rather than a `which` crate dep: this runs
-    // at most three times per fleet session and the shell built-in is
-    // faster to reason about than a transitive crate.
     Command::new("which")
         .arg(name)
         .stdout(Stdio::null())
@@ -96,36 +187,172 @@ fn default_vm_status() -> VmStatus {
     Lima::new(Arc::new(RealProcessInvoker), VM_NAME).status()
 }
 
+/// `limactl shell fleet-vm command -v <name>` — checks for a binary
+/// inside the running guest. Cheap (~300ms cold, faster while the VM
+/// is hot) so we run it per tracker plugin at startup rather than
+/// trying to cache; the phase only runs once.
+fn default_in_vm(name: &str) -> bool {
+    Command::new("limactl")
+        .args(["shell", VM_NAME, "command", "-v"])
+        .arg(name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_repo() -> PathBuf {
+        // Returning a fresh tempdir per call keeps the tests honest about
+        // AO yaml absence by default — they opt in to a yaml when they
+        // want to drive the tracker phase.
+        tempfile::tempdir().expect("tempdir").keep()
+    }
 
     #[test]
     fn host_missing_short_circuits_vm_check() {
-        // If `limactl` is missing the VM probe is meaningless — we'd be
-        // about to shell out to a binary we know isn't there. The result
-        // must report the host miss without consulting `vm_status`.
         let vm_status = || panic!("vm_status must not run when host check fails");
-        let result = check_with(|_| false, vm_status);
+        let in_vm = |_: &str| panic!("in_vm must not run when host check fails");
+        let result = check_with(|_| false, vm_status, in_vm, &tmp_repo());
         assert!(matches!(result, Preflight::HostBinsMissing(_)));
     }
 
     #[test]
-    fn ok_when_host_and_vm_running() {
-        let result = check_with(|_| true, || VmStatus::Running);
+    fn ok_when_host_and_vm_running_with_no_ao_yaml() {
+        // No yaml in tempdir → tracker phase is a no-op → Ok.
+        let result = check_with(|_| true, || VmStatus::Running, |_| true, &tmp_repo());
         assert!(matches!(result, Preflight::Ok));
     }
 
     #[test]
     fn vm_missing_when_lima_reports_missing() {
-        let result = check_with(|_| true, || VmStatus::Missing);
+        let result = check_with(|_| true, || VmStatus::Missing, |_| true, &tmp_repo());
         assert!(matches!(result, Preflight::VmMissing));
     }
 
     #[test]
     fn vm_stopped_when_lima_reports_stopped() {
-        let result = check_with(|_| true, || VmStatus::Stopped);
+        let result = check_with(|_| true, || VmStatus::Stopped, |_| true, &tmp_repo());
         assert!(matches!(result, Preflight::VmStopped));
+    }
+
+    #[test]
+    fn tracker_warning_when_git_bug_not_in_vm() {
+        let repo = tmp_repo();
+        std::fs::write(
+            repo.join("agent-orchestrator.yaml"),
+            r"
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/sandbox
+    tracker:
+      plugin: git-bug
+",
+        )
+        .unwrap();
+        // Override XDG so the loader doesn't pick up the dev's real
+        // ~/.config/fleet/agent-orchestrator.yaml. SAFETY: env mutation
+        // is process-global; restored before return.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &repo) };
+        let result = check_with(
+            |_| true,
+            || VmStatus::Running,
+            |tool| tool != "git-bug",
+            &repo,
+        );
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        match result {
+            Preflight::TrackerWarnings(w) => {
+                assert_eq!(w.len(), 1);
+                assert_eq!(w[0].plugin, "git-bug");
+                assert_eq!(w[0].tool, "git-bug");
+                assert_eq!(w[0].used_by, vec!["sandbox".to_string()]);
+            }
+            other => panic!("expected TrackerWarnings, got something else: {:?}", other_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn tracker_warning_when_gh_not_on_host() {
+        let repo = tmp_repo();
+        std::fs::write(
+            repo.join("agent-orchestrator.yaml"),
+            r"
+projects:
+  webapp:
+    name: webapp
+    path: /tmp/webapp
+    tracker:
+      plugin: github
+",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &repo) };
+        let result = check_with(
+            |tool| tool != "gh", // limactl present, gh missing
+            || VmStatus::Running,
+            |_| true,
+            &repo,
+        );
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        match result {
+            Preflight::TrackerWarnings(w) => {
+                assert_eq!(w.len(), 1);
+                assert_eq!(w[0].plugin, "github");
+                assert_eq!(w[0].tool, "gh");
+            }
+            _ => panic!("expected TrackerWarnings"),
+        }
+    }
+
+    #[test]
+    fn tracker_warning_skipped_when_tool_available() {
+        let repo = tmp_repo();
+        std::fs::write(
+            repo.join("agent-orchestrator.yaml"),
+            r"
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/sandbox
+    tracker:
+      plugin: git-bug
+",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &repo) };
+        let result = check_with(|_| true, || VmStatus::Running, |_| true, &repo);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert!(matches!(result, Preflight::Ok));
+    }
+
+    #[test]
+    fn unknown_tracker_plugin_is_silently_skipped() {
+        // Unknown plugin name → fleet doesn't know what tool to probe,
+        // so it skips. The spawn picker will surface a clearer error
+        // later if/when the user actually tries to spawn.
+        let repo = tmp_repo();
+        std::fs::write(
+            repo.join("agent-orchestrator.yaml"),
+            r"
+projects:
+  webapp:
+    name: webapp
+    path: /tmp/webapp
+    tracker:
+      plugin: linear
+",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &repo) };
+        let result = check_with(|_| true, || VmStatus::Running, |_| false, &repo);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert!(matches!(result, Preflight::Ok));
     }
 
     #[test]
@@ -136,5 +363,15 @@ mod tests {
     #[test]
     fn has_bin_misses_obvious_nonsense() {
         assert!(!default_has_bin("definitely-not-a-real-binary-zzz"));
+    }
+
+    fn other_kind(p: &Preflight) -> &'static str {
+        match p {
+            Preflight::Ok => "Ok",
+            Preflight::HostBinsMissing(_) => "HostBinsMissing",
+            Preflight::VmMissing => "VmMissing",
+            Preflight::VmStopped => "VmStopped",
+            Preflight::TrackerWarnings(_) => "TrackerWarnings",
+        }
     }
 }

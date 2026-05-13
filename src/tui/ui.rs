@@ -730,15 +730,85 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
         }
         lines.push(Line::raw(""));
     }
+    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
     draw_modal(
         frame,
         " preflight failed ",
         ERR,
         lines,
-        &[Line::from(Span::styled(
-            "Press any key to quit.",
-            Style::default().fg(MUTED),
-        ))],
+        &[Line::from(vec![
+            Span::styled("[c]", bold_key),
+            Span::styled(" edit agent-orchestrator.yaml   ", Style::default().fg(MUTED)),
+            Span::styled("[any other key]", bold_key),
+            Span::styled(" quit", Style::default().fg(MUTED)),
+        ])],
+    );
+}
+
+/// Soft-fail preflight: required tracker tools aren't installed for
+/// one or more configured plugins. The rest of the TUI works — only
+/// the spawn picker breaks for those projects — so the modal offers
+/// `c` (fix the AO yaml), Enter (continue anyway), or `q` (quit).
+pub(super) fn render_tracker_warnings(
+    frame: &mut Frame<'_>,
+    warnings: &[crate::tui::preflight::MissingTracker],
+) {
+    let muted = Style::default().fg(MUTED);
+    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Tracker tools missing — spawn picker will break for these:",
+        muted,
+    )));
+    lines.push(Line::raw(""));
+    for w in warnings {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                w.plugin.clone(),
+                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("(used by: {})", w.used_by.join(", ")),
+                muted.add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("needs `{}` in {}", w.tool, w.location),
+                muted,
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  install  ", muted),
+            Span::styled(w.install.to_string(), Style::default().fg(ACCENT)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "You can continue — only the spawn picker is affected.",
+        muted.add_modifier(Modifier::ITALIC),
+    )));
+
+    draw_modal(
+        frame,
+        " tracker warnings ",
+        WARN,
+        lines,
+        &[Line::from(vec![
+            Span::styled("[c]", bold_key),
+            Span::styled(" edit config   ", muted),
+            Span::styled("[Enter]", bold_key),
+            Span::styled(" continue   ", muted),
+            Span::styled("[q]", bold_key),
+            Span::styled(" quit", muted),
+        ])],
     );
 }
 
