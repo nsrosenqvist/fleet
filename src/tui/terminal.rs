@@ -212,6 +212,7 @@ fn drive(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     while !app.should_quit {
         // 1. Fold any state updates from the refresh thread.
         app.drain_updates();
+        app.drain_spawn_fetch();
 
         // 2. Paint.
         term.draw(|f| ui::render(app, f))?;

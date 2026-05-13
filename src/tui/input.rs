@@ -8,7 +8,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use super::app::{App, ClickKind, ClickTarget, Command, Confirm, SpawnPrompt};
+use super::app::{App, ClickKind, ClickTarget, Command, Confirm};
 
 /// Lines moved per scroll-wheel notch. Three matches the j/k cadence
 /// closely enough that mixing keyboard and wheel doesn't feel jumpy.
@@ -33,7 +33,7 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
         (KeyCode::Enter, _) => {
             // Sentinel row → open the spawn modal instead of attaching.
             if app.is_sentinel_selected() {
-                app.spawn_prompt = Some(SpawnPrompt::default());
+                app.open_spawn_prompt();
             } else {
                 app.push_command(Command::AttachSelected);
             }
@@ -46,9 +46,7 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
         }
         (KeyCode::Char('c'), _) => app.push_command(Command::EditConfig),
         (KeyCode::Char('t'), _) => app.push_command(Command::TrackerPreview),
-        (KeyCode::Char('n'), _) => {
-            app.spawn_prompt = Some(SpawnPrompt::default());
-        }
+        (KeyCode::Char('n'), _) => app.open_spawn_prompt(),
         (KeyCode::Char('S'), _) => app.push_command(Command::StartAo),
         (KeyCode::Char('X'), _) => {
             app.confirm = Some(Confirm::StopAo);
@@ -58,20 +56,35 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Spawn-prompt mode: capture text input for the issue id, submit on
-/// Enter, cancel on Esc. Other modifiers / function keys are dropped
-/// so unintended chords can't punch through to the underlying view
-/// while the modal is open.
+/// Spawn-prompt mode: filter the issue list with the buffer, navigate
+/// the filtered rows with arrow keys, submit the selected row (or the
+/// raw buffer when no list / no match) on Enter, cancel on Esc.
 pub(super) fn handle_key_spawn_prompt(app: &mut App, key: KeyEvent) {
     let Some(prompt) = app.spawn_prompt.as_mut() else {
         return;
     };
     match key.code {
         KeyCode::Enter => {
-            let issue = prompt.buffer.trim().to_string();
-            if issue.is_empty() {
+            // Prefer the picker row when one is highlighted — the
+            // user just spent effort filtering down to it. Fall back
+            // to the raw buffer for the "tracker unsupported" case
+            // or when the list has no matches.
+            let filtered = prompt.filtered();
+            let chosen: Option<String> = filtered
+                .get(prompt.selected_idx)
+                .map(|i| i.human_id.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let trimmed = prompt.buffer.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                });
+            let Some(issue) = chosen else {
                 return;
-            }
+            };
             app.spawn_prompt = None;
             app.push_command(Command::Spawn(issue));
         }
@@ -79,11 +92,25 @@ pub(super) fn handle_key_spawn_prompt(app: &mut App, key: KeyEvent) {
             app.spawn_prompt = None;
             app.flash_ok("cancelled");
         }
+        KeyCode::Down | KeyCode::Tab => {
+            let n = prompt.filtered().len();
+            if n > 0 {
+                prompt.selected_idx = (prompt.selected_idx + 1) % n;
+            }
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            let n = prompt.filtered().len();
+            if n > 0 {
+                prompt.selected_idx = (prompt.selected_idx + n - 1) % n;
+            }
+        }
         KeyCode::Backspace => {
             prompt.buffer.pop();
+            app.spawn_prompt_reset_selection();
         }
         KeyCode::Char(c) if !c.is_control() => {
             prompt.buffer.push(c);
+            app.spawn_prompt_reset_selection();
         }
         _ => {}
     }
@@ -128,7 +155,7 @@ pub(super) fn handle_mouse_normal(app: &mut App, me: MouseEvent) {
                     // points elsewhere.
                     app.select_at(idx);
                     if app.is_sentinel_selected() {
-                        app.spawn_prompt = Some(SpawnPrompt::default());
+                        app.open_spawn_prompt();
                     } else {
                         app.push_command(Command::AttachSelected);
                     }

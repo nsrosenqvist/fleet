@@ -6,6 +6,7 @@
 pub mod config;
 pub mod invoke;
 pub mod state;
+pub mod tracker;
 
 // Re-exported for the CLI dispatch + TUI to consume in subsequent tasks. The
 // `#[allow]` goes away when those modules use these names.

@@ -25,7 +25,7 @@ use ratatui::widgets::{Clear, List, ListItem, ListState, Padding, Paragraph, Wra
 use crate::ao::SessionInfo;
 use crate::lima::VmStatus;
 
-use super::app::{App, SpawnPrompt};
+use super::app::{App, IssuesState, SpawnPrompt};
 use super::bringup::BringUp;
 use super::preflight::MissingDep;
 use super::theme::{
@@ -527,49 +527,170 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// Missing host binary — fleet can't proceed and there's nothing fleet can
 /// do about it. Body lists each dep with its install hint; footer says
 /// "press any key to quit".
-/// "Spawn session" text-input modal. Rendered as an overlay on top
-/// of the normal Sessions view while [`crate::tui::app::App::spawn_prompt`]
-/// is `Some`. Submits the trimmed buffer as the issue id on Enter;
-/// Esc cancels.
+/// "Spawn session" picker modal. Rendered as an overlay on top of
+/// the normal Sessions view while [`crate::tui::app::App::spawn_prompt`]
+/// is `Some`. Shows a filter input on top, the tracker issue list
+/// below (filtered by the buffer), and footer key hints. Enter
+/// submits the highlighted row or, if there's no list / no match,
+/// the raw buffer. Esc cancels.
 pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
-    let lines = vec![
-        Line::from(Span::styled(
-            "Spawn a new agent session.",
-            Style::default().fg(MUTED),
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("issue       ", Style::default().fg(MUTED)),
-            Span::styled(
-                prompt.buffer.clone(),
-                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
-            ),
-            // Block caret so the user can see where input lands.
-            Span::styled("█", Style::default().fg(KEY_FG)),
-        ]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "AO will create the worktree, attach the configured agent",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-        )),
-        Line::from(Span::styled(
-            "(claude-code by default), and open a tmux session.",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-        )),
-    ];
+    const MAX_ROWS: usize = 12;
+
+    let muted = Style::default().fg(MUTED);
+    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Filter input with block caret.
+    lines.push(Line::from(vec![
+        Span::styled("filter      ", muted),
+        Span::styled(prompt.buffer.clone(), bold_key),
+        Span::styled("█", Style::default().fg(KEY_FG)),
+    ]));
+    lines.push(Line::raw(""));
+
+    // Body: depends on the issue-fetch state.
+    match &prompt.issues {
+        IssuesState::Loading => {
+            lines.push(Line::from(Span::styled(
+                "loading issues from git-bug…",
+                muted.add_modifier(Modifier::ITALIC),
+            )));
+        }
+        IssuesState::Unsupported { plugin } => {
+            lines.push(Line::from(vec![
+                Span::styled("tracker `", muted),
+                Span::styled(plugin.clone(), Style::default().fg(WARN)),
+                Span::styled(
+                    "` — listing not supported; type the issue id.",
+                    muted,
+                ),
+            ]));
+        }
+        IssuesState::Error(msg) => {
+            lines.push(Line::from(vec![
+                Span::styled("git-bug error: ", Style::default().fg(ERR)),
+                Span::styled(
+                    truncate(msg, 80),
+                    Style::default().fg(ERR).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "type the issue id manually below and press Enter.",
+                muted,
+            )));
+        }
+        IssuesState::Loaded(_) => {
+            // Build the filtered window with selection chrome.
+            let filtered = prompt.filtered();
+            let total = match &prompt.issues {
+                IssuesState::Loaded(all) => all.len(),
+                _ => 0,
+            };
+            if filtered.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    if total == 0 {
+                        "(no issues in this repo — type an id manually)".to_string()
+                    } else {
+                        format!("no issues match `{}` out of {total}", prompt.buffer)
+                    },
+                    muted.add_modifier(Modifier::ITALIC),
+                )));
+            } else {
+                let selected = prompt.selected_idx.min(filtered.len() - 1);
+                let window = scroll_window(filtered.len(), selected, MAX_ROWS);
+                for (offset, idx) in window.clone().enumerate() {
+                    let issue = filtered[idx];
+                    let focused = idx == selected;
+                    lines.push(issue_line(issue, focused));
+                    let _ = offset;
+                }
+                lines.push(Line::raw(""));
+                let shown = window.end - window.start;
+                lines.push(Line::from(Span::styled(
+                    format!("{shown} of {total} issues"),
+                    muted.add_modifier(Modifier::ITALIC),
+                )));
+            }
+        }
+    }
+
     let footer = vec![Line::from(vec![
-        Span::styled(
-            "[Enter]",
-            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" submit   ", Style::default().fg(MUTED)),
-        Span::styled(
-            "[Esc]",
-            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" cancel", Style::default().fg(MUTED)),
+        Span::styled("[↑↓]", bold_key),
+        Span::styled(" pick    ", muted),
+        Span::styled("[Enter]", bold_key),
+        Span::styled(" submit    ", muted),
+        Span::styled("[Esc]", bold_key),
+        Span::styled(" cancel", muted),
     ])];
     draw_modal(frame, " spawn session ", ACCENT, lines, &footer);
+}
+
+/// One filtered issue row. Layout: gutter `▶`/space, `human_id`
+/// (8-col padded), title (truncated to fit), trailing `[status]`
+/// tag for open vs closed at a glance.
+fn issue_line(issue: &crate::ao::tracker::Issue, focused: bool) -> Line<'static> {
+    let muted = Style::default().fg(MUTED);
+    let gutter = if focused { "▶ " } else { "  " };
+    let id_style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(KEY_FG)
+    };
+    let title_style = if focused {
+        Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let status_color = match issue.status.as_str() {
+        "open" => OK,
+        "closed" => MUTED,
+        _ => WARN,
+    };
+    Line::from(vec![
+        Span::styled(gutter.to_string(), id_style),
+        Span::styled(format!("{:<10}", issue.human_id), id_style),
+        Span::styled(truncate(&issue.title, 60), title_style),
+        Span::raw("  "),
+        Span::styled(
+            format!("[{}]", issue.status),
+            Style::default().fg(status_color),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            // Surface the first label as a tag — useful for git-bug
+            // workflows that use `type:bug` / `type:feature` etc.
+            issue
+                .labels
+                .first()
+                .map(|l| format!("({l})"))
+                .unwrap_or_default(),
+            muted,
+        ),
+    ])
+}
+
+/// Pick a `MAX_ROWS`-wide slice of the filtered list centered on the
+/// selected row. Keeps the cursor visible without making the user
+/// scroll manually.
+fn scroll_window(total: usize, selected: usize, window: usize) -> std::ops::Range<usize> {
+    if total <= window {
+        return 0..total;
+    }
+    let half = window / 2;
+    let start = selected.saturating_sub(half).min(total - window);
+    start..(start + window)
+}
+
+/// Cap a string at `max` chars, appending `…` on truncation. Counts
+/// chars not bytes so multibyte titles don't slice mid-codepoint.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {

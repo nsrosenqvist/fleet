@@ -51,13 +51,53 @@ pub(super) enum ClickKind {
 }
 
 
-/// In-progress "spawn session" prompt. The user is typing the issue
-/// id into `buffer`; Enter submits, Esc cancels. While `Some`, all
-/// keyboard input is intercepted by the prompt handler so accidental
+/// State of the issue list inside the spawn prompt. Async — the
+/// fetch runs on a background thread so the TUI stays responsive
+/// during the (typically 100–500 ms) `git-bug` round-trip.
+#[derive(Debug)]
+pub(super) enum IssuesState {
+    /// `git-bug bug --format json` is in flight.
+    Loading,
+    /// Issues fetched and ready to filter / pick from.
+    Loaded(Vec<crate::ao::tracker::Issue>),
+    /// Tracker plugin configured for this project isn't one fleet
+    /// supports listing for yet (e.g. github). User has to type the
+    /// id manually.
+    Unsupported { plugin: String },
+    /// `git-bug` errored out — VM is down, repo not initialised, etc.
+    Error(String),
+}
+
+/// In-progress "spawn session" prompt. While `Some`, all keyboard
+/// input is intercepted by the prompt handler so accidental
 /// keystrokes can't fire a different action.
-#[derive(Debug, Clone, Default)]
+///
+/// The picker layers a filterable issue list on top of a free-text
+/// fallback: `buffer` holds the filter / fallback text, `issues`
+/// gives the async-loaded picker rows, `selected_idx` tracks which
+/// filtered row is highlighted. Enter submits the selected row if
+/// one exists, otherwise the raw buffer.
 pub(super) struct SpawnPrompt {
     pub(super) buffer: String,
+    pub(super) issues: IssuesState,
+    pub(super) selected_idx: usize,
+    /// Result channel from the background fetch. `None` once the
+    /// state has transitioned (Loading → Loaded / Error / Unsupported)
+    /// so we don't keep polling a dead receiver.
+    pub(super) rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::ao::tracker::Issue>, String>>>,
+}
+
+impl SpawnPrompt {
+    /// Filtered subset of the loaded issue list. Returns an empty
+    /// vec for any non-Loaded state — the renderer special-cases
+    /// those (loading / error / unsupported placeholders) before
+    /// asking for filtered rows.
+    pub(super) fn filtered(&self) -> Vec<&crate::ao::tracker::Issue> {
+        let IssuesState::Loaded(all) = &self.issues else {
+            return Vec::new();
+        };
+        all.iter().filter(|i| i.matches(&self.buffer)).collect()
+    }
 }
 
 /// Pending destructive action awaiting a y/N confirmation in the status bar.
@@ -387,6 +427,93 @@ impl App {
     pub(super) fn dismiss_flash(&mut self) {
         self.last_info = None;
         self.action_error = None;
+    }
+
+    /// Open the spawn-session prompt. Kicks off a background fetch
+    /// of tracker issues so the picker is populated by the time the
+    /// user has typed their filter (or sooner). The tracker plugin
+    /// comes from the AO config entry for the current project; an
+    /// unconfigured / unrecognised plugin falls back to free-text
+    /// entry without a list.
+    pub(super) fn open_spawn_prompt(&mut self) {
+        let plugin = self
+            .current_project_key
+            .as_ref()
+            .and_then(|key| self.ao_config.as_ref()?.projects.get(key))
+            .and_then(|p| p.tracker.as_ref())
+            .map(|t| t.plugin.clone());
+
+        let (issues, rx) = match plugin.as_deref() {
+            Some("git-bug") => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let repo_root = self.repo_root.clone();
+                std::thread::spawn(move || {
+                    let result = crate::ao::tracker::list_git_bug_issues(&repo_root)
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(result);
+                });
+                (IssuesState::Loading, Some(rx))
+            }
+            Some(other) => (
+                IssuesState::Unsupported {
+                    plugin: other.to_string(),
+                },
+                None,
+            ),
+            None => (
+                IssuesState::Unsupported {
+                    plugin: "(none configured)".to_string(),
+                },
+                None,
+            ),
+        };
+
+        self.spawn_prompt = Some(SpawnPrompt {
+            buffer: String::new(),
+            issues,
+            selected_idx: 0,
+            rx,
+        });
+    }
+
+    /// Non-blocking poll of the spawn-prompt's issue fetcher channel.
+    /// Called from the main loop's `drain_updates` so the prompt
+    /// transitions Loading → Loaded / Error without the user having
+    /// to press a key.
+    pub(super) fn drain_spawn_fetch(&mut self) {
+        let Some(prompt) = self.spawn_prompt.as_mut() else {
+            return;
+        };
+        let Some(rx) = prompt.rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(issues)) => {
+                prompt.issues = IssuesState::Loaded(issues);
+                prompt.selected_idx = 0;
+                prompt.rx = None;
+            }
+            Ok(Err(msg)) => {
+                prompt.issues = IssuesState::Error(msg);
+                prompt.rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                prompt.issues = IssuesState::Error(
+                    "tracker fetch thread vanished without sending a result".to_string(),
+                );
+                prompt.rx = None;
+            }
+        }
+    }
+
+    /// Reset the spawn-prompt's selection to row 0. Called when the
+    /// filter buffer changes so the cursor doesn't point past the new
+    /// filtered list.
+    pub(super) fn spawn_prompt_reset_selection(&mut self) {
+        if let Some(p) = self.spawn_prompt.as_mut() {
+            p.selected_idx = 0;
+        }
     }
 
     /// Fold an action's `Result` into the flash slot. On error keeps the
