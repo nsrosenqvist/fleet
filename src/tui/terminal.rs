@@ -430,26 +430,93 @@ fn edit_config(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>)
     app.reload_ao_config();
 }
 
+/// Per-project tracker preview. Resolves the current project's
+/// `tracker.plugin` from AO config and dispatches:
+///
+/// - `git-bug` → `git-bug termui` inside the VM at the project's path.
+/// - `github` → open the repo's issues page in the host browser
+///   (derived from the project's `origin` remote).
+/// - anything else → flash, so the user knows fleet doesn't speak
+///   that plugin yet without dropping the terminal into a confusing
+///   `cd` error.
 fn tracker_preview(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
-    // The sandbox project uses git-bug. When more trackers exist, dispatch
-    // on `project.tracker.plugin` (read from agent-orchestrator.yaml).
-    let res = suspend_around(term, || {
-        crate::process::run_interactive(
-            "limactl",
-            &[
-                "shell".to_string(),
-                "--workdir".to_string(),
-                "/Users/niklas/Code/agent-team/tmp/git-bug-sandbox".to_string(),
-                "fleet-vm".to_string(),
-                "git-bug".to_string(),
-                "termui".to_string(),
-            ],
-            &[("TERM", "xterm-256color")],
-            &[],
-        )
-        .map(|_| ())
-    });
-    app.flash_result("closed tracker preview".to_string(), res);
+    let Some((project_path, plugin)) = current_project_tracker(app) else {
+        app.flash_err(
+            "no tracker configured for this project — set tracker.plugin in agent-orchestrator.yaml",
+        );
+        return;
+    };
+
+    match plugin.as_str() {
+        "git-bug" => {
+            let res = suspend_around(term, || {
+                crate::process::run_interactive(
+                    "limactl",
+                    &[
+                        "shell".to_string(),
+                        "--workdir".to_string(),
+                        project_path.display().to_string(),
+                        "fleet-vm".to_string(),
+                        "git-bug".to_string(),
+                        "termui".to_string(),
+                    ],
+                    &[("TERM", "xterm-256color")],
+                    &[],
+                )
+                .map(|_| ())
+            });
+            app.flash_result("closed tracker preview".to_string(), res);
+        }
+        "github" => match github_issues_url_for(&project_path) {
+            Ok(url) => match webbrowser::open(&url) {
+                Ok(()) => app.flash_ok(format!("opened {url}")),
+                Err(e) => app.flash_err(format!("open browser: {e}")),
+            },
+            Err(e) => app.flash_err(format!("github tracker: {e:#}")),
+        },
+        other => {
+            app.flash_err(format!(
+                "no tracker preview for plugin `{other}` — use `c` to edit config"
+            ));
+        }
+    }
+}
+
+/// `(project.path, project.tracker.plugin)` for the current project,
+/// if any. `None` when fleet was launched outside a known project, or
+/// when the project has no tracker block.
+fn current_project_tracker(app: &App) -> Option<(std::path::PathBuf, String)> {
+    let key = app.current_project_key.as_ref()?;
+    let cfg = app.ao_config.as_ref()?;
+    let project = cfg.projects.get(key)?;
+    let plugin = project.tracker.as_ref()?.plugin.clone();
+    Some((project.path.clone(), plugin))
+}
+
+/// Derive `https://github.com/<owner>/<name>/issues` from a project's
+/// `origin` git remote. Supports both ssh (`git@github.com:o/n.git`)
+/// and https (`https://github.com/o/n.git` or without the `.git`).
+fn github_issues_url_for(project_path: &std::path::Path) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .context("git -C <path> config remote.origin.url")?;
+    if !out.status.success() {
+        anyhow::bail!("no `origin` remote configured");
+    }
+    let remote = String::from_utf8(out.stdout)
+        .context("non-UTF-8 remote URL")?
+        .trim()
+        .to_string();
+    let trimmed = remote.trim_end_matches(".git");
+    let path = trimmed
+        .strip_prefix("git@github.com:")
+        .or_else(|| trimmed.strip_prefix("https://github.com/"))
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .ok_or_else(|| anyhow::anyhow!("unsupported remote URL: {remote}"))?;
+    Ok(format!("https://github.com/{path}/issues"))
 }
 
 fn start_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
