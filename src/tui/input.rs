@@ -46,6 +46,7 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
         }
         (KeyCode::Char('c'), _) => app.push_command(Command::EditConfig),
         (KeyCode::Char('t'), _) => app.push_command(Command::TrackerPreview),
+        (KeyCode::Char('T'), _) => app.push_command(Command::TrackerWeb),
         (KeyCode::Char('n'), _) => app.open_spawn_prompt(),
         (KeyCode::Char('S'), _) => app.push_command(Command::StartAo),
         (KeyCode::Char('X'), _) => {

@@ -371,6 +371,7 @@ fn run_command(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>,
         Command::AttachSelected => attach_selected(app, term),
         Command::EditConfig => edit_config(app, term),
         Command::TrackerPreview => tracker_preview(app, term),
+        Command::TrackerWeb => tracker_web(app),
         Command::StartAo => start_ao(app, term),
         Command::OpenWeb => open_web(app),
         Command::KillSession(id) => kill_session(app, term, id),
@@ -430,15 +431,11 @@ fn edit_config(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>)
     app.reload_ao_config();
 }
 
-/// Per-project tracker preview. Resolves the current project's
-/// `tracker.plugin` from AO config and dispatches:
-///
-/// - `git-bug` → `git-bug termui` inside the VM at the project's path.
-/// - `github` → open the repo's issues page in the host browser
-///   (derived from the project's `origin` remote).
-/// - anything else → flash, so the user knows fleet doesn't speak
-///   that plugin yet without dropping the terminal into a confusing
-///   `cd` error.
+/// `t`: open the tracker's terminal UI for the current project.
+/// Resolves the project's `tracker.plugin` from AO config and runs
+/// the matching in-VM TUI (`git-bug termui`, `gh dash`). Web-only
+/// plugins (none today, but conceptually a tracker without a
+/// terminal UI) flash a "use Shift+T for the web view" hint.
 fn tracker_preview(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let Some((project_path, plugin)) = current_project_tracker(app) else {
         app.flash_err(
@@ -447,26 +444,50 @@ fn tracker_preview(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdou
         return;
     };
 
-    match plugin.as_str() {
-        "git-bug" => {
-            let res = suspend_around(term, || {
-                crate::process::run_interactive(
-                    "limactl",
-                    &[
-                        "shell".to_string(),
-                        "--workdir".to_string(),
-                        project_path.display().to_string(),
-                        "fleet-vm".to_string(),
-                        "git-bug".to_string(),
-                        "termui".to_string(),
-                    ],
-                    &[("TERM", "xterm-256color")],
-                    &[],
-                )
-                .map(|_| ())
-            });
-            app.flash_result("closed tracker preview".to_string(), res);
+    let argv: Vec<String> = match plugin.as_str() {
+        "git-bug" => vec![
+            "shell".into(),
+            "--workdir".into(),
+            project_path.display().to_string(),
+            "fleet-vm".into(),
+            "git-bug".into(),
+            "termui".into(),
+        ],
+        "github" => vec![
+            "shell".into(),
+            "--workdir".into(),
+            project_path.display().to_string(),
+            "fleet-vm".into(),
+            "gh".into(),
+            "dash".into(),
+        ],
+        other => {
+            app.flash_err(format!(
+                "no terminal tracker preview for plugin `{other}` — use `c` to edit config"
+            ));
+            return;
         }
+    };
+    let res = suspend_around(term, || {
+        crate::process::run_interactive("limactl", &argv, &[("TERM", "xterm-256color")], &[])
+            .map(|_| ())
+    });
+    app.flash_result("closed tracker preview".to_string(), res);
+}
+
+/// `Shift+T`: open the tracker's web view in the host browser.
+/// Plugins without a web front-end (git-bug today) flash a hint
+/// pointing at the lowercase `t` TUI variant. The legend doesn't
+/// show the keybind for those plugins, but tolerate a stray press
+/// gracefully.
+fn tracker_web(app: &mut App) {
+    let Some((project_path, plugin)) = current_project_tracker(app) else {
+        app.flash_err(
+            "no tracker configured for this project — set tracker.plugin in agent-orchestrator.yaml",
+        );
+        return;
+    };
+    match plugin.as_str() {
         "github" => match github_issues_url_for(&project_path) {
             Ok(url) => match webbrowser::open(&url) {
                 Ok(()) => app.flash_ok(format!("opened {url}")),
@@ -474,10 +495,11 @@ fn tracker_preview(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdou
             },
             Err(e) => app.flash_err(format!("github tracker: {e:#}")),
         },
+        "git-bug" => {
+            app.flash_err("git-bug has no remote site — press `t` for the local TUI");
+        }
         other => {
-            app.flash_err(format!(
-                "no tracker preview for plugin `{other}` — use `c` to edit config"
-            ));
+            app.flash_err(format!("no web tracker for plugin `{other}`"));
         }
     }
 }

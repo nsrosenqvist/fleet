@@ -81,6 +81,19 @@ provision:
         -o /usr/local/bin/git-bug
       chmod +x /usr/local/bin/git-bug
 
+  # gh-dash extension for the gh CLI. Provides the github tracker's
+  # TUI preview (fleet's `t` keybind on github projects). Runs as
+  # the lima user since `gh extension install` writes to the user's
+  # ~/.local/share/gh/extensions and reads gh's auth — the host's
+  # `gh auth login` already syncs via Lima's home bind-mount.
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      if command -v gh >/dev/null 2>&1; then
+        gh extension install dlvhdr/gh-dash || true
+      fi
+
 probes:
   # Block `limactl start` from declaring the instance Ready until ao is
   # actually on PATH. Without this, fleet's first `ao status` call would

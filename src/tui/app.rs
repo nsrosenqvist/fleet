@@ -125,7 +125,14 @@ impl Confirm {
 pub(super) enum Command {
     AttachSelected,
     EditConfig,
+    /// Open the tracker's terminal UI for the current project
+    /// (git-bug termui, gh dash, …) inside the VM.
     TrackerPreview,
+    /// Open the tracker's web view for the current project in the
+    /// host browser. Only meaningful for plugins with a remote
+    /// front-end (github today; gitlab / jira in the future); fleet
+    /// flashes a no-op for plugins without one (git-bug).
+    TrackerWeb,
     StartAo,
     OpenWeb,
     KillSession(String),
@@ -397,6 +404,26 @@ impl App {
 
     pub(super) fn selected_session(&self) -> Option<&SessionInfo> {
         self.sessions.get(self.selected)
+    }
+
+    /// True when the current project's tracker has a remote web
+    /// view fleet can open. Drives the `Shift+T` legend entry: we
+    /// only advertise the keybind for plugins that have somewhere
+    /// to take the user.
+    pub(super) fn current_tracker_has_web(&self) -> bool {
+        let Some(key) = self.current_project_key.as_ref() else {
+            return false;
+        };
+        let Some(cfg) = self.ao_config.as_ref() else {
+            return false;
+        };
+        let Some(project) = cfg.projects.get(key) else {
+            return false;
+        };
+        let Some(tracker) = project.tracker.as_ref() else {
+            return false;
+        };
+        matches!(tracker.plugin.as_str(), "github")
     }
 
     pub(super) fn selected_session_id(&self) -> Option<String> {

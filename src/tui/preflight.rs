@@ -144,20 +144,24 @@ fn check_trackers(
 
     let mut missing = Vec::new();
     for (plugin, used_by) in grouped {
-        let tool: &'static str = match plugin.as_str() {
-            "git-bug" => "git-bug",
-            "github" => "gh",
+        let tools: &[&'static str] = match plugin.as_str() {
+            "git-bug" => &["git-bug"],
+            // github needs gh (issue list, used by the spawn picker)
+            // *and* gh-dash (the TUI preview triggered by `t`).
+            "github" => &["gh", "gh-dash"],
             _ => continue, // Unknown plugin; the per-action error
                            // surfaces the actual failure later.
         };
-        if in_vm(tool) {
-            continue;
+        for tool in tools {
+            if in_vm(tool) {
+                continue;
+            }
+            missing.push(MissingTracker {
+                plugin: plugin.clone(),
+                tool,
+                used_by: used_by.clone(),
+            });
         }
-        missing.push(MissingTracker {
-            plugin,
-            tool,
-            used_by,
-        });
         let _ = has_bin; // Probe signature is kept for parity / tests.
     }
     missing
@@ -175,6 +179,15 @@ fn check_trackers(
 /// shows the progress bar to a TTY.
 pub fn install_command(tool: &str) -> Option<&'static str> {
     match tool {
+        // gh extension — needs `gh` already installed. The
+        // preflight probes in declaration order (gh before gh-dash),
+        // so by the time the install runs, gh is present (either
+        // pre-existed or just installed).
+        "gh-dash" => Some(
+            r"set -ex
+gh extension install dlvhdr/gh-dash
+gh dash --version",
+        ),
         "git-bug" => Some(
             r#"set -ex
 arch="$(dpkg --print-architecture)"
@@ -216,14 +229,20 @@ fn default_vm_status() -> VmStatus {
     Lima::new(Arc::new(RealProcessInvoker), VM_NAME).status()
 }
 
-/// `limactl shell fleet-vm command -v <name>` — checks for a binary
-/// inside the running guest. Cheap (~300ms cold, faster while the VM
-/// is hot) so we run it per tracker plugin at startup rather than
-/// trying to cache; the phase only runs once.
+/// Probe for a binary inside the running guest. `gh-dash` is a gh
+/// extension (sub-command), not a standalone binary, so `command -v`
+/// doesn't find it — use `gh dash --version` which exits 0 when the
+/// extension is installed. Everything else goes through plain
+/// `command -v`. Cheap (~300ms cold, faster while the VM is hot)
+/// so we run it per tracker tool at startup rather than caching.
 fn default_in_vm(name: &str) -> bool {
+    let (cmd, args): (&str, &[&str]) = match name {
+        "gh-dash" => ("gh", &["dash", "--version"]),
+        _ => ("command", &["-v", name]),
+    };
     Command::new("limactl")
-        .args(["shell", VM_NAME, "command", "-v"])
-        .arg(name)
+        .args(["shell", VM_NAME, cmd])
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

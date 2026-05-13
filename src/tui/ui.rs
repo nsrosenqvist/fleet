@@ -489,7 +489,7 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         return;
     }
 
-    let spans: Vec<Span<'_>> = vec![
+    let mut spans: Vec<Span<'_>> = vec![
         chip("[fleet]", ACCENT),
         sep(),
         key("↑/↓"),
@@ -503,6 +503,18 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         sep(),
         key("t"),
         Span::raw(" tracker"),
+    ];
+    // Shift+T only advertised for plugins with a remote web view —
+    // showing it on a git-bug project would just promise something
+    // that flashes "no remote site" when pressed.
+    if app.current_tracker_has_web() {
+        spans.push(sep());
+        spans.push(key("⇧T"));
+        // "tracker web" rather than just "web" to disambiguate from
+        // `⇧W` (AO dashboard) below.
+        spans.push(Span::raw(" tracker web"));
+    }
+    spans.extend([
         sep(),
         key("c"),
         Span::raw(" edit config"),
@@ -521,7 +533,7 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         sep(),
         key("q"),
         Span::raw(" quit"),
-    ];
+    ]);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().fg(MUTED)),
         area,
