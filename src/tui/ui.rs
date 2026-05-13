@@ -566,6 +566,13 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// field, masked rendering, in-modal error row for save failures
 /// (keychain unreachable, config not writable, etc.).
 pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
+    // OAuth tokens are ~100 chars; one `•` per char would push the
+    // modal way past a comfortable reading width. Cap the masked
+    // rendering and surface the real length as a separate tally so
+    // the user still gets paste-landed feedback without the dots
+    // dictating layout.
+    const VISIBLE_DOT_CAP: usize = 40;
+
     let muted = Style::default().fg(MUTED);
 
     // Name the platform-native credential store so the user knows
@@ -580,6 +587,22 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
         // saying "Linux Secret Service" which is jargon.
         _ => "GNOME Keyring / KWallet (Secret Service)",
     };
+
+    let token_len = setup.buffer.chars().count();
+    let visible_dots = token_len.min(VISIBLE_DOT_CAP);
+    let mut token_row: Vec<Span<'static>> = vec![
+        Span::styled("token       ", muted),
+        Span::styled(
+            "•".repeat(visible_dots),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("█", Style::default().fg(KEY_FG)),
+    ];
+    if token_len > 0 {
+        // Always show the char count — it's the reliable signal
+        // that a long paste landed in full, since the dots cap out.
+        token_row.push(Span::styled(format!("  ({token_len} chars)"), muted));
+    }
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -605,17 +628,7 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
         Line::raw(""),
         Line::from(Span::styled("Paste the resulting token below.", muted)),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled("token       ", muted),
-            // Masked rendering — one `•` per input char. Lets the
-            // user see length / detect a missed paste char without
-            // the token landing in terminal scrollback.
-            Span::styled(
-                "•".repeat(setup.buffer.chars().count()),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("█", Style::default().fg(KEY_FG)),
-        ]),
+        Line::from(token_row),
     ];
     if let Some(err) = &setup.error {
         lines.push(Line::raw(""));
@@ -640,12 +653,23 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
         modal_key("esc"),
         Span::styled(" cancel", muted),
     ])];
-    draw_modal(
+    // Pin the modal width so a 100-char OAuth paste can't drag the
+    // layout sideways. `clamp(area * 0.6, 60, 80)` is wide enough
+    // for the explanatory copy and the masked-dots row with its
+    // `(N chars)` tally, without overflowing narrow terminals.
+    let area = frame.area();
+    let pinned = area
+        .width
+        .saturating_mul(3)
+        .saturating_div(5)
+        .clamp(60, 80);
+    draw_modal_sized(
         frame,
         " configure claude oauth token ",
         ACCENT,
         lines,
         &footer,
+        ModalWidth::Fixed(pinned),
     );
 }
 
