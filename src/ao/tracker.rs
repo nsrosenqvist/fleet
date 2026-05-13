@@ -132,17 +132,35 @@ impl Tracker for GitBugTracker {
 /// `git-bug bug --format json` row (subset). `git-bug` uses
 /// `snake_case` even though its `--field` selector is `camelCase` — we
 /// use the JSON form here so serde's renames stay minimal.
+///
+/// `labels` arrives as `null` (not `[]`) for issues with no labels —
+/// serde's default `Vec` deserializer rejects that, so we route it
+/// through [`null_as_default`] which collapses both null and missing
+/// to the type's `Default`. Same defensive treatment on the string
+/// fields in case git-bug ever decides to emit `null` for an empty
+/// title (unlikely, but cheap insurance).
 #[derive(Deserialize)]
 struct GitBugIssue {
     id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     human_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     status: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     labels: Vec<String>,
+}
+
+/// Serde helper: deserialize `null` (and missing) into the type's
+/// `Default` rather than failing. Pulls double duty as `null` →
+/// `[]` for vec fields and `null` → `""` for string fields.
+fn null_as_default<'de, D, T>(de: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Option::unwrap_or_default)
 }
 
 impl From<GitBugIssue> for Issue {
@@ -218,11 +236,11 @@ impl Tracker for GitHubTracker {
 #[derive(Deserialize)]
 struct GhIssue {
     number: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     state: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     labels: Vec<GhLabel>,
 }
 
@@ -299,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn git_bug_issue_mapping() {
+    fn git_bug_issue_mapping_with_labels() {
         let raw: GitBugIssue = serde_json::from_str(
             r#"{"id":"deadbeef","human_id":"abc1234","title":"Fix","status":"OPEN","labels":["bug"]}"#,
         )
@@ -313,6 +331,69 @@ mod tests {
     }
 
     #[test]
+    fn git_bug_issue_with_null_labels() {
+        // Regression: git-bug emits `"labels": null` (not `[]`) for
+        // an issue with no labels. The default serde derive rejected
+        // that with "invalid type: null, expected a sequence", which
+        // surfaced as a "tracker error" inside the spawn picker the
+        // first time the user listed a real git-bug repo.
+        let raw: GitBugIssue = serde_json::from_str(
+            r#"{"id":"deadbeef","human_id":"abc1234","title":"Fix","status":"open","labels":null}"#,
+        )
+        .expect("parse");
+        let issue: Issue = raw.into();
+        assert_eq!(issue.human_id, "abc1234");
+        assert!(issue.labels.is_empty());
+    }
+
+    #[test]
+    fn git_bug_issue_with_missing_labels_field() {
+        // Missing field also collapses to empty — same path as null,
+        // covered by `#[serde(default)]`. Kept as a separate test so
+        // a future serde refactor doesn't accidentally regress this.
+        let raw: GitBugIssue = serde_json::from_str(
+            r#"{"id":"deadbeef","human_id":"abc1234","title":"Fix","status":"open"}"#,
+        )
+        .expect("parse");
+        let issue: Issue = raw.into();
+        assert!(issue.labels.is_empty());
+    }
+
+    #[test]
+    fn git_bug_full_summary_parses() {
+        // Sample modelled on a real `git-bug bug --format json` row,
+        // including the fields fleet doesn't read (author, timestamps)
+        // — serde's `#[serde(default)]` plus the struct's lack of
+        // `deny_unknown_fields` means extra keys silently flow past.
+        let json = r#"
+[
+  {
+    "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "human_id": "abc1234",
+    "status": "open",
+    "title": "Fix the parser",
+    "labels": null,
+    "author": {
+      "id": "ffff",
+      "human_id": "zzz",
+      "name": "Niklas",
+      "login": ""
+    },
+    "create_time": {"timestamp": 1700000000, "time": "2023-11-14T..."},
+    "edit_time": {"timestamp": 1700000000, "time": "2023-11-14T..."}
+  }
+]
+"#;
+        let raw: Vec<GitBugIssue> = serde_json::from_str(json).expect("parse");
+        assert_eq!(raw.len(), 1);
+        let issue: Issue = raw.into_iter().next().unwrap().into();
+        assert_eq!(issue.human_id, "abc1234");
+        assert_eq!(issue.title, "Fix the parser");
+        assert_eq!(issue.status, "open");
+        assert!(issue.labels.is_empty());
+    }
+
+    #[test]
     fn gh_issue_mapping() {
         let raw: GhIssue = serde_json::from_str(
             r#"{"number":42,"title":"Fix","state":"OPEN","labels":[{"name":"bug"}]}"#,
@@ -323,6 +404,17 @@ mod tests {
         assert_eq!(issue.id, "gh:42");
         assert_eq!(issue.status, "open");
         assert_eq!(issue.labels, vec!["bug".to_string()]);
+    }
+
+    #[test]
+    fn gh_issue_with_empty_labels_array() {
+        // gh emits `[]` (not null) for empty labels, but the null
+        // tolerance should pass through here just as defensively.
+        let raw: GhIssue =
+            serde_json::from_str(r#"{"number":42,"title":"Fix","state":"OPEN","labels":[]}"#)
+                .expect("parse");
+        let issue: Issue = raw.into();
+        assert!(issue.labels.is_empty());
     }
 
     #[test]
