@@ -333,14 +333,11 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    // Action-driven flashes (success + failure from user input) fade
-    // after `FLASH_TTL` so the legend returns to the row — without
-    // this, a "edited /path/..." message from `c` hides the keybind
-    // legend forever. Refresh errors are tied to live state (the AO
-    // probe is currently failing) so they keep showing until the next
-    // successful refresh clears them.
-    let flash_live = app.flash_visible();
-    if flash_live && let Some(e) = &app.action_error {
+    // Action-driven flashes (success + failure from user input) stay
+    // until the next keystroke / mouse event — see
+    // `App::dismiss_flash`. Refresh errors reflect live state and keep
+    // showing until the next successful Sessions snapshot clears them.
+    if let Some(e) = &app.action_error {
         let line = Line::from(vec![
             badge(" ! ", ERR),
             Span::raw(" "),
@@ -349,7 +346,7 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    if flash_live && let Some(m) = &app.last_info {
+    if let Some(m) = &app.last_info {
         let line = Line::from(vec![
             badge(" ✓ ", OK),
             Span::raw(" "),

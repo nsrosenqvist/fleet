@@ -237,6 +237,12 @@ fn drive(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 fn dispatch_event(app: &mut App, ev: &event::Event) {
     match ev {
         event::Event::Key(k) if k.kind == event::KeyEventKind::Press => {
+            // Any keystroke counts as "user is driving the UI again,"
+            // so a stale flash dismisses immediately. Done *before*
+            // the handler runs so a key that itself sets a fresh
+            // flash (e.g. `c` → "edited /path/...") overrides cleanly
+            // rather than getting wiped a tick later.
+            app.dismiss_flash();
             // Mode-first dispatch. A pending confirm always intercepts.
             if app.confirm.is_some() {
                 input::handle_key_confirm(app, *k);
@@ -248,6 +254,7 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
         // resolution avoids accidentally killing a session by clicking
         // somewhere unrelated.
         event::Event::Mouse(m) if app.confirm.is_none() => {
+            app.dismiss_flash();
             input::handle_mouse_normal(app, *m);
         }
         _ => {}
