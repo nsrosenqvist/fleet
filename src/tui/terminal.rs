@@ -461,9 +461,22 @@ fn attach_selected(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdou
     };
     let repo_root: PathBuf = app.repo_root.clone();
     let target_for_attach = target.clone();
+    // Mark the session as actively attached so the refresh thread
+    // leaves it alone. Without this, the periodic `tmux capture-pane`
+    // briefly counts as the "latest" tmux client under `window-size
+    // latest` (set by the attach script) and shrinks the user's
+    // window mid-session. Cleared on every exit path below — keep the
+    // guard tight so we don't strand the marker after a panic or
+    // early return.
+    if let Ok(mut g) = app.attached_session.write() {
+        *g = Some(target.clone());
+    }
     let res = suspend_around(term, move || {
         crate::cli::attach::run(&repo_root, &target_for_attach).map(|_| ())
     });
+    if let Ok(mut g) = app.attached_session.write() {
+        *g = None;
+    }
     if let Err(e) = res {
         app.flash_err(format!("attach failed: {e:#}"));
         return;

@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -94,6 +95,7 @@ pub fn spawn(
     repo_root: PathBuf,
     invoker: Arc<dyn ProcessInvoker>,
     pane_size: Arc<AtomicU32>,
+    attached_session: Arc<RwLock<Option<String>>>,
 ) -> (
     mpsc::Sender<RefreshCommand>,
     mpsc::Receiver<RefreshUpdate>,
@@ -101,8 +103,16 @@ pub fn spawn(
 ) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (update_tx, update_rx) = mpsc::channel();
-    let handle =
-        thread::spawn(move || refresh_loop(repo_root, invoker, pane_size, cmd_rx, &update_tx));
+    let handle = thread::spawn(move || {
+        refresh_loop(
+            repo_root,
+            invoker,
+            pane_size,
+            attached_session,
+            cmd_rx,
+            &update_tx,
+        );
+    });
     (cmd_tx, update_rx, handle)
 }
 
@@ -113,6 +123,7 @@ fn refresh_loop(
     _repo_root: PathBuf,
     invoker: Arc<dyn ProcessInvoker>,
     pane_size: Arc<AtomicU32>,
+    attached_session: Arc<RwLock<Option<String>>>,
     cmds: mpsc::Receiver<RefreshCommand>,
     updates: &mpsc::Sender<RefreshUpdate>,
 ) {
@@ -192,7 +203,20 @@ fn refresh_loop(
                 resized.clear();
                 last_resize_size = packed;
             }
-            if run_status_probe(&lima, &ao_workdir, packed, &mut resized, updates).is_err() {
+            // Snapshot the attached session id (if any). Held only for
+            // the duration of the read so the UI thread can write a new
+            // value without blocking.
+            let busy = attached_session.read().ok().and_then(|g| g.clone());
+            if run_status_probe(
+                &lima,
+                &ao_workdir,
+                packed,
+                busy.as_deref(),
+                &mut resized,
+                updates,
+            )
+            .is_err()
+            {
                 return;
             }
             next_status = now + REFRESH_INTERVAL;
@@ -264,6 +288,7 @@ fn run_status_probe(
     lima: &Lima,
     ao_workdir: &std::path::Path,
     pane_size: u32,
+    attached: Option<&str>,
     resized: &mut HashSet<String>,
     updates: &mpsc::Sender<RefreshUpdate>,
 ) -> std::result::Result<(), ()> {
@@ -279,6 +304,17 @@ fn run_status_probe(
             }
             let packed = pane_size;
             for id in session_ids {
+                // Skip every tmux call against the session the user is
+                // currently attached to. The attach script switched it
+                // to `window-size latest`, so an ephemeral capture-pane
+                // client from the non-interactive `limactl shell` would
+                // count as "the latest" and shrink the window out from
+                // under the attached user. We'll resume both
+                // capture-pane and the panel-width pin once the attach
+                // handler clears this marker on detach.
+                if attached == Some(id.as_str()) {
+                    continue;
+                }
                 // First time we see this session id, pin its tmux window
                 // to the output pane's width. AO created the session at
                 // whatever default it picked; without this the

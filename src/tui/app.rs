@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::mpsc;
+use std::sync::RwLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -365,6 +366,18 @@ pub struct App {
     /// concurrent read access.
     pub(super) pane_size: Arc<AtomicU32>,
 
+    /// Session id the user is currently attached to (interactive
+    /// `tmux attach` running in the foreground), if any. Set by the
+    /// attach handler before suspending the TUI, cleared after detach.
+    /// The refresh thread skips both `resize_window` and `capture_pane`
+    /// for this id — `capture_pane` runs via a non-interactive
+    /// `limactl shell` whose ephemeral tmux client otherwise counts as
+    /// the "latest" client under `window-size latest` and shrinks the
+    /// attached user's window. `RwLock` because the refresh thread
+    /// reads it every tick and the UI thread only writes around the
+    /// attach.
+    pub(super) attached_session: Arc<RwLock<Option<String>>>,
+
     /// Last mouse-click timestamp + target, used by `resolve_click` to
     /// detect a double-click within `DOUBLE_CLICK_WINDOW`.
     last_click: Option<(Instant, ClickTarget)>,
@@ -412,6 +425,7 @@ impl App {
             refresh_handle: None,
             sidebar_item_rects: RefCell::new(Vec::new()),
             pane_size: Arc::new(AtomicU32::new(0)),
+            attached_session: Arc::new(RwLock::new(None)),
             last_click: None,
             pending_commands: Vec::new(),
         };
@@ -427,6 +441,7 @@ impl App {
             self.repo_root.clone(),
             self.invoker.clone(),
             self.pane_size.clone(),
+            self.attached_session.clone(),
         );
         self.refresh_cmd_tx = Some(cmd_tx);
         self.refresh_update_rx = Some(update_rx);
