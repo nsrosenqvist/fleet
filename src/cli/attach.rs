@@ -72,13 +72,25 @@ fn build_attach_script(session: &str) -> String {
     let status_left =
         " #[fg=colour141,bold]#S#[default] #[fg=brightblack]│#[default] ctrl+b d to detach ";
     let q_status_left = crate::cli::spawn::shell_quote_single(status_left);
+    // `window-size latest` flips the session out of the `manual` pin
+    // applied by [`crate::tmux::resize_window`] (used to keep the
+    // capture-pane width aligned with fleet's output panel). With
+    // `latest`, tmux resizes the window to the attaching client's
+    // terminal size, so the user sees the session at full width
+    // instead of cropped to the panel. The post-detach handler in
+    // `attach_selected` re-pins via `resize_window` for the panel.
+    // AO's tmux conf ships with `status off`, so the styling below
+    // would be invisible without explicitly turning the bar back on
+    // for this session.
     format!(
         "set -e
+tmux set-option -t {s} status on >/dev/null 2>&1 || true
 tmux set-option -t {s} status-style 'bg=default,fg=colour250' >/dev/null 2>&1 || true
 tmux set-option -t {s} status-left {q_status_left} >/dev/null 2>&1 || true
 tmux set-option -t {s} status-left-length 60 >/dev/null 2>&1 || true
 tmux set-option -t {s} window-status-current-style 'fg=colour141,bold' >/dev/null 2>&1 || true
 tmux set-option -t {s} window-status-style 'fg=colour250' >/dev/null 2>&1 || true
+tmux set-option -t {s} window-size latest >/dev/null 2>&1 || true
 exec tmux attach -t {s}
 "
     )
@@ -112,5 +124,33 @@ mod tests {
     fn script_sets_status_left_with_detach_hint() {
         let script = build_attach_script("fl-4");
         assert!(script.contains("ctrl+b d to detach"));
+    }
+
+    #[test]
+    fn script_turns_status_bar_on() {
+        // AO's tmux conf disables the status bar by default. Without
+        // an explicit `status on` the styled status-left would never
+        // render.
+        let script = build_attach_script("fl-4");
+        assert!(script.contains("set-option -t 'fl-4' status on"));
+    }
+
+    #[test]
+    fn script_switches_window_size_to_latest_before_attach() {
+        // The session is normally pinned to `window-size manual` so the
+        // capture-pane width matches the output panel. Without flipping
+        // back to `latest`, the attaching client would see the window
+        // at the panel's narrow width instead of their full terminal.
+        let script = build_attach_script("fl-4");
+        let ws_idx = script
+            .find("window-size latest")
+            .expect("attach script should switch window-size to latest");
+        let attach_idx = script
+            .find("exec tmux attach")
+            .expect("attach script should exec tmux attach");
+        assert!(
+            ws_idx < attach_idx,
+            "window-size latest must be set before the attach"
+        );
     }
 }
