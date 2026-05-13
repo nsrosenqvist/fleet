@@ -264,7 +264,6 @@ fn run_command(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>,
         Command::KillSession(id) => kill_session(app, term, id),
         Command::StopAo => stop_ao(app, term),
         Command::RequestRefresh => app.request_refresh(),
-        Command::SaveAoConfig => save_ao_config(app),
     }
 }
 
@@ -284,14 +283,38 @@ fn attach_selected(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdou
     }
 }
 
+/// Hand the AO catalog yaml to `$EDITOR` (suspending the alt screen)
+/// and reload the cached config when the user comes back, so any edits
+/// they made take effect on the next session-list refresh without
+/// needing a manual `r` press. Targets the file the running config was
+/// loaded from when one exists; otherwise creates / edits the XDG path
+/// so new users land in the central catalog by default.
 fn edit_config(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    let yaml_path = app.repo_root.join("agent-orchestrator.yaml");
+    let yaml_path = app
+        .ao_config_path
+        .clone()
+        .or_else(crate::ao::config::AoConfig::default_xdg_path)
+        .unwrap_or_else(|| app.repo_root.join("agent-orchestrator.yaml"));
+    // `$EDITOR` won't open a non-existent file gracefully in every
+    // editor (vi handles it, some fancy ones complain); make sure the
+    // parent dir exists so a brand-new XDG path is writable.
+    if let Some(parent) = yaml_path.parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        app.flash_err(format!("mkdir {}: {}", parent.display(), e));
+        return;
+    }
     let res = suspend_around(term, || {
         crate::process::run_interactive(&editor, &[yaml_path.display().to_string()], &[], &[])
             .map(|_| ())
     });
-    app.flash_result("edited config".to_string(), res);
+    app.flash_result(format!("edited {}", yaml_path.display()), res);
+    // Pick up any changes the user made (added projects, renamed,
+    // moved paths, …) so the breadcrumb chip + cwd-scoped filter
+    // reflect them immediately.
+    app.reload_ao_config();
 }
 
 fn tracker_preview(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
@@ -359,64 +382,6 @@ fn kill_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>
     });
     app.flash_result(format!("killed {killed_id}"), res);
     app.request_refresh();
-}
-
-/// Serialise the Config view's draft back to `agent-orchestrator.yaml`
-/// via a tempfile + rename so a partial write can never leave the
-/// file truncated. The user already confirmed the comment-loss via
-/// the `Confirm::SaveAoConfig` dialog. Re-loads the cached config
-/// after the rename so subsequent `is_dirty` checks see a clean
-/// baseline.
-fn save_ao_config(app: &mut App) {
-    let Some(form) = app.config_form.as_ref() else {
-        return;
-    };
-    let yaml_text = match serde_yml::to_string(&form.draft) {
-        Ok(s) => s,
-        Err(e) => {
-            app.flash_err(format!("serialize agent-orchestrator.yaml: {e}"));
-            return;
-        }
-    };
-    // Write back to whichever path the config was loaded from — an
-    // edit started against the XDG catalog must not land in the
-    // per-repo fallback or vice versa. If no path was tracked (config
-    // didn't exist at startup), default to XDG so new configs land in
-    // the central catalog.
-    let Some(path) = app
-        .ao_config_path
-        .clone()
-        .or_else(crate::ao::config::AoConfig::default_xdg_path)
-    else {
-        app.flash_err("can't resolve a target path (no HOME / XDG_CONFIG_HOME set)");
-        return;
-    };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        app.flash_err(format!("mkdir {}: {}", parent.display(), e));
-        return;
-    }
-    // Write to a sibling tempfile in the same directory so the rename
-    // stays on the same filesystem (atomic rename only crosses devices
-    // unreliably). `.tmp` suffix matches the convention git uses for
-    // its own writes.
-    let tmp = path.with_extension("yaml.tmp");
-    if let Err(e) = std::fs::write(&tmp, &yaml_text) {
-        app.flash_err(format!("write {}: {}", tmp.display(), e));
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        app.flash_err(format!("rename to {}: {}", path.display(), e));
-        // Best-effort cleanup so we don't leave the tmpfile behind.
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    let saved_to = path.display().to_string();
-    app.reload_ao_config();
-    // reload may have re-pointed ao_config_path; the flash should
-    // reflect what we actually just wrote, not the post-reload state.
-    app.flash_ok(format!("saved {saved_to}"));
 }
 
 fn stop_ao(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {

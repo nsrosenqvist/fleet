@@ -50,495 +50,12 @@ pub(super) enum ClickKind {
     Activate,
 }
 
-/// Top-level view the TUI is showing right now. View switches happen on
-/// global keys (`Shift+C` / `Shift+H`) and survive across refresh ticks
-/// so a slow probe doesn't bounce the user back to Sessions mid-edit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum View {
-    #[default]
-    Sessions,
-    Config,
-}
-
-/// Which form field the Config view currently has focused. Order
-/// matters — Tab cycles in declaration order.
-///
-/// Per-repo fleet means there's exactly one in-scope project at a
-/// time (the one whose path matches cwd), so the form has no project
-/// *selector* — the target project is implied. Each `Project*` field
-/// edits that one project's value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum ConfigField {
-    #[default]
-    Agent,
-    Runtime,
-    Workspace,
-    Port,
-    ProjectName,
-    ProjectSessionPrefix,
-    ProjectPath,
-    ProjectDefaultBranch,
-    ProjectAgentRulesFile,
-    ProjectAgent,
-}
-
-impl ConfigField {
-    pub(super) const ALL: &'static [Self] = &[
-        Self::Agent,
-        Self::Runtime,
-        Self::Workspace,
-        Self::Port,
-        Self::ProjectName,
-        Self::ProjectSessionPrefix,
-        Self::ProjectPath,
-        Self::ProjectDefaultBranch,
-        Self::ProjectAgentRulesFile,
-        Self::ProjectAgent,
-    ];
-
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::Agent => "agent",
-            Self::Runtime => "runtime",
-            Self::Workspace => "workspace",
-            Self::Port => "port",
-            Self::ProjectName => "name",
-            Self::ProjectSessionPrefix => "sessionPrefix",
-            Self::ProjectPath => "path",
-            Self::ProjectDefaultBranch => "defaultBranch",
-            Self::ProjectAgentRulesFile => "agentRulesFile",
-            Self::ProjectAgent => "agent override",
-        }
-    }
-
-    /// True when this field targets the in-scope project rather than
-    /// the defaults block. Used by the renderer to skip per-project
-    /// rows when no project is in scope.
-    pub(super) fn is_project_field(self) -> bool {
-        matches!(
-            self,
-            Self::ProjectName
-                | Self::ProjectSessionPrefix
-                | Self::ProjectPath
-                | Self::ProjectDefaultBranch
-                | Self::ProjectAgentRulesFile
-                | Self::ProjectAgent,
-        )
-    }
-
-    pub(super) fn next(self) -> Self {
-        let idx = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
-        Self::ALL[(idx + 1) % Self::ALL.len()]
-    }
-
-    pub(super) fn prev(self) -> Self {
-        let idx = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
-        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
-    }
-}
-
-/// Known values for each enum field, in cycle order. The trailing `""`
-/// represents "unset — fall back to AO's internal default" which is a
-/// legitimate state worth being able to reach from the form.
-pub(super) const AGENT_VALUES: &[&str] = &["claude-code", "codex", "aider", ""];
-pub(super) const RUNTIME_VALUES: &[&str] = &["tmux", ""];
-pub(super) const WORKSPACE_VALUES: &[&str] = &["worktree", "in-place", ""];
-
-/// Form state for the Config view. Wraps a writable draft of the
-/// parsed AO config so edits don't touch `app.ao_config` until the
-/// user saves; the original cached copy stays as the comparison
-/// baseline that determines whether the form is "dirty."
-#[derive(Debug, Clone)]
-pub(super) struct ConfigForm {
-    pub(super) draft: crate::ao::config::AoConfig,
-    pub(super) focus: ConfigField,
-    /// `Some` when the user is mid-text-edit on a string/number field.
-    /// Carries the in-progress string; commit on Enter, revert on Esc.
-    pub(super) editing: Option<String>,
-    /// Project key the form's per-project rows target. Set once at
-    /// form creation from `App::current_project_key`; stays fixed for
-    /// the form's lifetime so reload-on-save doesn't have to chase a
-    /// moving target. `None` when fleet was launched outside any
-    /// known project — the project rows render an "init this dir as
-    /// a project" hint instead of fields.
-    pub(super) target_project_key: Option<String>,
-}
-
-impl ConfigForm {
-    pub(super) fn new(cfg: crate::ao::config::AoConfig) -> Self {
-        Self {
-            draft: cfg,
-            focus: ConfigField::default(),
-            editing: None,
-            target_project_key: None,
-        }
-    }
-
-    /// Project the per-project rows write into, if any. Returns the
-    /// `(key, value)` pair so the renderer can title-case the panel
-    /// with the project's key.
-    pub(super) fn selected_project(&self) -> Option<(&str, &crate::ao::config::Project)> {
-        let key = self.target_project_key.as_deref()?;
-        self.draft.projects.get_key_value(key).map(|(k, v)| (k.as_str(), v))
-    }
-
-    /// True when the draft has diverged from the on-disk yaml. Drives
-    /// the "(modified)" indicator and gates the save flow.
-    pub(super) fn is_dirty(&self, original: &crate::ao::config::AoConfig) -> bool {
-        // Serialise both and compare strings. Simpler than implementing
-        // a manual deep-equal across the schema and round-trips the same
-        // shape we'd write to disk on save, so "no diff" is conservative.
-        let a = serde_yml::to_string(&self.draft).unwrap_or_default();
-        let b = serde_yml::to_string(original).unwrap_or_default();
-        a != b
-    }
-
-    /// Cycle to the next known value for an enum field. `delta = 1`
-    /// for "next", `-1` for "prev" so Tab + Shift-Tab don't have to
-    /// reach into the cycle table themselves.
-    pub(super) fn cycle_focused(&mut self, delta: i32) {
-        match self.focus {
-            ConfigField::Agent => {
-                self.draft.defaults.agent = cycle_value(
-                    AGENT_VALUES,
-                    self.draft.defaults.agent.as_deref(),
-                    delta,
-                );
-            }
-            ConfigField::Runtime => {
-                self.draft.defaults.runtime = cycle_value(
-                    RUNTIME_VALUES,
-                    self.draft.defaults.runtime.as_deref(),
-                    delta,
-                );
-            }
-            ConfigField::Workspace => {
-                self.draft.defaults.workspace = cycle_value(
-                    WORKSPACE_VALUES,
-                    self.draft.defaults.workspace.as_deref(),
-                    delta,
-                );
-            }
-            // Text-edited fields don't respond to cycle keystrokes;
-            // they enter edit mode on Enter / Space instead.
-            ConfigField::Port
-            | ConfigField::ProjectName
-            | ConfigField::ProjectSessionPrefix
-            | ConfigField::ProjectPath
-            | ConfigField::ProjectDefaultBranch
-            | ConfigField::ProjectAgentRulesFile
-            | ConfigField::ProjectAgent => {}
-        }
-    }
-
-    /// Start a text edit on the focused field, seeding the buffer
-    /// with the current value. No-op on enum fields (which cycle
-    /// instead) and on the project-selector field (which cycles).
-    pub(super) fn begin_edit(&mut self) {
-        let initial: String = match self.focus {
-            ConfigField::Port => self
-                .draft
-                .port
-                .map(|p| p.to_string())
-                .unwrap_or_default(),
-            ConfigField::ProjectName => self
-                .selected_project()
-                .map(|(_, p)| p.name.clone())
-                .unwrap_or_default(),
-            ConfigField::ProjectSessionPrefix => self
-                .selected_project()
-                .and_then(|(_, p)| p.session_prefix.clone())
-                .unwrap_or_default(),
-            ConfigField::ProjectPath => self
-                .selected_project()
-                .map(|(_, p)| p.path.display().to_string())
-                .unwrap_or_default(),
-            ConfigField::ProjectDefaultBranch => self
-                .selected_project()
-                .and_then(|(_, p)| p.default_branch.clone())
-                .unwrap_or_default(),
-            ConfigField::ProjectAgentRulesFile => self
-                .selected_project()
-                .and_then(|(_, p)| p.agent_rules_file.clone())
-                .unwrap_or_default(),
-            ConfigField::ProjectAgent => self
-                .selected_project()
-                .and_then(|(_, p)| p.agent.clone())
-                .unwrap_or_default(),
-            // Enum / cycle fields don't have a text editor.
-            ConfigField::Agent | ConfigField::Runtime | ConfigField::Workspace => return,
-        };
-        self.editing = Some(initial);
-    }
-
-    /// Commit the current text-edit buffer back into the draft. Bad
-    /// input on numeric fields drops back into "(unset)" rather than
-    /// rejecting the keystroke — the user can re-edit if they meant
-    /// something specific. Project-field commits write into the
-    /// currently selected project; if it vanished between begin/commit
-    /// (rare, but possible if an external edit removed it), the buffer
-    /// is silently dropped.
-    pub(super) fn commit_edit(&mut self) {
-        let Some(buf) = self.editing.take() else { return };
-        match self.focus {
-            ConfigField::Port => {
-                let trimmed = buf.trim();
-                self.draft.port = if trimmed.is_empty() {
-                    None
-                } else {
-                    trimmed.parse::<u16>().ok()
-                };
-            }
-            ConfigField::ProjectName
-            | ConfigField::ProjectSessionPrefix
-            | ConfigField::ProjectPath
-            | ConfigField::ProjectDefaultBranch
-            | ConfigField::ProjectAgentRulesFile
-            | ConfigField::ProjectAgent => {
-                let Some(key) = self.selected_project_key() else {
-                    return;
-                };
-                let Some(project) = self.draft.projects.get_mut(&key) else {
-                    return;
-                };
-                let trimmed = buf.trim();
-                let opt_string = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
-                match self.focus {
-                    ConfigField::ProjectName => {
-                        // `name` is non-optional in the schema — an
-                        // empty buffer reverts to the map key as a
-                        // safe-ish placeholder rather than producing
-                        // invalid yaml.
-                        project.name = opt_string.unwrap_or_else(|| key.clone());
-                    }
-                    ConfigField::ProjectSessionPrefix => project.session_prefix = opt_string,
-                    ConfigField::ProjectPath => {
-                        if let Some(s) = opt_string {
-                            project.path = std::path::PathBuf::from(s);
-                        }
-                    }
-                    ConfigField::ProjectDefaultBranch => project.default_branch = opt_string,
-                    ConfigField::ProjectAgentRulesFile => project.agent_rules_file = opt_string,
-                    ConfigField::ProjectAgent => project.agent = opt_string,
-                    _ => unreachable!(),
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub(super) fn cancel_edit(&mut self) {
-        self.editing = None;
-    }
-
-    /// Insert a new project entry seeded from `cwd` and (when
-    /// available) the current git branch. Returns the freshly-minted
-    /// map key so the caller can update navigation state (the
-    /// renderer wants `selected_project_idx` pointed at the new row;
-    /// the input layer wants focus on `ProjectName` so the user can
-    /// rename if the cwd-derived default isn't what they want).
-    pub(super) fn add_project_for_cwd(&mut self, cwd: &std::path::Path) -> String {
-        let base = cwd
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("project");
-        let sanitized = sanitize_project_key(base);
-        let key = uniquify_key(&self.draft.projects, &sanitized);
-        let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let default_branch = detect_git_branch(&canonical);
-        let session_prefix = key
-            .chars()
-            .take(2)
-            .collect::<String>()
-            .to_lowercase();
-        let project = crate::ao::config::Project {
-            name: key.clone(),
-            session_prefix: if session_prefix.is_empty() {
-                None
-            } else {
-                Some(session_prefix)
-            },
-            path: canonical,
-            default_branch,
-            agent_rules_file: None,
-            agent: None,
-            tracker: None,
-            post_create: Vec::new(),
-            extra: std::collections::BTreeMap::new(),
-        };
-        self.draft.projects.insert(key.clone(), project);
-        // Land the form on the new project for immediate editing.
-        self.target_project_key = Some(key.clone());
-        key
-    }
-
-    /// Tab navigation that skips fields with no content to edit.
-    /// Today that means: when `draft.projects` is empty, the project
-    /// detail fields are all unreachable — Tab walks past them so the
-    /// user doesn't land on a row that won't accept input.
-    pub(super) fn focus_next(&mut self) {
-        self.focus = self.advance(1);
-    }
-
-    pub(super) fn focus_prev(&mut self) {
-        self.focus = self.advance(-1);
-    }
-
-    fn advance(&self, delta: i32) -> ConfigField {
-        let mut next = if delta >= 0 {
-            self.focus.next()
-        } else {
-            self.focus.prev()
-        };
-        // Bounded loop — at most `ALL.len()` skips before we've walked
-        // the full cycle. Guards against an unreachable infinite loop
-        // if every field somehow gets disabled.
-        for _ in 0..ConfigField::ALL.len() {
-            if self.field_reachable(next) {
-                return next;
-            }
-            next = if delta >= 0 { next.next() } else { next.prev() };
-        }
-        self.focus
-    }
-
-    fn field_reachable(&self, field: ConfigField) -> bool {
-        if field.is_project_field() {
-            // Per-project fields are only reachable when there's a
-            // resolved target project to write into.
-            self.target_project_key.is_some()
-                && self
-                    .target_project_key
-                    .as_deref()
-                    .is_some_and(|k| self.draft.projects.contains_key(k))
-        } else {
-            true
-        }
-    }
-
-    /// Owned copy of the in-scope project's map key, if any. Returns
-    /// an owned `String` rather than a reference so `commit_edit`
-    /// (which mutates `self.draft.projects` in the same call) can hold
-    /// the key past the immutable borrow.
-    fn selected_project_key(&self) -> Option<String> {
-        let key = self.target_project_key.as_deref()?;
-        if self.draft.projects.contains_key(key) {
-            Some(key.to_string())
-        } else {
-            None
-        }
-    }
-}
-
-/// Reduce a cwd basename to a valid AO project key. The schema doesn't
-/// strictly require any specific character set, but lowercase-alnum-plus-
-/// dashes is the convention every existing config follows and avoids
-/// having to quote the key in yaml.
-fn sanitize_project_key(raw: &str) -> String {
-    let mut out: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    // Trim leading/trailing dashes; collapse internal runs. Cheap
-    // version: scan once, push only when the previous char wasn't a
-    // dash.
-    let mut compact = String::with_capacity(out.len());
-    let mut prev_dash = true; // suppresses leading dashes
-    for c in out.drain(..) {
-        if c == '-' {
-            if !prev_dash {
-                compact.push('-');
-                prev_dash = true;
-            }
-        } else {
-            compact.push(c);
-            prev_dash = false;
-        }
-    }
-    while compact.ends_with('-') {
-        compact.pop();
-    }
-    if compact.is_empty() {
-        "project".to_string()
-    } else {
-        compact
-    }
-}
-
-/// Append `-2`, `-3`, … until the key isn't already in `projects`.
-/// Guarantees a fresh entry even when the user has multiple repos
-/// with the same basename.
-fn uniquify_key(
-    projects: &std::collections::BTreeMap<String, crate::ao::config::Project>,
-    base: &str,
-) -> String {
-    if !projects.contains_key(base) {
-        return base.to_string();
-    }
-    for n in 2..u32::MAX {
-        let candidate = format!("{base}-{n}");
-        if !projects.contains_key(&candidate) {
-            return candidate;
-        }
-    }
-    base.to_string()
-}
-
-/// Best-effort current branch via `git symbolic-ref --short HEAD`.
-/// Returns `None` when the dir isn't a git repo, git isn't installed,
-/// or the repo is in detached-HEAD state. The user can edit the
-/// field after creation if our guess is wrong.
-fn detect_git_branch(cwd: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
-}
-
-fn cycle_value(values: &[&str], current: Option<&str>, delta: i32) -> Option<String> {
-    // `values` is a small `&'static [&str]` (4 entries at most for any
-    // field today) — the casts here can never overflow in practice.
-    let idx = values
-        .iter()
-        .position(|v| *v == current.unwrap_or(""))
-        .unwrap_or(0);
-    let len = values.len();
-    let next = if delta >= 0 {
-        (idx + delta.unsigned_abs() as usize) % len
-    } else {
-        (idx + len - (delta.unsigned_abs() as usize % len)) % len
-    };
-    let val = values[next];
-    if val.is_empty() {
-        None
-    } else {
-        Some(val.to_string())
-    }
-}
 
 /// Pending destructive action awaiting a y/N confirmation in the status bar.
 #[derive(Debug, Clone)]
 pub(super) enum Confirm {
     KillSession(String),
     StopAo,
-    SaveAoConfig,
 }
 
 impl Confirm {
@@ -546,9 +63,6 @@ impl Confirm {
         match self {
             Self::KillSession(id) => format!("Kill session {id}? [y/N]"),
             Self::StopAo => "Stop AO orchestrator + dashboard? [y/N]".to_string(),
-            Self::SaveAoConfig => {
-                "Save agent-orchestrator.yaml? Comments will be stripped. [y/N]".to_string()
-            }
         }
     }
 }
@@ -568,38 +82,27 @@ pub(super) enum Command {
     KillSession(String),
     StopAo,
     RequestRefresh,
-    SaveAoConfig,
 }
 
 pub struct App {
     pub(super) repo_root: PathBuf,
     pub(super) invoker: Arc<dyn ProcessInvoker>,
 
-    pub(super) view: View,
-
-    /// Parsed `agent-orchestrator.yaml`, cached so the Config view doesn't
-    /// re-parse on every draw. `None` when the file is missing; an `Err`
-    /// gets folded into [`Self::action_error`] at load time so the user
-    /// sees the failure instead of an empty Config panel.
+    /// Parsed `agent-orchestrator.yaml`, cached for the breadcrumb chip
+    /// and the per-cwd project filter. `None` when no file exists in
+    /// either the XDG or per-repo location; users `c` to create one.
     pub(super) ao_config: Option<crate::ao::config::AoConfig>,
 
-    /// Path the cached `ao_config` was read from. `None` mirrors
-    /// `ao_config = None`. Save writes back to this path so an edit
-    /// loaded from the central catalog doesn't accidentally land in
-    /// the per-repo file (or vice-versa).
+    /// Path the cached `ao_config` was read from. Used by `c` to know
+    /// which file to hand to `$EDITOR`; `None` mirrors `ao_config =
+    /// None` and falls back to creating the XDG file on first edit.
     pub(super) ao_config_path: Option<std::path::PathBuf>,
 
     /// Project key (the map key inside `ao_config.projects`) matching
     /// the directory fleet was launched from. `None` when no project
-    /// in the catalog claims this cwd — the user is either outside
-    /// any known project or hasn't initialised one for this repo yet.
-    /// Drives view scoping and the breadcrumb.
+    /// in the catalog claims this cwd. Drives the session-list filter
+    /// and the breadcrumb chip.
     pub(super) current_project_key: Option<String>,
-
-    /// Edit state for the Config view. Built on entry (or reset on `r`
-    /// reload) from `ao_config`. `None` when the yaml doesn't exist —
-    /// the Config view shows the missing-file panel instead of a form.
-    pub(super) config_form: Option<ConfigForm>,
 
     pub(super) sessions: Vec<SessionInfo>,
     pub(super) selected: usize,
@@ -649,31 +152,22 @@ pub struct App {
 impl App {
     #[allow(clippy::unnecessary_wraps)]
     pub fn new(repo_root: &Path) -> Result<Self> {
-        // Eagerly read AO config so the Config view has something to
-        // show on first switch. A parse error here is non-fatal — the
-        // view renders the error in place of the kv table.
+        // Eagerly read AO config so the breadcrumb chip + cwd-scope
+        // filter have something to work with on the first frame. A
+        // parse error here is non-fatal — fleet just operates in
+        // "(unscoped)" mode and the user can fix the yaml via `c`.
         let loaded = crate::ao::config::AoConfig::load(repo_root).ok().flatten();
         let (ao_config_path, ao_config) = loaded
             .map_or((None, None), |(p, c)| (Some(p), Some(c)));
         let current_project_key = ao_config
             .as_ref()
             .and_then(|c| c.project_for_cwd(repo_root).map(String::from));
-        let config_form = ao_config.clone().map(|cfg| {
-            let mut form = ConfigForm::new(cfg);
-            // Per-repo fleet: bind the form's project rows to the
-            // cwd-matched project. None = the form's project rows
-            // become unreachable until the user runs `N` to init one.
-            form.target_project_key.clone_from(&current_project_key);
-            form
-        });
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
             invoker: Arc::new(RealProcessInvoker),
-            view: View::default(),
             ao_config,
             ao_config_path,
             current_project_key,
-            config_form,
             sessions: Vec::new(),
             selected: 0,
             refresh_error: None,
@@ -768,24 +262,16 @@ impl App {
     /// into the Config view (catches edits made via `c` + $EDITOR) and
     /// when they press `r` while in that view. Read failures surface as
     /// an action error rather than crashing the cached value to `None`.
+    /// Re-read the AO catalog from disk. Called after the user returns
+    /// from `c` + `$EDITOR` so an edited yaml takes effect immediately,
+    /// and on the `r` keybind for manual refresh.
     pub(super) fn reload_ao_config(&mut self) {
         match crate::ao::config::AoConfig::load(&self.repo_root) {
             Ok(loaded) => {
-                // Reload always resets the form draft — picking up
-                // external edits is the whole point of `r`. Unsaved
-                // form changes are intentionally lost; the user can
-                // press Ctrl+S before reloading if they want to keep
-                // them.
                 let (path, cfg) = loaded.map_or((None, None), |(p, c)| (Some(p), Some(c)));
                 self.current_project_key = cfg
                     .as_ref()
                     .and_then(|c| c.project_for_cwd(&self.repo_root).map(String::from));
-                self.config_form = cfg.clone().map(|c| {
-                    let mut form = ConfigForm::new(c);
-                    form.target_project_key
-                        .clone_from(&self.current_project_key);
-                    form
-                });
                 self.ao_config = cfg;
                 self.ao_config_path = path;
                 self.action_error = None;
@@ -901,6 +387,14 @@ mod tests {
     fn app_with(n: usize) -> App {
         let mut app = App::new(std::path::Path::new(".")).expect("App::new");
         app.sessions = (0..n).map(|i| session(&format!("sb-{}", i + 1))).collect();
+        // Tests that don't opt into the cwd-scoped filter (most of them)
+        // expect the session list to flow through unfiltered. App::new
+        // resolves `current_project_key` from any catalog yaml the test
+        // host happens to have on disk; null it out here so tests stay
+        // isolated from the dev's `~/.config/fleet/`.
+        app.current_project_key = None;
+        app.ao_config = None;
+        app.ao_config_path = None;
         app
     }
 
@@ -1142,219 +636,6 @@ mod tests {
             app.resolve_click(ClickTarget::SidebarItem(1)),
             ClickKind::Select,
         ));
-    }
-
-    fn empty_ao_config() -> crate::ao::config::AoConfig {
-        serde_yml::from_str("").unwrap()
-    }
-
-    #[test]
-    fn config_field_cycles_forward_and_back() {
-        assert_eq!(ConfigField::Agent.next(), ConfigField::Runtime);
-        assert_eq!(ConfigField::Port.next(), ConfigField::ProjectName);
-        assert_eq!(
-            ConfigField::ProjectAgent.next(),
-            ConfigField::Agent,
-            "cycle wraps after the last project field",
-        );
-        assert_eq!(ConfigField::Agent.prev(), ConfigField::ProjectAgent);
-    }
-
-    #[test]
-    fn focus_next_skips_project_fields_when_none_defined() {
-        // Empty project map → Tab should walk Port → Agent, skipping
-        // ProjectSelection + the six per-project field variants.
-        let cfg = empty_ao_config();
-        let mut form = ConfigForm::new(cfg);
-        form.focus = ConfigField::Port;
-        form.focus_next();
-        assert_eq!(
-            form.focus,
-            ConfigField::Agent,
-            "no projects → skip the project section entirely",
-        );
-    }
-
-    #[test]
-    fn focus_next_walks_project_fields_when_target_set() {
-        let yaml = r"
-projects:
-  one:
-    name: one
-    path: /tmp/one
-";
-        let cfg: crate::ao::config::AoConfig = serde_yml::from_str(yaml).expect("parse");
-        let mut form = ConfigForm::new(cfg);
-        form.target_project_key = Some("one".to_string());
-        form.focus = ConfigField::Port;
-        form.focus_next();
-        assert_eq!(form.focus, ConfigField::ProjectName);
-        form.focus_next();
-        assert_eq!(form.focus, ConfigField::ProjectSessionPrefix);
-    }
-
-    #[test]
-    fn sanitize_project_key_lowercases_and_dashes() {
-        assert_eq!(super::sanitize_project_key("My Repo"), "my-repo");
-        assert_eq!(super::sanitize_project_key("__weird name__"), "weird-name");
-        assert_eq!(super::sanitize_project_key("Hello!World"), "hello-world");
-        assert_eq!(super::sanitize_project_key("123abc"), "123abc");
-    }
-
-    #[test]
-    fn sanitize_project_key_falls_back_when_empty() {
-        assert_eq!(super::sanitize_project_key(""), "project");
-        assert_eq!(super::sanitize_project_key("!@#$"), "project");
-    }
-
-    #[test]
-    fn uniquify_key_suffixes_on_collision() {
-        let mut projects = std::collections::BTreeMap::new();
-        projects.insert(
-            "alpha".to_string(),
-            crate::ao::config::Project {
-                name: "alpha".into(),
-                session_prefix: None,
-                path: std::path::PathBuf::from("/tmp/alpha"),
-                default_branch: None,
-                agent_rules_file: None,
-                agent: None,
-                tracker: None,
-                post_create: Vec::new(),
-                extra: std::collections::BTreeMap::new(),
-            },
-        );
-        assert_eq!(super::uniquify_key(&projects, "alpha"), "alpha-2");
-        assert_eq!(super::uniquify_key(&projects, "beta"), "beta");
-    }
-
-    #[test]
-    fn add_project_for_cwd_seeds_from_basename() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cwd = tmp.path().join("my-fancy-repo");
-        std::fs::create_dir_all(&cwd).unwrap();
-
-        let mut form = ConfigForm::new(empty_ao_config());
-        let key = form.add_project_for_cwd(&cwd);
-        assert_eq!(key, "my-fancy-repo");
-        let project = form.draft.projects.get(&key).expect("project added");
-        assert_eq!(project.name, "my-fancy-repo");
-        assert_eq!(project.session_prefix.as_deref(), Some("my"));
-        // Path should resolve to the canonicalised cwd (or fall back).
-        assert!(project.path.ends_with("my-fancy-repo"));
-    }
-
-    #[test]
-    fn project_name_edit_writes_into_target_project() {
-        let yaml = r"
-projects:
-  one:
-    name: one
-    path: /tmp/one
-";
-        let cfg: crate::ao::config::AoConfig = serde_yml::from_str(yaml).expect("parse");
-        let mut form = ConfigForm::new(cfg);
-        form.target_project_key = Some("one".to_string());
-        form.focus = ConfigField::ProjectName;
-        form.begin_edit();
-        let buf = form.editing.as_mut().expect("editing started");
-        buf.clear();
-        buf.push_str("renamed");
-        form.commit_edit();
-        assert_eq!(form.draft.projects.get("one").unwrap().name, "renamed");
-    }
-
-    #[test]
-    fn unscoped_form_makes_project_fields_unreachable() {
-        // A form with no target project (cwd outside any catalog
-        // entry) must skip all per-project rows when navigating.
-        let yaml = r"
-projects:
-  alpha:
-    name: alpha
-    path: /tmp/a
-";
-        let cfg: crate::ao::config::AoConfig = serde_yml::from_str(yaml).expect("parse");
-        let mut form = ConfigForm::new(cfg);
-        // target_project_key stays None — fleet wasn't launched
-        // inside any project's path.
-        form.focus = ConfigField::Port;
-        form.focus_next();
-        assert_eq!(
-            form.focus,
-            ConfigField::Agent,
-            "unreachable project rows → Tab wraps to defaults",
-        );
-    }
-
-    #[test]
-    fn cycle_value_walks_agent_options() {
-        let v = cycle_value(AGENT_VALUES, Some("claude-code"), 1);
-        assert_eq!(v.as_deref(), Some("codex"));
-        let v = cycle_value(AGENT_VALUES, Some("codex"), 1);
-        assert_eq!(v.as_deref(), Some("aider"));
-        // "" (the unset sentinel) maps to `None`, then wraps to the
-        // first non-empty value.
-        let v = cycle_value(AGENT_VALUES, Some("aider"), 1);
-        assert!(v.is_none(), "expected (unset) after aider");
-        let v = cycle_value(AGENT_VALUES, None, 1);
-        assert_eq!(v.as_deref(), Some("claude-code"));
-    }
-
-    #[test]
-    fn cycle_value_walks_backward() {
-        let v = cycle_value(AGENT_VALUES, Some("codex"), -1);
-        assert_eq!(v.as_deref(), Some("claude-code"));
-        let v = cycle_value(AGENT_VALUES, Some("claude-code"), -1);
-        assert!(v.is_none());
-    }
-
-    #[test]
-    fn form_dirty_only_when_draft_diverges() {
-        let cfg = empty_ao_config();
-        let form = ConfigForm::new(cfg.clone());
-        assert!(!form.is_dirty(&cfg));
-
-        let mut form = ConfigForm::new(cfg.clone());
-        form.draft.defaults.agent = Some("codex".into());
-        assert!(form.is_dirty(&cfg));
-    }
-
-    #[test]
-    fn cycle_focused_writes_into_draft() {
-        let cfg = empty_ao_config();
-        let mut form = ConfigForm::new(cfg);
-        form.focus = ConfigField::Agent;
-        // `None` (unset) is the sentinel at the end of AGENT_VALUES;
-        // +1 from there wraps to the first explicit entry.
-        form.cycle_focused(1);
-        assert_eq!(form.draft.defaults.agent.as_deref(), Some("claude-code"));
-        form.cycle_focused(1);
-        assert_eq!(form.draft.defaults.agent.as_deref(), Some("codex"));
-    }
-
-    #[test]
-    fn port_text_edit_commit_parses() {
-        let cfg = empty_ao_config();
-        let mut form = ConfigForm::new(cfg);
-        form.focus = ConfigField::Port;
-        form.begin_edit();
-        form.editing.as_mut().unwrap().push_str("3001");
-        form.commit_edit();
-        assert_eq!(form.draft.port, Some(3001));
-    }
-
-    #[test]
-    fn port_text_edit_cancel_does_not_mutate() {
-        let cfg = empty_ao_config();
-        let mut form = ConfigForm::new(cfg);
-        form.draft.port = Some(3000);
-        form.focus = ConfigField::Port;
-        form.begin_edit();
-        form.editing.as_mut().unwrap().clear();
-        form.editing.as_mut().unwrap().push_str("9999");
-        form.cancel_edit();
-        assert_eq!(form.draft.port, Some(3000), "cancel must revert");
     }
 
     #[test]

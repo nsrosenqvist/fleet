@@ -23,10 +23,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
 use crate::ao::SessionInfo;
-use crate::ao::config::AoConfig;
 use crate::lima::VmStatus;
 
-use super::app::{App, ConfigField, View};
+use super::app::App;
 use super::bringup::BringUp;
 use super::preflight::MissingDep;
 use super::theme::{
@@ -46,17 +45,12 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
         .split(area);
 
     draw_breadcrumb(app, frame, layout[0]);
-    match app.view {
-        View::Sessions => draw_body(app, frame, layout[1]),
-        View::Config => draw_config(app, frame, layout[1]),
-    }
+    draw_body(app, frame, layout[1]);
     draw_status_bar(app, frame, layout[2]);
 }
 
 fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    // Left chunk: view-specific chain. Right chunk: AO/VM badges
-    // (always shown — they reflect host-level health and are useful
-    // context regardless of which view the user is in).
+    // Left chunk: project chain. Right chunk: AO/VM badges.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(18)])
@@ -66,40 +60,31 @@ fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .current_project_key
         .as_deref()
         .unwrap_or("(unscoped)");
-    let chain: Vec<Span<'_>> = match app.view {
-        View::Sessions => app.selected_session().map_or_else(
-            || {
-                vec![
-                    chip("fleet", ACCENT),
-                    Span::raw(" | "),
-                    chip(project_chip, ACCENT),
-                    Span::raw(" | "),
-                    Span::styled("(no sessions)", Style::default().fg(MUTED)),
-                ]
-            },
-            |s| {
-                vec![
-                    chip("fleet", ACCENT),
-                    Span::raw(" | "),
-                    chip(project_chip, ACCENT),
-                    Span::raw(" | "),
-                    Span::raw(s.id.clone().unwrap_or_else(|| "?".into())),
-                    Span::raw(" "),
-                    Span::styled(
-                        s.status.clone().unwrap_or_else(|| "?".into()),
-                        Style::default().fg(MUTED),
-                    ),
-                ]
-            },
-        ),
-        View::Config => vec![
-            chip("fleet", ACCENT),
-            Span::raw(" | "),
-            chip(project_chip, ACCENT),
-            Span::raw(" | "),
-            Span::styled("config", Style::default().fg(MUTED)),
-        ],
-    };
+    let chain: Vec<Span<'_>> = app.selected_session().map_or_else(
+        || {
+            vec![
+                chip("fleet", ACCENT),
+                Span::raw(" | "),
+                chip(project_chip, ACCENT),
+                Span::raw(" | "),
+                Span::styled("(no sessions)", Style::default().fg(MUTED)),
+            ]
+        },
+        |s| {
+            vec![
+                chip("fleet", ACCENT),
+                Span::raw(" | "),
+                chip(project_chip, ACCENT),
+                Span::raw(" | "),
+                Span::raw(s.id.clone().unwrap_or_else(|| "?".into())),
+                Span::raw(" "),
+                Span::styled(
+                    s.status.clone().unwrap_or_else(|| "?".into()),
+                    Style::default().fg(MUTED),
+                ),
+            ]
+        },
+    );
     frame.render_widget(Paragraph::new(Line::from(chain)), cols[0]);
 
     let ao_color = if app.ao_up { OK } else { ERR };
@@ -331,373 +316,6 @@ fn draw_output(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-/// View-specific status-bar hints. The form's mode (idle / editing /
-/// nothing-loaded) decides which keys matter — showing irrelevant ones
-/// would clutter the legend without helping the user.
-fn config_status_spans(app: &App) -> Vec<Span<'_>> {
-    let mut out = vec![chip("[fleet:config]", ACCENT), sep()];
-
-    let editing = app
-        .config_form
-        .as_ref()
-        .is_some_and(|f| f.editing.is_some());
-
-    if editing {
-        out.extend([
-            key("Enter"),
-            Span::raw(" commit"),
-            sep(),
-            key("Esc"),
-            Span::raw(" cancel"),
-            sep(),
-            key("⌫"),
-            Span::raw(" del"),
-        ]);
-    } else {
-        out.extend([
-            key("Tab/↑↓"),
-            Span::raw(" nav"),
-            sep(),
-            key("Enter"),
-            Span::raw(" edit/cycle"),
-            sep(),
-            key("h/l"),
-            Span::raw(" prev/next"),
-            sep(),
-            key("^S"),
-            Span::raw(" save"),
-            sep(),
-            key("N"),
-            Span::raw(" new project"),
-            sep(),
-            key("⇧H"),
-            Span::raw(" sessions"),
-            sep(),
-            key("c"),
-            Span::raw(" yaml editor"),
-            sep(),
-            key("r"),
-            Span::raw(" reload"),
-            sep(),
-            key("q"),
-            Span::raw(" quit"),
-        ]);
-    }
-    out
-}
-
-// ─────────────────────── Config view ───────────────────────
-//
-// First-cut read-only render: a single column with two stacked panels
-// — `defaults` (agent / runtime / workspace / port) on top, the list
-// of configured projects below. Editing arrives in the next pass; for
-// now `c` keeps opening $EDITOR as the escape hatch.
-
-fn draw_config(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let (Some(orig), Some(form)) = (app.ao_config.as_ref(), app.config_form.as_ref()) else {
-        draw_config_missing(app, frame, area);
-        return;
-    };
-
-    let defaults_lines = build_defaults_form_lines(form);
-    let project_lines = build_project_panel_lines(form);
-
-    let defaults_h = u16::try_from(defaults_lines.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(2);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(defaults_h.min(area.height.saturating_sub(5).max(3))),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
-    draw_defaults_panel(form, orig, defaults_lines, frame, rows[0]);
-    draw_project_panel(form, project_lines, frame, rows[1]);
-}
-
-fn draw_config_missing(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let xdg = crate::ao::config::AoConfig::default_xdg_path();
-    let repo = app.repo_root.join("agent-orchestrator.yaml");
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "agent-orchestrator.yaml not found",
-            Style::default().fg(MUTED),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Fleet looks for the AO catalog in two places, in order:",
-            Style::default().fg(MUTED),
-        )),
-    ];
-    if let Some(xdg_path) = &xdg {
-        lines.push(Line::from(vec![
-            Span::styled("  1.  ", Style::default().fg(MUTED)),
-            Span::styled(
-                xdg_path.display().to_string(),
-                Style::default().fg(ACCENT),
-            ),
-            Span::raw("  (central)"),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        Span::styled("  2.  ", Style::default().fg(MUTED)),
-        Span::styled(repo.display().to_string(), Style::default().fg(ACCENT)),
-        Span::raw("  (per-repo)"),
-    ]));
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("Press ", Style::default().fg(MUTED)),
-        Span::styled(
-            "N",
-            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " to bootstrap a fresh config seeded with this directory ",
-            Style::default().fg(MUTED),
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        "as its first project, `r` to retry, or `⇧H` for sessions.",
-        Style::default().fg(MUTED),
-    )));
-    let title = Line::from(vec![Span::styled(
-        " agent-orchestrator.yaml ",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )]);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(framed_block_titled(title).padding(Padding::horizontal(2))),
-        area,
-    );
-}
-
-/// Build the defaults form lines with focus + edit-mode indicators.
-/// Each row reads as `kv_line` would, but the focused row carries a
-/// `▶` gutter glyph and an accent-coloured value; the focused row
-/// during text-edit shows a `█` caret in place of the value.
-fn build_defaults_form_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>> {
-    let d = &form.draft.defaults;
-    // Only the four `defaults.*` fields render in the defaults panel —
-    // `ProjectSelection` lives in the project panel below.
-    let defaults_fields = [
-        ConfigField::Agent,
-        ConfigField::Runtime,
-        ConfigField::Workspace,
-        ConfigField::Port,
-    ];
-    let mut out = Vec::new();
-    for field in defaults_fields {
-        let value: String = match field {
-            ConfigField::Agent => d
-                .agent
-                .clone()
-                .unwrap_or_else(|| "(unset — AO default)".into()),
-            ConfigField::Runtime => d
-                .runtime
-                .clone()
-                .unwrap_or_else(|| "(unset — AO default)".into()),
-            ConfigField::Workspace => d
-                .workspace
-                .clone()
-                .unwrap_or_else(|| "(unset — AO default)".into()),
-            ConfigField::Port => form
-                .draft
-                .port
-                .map_or_else(|| "(unset — AO default)".into(), |p| p.to_string()),
-            // Anything else (ProjectSelection + the per-project rows)
-            // is rendered by the project panel, not here.
-            _ => continue,
-        };
-        out.push(field_line(field, &value, form));
-    }
-    out
-}
-
-/// Project panel body. Renders the target project's fields when fleet is
-/// scoped to a project; otherwise prints a hint nudging the user toward
-/// `N` to initialise this directory as a new project entry.
-fn build_project_panel_lines(form: &super::app::ConfigForm) -> Vec<Line<'static>> {
-    let Some((_, project)) = form.selected_project() else {
-        return vec![
-            Line::from(Span::styled(
-                "(this directory isn't a known fleet project)",
-                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-            )),
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("  Press ", Style::default().fg(MUTED)),
-                Span::styled(
-                    "N",
-                    Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " to add this directory as a project entry,",
-                    Style::default().fg(MUTED),
-                ),
-            ]),
-            Line::from(Span::styled(
-                "  seeded from the cwd basename + the current git branch.",
-                Style::default().fg(MUTED),
-            )),
-        ];
-    };
-
-    // Editable project rows — each routed through `field_line` so the
-    // focus/edit chrome is identical to the defaults block.
-    let mut out = vec![
-        field_line(ConfigField::ProjectName, &project.name, form),
-        field_line(
-            ConfigField::ProjectSessionPrefix,
-            project.session_prefix.as_deref().unwrap_or("(unset)"),
-            form,
-        ),
-        field_line(
-            ConfigField::ProjectPath,
-            &project.path.display().to_string(),
-            form,
-        ),
-        field_line(
-            ConfigField::ProjectDefaultBranch,
-            project.default_branch.as_deref().unwrap_or("(unset)"),
-            form,
-        ),
-        field_line(
-            ConfigField::ProjectAgentRulesFile,
-            project.agent_rules_file.as_deref().unwrap_or("(unset)"),
-            form,
-        ),
-        field_line(
-            ConfigField::ProjectAgent,
-            project
-                .agent
-                .as_deref()
-                .unwrap_or("(unset — use defaults.agent)"),
-            form,
-        ),
-    ];
-
-    // Tracker + postCreate stay read-only for now — tracker is a nested
-    // object and postCreate is a string list; both want richer editors
-    // than the single-line text input.
-    let push = |out: &mut Vec<Line<'static>>, label: &str, value: &str| {
-        out.push(Line::from(vec![
-            Span::styled(
-                format!("  {label:<14}"),
-                Style::default().fg(MUTED),
-            ),
-            Span::raw(value.to_string()),
-        ]));
-    };
-    if let Some(tracker) = &project.tracker {
-        push(&mut out, "tracker", &tracker.plugin);
-    }
-    if !project.post_create.is_empty() {
-        push(&mut out, "postCreate", "");
-        for cmd in &project.post_create {
-            out.push(Line::from(vec![
-                Span::styled("                  ", Style::default().fg(MUTED)),
-                Span::raw(cmd.clone()),
-            ]));
-        }
-    }
-    out
-}
-
-fn field_line(field: ConfigField, value: &str, form: &super::app::ConfigForm) -> Line<'static> {
-    let focused = field == form.focus;
-    let editing = focused && form.editing.is_some();
-    let gutter = if focused { "▶ " } else { "  " };
-
-    // Label: same 14-col muted column as kv_line, plus the gutter.
-    let label_span = Span::styled(
-        format!("{gutter}{:<14}", field.label()),
-        Style::default().fg(if focused { ACCENT } else { MUTED }),
-    );
-
-    // Value: when editing, show the in-progress buffer + caret. When
-    // focused-but-not-editing, accent colour to signal "this is what
-    // the keys will affect." Otherwise plain.
-    let value_span = if editing {
-        let buf = form.editing.as_deref().unwrap_or("");
-        Span::styled(
-            format!("{buf}█"),
-            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
-        )
-    } else if focused {
-        Span::styled(
-            value.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::raw(value.to_string())
-    };
-
-    Line::from(vec![label_span, value_span])
-}
-
-fn draw_project_panel(
-    form: &super::app::ConfigForm,
-    body: Vec<Line<'static>>,
-    frame: &mut Frame<'_>,
-    area: Rect,
-) {
-    let mut title_spans = vec![
-        Span::raw(" "),
-        Span::styled(
-            "project",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some((key, _)) = form.selected_project() {
-        title_spans.push(Span::raw("  "));
-        title_spans.push(Span::styled(
-            key.to_string(),
-            Style::default()
-                .fg(MUTED)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    }
-    title_spans.push(Span::raw(" "));
-    let block = framed_block_titled(Line::from(title_spans)).padding(Padding::horizontal(2));
-    frame.render_widget(
-        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn draw_defaults_panel(
-    form: &super::app::ConfigForm,
-    orig: &AoConfig,
-    body: Vec<Line<'static>>,
-    frame: &mut Frame<'_>,
-    area: Rect,
-) {
-    let dirty = form.is_dirty(orig);
-    let mut title_spans = vec![
-        Span::raw(" "),
-        Span::styled(
-            "defaults",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if dirty {
-        title_spans.push(Span::raw("  "));
-        title_spans.push(Span::styled(
-            "modified",
-            Style::default()
-                .fg(WARN)
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-        ));
-    }
-    title_spans.push(Span::raw(" "));
-    let block = framed_block_titled(Line::from(title_spans)).padding(Padding::horizontal(2));
-    frame.render_widget(
-        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
-        area,
-    );
-}
 
 fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // Three overlays replace the legend rather than appending to it: a
@@ -738,42 +356,36 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         return;
     }
 
-    let spans: Vec<Span<'_>> = match app.view {
-        View::Sessions => vec![
-            chip("[fleet]", ACCENT),
-            sep(),
-            key("↑/↓"),
-            Span::raw(" nav"),
-            sep(),
-            key("Enter"),
-            Span::raw(" attach"),
-            sep(),
-            key("⇧C"),
-            Span::raw(" config"),
-            sep(),
-            key("t"),
-            Span::raw(" tracker"),
-            sep(),
-            key("c"),
-            Span::raw(" edit yaml"),
-            sep(),
-            key("K"),
-            Span::raw(" kill"),
-            sep(),
-            key("⇧S"),
-            Span::raw("/⇧X start/stop"),
-            sep(),
-            key("⇧W"),
-            Span::raw(" web"),
-            sep(),
-            key("r"),
-            Span::raw(" refresh"),
-            sep(),
-            key("q"),
-            Span::raw(" quit"),
-        ],
-        View::Config => config_status_spans(app),
-    };
+    let spans: Vec<Span<'_>> = vec![
+        chip("[fleet]", ACCENT),
+        sep(),
+        key("↑/↓"),
+        Span::raw(" nav"),
+        sep(),
+        key("Enter"),
+        Span::raw(" attach"),
+        sep(),
+        key("c"),
+        Span::raw(" edit config"),
+        sep(),
+        key("t"),
+        Span::raw(" tracker"),
+        sep(),
+        key("K"),
+        Span::raw(" kill"),
+        sep(),
+        key("⇧S"),
+        Span::raw("/⇧X start/stop"),
+        sep(),
+        key("⇧W"),
+        Span::raw(" web"),
+        sep(),
+        key("r"),
+        Span::raw(" refresh"),
+        sep(),
+        key("q"),
+        Span::raw(" quit"),
+    ];
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().fg(MUTED)),
         area,

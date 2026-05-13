@@ -203,13 +203,27 @@ mod tests {
         assert_eq!(cfg.agent_auth(), AgentAuthMode::Auto);
     }
 
+    /// Run `body` with `XDG_CONFIG_HOME` pointed at `tmp` so the
+    /// AO-yaml lookup can't fall through to the host developer's
+    /// real `~/.config/fleet/agent-orchestrator.yaml`. Process-global
+    /// state, so callers must not nest these or run in parallel with
+    /// other XDG-mutating tests.
+    fn with_isolated_xdg(tmp: &std::path::Path, body: impl FnOnce()) {
+        // SAFETY: env mutation is process-global; restored before return.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp) };
+        body();
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
     #[test]
     fn auto_resolves_to_claude_oauth_when_yaml_missing() {
         // Backwards compat: no agent-orchestrator.yaml in the repo →
         // historical claude-oauth behaviour.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let resolved = AgentAuthMode::Auto.resolve(tmp.path());
-        assert_eq!(resolved, ResolvedAuthMode::ClaudeOauth);
+        with_isolated_xdg(tmp.path(), || {
+            let resolved = AgentAuthMode::Auto.resolve(tmp.path());
+            assert_eq!(resolved, ResolvedAuthMode::ClaudeOauth);
+        });
     }
 
     #[test]
@@ -220,8 +234,10 @@ mod tests {
             "defaults:\n  agent: claude-code\n",
         )
         .unwrap();
-        let resolved = AgentAuthMode::Auto.resolve(tmp.path());
-        assert_eq!(resolved, ResolvedAuthMode::ClaudeOauth);
+        with_isolated_xdg(tmp.path(), || {
+            let resolved = AgentAuthMode::Auto.resolve(tmp.path());
+            assert_eq!(resolved, ResolvedAuthMode::ClaudeOauth);
+        });
     }
 
     #[test]
@@ -232,8 +248,10 @@ mod tests {
             "defaults:\n  agent: codex\n",
         )
         .unwrap();
-        let resolved = AgentAuthMode::Auto.resolve(tmp.path());
-        assert_eq!(resolved, ResolvedAuthMode::Passthrough);
+        with_isolated_xdg(tmp.path(), || {
+            let resolved = AgentAuthMode::Auto.resolve(tmp.path());
+            assert_eq!(resolved, ResolvedAuthMode::Passthrough);
+        });
     }
 
     #[test]
@@ -247,8 +265,10 @@ mod tests {
             "defaults:\n  agent: claude-code\n",
         )
         .unwrap();
-        let resolved = AgentAuthMode::Passthrough.resolve(tmp.path());
-        assert_eq!(resolved, ResolvedAuthMode::Passthrough);
+        with_isolated_xdg(tmp.path(), || {
+            let resolved = AgentAuthMode::Passthrough.resolve(tmp.path());
+            assert_eq!(resolved, ResolvedAuthMode::Passthrough);
+        });
     }
 
     #[test]
