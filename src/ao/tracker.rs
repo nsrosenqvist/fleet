@@ -8,14 +8,19 @@
 //! speak so callers can fall back to manual id entry without
 //! special-casing each plugin at the call site.
 //!
-//! Today fleet ships two backends:
+//! Today fleet ships two backends. Both run **inside the Lima VM**
+//! via `limactl shell --workdir <repo>` — keeps the install story
+//! uniform (fleet's Lima template provisions git-bug + gh; no
+//! host-side tracker dependencies) and lets gh-in-VM reuse the
+//! host's `gh auth login` via Lima's home bind-mount (gh's config
+//! at `~/.config/gh/hosts.yml` is the same file in both
+//! filesystems).
 //!
-//! - [`GitBugTracker`] — `limactl shell --workdir <repo> fleet-vm
-//!   git-bug bug --format json`. The data lives inside the project's
-//!   git history (per-repo, in-VM).
-//! - [`GitHubTracker`] — `gh issue list --json …` from the host. Uses
-//!   the developer's existing `gh auth login`; gh auto-detects the
-//!   repo from the current dir's git remote.
+//! - [`GitBugTracker`] — `git-bug bug --format json`. Data lives in
+//!   the project's git history.
+//! - [`GitHubTracker`] — `gh issue list --json …`. gh talks to
+//!   github.com directly, auto-detects the repo from the project
+//!   path's git remote.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -162,28 +167,28 @@ impl Tracker for GitHubTracker {
     }
 
     fn list_issues(&self, repo_root: &Path) -> Result<Vec<Issue>> {
-        // `gh` runs on the host, not inside the VM — most developers
-        // already have it authenticated (`gh auth login`) on the host
-        // and going through limactl just adds latency + an "is gh
-        // auth'd inside the guest?" question we don't need.
-        //
-        // `gh issue list` auto-detects the repo from the cwd's git
-        // remote, so `current_dir(repo_root)` is all the targeting
-        // we need — no `-R owner/name` flag.
-        let output = Command::new("gh")
-            .args([
-                "issue",
-                "list",
-                "--json",
-                "number,title,state,labels",
-                "--limit",
-                "200",
-                "--state",
-                "all",
-            ])
-            .current_dir(repo_root)
+        // gh runs in the VM (like git-bug) for a uniform install
+        // story — fleet's Lima template provisions both, no host-side
+        // tracker deps. The host's `gh auth login` config lives at
+        // `~/.config/gh/hosts.yml`, which is bind-mounted into the VM
+        // at the same path, so gh-in-guest reads the same creds —
+        // the user doesn't have to re-auth inside the VM.
+        let output = Command::new("limactl")
+            .arg("shell")
+            .arg("--workdir")
+            .arg(repo_root)
+            .arg("fleet-vm")
+            .arg("gh")
+            .arg("issue")
+            .arg("list")
+            .arg("--json")
+            .arg("number,title,state,labels")
+            .arg("--limit")
+            .arg("200")
+            .arg("--state")
+            .arg("all")
             .output()
-            .context("invoke `gh issue list` — is gh installed and on PATH?")?;
+            .context("invoke `gh issue list` via limactl shell")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

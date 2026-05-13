@@ -52,15 +52,15 @@ pub struct MissingDep {
     pub docs: Option<&'static str>,
 }
 
-/// One tracker plugin whose required tool isn't installed. `location`
-/// distinguishes host-side tools (gh) from in-VM tools (git-bug). `used_by`
-/// lists the project keys that configure this plugin so the user can
-/// see exactly which projects' spawn pickers will break.
+/// One tracker plugin whose required in-VM tool isn't installed.
+/// `used_by` lists the project keys that configure this plugin so
+/// the user can see exactly which projects' spawn pickers will
+/// break. Install commands live in [`install_command`] so callers
+/// (the modal's auto-install path) and template provisioning stay
+/// in one place.
 pub struct MissingTracker {
     pub plugin: String,
     pub tool: &'static str,
-    pub location: &'static str,
-    pub install: &'static str,
     pub used_by: Vec<String>,
 }
 
@@ -144,34 +144,49 @@ fn check_trackers(
 
     let mut missing = Vec::new();
     for (plugin, used_by) in grouped {
-        let probe = match plugin.as_str() {
-            "git-bug" => Some(("git-bug", "the fleet-vm guest", true)),
-            "github" => Some(("gh", "the host", false)),
-            _ => None,
+        let tool: &'static str = match plugin.as_str() {
+            "git-bug" => "git-bug",
+            "github" => "gh",
+            _ => continue, // Unknown plugin; the per-action error
+                           // surfaces the actual failure later.
         };
-        let Some((tool, location, in_guest)) = probe else {
-            continue;
-        };
-        let available = if in_guest { in_vm(tool) } else { has_bin(tool) };
-        if available {
+        if in_vm(tool) {
             continue;
         }
-        let install: &'static str = match plugin.as_str() {
-            // `git-bug` upstream binaries: `go install` or pull a
-            // release. The Lima default Ubuntu doesn't package it.
-            "git-bug" => "limactl shell fleet-vm -- sudo bash -c 'curl -L https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_amd64 -o /usr/local/bin/git-bug && chmod +x /usr/local/bin/git-bug'",
-            "github" => "sudo dnf install gh   #   sudo apt install gh   |   brew install gh",
-            _ => "",
-        };
         missing.push(MissingTracker {
             plugin,
             tool,
-            location,
-            install,
             used_by,
         });
+        let _ = has_bin; // Probe signature is kept for parity / tests.
     }
     missing
+}
+
+/// In-VM install command for a tracker tool. Run via `limactl shell
+/// fleet-vm -- bash -c '...'` from the preflight modal's auto-install
+/// action. Mirrors the provisioning steps in `templates/fleet-vm.yaml`
+/// so an existing VM (created before fleet's template included these)
+/// converges on the same state without a rebuild.
+pub fn install_command(tool: &str) -> Option<&'static str> {
+    match tool {
+        "git-bug" => Some(
+            r#"arch="$(dpkg --print-architecture)"; \
+case "$arch" in amd64) gb=amd64;; arm64) gb=arm64;; *) gb="$arch";; esac; \
+sudo curl -fsSL "https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_${gb}" \
+  -o /usr/local/bin/git-bug && sudo chmod +x /usr/local/bin/git-bug"#,
+        ),
+        "gh" => Some(
+            r#"sudo apt-get update && sudo apt-get install -y gh || (sudo mkdir -p -m 755 /etc/apt/keyrings && \
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+  | sudo dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+  | sudo tee /etc/apt/sources.list.d/github-cli.list && \
+sudo apt-get update && sudo apt-get install -y gh)"#,
+        ),
+        _ => None,
+    }
 }
 
 fn default_has_bin(name: &str) -> bool {
@@ -278,7 +293,7 @@ projects:
     }
 
     #[test]
-    fn tracker_warning_when_gh_not_on_host() {
+    fn tracker_warning_when_gh_not_in_vm() {
         let repo = tmp_repo();
         std::fs::write(
             repo.join("agent-orchestrator.yaml"),
@@ -294,9 +309,9 @@ projects:
         .unwrap();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &repo) };
         let result = check_with(
-            |tool| tool != "gh", // limactl present, gh missing
-            || VmStatus::Running,
             |_| true,
+            || VmStatus::Running,
+            |tool| tool != "gh", // gh is what's missing in the guest
             &repo,
         );
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
@@ -308,6 +323,13 @@ projects:
             }
             _ => panic!("expected TrackerWarnings"),
         }
+    }
+
+    #[test]
+    fn install_command_covers_known_tools() {
+        assert!(install_command("git-bug").is_some());
+        assert!(install_command("gh").is_some());
+        assert!(install_command("linear").is_none());
     }
 
     #[test]

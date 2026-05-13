@@ -781,18 +781,18 @@ pub(super) fn render_tracker_warnings(
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("needs `{}` in {}", w.tool, w.location),
+                format!("needs `{}` inside the fleet-vm guest", w.tool),
                 muted,
             ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  install  ", muted),
-            Span::styled(w.install.to_string(), Style::default().fg(ACCENT)),
         ]));
         lines.push(Line::raw(""));
     }
     lines.push(Line::from(Span::styled(
-        "You can continue — only the spawn picker is affected.",
+        "fleet can install these for you — they live inside the VM,",
+        muted.add_modifier(Modifier::ITALIC),
+    )));
+    lines.push(Line::from(Span::styled(
+        "and gh-in-VM reuses your host's `gh auth login` automatically.",
         muted.add_modifier(Modifier::ITALIC),
     )));
 
@@ -802,6 +802,8 @@ pub(super) fn render_tracker_warnings(
         WARN,
         lines,
         &[Line::from(vec![
+            Span::styled("[y]", bold_key),
+            Span::styled(" install in VM   ", muted),
             Span::styled("[c]", bold_key),
             Span::styled(" edit config   ", muted),
             Span::styled("[Enter]", bold_key),

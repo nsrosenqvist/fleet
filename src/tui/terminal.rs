@@ -103,6 +103,11 @@ fn settle_preflight(
                             return PreflightOutcome::Err(e);
                         }
                     }
+                    Ok(TrackerAction::InstallInVm) => {
+                        if let Err(e) = install_trackers_in_vm(term, &warnings) {
+                            return PreflightOutcome::Err(e);
+                        }
+                    }
                     Ok(TrackerAction::Quit) => return PreflightOutcome::Quit(1),
                     Err(e) => return PreflightOutcome::Err(e),
                 }
@@ -128,9 +133,12 @@ enum HostBinsAction {
 }
 
 enum TrackerAction {
+    /// Install the missing tools inside the VM via `limactl shell …`.
+    /// Suspends the alt screen so the user can see apt / curl output
+    /// directly, then re-runs preflight.
+    InstallInVm,
     /// Proceed into the main TUI; the missing tracker tools only
-    /// break the spawn picker for those plugins. The user has been
-    /// warned and chose to continue.
+    /// break the spawn picker for those plugins.
     Continue,
     EditConfig,
     Quit,
@@ -165,6 +173,7 @@ fn run_tracker_warnings_modal(
             && k.kind == event::KeyEventKind::Press
         {
             return Ok(match k.code {
+                event::KeyCode::Char('y' | 'Y') => TrackerAction::InstallInVm,
                 event::KeyCode::Char('c' | 'C') => TrackerAction::EditConfig,
                 event::KeyCode::Char('q' | 'Q') | event::KeyCode::Esc => TrackerAction::Quit,
                 // Any other key (including Enter) continues into the TUI.
@@ -172,6 +181,43 @@ fn run_tracker_warnings_modal(
             });
         }
     }
+}
+
+/// Install each missing tracker tool inside the VM via `limactl
+/// shell fleet-vm -- bash -c '...'`, suspending the alt screen so
+/// the user sees apt / curl output directly. After every tool runs
+/// (or fails), control returns to the preflight loop which probes
+/// again — a successful install converges on `Preflight::Ok` without
+/// extra work.
+fn install_trackers_in_vm(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    warnings: &[MissingTracker],
+) -> Result<()> {
+    suspend_around(term, || {
+        for w in warnings {
+            let Some(script) = preflight::install_command(w.tool) else {
+                eprintln!("fleet: no install command registered for `{}`", w.tool);
+                continue;
+            };
+            eprintln!("\n── installing `{}` inside fleet-vm ──", w.tool);
+            let status = crate::process::run_interactive(
+                "limactl",
+                &[
+                    "shell".to_string(),
+                    "fleet-vm".to_string(),
+                    "bash".to_string(),
+                    "-c".to_string(),
+                    script.to_string(),
+                ],
+                &[],
+                &[],
+            )?;
+            if status != 0 {
+                eprintln!("fleet: install of `{}` exited with status {status}", w.tool);
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Suspend the alt screen, open the AO yaml in `$EDITOR`, return so

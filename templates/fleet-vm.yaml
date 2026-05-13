@@ -68,6 +68,19 @@ provision:
 
       npm install -g @aoagents/ao @anthropic-ai/claude-code
 
+      # git-bug: not in apt, so pull the upstream release binary
+      # straight into /usr/local/bin. Matches the install fleet's
+      # preflight auto-install action runs against existing VMs.
+      arch="$(dpkg --print-architecture)"
+      case "$arch" in
+        amd64) gb_arch=amd64 ;;
+        arm64) gb_arch=arm64 ;;
+        *)     gb_arch="$arch" ;;
+      esac
+      curl -fsSL "https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_${gb_arch}" \
+        -o /usr/local/bin/git-bug
+      chmod +x /usr/local/bin/git-bug
+
 probes:
   # Block `limactl start` from declaring the instance Ready until ao is
   # actually on PATH. Without this, fleet's first `ao status` call would
