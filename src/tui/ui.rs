@@ -582,21 +582,27 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
 
     let mut lines = vec![
         Line::from(Span::styled(
-            "Fleet needs your Claude Pro / Max OAuth token to spawn",
+            "Fleet needs a Claude Pro / Max OAuth token to spawn",
             muted,
         )),
         Line::from(Span::styled(
-            "claude-code sessions inside the VM. Paste the value of",
+            "claude-code sessions inside the VM. Generate one with",
             muted,
         )),
         Line::from(Span::styled(
-            "the `accessToken` field from ~/.claude/.credentials.json",
+            "claude-code's official setup-token command:",
             muted,
         )),
-        Line::from(Span::styled(
-            "(written by `claude` after you `/login`).",
-            muted,
-        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  ", muted),
+            Span::styled(
+                "claude setup-token",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled("Paste the resulting token below.", muted)),
         Line::raw(""),
         Line::from(vec![
             Span::styled("token       ", muted),
@@ -620,18 +626,6 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
             ),
         ]));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Quick extract:",
-        muted.add_modifier(Modifier::ITALIC),
-    )));
-    lines.push(Line::from(vec![
-        Span::styled("  ", muted),
-        Span::styled(
-            "jq -r '.claudeAiOauth.accessToken' ~/.claude/.credentials.json",
-            Style::default().fg(ACCENT),
-        ),
-    ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::styled("Stored in ", muted),
