@@ -107,3 +107,16 @@ pub fn key(k: &str) -> Span<'_> {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )
 }
+
+/// Hotkey glyph as rendered inside a modal footer — same shape as
+/// [`key`] but muted instead of accented. Modals already have the
+/// user's full attention (they block the rest of the UI), so the
+/// footer keys don't need to compete with the body. Bold-on-muted
+/// keeps the key glyph distinguishable from the surrounding labels
+/// without shouting.
+pub fn modal_key(k: &str) -> Span<'_> {
+    Span::styled(
+        k.to_string(),
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    )
+}

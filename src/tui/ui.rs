@@ -30,7 +30,7 @@ use super::bringup::BringUp;
 use super::preflight::MissingDep;
 use super::theme::{
     ACCENT, ERR, KEY_FG, MUTED, OK, WARN, badge, chip, framed_block, framed_block_titled, key,
-    kv_line, sep,
+    kv_line, modal_key, sep,
 };
 
 pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
@@ -567,7 +567,6 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// (keychain unreachable, config not writable, etc.).
 pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
     let muted = Style::default().fg(MUTED);
-    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
 
     // Name the platform-native credential store so the user knows
     // exactly where their token's going. macOS Keychain / Linux
@@ -636,9 +635,9 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
     ]));
 
     let footer = vec![Line::from(vec![
-        Span::styled("enter", bold_key),
+        modal_key("enter"),
         Span::styled(" save to keychain   ", muted),
-        Span::styled("esc", bold_key),
+        modal_key("esc"),
         Span::styled(" cancel", muted),
     ])];
     draw_modal(
@@ -733,11 +732,11 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
     }
 
     let footer = vec![Line::from(vec![
-        Span::styled("↑↓", bold_key),
+        modal_key("↑↓"),
         Span::styled(" pick    ", muted),
-        Span::styled("enter", bold_key),
+        modal_key("enter"),
         Span::styled(" submit    ", muted),
-        Span::styled("esc", bold_key),
+        modal_key("esc"),
         Span::styled(" cancel", muted),
     ])];
     // Pin the modal width so it doesn't shrink as the user narrows
@@ -865,16 +864,15 @@ pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
         }
         lines.push(Line::raw(""));
     }
-    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     draw_modal(
         frame,
         " preflight failed ",
         ERR,
         lines,
         &[Line::from(vec![
-            Span::styled("c", bold_key),
+            modal_key("c"),
             Span::styled(" edit agent-orchestrator.yaml   ", Style::default().fg(MUTED)),
-            Span::styled("any other key", bold_key),
+            modal_key("any other key"),
             Span::styled(" quit", Style::default().fg(MUTED)),
         ])],
     );
@@ -980,7 +978,6 @@ pub(super) fn render_tracker_warnings(
     warnings: &[crate::tui::preflight::MissingTracker],
 ) {
     let muted = Style::default().fg(MUTED);
-    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -1028,13 +1025,13 @@ pub(super) fn render_tracker_warnings(
         WARN,
         lines,
         &[Line::from(vec![
-            Span::styled("y", bold_key),
+            modal_key("y"),
             Span::styled(" install in VM   ", muted),
-            Span::styled("c", bold_key),
+            modal_key("c"),
             Span::styled(" edit config   ", muted),
-            Span::styled("enter", bold_key),
+            modal_key("enter"),
             Span::styled(" continue   ", muted),
-            Span::styled("q", bold_key),
+            modal_key("q"),
             Span::styled(" quit", muted),
         ])],
     );
@@ -1185,17 +1182,11 @@ fn truncate_for_modal(s: &str, max: usize) -> String {
 
 fn footer_yn(verb: &str) -> Vec<Line<'static>> {
     vec![Line::from(vec![
-        Span::styled(
-            "y",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
+        modal_key("y"),
         Span::raw(" "),
         Span::styled(verb.to_string(), Style::default().fg(MUTED)),
         Span::raw("   "),
-        Span::styled(
-            "q",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
+        modal_key("q"),
         Span::raw(" "),
         Span::styled("quit", Style::default().fg(MUTED)),
     ])]
