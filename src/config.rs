@@ -58,15 +58,15 @@ pub enum AgentAuthMode {
 
 impl AgentAuthMode {
     /// Resolve to a concrete flow (`ClaudeOauth` or `Passthrough`).
-    /// `Auto` reads the AO yaml from `repo_root` and consults the
+    /// `Auto` reads the canonical XDG AO yaml and consults the
     /// configured agent; unreadable yaml or unset agent falls through
     /// to `ClaudeOauth` for backwards compatibility.
-    pub fn resolve(self, repo_root: &Path) -> ResolvedAuthMode {
+    pub fn resolve(self, _repo_root: &Path) -> ResolvedAuthMode {
         match self {
             Self::ClaudeOauth => ResolvedAuthMode::ClaudeOauth,
             Self::Passthrough => ResolvedAuthMode::Passthrough,
             Self::Auto => {
-                let ao_cfg = crate::ao::config::AoConfig::load(repo_root)
+                let ao_cfg = crate::ao::config::AoConfig::load()
                     .ok()
                     .flatten()
                     .map(|(_, cfg)| cfg);
@@ -203,22 +203,32 @@ mod tests {
         assert_eq!(cfg.agent_auth(), AgentAuthMode::Auto);
     }
 
-    /// Run `body` with `XDG_CONFIG_HOME` pointed at `tmp` so the
-    /// AO-yaml lookup can't fall through to the host developer's
-    /// real `~/.config/fleet/agent-orchestrator.yaml`. Process-global
+    /// Run `body` with `XDG_CONFIG_HOME` pointed at `tmp` so the AO-yaml
+    /// lookup can't fall through to the host developer's real
+    /// `~/.config/fleet/agent-orchestrator.yaml`. Also ensures the
+    /// `<tmp>/fleet/` subdir exists since the loader looks for
+    /// `<XDG_CONFIG_HOME>/fleet/agent-orchestrator.yaml`. Process-global
     /// state, so callers must not nest these or run in parallel with
     /// other XDG-mutating tests.
     fn with_isolated_xdg(tmp: &std::path::Path, body: impl FnOnce()) {
+        std::fs::create_dir_all(tmp.join("fleet")).expect("mkdir fleet");
         // SAFETY: env mutation is process-global; restored before return.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp) };
         body();
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
+    /// Write an AO yaml into the canonical XDG location under `tmp`.
+    /// Pair with [`with_isolated_xdg`] in the same test body.
+    fn write_xdg_ao_yaml(tmp: &std::path::Path, body: &str) {
+        std::fs::write(tmp.join("fleet").join("agent-orchestrator.yaml"), body)
+            .expect("write agent-orchestrator.yaml");
+    }
+
     #[test]
     fn auto_resolves_to_claude_oauth_when_yaml_missing() {
-        // Backwards compat: no agent-orchestrator.yaml in the repo →
-        // historical claude-oauth behaviour.
+        // Backwards compat: no AO yaml configured → historical
+        // claude-oauth behaviour.
         let tmp = tempfile::tempdir().expect("tempdir");
         with_isolated_xdg(tmp.path(), || {
             let resolved = AgentAuthMode::Auto.resolve(tmp.path());
@@ -229,12 +239,8 @@ mod tests {
     #[test]
     fn auto_resolves_to_claude_oauth_when_agent_is_claude_code() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            tmp.path().join("agent-orchestrator.yaml"),
-            "defaults:\n  agent: claude-code\n",
-        )
-        .unwrap();
         with_isolated_xdg(tmp.path(), || {
+            write_xdg_ao_yaml(tmp.path(), "defaults:\n  agent: claude-code\n");
             let resolved = AgentAuthMode::Auto.resolve(tmp.path());
             assert_eq!(resolved, ResolvedAuthMode::ClaudeOauth);
         });
@@ -243,12 +249,8 @@ mod tests {
     #[test]
     fn auto_resolves_to_passthrough_for_non_claude_agent() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            tmp.path().join("agent-orchestrator.yaml"),
-            "defaults:\n  agent: codex\n",
-        )
-        .unwrap();
         with_isolated_xdg(tmp.path(), || {
+            write_xdg_ao_yaml(tmp.path(), "defaults:\n  agent: codex\n");
             let resolved = AgentAuthMode::Auto.resolve(tmp.path());
             assert_eq!(resolved, ResolvedAuthMode::Passthrough);
         });
@@ -260,12 +262,8 @@ mod tests {
         // the AO yaml says; the user is forcing the mode for a reason
         // (e.g. claude-code with API-key auth instead of subscription).
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            tmp.path().join("agent-orchestrator.yaml"),
-            "defaults:\n  agent: claude-code\n",
-        )
-        .unwrap();
         with_isolated_xdg(tmp.path(), || {
+            write_xdg_ao_yaml(tmp.path(), "defaults:\n  agent: claude-code\n");
             let resolved = AgentAuthMode::Passthrough.resolve(tmp.path());
             assert_eq!(resolved, ResolvedAuthMode::Passthrough);
         });

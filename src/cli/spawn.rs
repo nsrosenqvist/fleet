@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use secrecy::ExposeSecret;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::{Config, ResolvedAuthMode};
@@ -40,7 +40,8 @@ pub fn run_spawn(
     prompt: Option<&str>,
     agent: Option<&str>,
 ) -> Result<i32> {
-    let mut argv = vec!["spawn".to_string(), issue.to_string()];
+    let qualified = qualify_issue(repo_root, issue)?;
+    let mut argv = vec!["spawn".to_string(), qualified];
     if let Some(p) = prompt {
         argv.push("--prompt".to_string());
         argv.push(p.to_string());
@@ -54,16 +55,85 @@ pub fn run_spawn(
 
 pub fn run_batch_spawn(repo_root: &Path, issues: &[String]) -> Result<i32> {
     let mut argv = vec!["batch-spawn".to_string()];
-    argv.extend(issues.iter().cloned());
+    for issue in issues {
+        argv.push(qualify_issue(repo_root, issue)?);
+    }
     run_with_token(repo_root, &argv)
 }
 
 fn run_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
     let cfg = Config::load(repo_root)?;
     match cfg.agent_auth().resolve(repo_root) {
-        ResolvedAuthMode::ClaudeOauth => run_claude_oauth(repo_root, ao_argv, &cfg),
-        ResolvedAuthMode::Passthrough => run_passthrough(repo_root, ao_argv),
+        ResolvedAuthMode::ClaudeOauth => run_claude_oauth(ao_argv, &cfg),
+        ResolvedAuthMode::Passthrough => run_passthrough(ao_argv),
     }
+}
+
+/// Directory we hand to `limactl shell --workdir`. AO discovers its
+/// config from the cwd only — no XDG fallback, no `--config` flag —
+/// so fleet has to land in a directory that holds the canonical
+/// `agent-orchestrator.yaml`. The XDG config dir (`~/.config/fleet/`)
+/// is bind-mounted into the VM at the same absolute path by Lima, so
+/// the same path works on both sides.
+///
+/// We refuse to proceed if the directory or yaml is missing rather
+/// than letting AO auto-create one in an unexpected location.
+fn ao_workdir() -> Result<PathBuf> {
+    let yaml = crate::ao::config::AoConfig::default_xdg_path()
+        .context("no $HOME / $XDG_CONFIG_HOME — can't resolve the AO config directory")?;
+    let dir = yaml
+        .parent()
+        .map(Path::to_path_buf)
+        .context("AO config path has no parent directory")?;
+    if !yaml.is_file() {
+        bail!(
+            "no AO config at {}. Launch fleet's TUI and press `c` to scaffold it, or create the \
+             file manually with at least one `projects.*` entry whose `path:` covers your repo.",
+            yaml.display()
+        );
+    }
+    Ok(dir)
+}
+
+/// Re-write a bare issue id (`42`, `INT-100`) as the project-prefixed
+/// form (`fl/42`) AO expects when there are multiple projects in the
+/// catalog. The project comes from `project_for_cwd(repo_root)` — the
+/// deepest `projects.*.path:` that covers the launch directory.
+///
+/// Already-prefixed ids (anything containing `/`) pass through, so
+/// users who type `fl/42` in the spawn picker aren't double-prefixed
+/// into `fl/fl/42`.
+fn qualify_issue(repo_root: &Path, issue: &str) -> Result<String> {
+    if issue.contains('/') {
+        return Ok(issue.to_string());
+    }
+    let (_, ao) = crate::ao::config::AoConfig::load()
+        .context("loading AO config")?
+        .with_context(|| {
+            let path = crate::ao::config::AoConfig::default_xdg_path().map_or_else(
+                || "~/.config/fleet/agent-orchestrator.yaml".to_string(),
+                |p| p.display().to_string(),
+            );
+            format!("no AO config at {path}. Press `c` in fleet's TUI to scaffold one.")
+        })?;
+    let key = ao.project_for_cwd(repo_root).with_context(|| {
+        format!(
+            "no `projects.*` entry in agent-orchestrator.yaml covers `{}`. Add one whose `path:` \
+             matches this directory.",
+            repo_root.display()
+        )
+    })?;
+    let project = ao
+        .projects
+        .get(key)
+        .expect("project_for_cwd returned a key not in the map");
+    let prefix = project.session_prefix.as_deref().with_context(|| {
+        format!(
+            "project `{key}` has no `sessionPrefix`. Add one so AO can disambiguate issues by \
+             project."
+        )
+    })?;
+    Ok(format!("{prefix}/{issue}"))
 }
 
 /// Pre-`ao start` flow for the Claude Code subscription path: write
@@ -73,10 +143,11 @@ fn run_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
 /// is set in the shell — that var would make claude prefer API auth
 /// over the OAuth credential we just wrote and silently bypass the
 /// handoff.
-fn run_claude_oauth(repo_root: &Path, ao_argv: &[String], cfg: &Config) -> Result<i32> {
+fn run_claude_oauth(ao_argv: &[String], cfg: &Config) -> Result<i32> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker.clone(), "fleet-vm");
     ensure_vm_running(&lima)?;
+    let workdir = ao_workdir()?;
 
     // Refusal only fires under claude-oauth: under `passthrough`, an
     // ANTHROPIC_API_KEY is exactly what Codex / Aider users need to
@@ -131,7 +202,7 @@ fn run_claude_oauth(repo_root: &Path, ao_argv: &[String], cfg: &Config) -> Resul
         "shell".to_string(),
         "--preserve-env".to_string(),
         "--workdir".to_string(),
-        repo_root.display().to_string(),
+        workdir.display().to_string(),
         lima.vm_name().to_string(),
         "bash".to_string(),
         "-c".to_string(),
@@ -161,10 +232,11 @@ fn run_claude_oauth(repo_root: &Path, ao_argv: &[String], cfg: &Config) -> Resul
 /// provider env vars into the VM and run `ao` directly. Lima's
 /// `--preserve-env` carries the env over; `LIMA_SHELLENV_ALLOW` opts
 /// each var into the guest shell.
-fn run_passthrough(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
+fn run_passthrough(ao_argv: &[String]) -> Result<i32> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker, "fleet-vm");
     ensure_vm_running(&lima)?;
+    let workdir = ao_workdir()?;
 
     let ao_cmd = ao_argv
         .iter()
@@ -178,7 +250,7 @@ fn run_passthrough(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
             "shell".to_string(),
             "--preserve-env".to_string(),
             "--workdir".to_string(),
-            repo_root.display().to_string(),
+            workdir.display().to_string(),
             lima.vm_name().to_string(),
             "bash".to_string(),
             "-c".to_string(),

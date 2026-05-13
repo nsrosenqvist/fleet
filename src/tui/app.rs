@@ -239,7 +239,7 @@ impl App {
         // filter have something to work with on the first frame. A
         // parse error here is non-fatal — fleet just operates in
         // "(unscoped)" mode and the user can fix the yaml via `c`.
-        let loaded = crate::ao::config::AoConfig::load(repo_root).ok().flatten();
+        let loaded = crate::ao::config::AoConfig::load().ok().flatten();
         let (ao_config_path, ao_config) = loaded
             .map_or((None, None), |(p, c)| (Some(p), Some(c)));
         let current_project_key = ao_config
@@ -356,7 +356,7 @@ impl App {
     /// from `c` + `$EDITOR` so an edited yaml takes effect immediately,
     /// and on the `r` keybind for manual refresh.
     pub(super) fn reload_ao_config(&mut self) {
-        match crate::ao::config::AoConfig::load(&self.repo_root) {
+        match crate::ao::config::AoConfig::load() {
             Ok(loaded) => {
                 let (path, cfg) = loaded.map_or((None, None), |(p, c)| (Some(p), Some(c)));
                 self.current_project_key = cfg

@@ -69,7 +69,7 @@ fn settle_preflight(
     repo_root: &std::path::Path,
 ) -> PreflightOutcome {
     loop {
-        match preflight::check(repo_root) {
+        match preflight::check() {
             Preflight::Ok => return PreflightOutcome::Proceed,
             Preflight::HostBinsMissing(deps) => match run_host_bins_modal(term, &deps) {
                 Ok(HostBinsAction::EditConfig) => {
@@ -183,17 +183,17 @@ fn run_tracker_install(
 
 /// Suspend the alt screen, open the AO yaml in `$EDITOR`, return so
 /// the preflight loop re-runs against the (possibly edited) file.
-/// Targets the file the running config was loaded from when one
-/// exists; otherwise the XDG default so new users land in the central
-/// catalog by default. Same shape as the in-TUI `c` keybind.
+/// Always targets the canonical XDG yaml — fleet is distributed as a
+/// binary users run inside their own repos, and dropping artefacts
+/// into someone else's working tree is hostile. Same shape as the
+/// in-TUI `c` keybind.
 fn edit_ao_yaml(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    repo_root: &std::path::Path,
+    _repo_root: &std::path::Path,
 ) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    let yaml_path = crate::ao::config::AoConfig::resolve_path(repo_root)
-        .or_else(crate::ao::config::AoConfig::default_xdg_path)
-        .unwrap_or_else(|| repo_root.join("agent-orchestrator.yaml"));
+    let yaml_path = crate::ao::config::AoConfig::default_xdg_path()
+        .context("no $HOME / $XDG_CONFIG_HOME — can't resolve AO config path")?;
     if let Some(parent) = yaml_path.parent()
         && !parent.exists()
     {
@@ -412,16 +412,15 @@ fn attach_selected(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdou
 /// Hand the AO catalog yaml to `$EDITOR` (suspending the alt screen)
 /// and reload the cached config when the user comes back, so any edits
 /// they made take effect on the next session-list refresh without
-/// needing a manual `r` press. Targets the file the running config was
-/// loaded from when one exists; otherwise creates / edits the XDG path
-/// so new users land in the central catalog by default.
+/// needing a manual `r` press. Always targets the canonical XDG yaml
+/// — fleet ships as a binary users run inside their own repos, so
+/// dropping artefacts into someone else's working tree is off-limits.
 fn edit_config(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    let yaml_path = app
-        .ao_config_path
-        .clone()
-        .or_else(crate::ao::config::AoConfig::default_xdg_path)
-        .unwrap_or_else(|| app.repo_root.join("agent-orchestrator.yaml"));
+    let Some(yaml_path) = crate::ao::config::AoConfig::default_xdg_path() else {
+        app.flash_err("no $HOME / $XDG_CONFIG_HOME — can't resolve AO config path");
+        return;
+    };
     // `$EDITOR` won't open a non-existent file gracefully in every
     // editor (vi handles it, some fancy ones complain); make sure the
     // parent dir exists so a brand-new XDG path is writable.

@@ -94,37 +94,32 @@ impl AoConfig {
         Some(base.join("fleet").join("agent-orchestrator.yaml"))
     }
 
-    /// Resolve the path fleet should read from, in order of precedence:
+    /// Resolve the canonical AO config path.
     ///
-    /// 1. `$XDG_CONFIG_HOME/fleet/agent-orchestrator.yaml` (or
-    ///    `~/.config/fleet/…`) — the central catalog. Wins when
-    ///    present; lets one yaml drive many per-repo fleet instances.
-    /// 2. `<repo_root>/agent-orchestrator.yaml` — the historical
-    ///    per-repo location. Kept as a fallback so existing setups
-    ///    keep working until users migrate.
+    /// Fleet keeps a single catalog at `$XDG_CONFIG_HOME/fleet/agent-orchestrator.yaml`
+    /// (or `~/.config/fleet/…`) that lists every project the user has registered.
+    /// The same file drives every fleet invocation regardless of which repo the
+    /// user launches from — AO reads it inside the VM via Lima's bind-mount.
     ///
-    /// Returns `None` when neither file exists — caller should treat
-    /// that as "nothing configured yet" rather than an error.
-    pub fn resolve_path(repo_root: &Path) -> Option<PathBuf> {
-        if let Some(xdg) = Self::default_xdg_path()
-            && xdg.is_file()
-        {
-            return Some(xdg);
-        }
-        let repo_path = repo_root.join("agent-orchestrator.yaml");
-        if repo_path.is_file() {
-            return Some(repo_path);
-        }
-        None
+    /// There used to be a per-repo fallback (`<repo_root>/agent-orchestrator.yaml`)
+    /// but it was retired: fleet ships as a binary users run inside their own
+    /// repos, and dropping artefacts into someone's working tree is hostile.
+    /// Centralising on XDG also matches AO's own contract — AO discovers its
+    /// config from cwd only, so fleet runs AO from the XDG directory.
+    ///
+    /// Returns `None` when `$HOME` / `$XDG_CONFIG_HOME` are missing (so we
+    /// can't even construct a path); callers should treat the file simply
+    /// not existing as "nothing configured yet" rather than an error.
+    pub fn resolve_path() -> Option<PathBuf> {
+        Self::default_xdg_path().filter(|p| p.is_file())
     }
 
-    /// Parse the on-disk yaml. Returns `Ok(None)` when neither the
-    /// XDG nor the repo-local file exists. Anything else (parse error,
-    /// IO error) bubbles as `Err` with context. The successful return
-    /// includes the *path* the config was loaded from so callers can
-    /// save back to the same file.
-    pub fn load(repo_root: &Path) -> Result<Option<(PathBuf, Self)>> {
-        let Some(path) = Self::resolve_path(repo_root) else {
+    /// Parse the canonical AO yaml. Returns `Ok(None)` when the XDG file
+    /// doesn't exist. Anything else (parse error, IO error) bubbles as
+    /// `Err` with context. The successful return includes the *path* the
+    /// config was loaded from so callers can save back to the same file.
+    pub fn load() -> Result<Option<(PathBuf, Self)>> {
+        let Some(path) = Self::resolve_path() else {
             return Ok(None);
         };
         let text = std::fs::read_to_string(&path)

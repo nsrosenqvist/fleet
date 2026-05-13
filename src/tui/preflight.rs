@@ -18,7 +18,6 @@
 //! through `limactl shell <vm> … tmux …`, so tmux's availability is a
 //! property of the Lima guest image, not the host.
 
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
@@ -64,15 +63,11 @@ pub struct MissingTracker {
     pub used_by: Vec<String>,
 }
 
-/// Run the preflight probes against the project rooted at `repo_root`
-/// (used to load the AO yaml for phase 4). See module docs for ordering.
-pub fn check(repo_root: &Path) -> Preflight {
-    check_with(
-        default_has_bin,
-        default_vm_status,
-        default_in_vm,
-        repo_root,
-    )
+/// Run the preflight probes. See module docs for ordering. The AO yaml
+/// is read from the canonical XDG path; the launch repo doesn't enter
+/// into the check.
+pub fn check() -> Preflight {
+    check_with(default_has_bin, default_vm_status, default_in_vm)
 }
 
 /// Inner form with probe functions injected so tests can drive any
@@ -81,7 +76,6 @@ fn check_with(
     has_bin: impl Fn(&str) -> bool,
     vm_status: impl FnOnce() -> VmStatus,
     in_vm: impl Fn(&str) -> bool,
-    repo_root: &Path,
 ) -> Preflight {
     // Phase 1: host bins.
     let mut host = Vec::new();
@@ -107,7 +101,7 @@ fn check_with(
     // Phase 4: tracker tools. Loading the AO yaml is best-effort — if
     // it doesn't parse, the spawn picker will report the error later;
     // we just skip the tracker check rather than blocking on it.
-    let ao = crate::ao::config::AoConfig::load(repo_root)
+    let ao = crate::ao::config::AoConfig::load()
         .ok()
         .flatten()
         .map(|(_, cfg)| cfg);
@@ -252,47 +246,59 @@ fn default_in_vm(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    fn tmp_repo() -> PathBuf {
-        // Returning a fresh tempdir per call keeps the tests honest about
-        // AO yaml absence by default — they opt in to a yaml when they
-        // want to drive the tracker phase.
-        tempfile::tempdir().expect("tempdir").keep()
+    /// Create a tempdir laid out as an `$XDG_CONFIG_HOME` root —
+    /// i.e. with a `fleet/` subdir ready to receive the AO yaml.
+    /// Returns the *base* path (the value to set `XDG_CONFIG_HOME`
+    /// to); the yaml itself goes inside `<base>/fleet/`.
+    fn tmp_xdg() -> PathBuf {
+        let base = tempfile::tempdir().expect("tempdir").keep();
+        std::fs::create_dir_all(base.join("fleet")).expect("mkdir fleet");
+        base
+    }
+
+    /// Write an `agent-orchestrator.yaml` into `<xdg>/fleet/` so the
+    /// `AoConfig` loader picks it up via `default_xdg_path`. Caller is
+    /// responsible for setting `XDG_CONFIG_HOME=<xdg>` around the
+    /// `check_with` call.
+    fn write_ao_yaml(xdg: &Path, body: &str) {
+        std::fs::write(xdg.join("fleet").join("agent-orchestrator.yaml"), body)
+            .expect("write agent-orchestrator.yaml");
     }
 
     #[test]
     fn host_missing_short_circuits_vm_check() {
         let vm_status = || panic!("vm_status must not run when host check fails");
         let in_vm = |_: &str| panic!("in_vm must not run when host check fails");
-        let result = check_with(|_| false, vm_status, in_vm, &tmp_repo());
+        let result = check_with(|_| false, vm_status, in_vm);
         assert!(matches!(result, Preflight::HostBinsMissing(_)));
     }
 
     #[test]
     fn ok_when_host_and_vm_running_with_no_ao_yaml() {
-        // No yaml in tempdir → tracker phase is a no-op → Ok.
-        let result = check_with(|_| true, || VmStatus::Running, |_| true, &tmp_repo());
+        // No yaml → tracker phase is a no-op → Ok.
+        let result = check_with(|_| true, || VmStatus::Running, |_| true);
         assert!(matches!(result, Preflight::Ok));
     }
 
     #[test]
     fn vm_missing_when_lima_reports_missing() {
-        let result = check_with(|_| true, || VmStatus::Missing, |_| true, &tmp_repo());
+        let result = check_with(|_| true, || VmStatus::Missing, |_| true);
         assert!(matches!(result, Preflight::VmMissing));
     }
 
     #[test]
     fn vm_stopped_when_lima_reports_stopped() {
-        let result = check_with(|_| true, || VmStatus::Stopped, |_| true, &tmp_repo());
+        let result = check_with(|_| true, || VmStatus::Stopped, |_| true);
         assert!(matches!(result, Preflight::VmStopped));
     }
 
     #[test]
     fn tracker_warning_when_git_bug_not_in_vm() {
-        let repo = tmp_repo();
-        std::fs::write(
-            repo.join("agent-orchestrator.yaml"),
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
             r"
 projects:
   sandbox:
@@ -301,18 +307,12 @@ projects:
     tracker:
       plugin: git-bug
 ",
-        )
-        .unwrap();
+        );
         // Override XDG so the loader doesn't pick up the dev's real
         // ~/.config/fleet/agent-orchestrator.yaml. SAFETY: env mutation
         // is process-global; restored before return.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &repo) };
-        let result = check_with(
-            |_| true,
-            || VmStatus::Running,
-            |tool| tool != "git-bug",
-            &repo,
-        );
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        let result = check_with(|_| true, || VmStatus::Running, |tool| tool != "git-bug");
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         match result {
             Preflight::TrackerWarnings(w) => {
@@ -321,15 +321,18 @@ projects:
                 assert_eq!(w[0].tool, "git-bug");
                 assert_eq!(w[0].used_by, vec!["sandbox".to_string()]);
             }
-            other => panic!("expected TrackerWarnings, got something else: {:?}", other_kind(&other)),
+            other => panic!(
+                "expected TrackerWarnings, got something else: {:?}",
+                other_kind(&other)
+            ),
         }
     }
 
     #[test]
     fn tracker_warning_when_gh_not_in_vm() {
-        let repo = tmp_repo();
-        std::fs::write(
-            repo.join("agent-orchestrator.yaml"),
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
             r"
 projects:
   webapp:
@@ -338,14 +341,12 @@ projects:
     tracker:
       plugin: github
 ",
-        )
-        .unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &repo) };
+        );
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         let result = check_with(
             |_| true,
             || VmStatus::Running,
             |tool| tool != "gh", // gh is what's missing in the guest
-            &repo,
         );
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         match result {
@@ -367,9 +368,9 @@ projects:
 
     #[test]
     fn tracker_warning_skipped_when_tool_available() {
-        let repo = tmp_repo();
-        std::fs::write(
-            repo.join("agent-orchestrator.yaml"),
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
             r"
 projects:
   sandbox:
@@ -378,10 +379,9 @@ projects:
     tracker:
       plugin: git-bug
 ",
-        )
-        .unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &repo) };
-        let result = check_with(|_| true, || VmStatus::Running, |_| true, &repo);
+        );
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        let result = check_with(|_| true, || VmStatus::Running, |_| true);
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         assert!(matches!(result, Preflight::Ok));
     }
@@ -391,9 +391,9 @@ projects:
         // Unknown plugin name → fleet doesn't know what tool to probe,
         // so it skips. The spawn picker will surface a clearer error
         // later if/when the user actually tries to spawn.
-        let repo = tmp_repo();
-        std::fs::write(
-            repo.join("agent-orchestrator.yaml"),
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
             r"
 projects:
   webapp:
@@ -402,10 +402,9 @@ projects:
     tracker:
       plugin: linear
 ",
-        )
-        .unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &repo) };
-        let result = check_with(|_| true, || VmStatus::Running, |_| false, &repo);
+        );
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        let result = check_with(|_| true, || VmStatus::Running, |_| false);
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         assert!(matches!(result, Preflight::Ok));
     }
