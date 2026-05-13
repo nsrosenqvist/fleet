@@ -25,7 +25,7 @@ use ratatui::widgets::{Clear, List, ListItem, ListState, Padding, Paragraph, Wra
 use crate::ao::SessionInfo;
 use crate::lima::VmStatus;
 
-use super::app::App;
+use super::app::{App, SpawnPrompt};
 use super::bringup::BringUp;
 use super::preflight::MissingDep;
 use super::theme::{
@@ -47,6 +47,13 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
     draw_breadcrumb(app, frame, layout[0]);
     draw_body(app, frame, layout[1]);
     draw_status_bar(app, frame, layout[2]);
+
+    // Overlay modals — painted last so they sit on top of the normal
+    // layout. The spawn prompt punches a `Clear` through the frame so
+    // background content can't leak through.
+    if let Some(prompt) = &app.spawn_prompt {
+        render_spawn_prompt(frame, prompt);
+    }
 }
 
 fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -116,7 +123,7 @@ fn draw_body(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // Size the details panel to its content: `body.len()` rows + 2 borders.
     // Cap at `area.height - 5` so the output panel always gets at least 5
     // rows even when a future session grows extra kv fields.
-    let body = build_details_body(app.selected_session());
+    let body = build_details_body(app);
     let max_info_h = cols[1].height.saturating_sub(5).max(3);
     let info_h = (u16::try_from(body.len()).unwrap_or(u16::MAX) + 2).min(max_info_h);
     let rows = Layout::default()
@@ -194,18 +201,19 @@ fn record_sidebar_rects(app: &App, area: Rect) {
     }
 }
 
-/// Build the details-panel body for the currently selected session.
-/// Empty-value rows are skipped — keel's pattern is "what's relevant
-/// shows up; what isn't, doesn't" rather than padding with `(none)`.
-/// The first row is always present when a session is selected so the
-/// panel never collapses to zero rows mid-frame.
-fn build_details_body(session: Option<&SessionInfo>) -> Vec<Line<'static>> {
-    let Some(s) = session else {
-        return vec![Line::from(Span::styled(
-            "(no session selected)",
-            Style::default().fg(MUTED),
-        ))];
-    };
+/// Build the details-panel body. With a selection, shows the kv table
+/// for that session; without one, shows a state-aware welcome screen
+/// that tells the user what to do next (start AO, spawn a session,
+/// add a project entry for cwd, …) instead of a dead `(no session)`
+/// placeholder.
+fn build_details_body(app: &App) -> Vec<Line<'static>> {
+    if let Some(s) = app.selected_session() {
+        return build_session_kv_lines(s);
+    }
+    build_welcome_lines(app)
+}
+
+fn build_session_kv_lines(s: &SessionInfo) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut push = |label: &str, value: Option<&str>| {
         if let Some(v) = value.filter(|v| !v.is_empty()) {
@@ -228,6 +236,113 @@ fn build_details_body(session: Option<&SessionInfo>) -> Vec<Line<'static>> {
         )));
     }
     lines
+}
+
+/// State-aware "what do I do next?" panel. Three cases:
+///
+/// 1. Cwd doesn't match any project in the catalog → tell the user to
+///    add one via `c` (or cd into one).
+/// 2. Cwd matches a project but AO isn't running → tell them to start
+///    it (Shift+S).
+/// 3. AO is up but no sessions exist → tell them how to spawn one.
+///
+/// Each step references the keybind that fixes it, so the user never
+/// has to consult the legend to figure out what to press first.
+fn build_welcome_lines(app: &App) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(MUTED);
+    let bold_key = Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD);
+
+    if app.current_project_key.is_none() {
+        return vec![
+            Line::from(Span::styled(
+                "This directory isn't a known fleet project.",
+                muted,
+            )),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  Press ", muted),
+                Span::styled("c", bold_key),
+                Span::styled(
+                    "  to edit agent-orchestrator.yaml and add a `path:`",
+                    muted,
+                ),
+            ]),
+            Line::from(Span::styled(
+                "  entry that points at this directory, then press ",
+                muted,
+            )),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("r", bold_key),
+                Span::styled("  to reload.", muted),
+            ]),
+        ];
+    }
+
+    if !app.ao_up {
+        return vec![
+            Line::from(Span::styled(
+                "AO isn't running yet — nothing's listening on :3000.",
+                muted,
+            )),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("⇧S", bold_key),
+                Span::styled(
+                    "      start the orchestrator inside the VM",
+                    muted,
+                ),
+            ]),
+            Line::raw(""),
+            Line::from(Span::styled("  Once it's up:", muted)),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("n", bold_key),
+                Span::styled(
+                    "       spawn a session on an issue",
+                    muted,
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("t", bold_key),
+                Span::styled(
+                    "       open the tracker (git-bug) to create one",
+                    muted,
+                ),
+            ]),
+        ];
+    }
+
+    vec![
+        Line::from(Span::styled(
+            "AO is up. No sessions running for this project yet.",
+            muted,
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  ", muted),
+            Span::styled("n", bold_key),
+            Span::styled(
+                "       spawn a session on an issue",
+                muted,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  ", muted),
+            Span::styled("t", bold_key),
+            Span::styled(
+                "       open the tracker to browse / create issues",
+                muted,
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Or from a shell:  fleet spawn <issue-id>",
+            muted,
+        )),
+    ]
 }
 
 fn details_title(session: Option<&SessionInfo>) -> Line<'static> {
@@ -374,11 +489,14 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         key("Enter"),
         Span::raw(" attach"),
         sep(),
-        key("c"),
-        Span::raw(" edit config"),
+        key("n"),
+        Span::raw(" new"),
         sep(),
         key("t"),
         Span::raw(" tracker"),
+        sep(),
+        key("c"),
+        Span::raw(" edit config"),
         sep(),
         key("K"),
         Span::raw(" kill"),
@@ -411,6 +529,51 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
 /// Missing host binary — fleet can't proceed and there's nothing fleet can
 /// do about it. Body lists each dep with its install hint; footer says
 /// "press any key to quit".
+/// "Spawn session" text-input modal. Rendered as an overlay on top
+/// of the normal Sessions view while [`crate::tui::app::App::spawn_prompt`]
+/// is `Some`. Submits the trimmed buffer as the issue id on Enter;
+/// Esc cancels.
+pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "Spawn a new agent session.",
+            Style::default().fg(MUTED),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("issue       ", Style::default().fg(MUTED)),
+            Span::styled(
+                prompt.buffer.clone(),
+                Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+            ),
+            // Block caret so the user can see where input lands.
+            Span::styled("█", Style::default().fg(KEY_FG)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "AO will create the worktree, attach the configured agent",
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        )),
+        Line::from(Span::styled(
+            "(claude-code by default), and open a tmux session.",
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        )),
+    ];
+    let footer = vec![Line::from(vec![
+        Span::styled(
+            "[Enter]",
+            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" submit   ", Style::default().fg(MUTED)),
+        Span::styled(
+            "[Esc]",
+            Style::default().fg(KEY_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cancel", Style::default().fg(MUTED)),
+    ])];
+    draw_modal(frame, " spawn session ", ACCENT, lines, &footer);
+}
+
 pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(

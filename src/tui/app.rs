@@ -51,6 +51,15 @@ pub(super) enum ClickKind {
 }
 
 
+/// In-progress "spawn session" prompt. The user is typing the issue
+/// id into `buffer`; Enter submits, Esc cancels. While `Some`, all
+/// keyboard input is intercepted by the prompt handler so accidental
+/// keystrokes can't fire a different action.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SpawnPrompt {
+    pub(super) buffer: String,
+}
+
 /// Pending destructive action awaiting a y/N confirmation in the status bar.
 #[derive(Debug, Clone)]
 pub(super) enum Confirm {
@@ -82,6 +91,7 @@ pub(super) enum Command {
     KillSession(String),
     StopAo,
     RequestRefresh,
+    Spawn(String),
 }
 
 pub struct App {
@@ -118,6 +128,11 @@ pub struct App {
     /// moment the user starts driving the UI again.
     pub(super) action_error: Option<String>,
     pub(super) last_info: Option<String>,
+
+    /// Active "spawn session" modal, or `None` when the prompt isn't
+    /// open. Renders as a centred overlay; while present, all key
+    /// input goes to the prompt handler.
+    pub(super) spawn_prompt: Option<SpawnPrompt>,
     pub(super) ao_up: bool,
     pub(super) vm_status: VmStatus,
     pub(super) confirm: Option<Confirm>,
@@ -170,6 +185,7 @@ impl App {
             refresh_error: None,
             action_error: None,
             last_info: None,
+            spawn_prompt: None,
             ao_up: false,
             vm_status: VmStatus::Missing,
             confirm: None,

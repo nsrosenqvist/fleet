@@ -8,7 +8,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use super::app::{App, ClickKind, ClickTarget, Command, Confirm};
+use super::app::{App, ClickKind, ClickTarget, Command, Confirm, SpawnPrompt};
 
 /// Lines moved per scroll-wheel notch. Three matches the j/k cadence
 /// closely enough that mixing keyboard and wheel doesn't feel jumpy.
@@ -39,11 +39,45 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
         }
         (KeyCode::Char('c'), _) => app.push_command(Command::EditConfig),
         (KeyCode::Char('t'), _) => app.push_command(Command::TrackerPreview),
+        (KeyCode::Char('n'), _) => {
+            app.spawn_prompt = Some(SpawnPrompt::default());
+        }
         (KeyCode::Char('S'), _) => app.push_command(Command::StartAo),
         (KeyCode::Char('X'), _) => {
             app.confirm = Some(Confirm::StopAo);
         }
         (KeyCode::Char('W'), _) => app.push_command(Command::OpenWeb),
+        _ => {}
+    }
+}
+
+/// Spawn-prompt mode: capture text input for the issue id, submit on
+/// Enter, cancel on Esc. Other modifiers / function keys are dropped
+/// so unintended chords can't punch through to the underlying view
+/// while the modal is open.
+pub(super) fn handle_key_spawn_prompt(app: &mut App, key: KeyEvent) {
+    let Some(prompt) = app.spawn_prompt.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Enter => {
+            let issue = prompt.buffer.trim().to_string();
+            if issue.is_empty() {
+                return;
+            }
+            app.spawn_prompt = None;
+            app.push_command(Command::Spawn(issue));
+        }
+        KeyCode::Esc => {
+            app.spawn_prompt = None;
+            app.flash_ok("cancelled");
+        }
+        KeyCode::Backspace => {
+            prompt.buffer.pop();
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            prompt.buffer.push(c);
+        }
         _ => {}
     }
 }

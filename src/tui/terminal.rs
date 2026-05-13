@@ -243,17 +243,21 @@ fn dispatch_event(app: &mut App, ev: &event::Event) {
             // flash (e.g. `c` → "edited /path/...") overrides cleanly
             // rather than getting wiped a tick later.
             app.dismiss_flash();
-            // Mode-first dispatch. A pending confirm always intercepts.
-            if app.confirm.is_some() {
+            // Mode-first dispatch. Order of precedence: spawn modal
+            // (text input intercepts everything) → confirm (y/N gate)
+            // → normal view keys.
+            if app.spawn_prompt.is_some() {
+                input::handle_key_spawn_prompt(app, *k);
+            } else if app.confirm.is_some() {
                 input::handle_key_confirm(app, *k);
             } else {
                 input::handle_key_normal(app, *k);
             }
         }
-        // Mouse is ignored while a confirm is pending — keyboard-only
-        // resolution avoids accidentally killing a session by clicking
-        // somewhere unrelated.
-        event::Event::Mouse(m) if app.confirm.is_none() => {
+        // Mouse is ignored while either modal is pending — keyboard-
+        // only resolution avoids accidentally killing a session or
+        // dismissing a spawn prompt with a stray click.
+        event::Event::Mouse(m) if app.confirm.is_none() && app.spawn_prompt.is_none() => {
             app.dismiss_flash();
             input::handle_mouse_normal(app, *m);
         }
@@ -271,6 +275,7 @@ fn run_command(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>,
         Command::KillSession(id) => kill_session(app, term, id),
         Command::StopAo => stop_ao(app, term),
         Command::RequestRefresh => app.request_refresh(),
+        Command::Spawn(issue) => spawn_session(app, term, &issue),
     }
 }
 
@@ -388,6 +393,26 @@ fn kill_session(app: &mut App, term: &mut Terminal<CrosstermBackend<io::Stdout>>
         .map(|_| ())
     });
     app.flash_result(format!("killed {killed_id}"), res);
+    app.request_refresh();
+}
+
+/// Spawn an AO worker session against the given issue id. Hands off
+/// to `cli::spawn::run_spawn` (which carries the full OAuth handoff +
+/// limactl shell + token-injection wrapper) via `suspend_around`, so
+/// the user sees AO's output stream — and any failure surface — in
+/// the terminal directly. On success we kick a refresh so the new
+/// session appears in the sidebar without waiting for the next tick.
+fn spawn_session(
+    app: &mut App,
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    issue: &str,
+) {
+    let repo_root = app.repo_root.clone();
+    let issue_owned = issue.to_string();
+    let res = suspend_around(term, || {
+        crate::cli::spawn::run_spawn(&repo_root, &issue_owned, None, None).map(|_| ())
+    });
+    app.flash_result(format!("spawned session for `{issue}`"), res);
     app.request_refresh();
 }
 
