@@ -159,19 +159,19 @@ fn draw_sessions_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     ))));
 
     let title = format!(" sessions ({}) ", app.sessions.len());
-    // Selected-row highlight needs a contrasting background — fg-only
-    // (accent+bold) was invisible against the sentinel's accent-italic
-    // styling, so the user couldn't tell anything was "focused" on a
-    // fresh start. Subtle dim-grey bg + bright-white fg lifts the
-    // focused row off the panel regardless of what colour the row's
-    // own spans use.
+    // Selected-row highlight: indexed 238 (subtle dim grey) bg +
+    // indexed 255 (bright white) fg + BOLD. Same palette keel uses —
+    // pairs with any row text colour without washing it out, and
+    // lifts the focused row off the panel by tone rather than by
+    // recolouring the foreground (so the sentinel's accent + italic
+    // stays readable when selected).
     let list = List::new(items)
         .block(framed_block(&title))
         .highlight_symbol("▸ ")
         .highlight_style(
             Style::default()
-                .fg(KEY_FG)
-                .bg(Color::DarkGray)
+                .fg(Color::Indexed(255))
+                .bg(Color::Indexed(238))
                 .add_modifier(Modifier::BOLD),
         );
     let mut state = ListState::default();
