@@ -168,22 +168,36 @@ fn check_trackers(
 /// action. Mirrors the provisioning steps in `templates/fleet-vm.yaml`
 /// so an existing VM (created before fleet's template included these)
 /// converges on the same state without a rebuild.
+///
+/// `set -ex` at the top echoes each command before running it
+/// (otherwise the user sees a silent pause during long downloads /
+/// apt updates) and aborts on first failure. `curl -fSL` (no `s`)
+/// shows the progress bar to a TTY.
 pub fn install_command(tool: &str) -> Option<&'static str> {
     match tool {
         "git-bug" => Some(
-            r#"arch="$(dpkg --print-architecture)"; \
-case "$arch" in amd64) gb=amd64;; arm64) gb=arm64;; *) gb="$arch";; esac; \
-sudo curl -fsSL "https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_${gb}" \
-  -o /usr/local/bin/git-bug && sudo chmod +x /usr/local/bin/git-bug"#,
+            r#"set -ex
+arch="$(dpkg --print-architecture)"
+case "$arch" in
+  amd64) gb=amd64 ;;
+  arm64) gb=arm64 ;;
+  *)     gb="$arch" ;;
+esac
+sudo curl -fSL "https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_${gb}" -o /usr/local/bin/git-bug
+sudo chmod +x /usr/local/bin/git-bug
+git-bug --version"#,
         ),
         "gh" => Some(
-            r#"sudo apt-get update && sudo apt-get install -y gh || (sudo mkdir -p -m 755 /etc/apt/keyrings && \
-curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-  | sudo dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg && \
-sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-  | sudo tee /etc/apt/sources.list.d/github-cli.list && \
-sudo apt-get update && sudo apt-get install -y gh)"#,
+            r#"set -ex
+if ! sudo apt-get install -y gh; then
+  sudo mkdir -p -m 755 /etc/apt/keyrings
+  curl -fSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg
+  sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list
+  sudo apt-get update
+  sudo apt-get install -y gh
+fi
+gh --version"#,
         ),
         _ => None,
     }
