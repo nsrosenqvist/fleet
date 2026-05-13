@@ -94,6 +94,21 @@ impl AoConfig {
         Some(base.join("fleet").join("agent-orchestrator.yaml"))
     }
 
+    /// Directory that `limactl shell --workdir` should land in so AO
+    /// finds its catalog. AO discovers its config from the cwd only —
+    /// no XDG fallback, no `--config` flag — so every fleet call that
+    /// invokes `ao` (status probe, spawn, attach, passthrough, …)
+    /// must run from the directory holding the canonical XDG yaml.
+    ///
+    /// Lima bind-mounts the host home, so this same absolute path is
+    /// valid inside the VM as well. Returns `None` when neither
+    /// `$XDG_CONFIG_HOME` nor `$HOME` are set, in which case the
+    /// caller should surface the configuration problem rather than
+    /// invoking AO from a fallback directory.
+    pub fn workdir() -> Option<PathBuf> {
+        Self::default_xdg_path()?.parent().map(Path::to_path_buf)
+    }
+
     /// Resolve the canonical AO config path.
     ///
     /// Fleet keeps a single catalog at `$XDG_CONFIG_HOME/fleet/agent-orchestrator.yaml`

@@ -1,15 +1,19 @@
 //! Generic passthrough to `ao` inside the VM. Used for `status`, `doctor`,
 //! `session …`, `plugin …`, `stop`. No secret needed.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::lima::{Lima, VmStatus};
 use crate::process::{RealProcessInvoker, run_interactive};
 
-/// Pass `ao <args…>` to AO inside the VM.
-pub fn run(repo_root: &Path, ao_args: &[String]) -> Result<i32> {
+/// Pass `ao <args…>` to AO inside the VM. AO discovers its config from
+/// cwd only, so we always run from the canonical XDG dir — the same
+/// place fleet's spawn / status / refresh paths use — so the user
+/// gets the registered projects regardless of which directory fleet
+/// was launched from.
+pub fn run(_repo_root: &Path, ao_args: &[String]) -> Result<i32> {
     let invoker = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker, "fleet-vm");
     match lima.status() {
@@ -17,10 +21,12 @@ pub fn run(repo_root: &Path, ao_args: &[String]) -> Result<i32> {
         VmStatus::Stopped => bail!("Lima VM `{}` is stopped.", lima.vm_name()),
         VmStatus::Missing => bail!("Lima VM `{}` not found.", lima.vm_name()),
     }
+    let workdir = crate::ao::config::AoConfig::workdir()
+        .context("no $HOME / $XDG_CONFIG_HOME — can't resolve AO workdir")?;
     let mut argv = vec![
         "shell".to_string(),
         "--workdir".to_string(),
-        repo_root.display().to_string(),
+        workdir.display().to_string(),
         lima.vm_name().to_string(),
         "ao".to_string(),
     ];

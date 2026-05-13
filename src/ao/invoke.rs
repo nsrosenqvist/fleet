@@ -46,20 +46,33 @@ impl<'a> Ao<'a> {
 /// line — careful not to mistake the `[` in `[notifier-...]` for a JSON array.
 fn parse_response(raw: &str) -> Result<AoResponse<SessionInfo>> {
     let start = find_json_start(raw)
-        .with_context(|| format!("no JSON object found in ao output: {raw:?}"))?;
+        .with_context(|| format!("no JSON object found in ao output: {}", error_preview(raw)))?;
     let json = &raw[start..];
-    let parsed: AoResponse<SessionInfo> = serde_json::from_str(json).with_context(|| {
-        let preview = if json.len() > 400 {
-            format!("{}…", &json[..400])
-        } else {
-            json.to_string()
-        };
-        format!("parsing JSON: {preview}")
-    })?;
+    let parsed: AoResponse<SessionInfo> = serde_json::from_str(json)
+        .with_context(|| format!("parsing JSON: {}", error_preview(json)))?;
     if parsed.data.is_empty() && !json.contains("\"data\"") {
-        bail!("ao response had no `data` key — unexpected shape: {json}");
+        bail!(
+            "ao response had no `data` key — unexpected shape: {}",
+            error_preview(json)
+        );
     }
     Ok(parsed)
+}
+
+/// Trim raw AO output for inclusion in an error message. The status
+/// bar shows errors as a single line; a 500-line AO banner dump
+/// pushes the actual cause off-screen. Keep the first line (where
+/// the real signal — "No config found", a JSON-shape mismatch — lives)
+/// plus a length hint when truncation occurred.
+fn error_preview(raw: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let first_line = raw.lines().next().unwrap_or("").trim();
+    let trimmed: String = first_line.chars().take(MAX_CHARS).collect();
+    if first_line.chars().count() > MAX_CHARS || raw.len() > first_line.len() {
+        format!("{trimmed}… ({} bytes total)", raw.len())
+    } else {
+        trimmed
+    }
 }
 
 /// Return the byte offset of the first character that starts a JSON body.

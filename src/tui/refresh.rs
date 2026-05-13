@@ -57,11 +57,23 @@ pub fn spawn(
 // clippy::needless_pass_by_value doesn't account for that pattern.
 #[allow(clippy::needless_pass_by_value)]
 fn refresh_loop(
-    repo_root: PathBuf,
+    _repo_root: PathBuf,
     invoker: Arc<dyn ProcessInvoker>,
     cmds: mpsc::Receiver<RefreshCommand>,
     updates: &mpsc::Sender<RefreshUpdate>,
 ) {
+    // AO discovers its config from cwd only, so every `ao …` and
+    // `tmux …` we run inside the VM has to land in the directory
+    // holding the canonical XDG yaml. Resolving once at the top of
+    // the loop keeps the contract identical across iterations and
+    // surfaces a misconfigured environment immediately rather than
+    // every refresh tick.
+    let Some(ao_workdir) = crate::ao::config::AoConfig::workdir() else {
+        let _ = updates.send(RefreshUpdate::Error(
+            "no $HOME / $XDG_CONFIG_HOME — can't locate AO config dir".to_string(),
+        ));
+        return;
+    };
     let lima = Lima::new(invoker.clone(), VM_NAME);
     let mut next_status = Instant::now();
     let mut next_ao_probe = Instant::now();
@@ -87,7 +99,7 @@ fn refresh_loop(
 
         let now = Instant::now();
         if now >= next_status {
-            let ao = Ao::new(&lima, &repo_root);
+            let ao = Ao::new(&lima, &ao_workdir);
             match ao.status() {
                 Ok(r) => {
                     // Send Sessions first so the UI sees the structure
@@ -102,7 +114,7 @@ fn refresh_loop(
                         // 200 lines of scrollback is enough to fill any
                         // realistic output panel. tmux capture inside the VM
                         // is fast (~30 ms); we tail at render time.
-                        if let Ok(out) = crate::tmux::capture_pane(&lima, &repo_root, &id, 200)
+                        if let Ok(out) = crate::tmux::capture_pane(&lima, &ao_workdir, &id, 200)
                             && updates
                                 .send(RefreshUpdate::PaneCapture {
                                     session_id: id,

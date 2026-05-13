@@ -69,22 +69,19 @@ fn run_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<i32> {
     }
 }
 
-/// Directory we hand to `limactl shell --workdir`. AO discovers its
-/// config from the cwd only — no XDG fallback, no `--config` flag —
-/// so fleet has to land in a directory that holds the canonical
-/// `agent-orchestrator.yaml`. The XDG config dir (`~/.config/fleet/`)
-/// is bind-mounted into the VM at the same absolute path by Lima, so
-/// the same path works on both sides.
+/// Like [`crate::ao::config::AoConfig::workdir`] but bails with a
+/// pointed error message when the workdir isn't usable for `ao` —
+/// either because we can't resolve a path at all (no $HOME) or
+/// because the yaml inside it doesn't exist (no projects registered).
 ///
-/// We refuse to proceed if the directory or yaml is missing rather
-/// than letting AO auto-create one in an unexpected location.
-fn ao_workdir() -> Result<PathBuf> {
-    let yaml = crate::ao::config::AoConfig::default_xdg_path()
+/// Spawn / start / passthrough need a real config in place before AO
+/// is invoked, since AO will otherwise auto-scaffold one in an
+/// unexpected location and report "No config found" first.
+fn ao_workdir_or_bail() -> Result<PathBuf> {
+    let dir = crate::ao::config::AoConfig::workdir()
         .context("no $HOME / $XDG_CONFIG_HOME — can't resolve the AO config directory")?;
-    let dir = yaml
-        .parent()
-        .map(Path::to_path_buf)
-        .context("AO config path has no parent directory")?;
+    let yaml = crate::ao::config::AoConfig::default_xdg_path()
+        .expect("workdir() returned Some, so default_xdg_path() must too");
     if !yaml.is_file() {
         bail!(
             "no AO config at {}. Launch fleet's TUI and press `c` to scaffold it, or create the \
@@ -147,7 +144,7 @@ fn run_claude_oauth(ao_argv: &[String], cfg: &Config) -> Result<i32> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker.clone(), "fleet-vm");
     ensure_vm_running(&lima)?;
-    let workdir = ao_workdir()?;
+    let workdir = ao_workdir_or_bail()?;
 
     // Refusal only fires under claude-oauth: under `passthrough`, an
     // ANTHROPIC_API_KEY is exactly what Codex / Aider users need to
@@ -236,7 +233,7 @@ fn run_passthrough(ao_argv: &[String]) -> Result<i32> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker, "fleet-vm");
     ensure_vm_running(&lima)?;
-    let workdir = ao_workdir()?;
+    let workdir = ao_workdir_or_bail()?;
 
     let ao_cmd = ao_argv
         .iter()

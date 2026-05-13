@@ -5,14 +5,14 @@
 //! `tmux attach` directly through `limactl shell`, inheriting the calling
 //! shell's TTY.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::lima::{Lima, VmStatus};
 use crate::process::{RealProcessInvoker, run_interactive};
 
-pub fn run(repo_root: &Path, session: &str) -> Result<i32> {
+pub fn run(_repo_root: &Path, session: &str) -> Result<i32> {
     let invoker = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker, "fleet-vm");
     match lima.status() {
@@ -20,10 +20,16 @@ pub fn run(repo_root: &Path, session: &str) -> Result<i32> {
         VmStatus::Stopped => bail!("Lima VM `{}` is stopped.", lima.vm_name()),
         VmStatus::Missing => bail!("Lima VM `{}` not found.", lima.vm_name()),
     }
+    // tmux addresses sessions through its socket, so workdir doesn't
+    // change the attach result — but we run from the canonical AO
+    // config dir for consistency with every other fleet `limactl
+    // shell` call and to avoid a path that might not exist in the VM.
+    let workdir = crate::ao::config::AoConfig::workdir()
+        .context("no $HOME / $XDG_CONFIG_HOME — can't resolve AO workdir")?;
     let argv = vec![
         "shell".to_string(),
         "--workdir".to_string(),
-        repo_root.display().to_string(),
+        workdir.display().to_string(),
         lima.vm_name().to_string(),
         "tmux".to_string(),
         "attach".to_string(),
