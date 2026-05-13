@@ -720,8 +720,7 @@ fn start_ao(app: &mut App) {
         app.confirm = Some(crate::tui::app::Confirm::RestartAoForOrchestrator);
         return;
     }
-    let repo_root = app.repo_root.clone();
-    let start_phase = match build_start_phase(&repo_root, None) {
+    let start_phase = match build_start_phase(None) {
         Ok(p) => p,
         Err(e) => {
             app.flash_err(
@@ -754,7 +753,6 @@ fn restart_ao_for_orchestrator(app: &mut App) {
     if !ensure_oauth_token_configured(app) {
         return;
     }
-    let repo_root = app.repo_root.clone();
     // `ao stop --all` releases the lock and frees the dashboard's
     // port so the subsequent `ao start` doesn't hit the "already
     // running" check.
@@ -772,7 +770,7 @@ fn restart_ao_for_orchestrator(app: &mut App) {
                 return;
             }
         };
-    let start_phase = match build_start_phase(&repo_root, Some("starting AO")) {
+    let start_phase = match build_start_phase(Some("starting AO")) {
         Ok(phase) => phase,
         Err(e) => {
             app.flash_err(
@@ -801,8 +799,8 @@ fn restart_ao_for_orchestrator(app: &mut App) {
 /// spinner sub-label for multi-phase tasks (restart-for-orchestrator
 /// uses "starting AO"); `None` lets the task-wide label own the
 /// spinner for single-phase starts.
-fn build_start_phase(repo_root: &std::path::Path, phase_label: Option<&str>) -> Result<TaskPhase> {
-    let spec = crate::cli::spawn::build_start_spec(repo_root, false, false)?;
+fn build_start_phase(phase_label: Option<&str>) -> Result<TaskPhase> {
+    let spec = crate::cli::spawn::build_start_spec(false, false)?;
     Ok(spec_to_phase(spec, phase_label))
 }
 
@@ -964,8 +962,8 @@ fn spawn_session(app: &mut App, issue: &str) {
 /// passthrough auth mode short-circuits to `true` since it doesn't
 /// touch fleet's `claude_code_oauth_token` secret.
 fn ensure_oauth_token_configured(app: &mut App) -> bool {
-    let cfg = crate::config::Config::load(&app.repo_root).unwrap_or_default();
-    if cfg.agent_auth().resolve(&app.repo_root) != crate::config::ResolvedAuthMode::ClaudeOauth {
+    let cfg = crate::config::Config::load().unwrap_or_default();
+    if cfg.agent_auth.resolve() != crate::config::ResolvedAuthMode::ClaudeOauth {
         return true;
     }
     if cfg.secrets.contains_key("claude_code_oauth_token") {

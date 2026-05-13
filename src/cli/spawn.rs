@@ -23,8 +23,8 @@ const SECRET_KEY: &str = "claude_code_oauth_token";
 const PASSTHROUGH_ENV_ALLOW: &str =
     "ANTHROPIC_API_KEY,OPENAI_API_KEY,GEMINI_API_KEY,GOOGLE_API_KEY,COMPOSIO_API_KEY";
 
-pub fn run_start(repo_root: &Path, no_dashboard: bool, no_orchestrator: bool) -> Result<i32> {
-    let spec = build_start_spec(repo_root, no_dashboard, no_orchestrator)?;
+pub fn run_start(no_dashboard: bool, no_orchestrator: bool) -> Result<i32> {
+    let spec = build_start_spec(no_dashboard, no_orchestrator)?;
     run_interactive_spec(&spec)
 }
 
@@ -46,11 +46,7 @@ pub fn run_batch_spawn(repo_root: &Path, issues: &[String]) -> Result<i32> {
 /// Build the spec for `ao start [--no-dashboard] [--no-orchestrator]`.
 /// Includes the full OAuth credentials-write bootstrap when the
 /// resolved auth mode is `claude-oauth`.
-pub fn build_start_spec(
-    repo_root: &Path,
-    no_dashboard: bool,
-    no_orchestrator: bool,
-) -> Result<CommandSpec> {
+pub fn build_start_spec(no_dashboard: bool, no_orchestrator: bool) -> Result<CommandSpec> {
     let mut argv = vec!["start".to_string()];
     if no_dashboard {
         argv.push("--no-dashboard".to_string());
@@ -58,7 +54,7 @@ pub fn build_start_spec(
     if no_orchestrator {
         argv.push("--no-orchestrator".to_string());
     }
-    build_with_token(repo_root, &argv)
+    build_with_token(&argv)
 }
 
 /// Build the spec for `ao spawn <qualified-issue> [--prompt …] [--agent …]`.
@@ -78,7 +74,7 @@ pub fn build_spawn_spec(
         argv.push("--agent".to_string());
         argv.push(a.to_string());
     }
-    build_with_token(repo_root, &argv)
+    build_with_token(&argv)
 }
 
 /// Build the spec for `ao batch-spawn <qualified-issue> …`.
@@ -87,13 +83,13 @@ pub fn build_batch_spawn_spec(repo_root: &Path, issues: &[String]) -> Result<Com
     for issue in issues {
         argv.push(qualify_issue(repo_root, issue)?);
     }
-    build_with_token(repo_root, &argv)
+    build_with_token(&argv)
 }
 
-fn build_with_token(repo_root: &Path, ao_argv: &[String]) -> Result<CommandSpec> {
+fn build_with_token(ao_argv: &[String]) -> Result<CommandSpec> {
     ensure_worktree_workspace()?;
-    let cfg = Config::load(repo_root)?;
-    match cfg.agent_auth().resolve(repo_root) {
+    let cfg = Config::load()?;
+    match cfg.agent_auth.resolve() {
         ResolvedAuthMode::ClaudeOauth => build_claude_oauth_spec(ao_argv, &cfg),
         ResolvedAuthMode::Passthrough => build_passthrough_spec(ao_argv),
     }
@@ -221,8 +217,9 @@ fn build_claude_oauth_spec(ao_argv: &[String], cfg: &Config) -> Result<CommandSp
     // Resolve secret.
     let secret_cfg: &SecretBackendConfig = cfg.secrets.get(SECRET_KEY).with_context(|| {
         format!(
-            "no secret configured under `[secrets.{SECRET_KEY}]`. Run `fleet config init` to scaffold \
-             ~/.config/fleet/config.toml, or create an in-repo `.fleet.local.toml`."
+            "no secret configured under `[secrets.{SECRET_KEY}]`. Run `fleet config init` to \
+             scaffold ~/.config/fleet/config.toml, then `fleet config edit` to point at your \
+             secret backend."
         )
     })?;
     let backend = secrets::build(secret_cfg, invoker);

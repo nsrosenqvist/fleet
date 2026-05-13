@@ -258,14 +258,7 @@ fn draw_sidebar_group(
             crate::tui::app::SidebarRow::Session(s) => {
                 let id = s.id.clone().unwrap_or_else(|| "?".into());
                 let activity = s.activity.clone().unwrap_or_default();
-                let is_orch = s.role.as_deref() == Some("orchestrator");
                 let mut spans = vec![Span::raw(format!("{id:<10}"))];
-                if is_orch {
-                    spans.push(Span::styled(
-                        "(read-only) ",
-                        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-                    ));
-                }
                 // Sidebar badges from the per-session meta probe. Crash
                 // takes priority over "done" — a runtime that died
                 // unexpectedly is more urgent than a self-reported
@@ -792,12 +785,10 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // Capital letters mean shift-modified bindings (S = Shift+S, K =
     // Shift+K, …). No ⇧ glyph anywhere in the legend — the case
     // already carries the meaning and the arrow added visual noise.
-    // The orchestrator row is read-only from fleet's perspective:
-    // `Enter` is a silent no-op (no attach), `Shift+K` is blocked
-    // (would leave the daemon orphaned — see input.rs). Hide both
-    // chips so the legend never advertises an action it won't
-    // perform; lifecycle for the orchestrator goes through
-    // `Shift+S` / `Shift+X` instead.
+    // `Shift+K` is hidden when the orchestrator row is selected:
+    // killing it standalone would orphan the daemon (see input.rs).
+    // Lifecycle for the orchestrator goes through `Shift+S` /
+    // `Shift+X` instead.
     let orchestrator_selected = app.is_orchestrator_selected();
 
     let mut spans: Vec<Span<'_>> = vec![
@@ -805,18 +796,16 @@ fn draw_status_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         sep(),
         key("↑/↓"),
         Span::raw(" nav"),
-    ];
-    if !orchestrator_selected {
-        spans.extend([sep(), key("enter"), Span::raw(" attach")]);
-    }
-    spans.extend([
+        sep(),
+        key("enter"),
+        Span::raw(" attach"),
         sep(),
         key("n"),
         Span::raw(" new"),
         sep(),
         key("t"),
         Span::raw(" tracker"),
-    ]);
+    ];
     if app.current_tracker_has_web() {
         spans.push(sep());
         spans.push(key("T"));

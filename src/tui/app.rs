@@ -664,9 +664,10 @@ impl App {
     }
 
     /// True when the selected row is an orchestrator entry. Used by
-    /// the input layer to short-circuit attach (orchestrator stays
-    /// read-only in fleet — its pane shows the coordinator's claude
-    /// transcript, but Enter doesn't drop into it).
+    /// the input layer to block `Shift+K`/Delete — killing the
+    /// orchestrator standalone would leave the AO daemon in a
+    /// degraded "no orchestrator" state with no in-AO recovery path.
+    /// Lifecycle goes through `Shift+S` / `Shift+X` instead.
     pub(super) fn is_orchestrator_selected(&self) -> bool {
         matches!(
             self.sidebar_rows().get(self.selected),

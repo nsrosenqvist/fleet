@@ -28,16 +28,11 @@ pub(super) fn handle_key_normal(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('r'), _) => app.push_command(Command::RequestRefresh),
         (KeyCode::Enter, _) => {
             // Sentinel row → open the spawn modal instead of attaching.
-            // Orchestrator entry → read-only pane view (no attach);
-            // fleet covers the orchestrator's coordination role via
-            // the spawn modal, so dropping into its tmux session
-            // would just expose a redundant claude REPL. The sidebar
-            // tags the row `(read-only)` for discoverability.
+            // Orchestrator rows attach like any other session — the
+            // orchestrator is a Claude Code meta-agent you converse
+            // with to coordinate work.
             if app.is_sentinel_selected() {
                 app.open_spawn_prompt();
-            } else if app.is_orchestrator_selected() {
-                // Silent no-op. Selection already shows the
-                // orchestrator's pane in the output panel.
             } else {
                 app.push_command(Command::AttachSelected);
             }
@@ -332,8 +327,6 @@ pub(super) fn handle_mouse_normal(app: &mut App, me: MouseEvent) {
             app.select_at(idx);
             if app.is_sentinel_selected() {
                 app.open_spawn_prompt();
-            } else if app.is_orchestrator_selected() {
-                // Read-only — see handle_key_normal.
             } else {
                 app.push_command(Command::AttachSelected);
             }

@@ -100,7 +100,7 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigSub {
-    /// Print effective config (XDG ∪ repo overlay).
+    /// Print effective config from the XDG path.
     Show,
     /// Open the XDG config in `$EDITOR`.
     Edit,
@@ -115,7 +115,7 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
         Command::Start {
             no_dashboard,
             no_orchestrator,
-        } => spawn::run_start(repo_root, no_dashboard, no_orchestrator),
+        } => spawn::run_start(no_dashboard, no_orchestrator),
         Command::Stop => passthrough::run(repo_root, &["stop".to_string()]),
         Command::Spawn {
             issue,
@@ -134,7 +134,7 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
         Command::VmStop => vm::run_stop(),
         Command::Ui => ui::run(repo_root),
         Command::Config { sub } => match sub {
-            ConfigSub::Show => config_cmd::run_show(repo_root),
+            ConfigSub::Show => config_cmd::run_show(),
             ConfigSub::Edit => config_cmd::run_edit(),
             ConfigSub::Init => config_cmd::run_init(),
         },

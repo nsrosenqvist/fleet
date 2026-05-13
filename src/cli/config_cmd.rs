@@ -1,22 +1,20 @@
 //! `fleet config show|edit|init` — manage per-engineer secret-backend config.
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
 
 use crate::config::Config;
 use crate::process::run_interactive;
 
-pub fn run_show(repo_root: &Path) -> Result<i32> {
-    let cfg = Config::load(repo_root)?;
+pub fn run_show() -> Result<i32> {
+    let cfg = Config::load()?;
     println!("# Effective fleet config");
     println!(
         "# XDG path:  {}",
         Config::xdg_path().map_or_else(|| "<no HOME>".into(), |p| p.display().to_string()),
     );
-    println!("# Repo override: {}/.fleet.local.toml", repo_root.display());
     println!();
-    let mode = cfg.agent_auth();
-    let resolved = mode.resolve(repo_root);
+    let mode = cfg.agent_auth;
+    let resolved = mode.resolve();
     println!(
         "agent_auth = \"{}\"   # resolves to: {}",
         match mode {
