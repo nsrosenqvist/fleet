@@ -24,6 +24,7 @@ pub mod detect;
 pub mod devcontainer;
 pub mod devcontainer_cli;
 pub mod local;
+pub mod podman;
 
 pub use capabilities::{Capabilities, Hardening, NetworkIsolation};
 pub use devcontainer::Devcontainer;
