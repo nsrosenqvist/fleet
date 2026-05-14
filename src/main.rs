@@ -18,6 +18,7 @@ mod process;
 mod repo;
 mod runtime;
 mod secrets;
+mod session;
 mod templates_sync;
 #[cfg(test)]
 mod test_env;
