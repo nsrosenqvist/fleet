@@ -81,16 +81,8 @@ fn settle_preflight(
                 Ok(HostBinsAction::Quit) => return PreflightOutcome::Quit(1),
                 Err(e) => return PreflightOutcome::Err(e),
             },
-            Preflight::VmMissing => match prompt_vm_action(term, VmAction::Create) {
+            Preflight::VmMissing => match prompt_vm_create(term) {
                 Ok(true) => match bring_up_vm(term, BringUpMode::Create) {
-                    Ok(()) => {}
-                    Err(e) => return PreflightOutcome::Err(e),
-                },
-                Ok(false) => return PreflightOutcome::Quit(1),
-                Err(e) => return PreflightOutcome::Err(e),
-            },
-            Preflight::VmStopped => match prompt_vm_action(term, VmAction::Start) {
-                Ok(true) => match bring_up_vm(term, BringUpMode::StartExisting) {
                     Ok(()) => {}
                     Err(e) => return PreflightOutcome::Err(e),
                 },
@@ -122,12 +114,6 @@ fn settle_preflight(
             }
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum VmAction {
-    Create,
-    Start,
 }
 
 /// User's choice from the host-bins modal. Edit-config loops back
@@ -239,19 +225,13 @@ fn edit_ao_yaml(
     Ok(())
 }
 
-/// Draw the VM-setup modal (missing or stopped variant) and wait for a
-/// y/n decision. Returns `Ok(true)` for "yes, remediate" and `Ok(false)`
-/// for "quit"; anything that isn't an explicit `y`/`Y` is a quit, same
-/// as the in-app confirm dialogs.
-fn prompt_vm_action(
-    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    action: VmAction,
-) -> Result<bool> {
+/// Draw the VM-create modal (the only remaining VM-setup gate) and
+/// wait for a y/n decision. Returns `Ok(true)` for "yes, create" and
+/// `Ok(false)` for "quit"; anything that isn't an explicit `y`/`Y`
+/// quits, same as the in-app confirm dialogs.
+fn prompt_vm_create(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<bool> {
     loop {
-        term.draw(|f| match action {
-            VmAction::Create => ui::render_vm_missing(f),
-            VmAction::Start => ui::render_vm_stopped(f),
-        })?;
+        term.draw(ui::render_vm_missing)?;
         if event::poll(TICK_INTERVAL)?
             && let event::Event::Key(k) = event::read()?
             && k.kind == event::KeyEventKind::Press
@@ -714,6 +694,10 @@ fn github_issues_url_for(project_path: &std::path::Path) -> Result<String> {
 /// branches below keep the TUI in charge:
 ///
 /// - AO down: spawn an `ao start` `AoTask` (creates dashboard + orchestrator).
+///   When the VM is stopped, a `limactl start fleet-vm` phase runs
+///   first — VM and AO lifecycle move together so we never sit on a
+///   running VM with no AO inside it (wasteful) or try to start AO
+///   against a stopped VM (fails on the first `limactl shell`).
 /// - AO up + orchestrator present: silent flash, no subprocess.
 /// - AO up, no orchestrator: open a confirm modal offering to
 ///   restart the daemon. The actual restart runs from `Command::
@@ -733,7 +717,22 @@ fn start_ao(app: &mut App) {
         app.confirm = Some(crate::tui::app::Confirm::RestartAoForOrchestrator);
         return;
     }
-    let start_phase = match build_start_phase(None) {
+    let vm_stopped = matches!(app.vm_status, crate::lima::VmStatus::Stopped);
+    // VmStatus::Missing shouldn't reach here — preflight catches it
+    // at TUI start. If it does (user `limactl delete`d mid-session),
+    // surface a flash rather than trying to recreate the instance.
+    if matches!(app.vm_status, crate::lima::VmStatus::Missing) {
+        app.flash_err("Lima VM `fleet-vm` not found — restart fleet to recreate it");
+        return;
+    }
+    let start_phase = match build_start_phase(
+        app,
+        if vm_stopped {
+            Some("starting AO")
+        } else {
+            None
+        },
+    ) {
         Ok(p) => p,
         Err(e) => {
             app.flash_err(
@@ -746,12 +745,20 @@ fn start_ao(app: &mut App) {
             return;
         }
     };
-    let mut phases: Vec<TaskPhase> = Vec::with_capacity(2);
+    let mut phases: Vec<TaskPhase> = Vec::with_capacity(3);
+    if vm_stopped {
+        phases.push(vm_start_phase());
+    }
     if let Some(p) = purge_stale_orchestrator_phase(app) {
         phases.push(p);
     }
     phases.push(start_phase);
-    match AoTask::spawn("starting AO", phases) {
+    let task_label = if vm_stopped {
+        "starting AO + VM"
+    } else {
+        "starting AO"
+    };
+    match AoTask::spawn(task_label, phases) {
         Ok(task) => app.in_flight_ao = Some(task),
         Err(e) => app.flash_err(format!("spawn AO task: {e:#}")),
     }
@@ -783,7 +790,7 @@ fn restart_ao_for_orchestrator(app: &mut App) {
                 return;
             }
         };
-    let start_phase = match build_start_phase(Some("starting AO")) {
+    let start_phase = match build_start_phase(app, Some("starting AO")) {
         Ok(phase) => phase,
         Err(e) => {
             app.flash_err(
@@ -811,10 +818,41 @@ fn restart_ao_for_orchestrator(app: &mut App) {
 /// Build the `ao start` `TaskPhase`. `phase_label` becomes the
 /// spinner sub-label for multi-phase tasks (restart-for-orchestrator
 /// uses "starting AO"); `None` lets the task-wide label own the
-/// spinner for single-phase starts.
-fn build_start_phase(phase_label: Option<&str>) -> Result<TaskPhase> {
-    let spec = crate::cli::spawn::build_start_spec(false, false)?;
+/// spinner for single-phase starts. `project` is the AO project key
+/// for the current TUI scope — passed both as the positional arg to
+/// `ao start` and into the bash readiness poll so the phase doesn't
+/// declare success until lifecycle polling for that project is
+/// actually active in `running.json`.
+fn build_start_phase(app: &App, phase_label: Option<&str>) -> Result<TaskPhase> {
+    let project = app.current_project_key.as_deref();
+    let spec = crate::cli::spawn::build_start_spec(project, false, false)?;
     Ok(spec_to_phase(spec, phase_label))
+}
+
+/// `limactl start fleet-vm` as an `AoTask` phase. Used as the
+/// preceding phase of Shift+S when the VM is stopped, so VM and AO
+/// lifecycle move together.
+fn vm_start_phase() -> TaskPhase {
+    TaskPhase {
+        program: "limactl".into(),
+        args: vec!["start".into(), "fleet-vm".into()],
+        env_set: Vec::new(),
+        env_unset: Vec::new(),
+        label: Some("starting VM".into()),
+    }
+}
+
+/// `limactl stop fleet-vm` as an `AoTask` phase. Runs after `ao
+/// stop` on Shift+X so we never leave a running VM with no AO
+/// inside it.
+fn vm_stop_phase() -> TaskPhase {
+    TaskPhase {
+        program: "limactl".into(),
+        args: vec!["stop".into(), "fleet-vm".into()],
+        env_set: Vec::new(),
+        env_unset: Vec::new(),
+        label: Some("stopping VM".into()),
+    }
 }
 
 /// Pre-`ao start` phase that purges a stale terminated orchestrator
@@ -1105,13 +1143,19 @@ fn save_register_project(app: &mut App, key: &str, name: &str, prefix: &str, pat
     app.request_refresh();
 }
 
+/// `Shift+X` handler. Tears the whole stack down: `ao stop` (graceful
+/// dashboard + orchestrator shutdown) followed by `limactl stop
+/// fleet-vm`. Tied together so we don't leave a running VM with no
+/// AO inside it (wasteful) — bringing it back up is one Shift+S.
+/// The `fleet vm-start` / `fleet vm-stop` CLIs are still available
+/// for the rare "keep the VM warm" case.
 fn stop_ao(app: &mut App) {
-    let label = "stopping AO";
-    let spec = match crate::cli::passthrough::build_spec(&["stop".to_string()]) {
+    let task_label = "stopping AO + VM";
+    let ao_stop = match crate::cli::passthrough::build_spec(&["stop".to_string()]) {
         Ok(s) => s,
         Err(e) => {
             app.flash_err(
-                format!("{label}: {e:#}")
+                format!("{task_label}: {e:#}")
                     .lines()
                     .next()
                     .unwrap_or("")
@@ -1120,7 +1164,8 @@ fn stop_ao(app: &mut App) {
             return;
         }
     };
-    match AoTask::spawn(label, vec![spec_to_phase(spec, None)]) {
+    let phases = vec![spec_to_phase(ao_stop, Some("stopping AO")), vm_stop_phase()];
+    match AoTask::spawn(task_label, phases) {
         Ok(task) => app.in_flight_ao = Some(task),
         Err(e) => app.flash_err(format!("spawn AO task: {e:#}")),
     }

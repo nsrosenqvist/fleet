@@ -23,8 +23,17 @@ const SECRET_KEY: &str = "claude_code_oauth_token";
 const PASSTHROUGH_ENV_ALLOW: &str =
     "ANTHROPIC_API_KEY,OPENAI_API_KEY,GEMINI_API_KEY,GOOGLE_API_KEY,COMPOSIO_API_KEY";
 
-pub fn run_start(no_dashboard: bool, no_orchestrator: bool) -> Result<i32> {
-    let spec = build_start_spec(no_dashboard, no_orchestrator)?;
+pub fn run_start(repo_root: &Path, no_dashboard: bool, no_orchestrator: bool) -> Result<i32> {
+    ensure_vm_running()?;
+    // Resolve the project from cwd so AO sets up lifecycle polling for
+    // it on startup. Without an explicit project, AO's project-supervisor
+    // reconcile loop is the only path that registers a project in
+    // `running.json`, and it can take up to 60s — long enough that an
+    // immediate `ao spawn` after `ao start` hits "AO is not polling
+    // project <foo>". Resolution failure is non-fatal: AO will fall
+    // back to its own cwd / single-project logic.
+    let project = project_for_repo(repo_root);
+    let spec = build_start_spec(project.as_deref(), no_dashboard, no_orchestrator)?;
     run_interactive_spec(&spec)
 }
 
@@ -34,27 +43,50 @@ pub fn run_spawn(
     prompt: Option<&str>,
     agent: Option<&str>,
 ) -> Result<i32> {
+    ensure_vm_running()?;
     let spec = build_spawn_spec(repo_root, issue, prompt, agent)?;
     run_interactive_spec(&spec)
 }
 
 pub fn run_batch_spawn(repo_root: &Path, issues: &[String]) -> Result<i32> {
+    ensure_vm_running()?;
     let spec = build_batch_spawn_spec(repo_root, issues)?;
     run_interactive_spec(&spec)
 }
 
-/// Build the spec for `ao start [--no-dashboard] [--no-orchestrator]`.
-/// Includes the full OAuth credentials-write bootstrap when the
-/// resolved auth mode is `claude-oauth`.
-pub fn build_start_spec(no_dashboard: bool, no_orchestrator: bool) -> Result<CommandSpec> {
+/// Build the spec for `ao start [<project>] [--no-dashboard]
+/// [--no-orchestrator]`. Includes the full OAuth credentials-write
+/// bootstrap when the resolved auth mode is `claude-oauth`. Always
+/// runs in daemon mode: `ao start` is a foreground supervisor by
+/// design, so the bash bootstrap `setsid`s it and polls
+/// `running.json` for readiness so the caller sees a real exit code
+/// within ~seconds instead of hanging on a child that never returns.
+///
+/// `project` is the AO project key for the current scope (e.g.
+/// `"fleet"`). When `Some`, fleet passes it as the positional arg to
+/// `ao start` AND has the readiness poll wait for
+/// `running.json.projects` to contain it — otherwise AO declares
+/// success the moment `register()` writes the file but the lifecycle
+/// supervisor's reconcile loop may not have attached the project yet,
+/// so an immediate `ao spawn` fails with "AO is not polling project
+/// <foo>". When `None` (e.g. fleet started outside any project dir)
+/// we fall back to file-existence polling only.
+pub fn build_start_spec(
+    project: Option<&str>,
+    no_dashboard: bool,
+    no_orchestrator: bool,
+) -> Result<CommandSpec> {
     let mut argv = vec!["start".to_string()];
+    if let Some(p) = project {
+        argv.push(p.to_string());
+    }
     if no_dashboard {
         argv.push("--no-dashboard".to_string());
     }
     if no_orchestrator {
         argv.push("--no-orchestrator".to_string());
     }
-    build_with_token(&argv)
+    build_with_token(&argv, /* daemonize */ true, project)
 }
 
 /// Build the spec for `ao spawn <qualified-issue> [--prompt …] [--agent …]`.
@@ -74,7 +106,7 @@ pub fn build_spawn_spec(
         argv.push("--agent".to_string());
         argv.push(a.to_string());
     }
-    build_with_token(&argv)
+    build_with_token(&argv, /* daemonize */ false, None)
 }
 
 /// Build the spec for `ao batch-spawn <qualified-issue> …`.
@@ -83,16 +115,35 @@ pub fn build_batch_spawn_spec(repo_root: &Path, issues: &[String]) -> Result<Com
     for issue in issues {
         argv.push(qualify_issue(repo_root, issue)?);
     }
-    build_with_token(&argv)
+    build_with_token(&argv, /* daemonize */ false, None)
 }
 
-fn build_with_token(ao_argv: &[String]) -> Result<CommandSpec> {
+/// `wait_project` is the project key the daemon poll waits to see in
+/// `running.json.projects` before declaring readiness. Only meaningful
+/// when `daemonize` is true; ignored for `spawn` / `batch-spawn` /
+/// `passthrough` invocations.
+fn build_with_token(
+    ao_argv: &[String],
+    daemonize: bool,
+    wait_project: Option<&str>,
+) -> Result<CommandSpec> {
     ensure_worktree_workspace()?;
     let cfg = Config::load()?;
     match cfg.agent_auth.resolve() {
-        ResolvedAuthMode::ClaudeOauth => build_claude_oauth_spec(ao_argv, &cfg),
-        ResolvedAuthMode::Passthrough => build_passthrough_spec(ao_argv),
+        ResolvedAuthMode::ClaudeOauth => {
+            build_claude_oauth_spec(ao_argv, &cfg, daemonize, wait_project)
+        }
+        ResolvedAuthMode::Passthrough => build_passthrough_spec(ao_argv, daemonize, wait_project),
     }
+}
+
+/// Resolve the AO project covering `repo_root`, returning `None` when
+/// the AO config is absent / unparseable or `repo_root` doesn't fall
+/// under any `projects.*.path:`. Non-fatal; callers proceed without
+/// an explicit project arg in that case.
+fn project_for_repo(repo_root: &Path) -> Option<String> {
+    let (_, ao) = crate::ao::config::AoConfig::load().ok().flatten()?;
+    ao.project_for_cwd(repo_root).map(String::from)
 }
 
 /// Refuse to hand off to AO when `defaults.workspace` in the AO yaml
@@ -197,10 +248,19 @@ fn qualify_issue(repo_root: &Path, issue: &str) -> Result<String> {
 /// is set in the shell — that var would make claude prefer API auth
 /// over the OAuth credential we just wrote and silently bypass the
 /// handoff.
-fn build_claude_oauth_spec(ao_argv: &[String], cfg: &Config) -> Result<CommandSpec> {
+fn build_claude_oauth_spec(
+    ao_argv: &[String],
+    cfg: &Config,
+    daemonize: bool,
+    wait_project: Option<&str>,
+) -> Result<CommandSpec> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker.clone(), "fleet-vm");
-    ensure_vm_running(&lima)?;
+    // Note: no `ensure_vm_running` here. The TUI's Shift+S chains a
+    // `limactl start fleet-vm` phase before this spec runs, so the VM
+    // can be stopped at *build* time. CLI callers (`fleet start`,
+    // `fleet spawn`, …) enforce the running-VM precondition at the
+    // `run_*` layer above.
     let workdir = ao_workdir_or_bail()?;
 
     // Refusal only fires under claude-oauth: under `passthrough`, an
@@ -251,7 +311,14 @@ fn build_claude_oauth_spec(ao_argv: &[String], cfg: &Config) -> Result<CommandSp
         .map(|a| shell_quote_single(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let bash_script = BOOTSTRAP_SCRIPT.replace("__AO_CMD__", &ao_cmd);
+    let template = if daemonize {
+        BOOTSTRAP_SCRIPT_DAEMON
+    } else {
+        BOOTSTRAP_SCRIPT
+    };
+    let bash_script = template
+        .replace("__AO_CMD__", &ao_cmd)
+        .replace("__WAIT_PROJECT__", wait_project.unwrap_or(""));
 
     let args = vec![
         "shell".to_string(),
@@ -265,14 +332,25 @@ fn build_claude_oauth_spec(ao_argv: &[String], cfg: &Config) -> Result<CommandSp
     ];
 
     let token_str = token.expose_secret().to_string();
+    let ao_global_config = crate::ao::config::AoConfig::default_xdg_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     Ok(CommandSpec {
         program: "limactl".to_string(),
         args,
         env_set: vec![
             ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token_str),
+            // AO_GLOBAL_CONFIG points AO's `getGlobalConfigPath()` at
+            // fleet's XDG config. Without it, the project-supervisor
+            // reconcile loop reads ~/.agent-orchestrator/config.yaml
+            // (the upstream default), finds no project, silently
+            // bails — and `running.json.projects` stays empty so an
+            // immediate `ao spawn` fails with "AO is not polling
+            // project <foo>".
+            ("AO_GLOBAL_CONFIG".to_string(), ao_global_config),
             (
                 "LIMA_SHELLENV_ALLOW".to_string(),
-                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "CLAUDE_CODE_OAUTH_TOKEN,AO_GLOBAL_CONFIG".to_string(),
             ),
             // The Ubuntu 24.04 VM doesn't carry terminfo for newer host
             // terminals (`xterm-ghostty`, `wezterm`, …); tmux bails with
@@ -289,11 +367,19 @@ fn build_claude_oauth_spec(ao_argv: &[String], cfg: &Config) -> Result<CommandSp
 /// credentials handoff, no env scrubbing, just forward a known set of
 /// provider env vars into the VM and run `ao` directly. Lima's
 /// `--preserve-env` carries the env over; `LIMA_SHELLENV_ALLOW` opts
-/// each var into the guest shell.
-fn build_passthrough_spec(ao_argv: &[String]) -> Result<CommandSpec> {
+/// each var into the guest shell. When `daemonize` is true, the bash
+/// script `setsid`s `ao __AO_CMD__` and polls `running.json` for
+/// readiness — same daemonize pattern as the claude-oauth path,
+/// without the credentials prefix.
+fn build_passthrough_spec(
+    ao_argv: &[String],
+    daemonize: bool,
+    wait_project: Option<&str>,
+) -> Result<CommandSpec> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
     let lima = Lima::new(invoker, "fleet-vm");
-    ensure_vm_running(&lima)?;
+    // See note in `build_claude_oauth_spec` about why there's no
+    // `ensure_vm_running` at the builder layer.
     let workdir = ao_workdir_or_bail()?;
 
     let ao_cmd = ao_argv
@@ -301,6 +387,14 @@ fn build_passthrough_spec(ao_argv: &[String]) -> Result<CommandSpec> {
         .map(|a| shell_quote_single(a))
         .collect::<Vec<_>>()
         .join(" ");
+
+    let bash_script = if daemonize {
+        PASSTHROUGH_SCRIPT_DAEMON
+            .replace("__AO_CMD__", &ao_cmd)
+            .replace("__WAIT_PROJECT__", wait_project.unwrap_or(""))
+    } else {
+        format!("ao {ao_cmd}")
+    };
 
     Ok(CommandSpec {
         program: "limactl".to_string(),
@@ -312,12 +406,21 @@ fn build_passthrough_spec(ao_argv: &[String]) -> Result<CommandSpec> {
             lima.vm_name().to_string(),
             "bash".to_string(),
             "-c".to_string(),
-            format!("ao {ao_cmd}"),
+            bash_script,
         ],
         env_set: vec![
+            // See `build_claude_oauth_spec` for why AO_GLOBAL_CONFIG is
+            // forwarded. Concatenated into LIMA_SHELLENV_ALLOW alongside
+            // the passthrough provider env so Lima admits both groups.
+            (
+                "AO_GLOBAL_CONFIG".to_string(),
+                crate::ao::config::AoConfig::default_xdg_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ),
             (
                 "LIMA_SHELLENV_ALLOW".to_string(),
-                PASSTHROUGH_ENV_ALLOW.to_string(),
+                format!("{PASSTHROUGH_ENV_ALLOW},AO_GLOBAL_CONFIG"),
             ),
             ("TERM".to_string(), "xterm-256color".to_string()),
         ],
@@ -325,7 +428,14 @@ fn build_passthrough_spec(ao_argv: &[String]) -> Result<CommandSpec> {
     })
 }
 
-fn ensure_vm_running(lima: &Lima) -> Result<()> {
+/// CLI-layer precondition: the Lima VM must be running before we hand
+/// off to `ao`. The TUI path (`tui::terminal::start_ao` and friends)
+/// drives lifecycle through `AoTask` phases, prepending a `limactl
+/// start fleet-vm` phase when the VM is stopped — those callers do
+/// **not** go through this check; they call `build_*_spec` directly.
+fn ensure_vm_running() -> Result<()> {
+    let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
+    let lima = Lima::new(invoker, "fleet-vm");
     match lima.status() {
         VmStatus::Running => Ok(()),
         VmStatus::Stopped => bail!(
@@ -395,6 +505,162 @@ fi
 
 # 5. Hand off to AO.
 ao __AO_CMD__
+"#;
+
+/// Daemon variant for `ao start`. Same credentials prefix as
+/// [`BOOTSTRAP_SCRIPT`]; the tail `setsid`s `ao __AO_CMD__` so it
+/// reparents to init and survives this script's exit, then polls
+/// `~/.agent-orchestrator/running.json` for readiness. AO writes that
+/// file atomically after both the dashboard and orchestrator are up
+/// and `register()` has run — the same signal AO's own
+/// `isAlreadyRunning` check reads. On daemon death or timeout we
+/// surface the tail of the captured log so [`crate::tui::ao_task::
+/// AoTask::failure_hint`] can pick the real error line out of it.
+///
+/// The tmux anchor here has no `trap` kill: we want the server alive
+/// after this script exits so AO's orchestrator session can attach
+/// to it. Subsequent invocations are idempotent — `has-session` short-
+/// circuits if a server is already up.
+const BOOTSTRAP_SCRIPT_DAEMON: &str = r#"
+set -e
+mkdir -p "$HOME/.claude"
+umask 077
+
+# 1. Credentials file (claude reads this in interactive mode).
+printf '{"claudeAiOauth":{"accessToken":"%s","scopes":["user:inference"],"subscriptionType":"subscription"}}\n' "$CLAUDE_CODE_OAUTH_TOKEN" > "$HOME/.claude/.credentials.json"
+chmod 600 "$HOME/.claude/.credentials.json"
+
+# 2. Mark onboarding complete in ~/.claude.json.
+node -e '
+const fs = require("fs");
+const path = process.env.HOME + "/.claude.json";
+let data = {};
+try { data = JSON.parse(fs.readFileSync(path, "utf8")); } catch (e) {}
+data.hasCompletedOnboarding = true;
+data.bypassPermissionsModeAccepted = true;
+fs.writeFileSync(path, JSON.stringify(data, null, 2));
+'
+
+# 2b. Suppress the bypass-permissions dialog.
+node -e '
+const fs = require("fs");
+const path = process.env.HOME + "/.claude/settings.json";
+let data = {};
+try { data = JSON.parse(fs.readFileSync(path, "utf8")); } catch (e) {}
+data.skipDangerousModePermissionPrompt = true;
+fs.writeFileSync(path, JSON.stringify(data, null, 2));
+'
+
+# 3. Strip OAuth env so claude takes the file-based auth path.
+unset CLAUDE_CODE_OAUTH_TOKEN
+
+# 4. Anchor tmux server. No `trap` kill — daemon mode needs the
+#    server alive after this script exits so AO can attach its
+#    orchestrator session to it.
+if ! tmux has-session 2>/dev/null; then
+    tmux new-session -d -s _fleet_bootstrap
+fi
+
+# 5. Daemonize `ao __AO_CMD__` and poll for readiness.
+LOG_DIR="$HOME/.agent-orchestrator"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/ao-start.log"
+RUNNING_JSON="$LOG_DIR/running.json"
+
+# Clear the readiness marker so we wait for a fresh write. Safe in
+# the daemon path because fleet only invokes `ao start` when AO is
+# already down (TCP probe on the dashboard port is false). A stale
+# running.json's PID is also self-cleaning inside AO's `getRunning`,
+# so a missed delete here can't promote a stale daemon to "ready".
+rm -f "$RUNNING_JSON"
+: > "$LOG_FILE"
+
+setsid nohup ao __AO_CMD__ > "$LOG_FILE" 2>&1 < /dev/null &
+DAEMON_PID=$!
+
+# 120s ceiling. Cold start with the dashboard bundle cached lands in
+# 5-15s; the headroom covers a constrained host (qemu on battery,
+# paging) plus AO's project-supervisor reconcile cycle (60s) when
+# we need to wait for project registration in running.json.
+#
+# Readiness signal:
+#   - Always: `running.json` exists (the dashboard + orchestrator are up
+#     and AO has called `register()`).
+#   - When WAIT_PROJECT is non-empty: also wait until `running.json.projects`
+#     contains "<WAIT_PROJECT>". AO's `register()` writes `projects:
+#     listLifecycleWorkers()`, and the supervisor only attaches a
+#     lifecycle worker for a project with a non-terminal session — there's
+#     a window where running.json exists but the project isn't polled
+#     yet. Without this wait, an immediate `ao spawn` after `ao start`
+#     fails with "AO is not polling project <foo>".
+WAIT_PROJECT="__WAIT_PROJECT__"
+DEADLINE=$(( $(date +%s) + 120 ))
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    if [ -f "$RUNNING_JSON" ]; then
+        if [ -z "$WAIT_PROJECT" ] || grep -q "\"$WAIT_PROJECT\"" "$RUNNING_JSON"; then
+            exit 0
+        fi
+    fi
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "Error: ao start exited before becoming ready" >&2
+        tail -50 "$LOG_FILE" >&2
+        exit 1
+    fi
+    sleep 1
+done
+if [ -n "$WAIT_PROJECT" ] && [ -f "$RUNNING_JSON" ] && ! grep -q "\"$WAIT_PROJECT\"" "$RUNNING_JSON"; then
+    echo "Error: ao start brought the daemon up but did not register polling for project \"$WAIT_PROJECT\" within 120s" >&2
+else
+    echo "Error: ao start did not become ready within 120s" >&2
+fi
+tail -50 "$LOG_FILE" >&2
+exit 1
+"#;
+
+/// Passthrough variant for `ao start` (non-Claude agents). Same
+/// daemonize-and-poll tail as [`BOOTSTRAP_SCRIPT_DAEMON`], minus the
+/// credentials prefix and OAuth env scrub.
+const PASSTHROUGH_SCRIPT_DAEMON: &str = r#"
+set -e
+
+# Anchor tmux server (no trap — see BOOTSTRAP_SCRIPT_DAEMON).
+if ! tmux has-session 2>/dev/null; then
+    tmux new-session -d -s _fleet_bootstrap
+fi
+
+# Daemonize `ao __AO_CMD__` and poll for readiness.
+LOG_DIR="$HOME/.agent-orchestrator"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/ao-start.log"
+RUNNING_JSON="$LOG_DIR/running.json"
+rm -f "$RUNNING_JSON"
+: > "$LOG_FILE"
+
+setsid nohup ao __AO_CMD__ > "$LOG_FILE" 2>&1 < /dev/null &
+DAEMON_PID=$!
+
+WAIT_PROJECT="__WAIT_PROJECT__"
+DEADLINE=$(( $(date +%s) + 120 ))
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    if [ -f "$RUNNING_JSON" ]; then
+        if [ -z "$WAIT_PROJECT" ] || grep -q "\"$WAIT_PROJECT\"" "$RUNNING_JSON"; then
+            exit 0
+        fi
+    fi
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "Error: ao start exited before becoming ready" >&2
+        tail -50 "$LOG_FILE" >&2
+        exit 1
+    fi
+    sleep 1
+done
+if [ -n "$WAIT_PROJECT" ] && [ -f "$RUNNING_JSON" ] && ! grep -q "\"$WAIT_PROJECT\"" "$RUNNING_JSON"; then
+    echo "Error: ao start brought the daemon up but did not register polling for project \"$WAIT_PROJECT\" within 120s" >&2
+else
+    echo "Error: ao start did not become ready within 120s" >&2
+fi
+tail -50 "$LOG_FILE" >&2
+exit 1
 "#;
 
 /// Quote a string for inclusion in a single-quoted bash word.

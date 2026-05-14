@@ -50,16 +50,36 @@ pub fn build_spec(ao_args: &[String]) -> Result<CommandSpec> {
     }
     let mut args = vec![
         "shell".to_string(),
+        // `--preserve-env` + `LIMA_SHELLENV_ALLOW=AO_GLOBAL_CONFIG`
+        // below forwards fleet's config path to AO inside the guest.
+        // Without this, `ao stop` / `ao session ls` / etc. resolve
+        // `getGlobalConfigPath()` to AO's upstream default
+        // (~/.agent-orchestrator/config.yaml) which doesn't exist on
+        // fleet-managed installs, and the supervisor's reconcile
+        // silently bails on missing-config. Mirror in
+        // `cli::spawn::build_claude_oauth_spec` /
+        // `build_passthrough_spec` keeps every host→guest entrypoint
+        // consistent.
+        "--preserve-env".to_string(),
         "--workdir".to_string(),
         workdir.display().to_string(),
         lima.vm_name().to_string(),
         "ao".to_string(),
     ];
     args.extend(ao_args.iter().cloned());
+    let ao_global_config = crate::ao::config::AoConfig::default_xdg_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     Ok(CommandSpec {
         program: "limactl".to_string(),
         args,
-        env_set: Vec::new(),
+        env_set: vec![
+            ("AO_GLOBAL_CONFIG".to_string(), ao_global_config),
+            (
+                "LIMA_SHELLENV_ALLOW".to_string(),
+                "AO_GLOBAL_CONFIG".to_string(),
+            ),
+        ],
         env_unset: Vec::new(),
     })
 }

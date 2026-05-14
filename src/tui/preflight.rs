@@ -1,23 +1,27 @@
 //! Startup checks that gate the main event loop.
 //!
-//! Fleet has no degraded mode — every host-side operation funnels through
-//! `limactl shell <vm> …`, so running the TUI when prerequisites are wrong
-//! just produces noisy mid-session failures. Phases:
+//! Fleet's TUI is usable without AO running (empty sidebar, Shift+S to
+//! bring the stack up). Preflight catches the things that *can't* be
+//! fixed from inside the TUI:
 //!
 //! 1. `limactl` on `$PATH` (hard fail — nothing else works without it).
-//! 2. `fleet-vm` Lima instance exists.
-//! 3. The instance is running.
-//! 4. `defaults.workspace: worktree` is set in the AO yaml. **Hard
+//! 2. `fleet-vm` Lima instance *exists*. Missing means we need to
+//!    provision from the embedded template — a ~10-minute cloud-init
+//!    flow with a streaming progress modal, so it stays a startup gate.
+//!    *Stopped* is no longer a preflight failure: Shift+S handles VM
+//!    start + AO start as a single `AoTask` chain, so the modal would
+//!    just duplicate work the keybind does one keystroke later.
+//! 3. `defaults.workspace: worktree` is set in the AO yaml. **Hard
 //!    fail** — without it, AO may run an agent against the host
 //!    checkout's working tree, which is the exact scenario fleet
 //!    exists to prevent. Surfaced as a dead-end modal until the user
-//!    edits the yaml.
-//! 5. Tracker tools (`git-bug` inside the VM, `gh` on the host) match the
-//!    plugins configured in `agent-orchestrator.yaml`. **Advisory** — the
-//!    rest of the TUI works without these; only the spawn picker breaks
-//!    for that one project. Surfaced as a continue-able warning so the
-//!    user can fix the AO yaml or install the tool without blocking
-//!    everything else.
+//!    edits the yaml. Local-file check, runs even with a stopped VM.
+//! 4. Tracker tools (`git-bug` inside the VM, `gh` on the host) match
+//!    the plugins configured in `agent-orchestrator.yaml`. **Advisory**
+//!    — the rest of the TUI works without these; only the spawn picker
+//!    breaks for that one project. Only fires when the VM is running
+//!    (the check probes the guest); for a launch-with-stopped-VM the
+//!    user discovers missing trackers via the spawn picker error.
 //!
 //! Tmux is intentionally not probed here. Every tmux call in fleet runs
 //! through `limactl shell <vm> … tmux …`, so tmux's availability is a
@@ -33,15 +37,19 @@ use crate::process::RealProcessInvoker;
 pub(super) const VM_NAME: &str = "fleet-vm";
 
 /// Outcome of [`check`]. Hard failures (`HostBinsMissing`, `VmMissing`,
-/// `VmStopped`, `WorkspaceUnsafe`) short-circuit later phases.
-/// `TrackerWarnings` only arrives after the hard phases pass — the
-/// spawn picker is broken but the rest of the TUI works, so the modal
-/// is continue-able.
+/// `WorkspaceUnsafe`) short-circuit later phases. `TrackerWarnings`
+/// only arrives after the hard phases pass — the spawn picker is
+/// broken but the rest of the TUI works, so the modal is continue-able.
+///
+/// A *stopped* VM is intentionally not a preflight failure: Shift+S
+/// inside the TUI brings VM + AO up together, so blocking startup on
+/// a yes/no modal that does the same thing one keystroke later is
+/// just noise. The TUI launches with empty sidebar + "AO down" badge
+/// and the user starts the stack when they're ready.
 pub enum Preflight {
     Ok,
     HostBinsMissing(Vec<MissingDep>),
     VmMissing,
-    VmStopped,
     /// `defaults.workspace` in the AO yaml is missing or set to
     /// something other than `"worktree"`. `current` carries the
     /// observed value (or `None` when the key is absent) so the
@@ -104,11 +112,15 @@ fn check_with(
         return Preflight::HostBinsMissing(host);
     }
 
-    // Phase 2 + 3: VM lifecycle.
-    match vm_status() {
-        VmStatus::Missing => return Preflight::VmMissing,
-        VmStatus::Stopped => return Preflight::VmStopped,
-        VmStatus::Running => {}
+    // Phase 2: VM existence. Missing means we need to provision from
+    // the embedded template — that's a ~10-minute cloud-init flow with
+    // a streaming progress modal, so it stays a startup gate.
+    // *Stopped* falls through: Shift+S inside the TUI starts the VM
+    // and AO together, no point making the user click through a modal
+    // that does the same thing.
+    let vm = vm_status();
+    if matches!(vm, VmStatus::Missing) {
+        return Preflight::VmMissing;
     }
 
     // Materialize the worker AGENTS.md to its XDG path before any AO
@@ -119,7 +131,7 @@ fn check_with(
         tracing::warn!(error = ?e, "failed to materialize worker AGENTS.md");
     }
 
-    // Phase 4 + 5: AO yaml-driven checks. Loading is best-effort — if
+    // Phase 3 + 4: AO yaml-driven checks. Loading is best-effort — if
     // it doesn't parse / doesn't exist, we skip both checks; the
     // spawn flow will surface the underlying error later.
     let ao = crate::ao::config::AoConfig::load()
@@ -127,18 +139,29 @@ fn check_with(
         .flatten()
         .map(|(_, cfg)| cfg);
     if let Some(cfg) = ao {
-        // Phase 4: workspace isolation gate. Hard fail — fleet exists
+        // Phase 3: workspace isolation gate. Hard fail — fleet exists
         // to keep agents off the host checkout, so anything other
         // than `worktree` blocks the TUI until the user fixes it.
+        // Reads the local yaml, so VM state doesn't matter.
         if !cfg.defaults.workspace_is_worktree() {
             return Preflight::WorkspaceUnsafe {
                 current: cfg.defaults.workspace,
             };
         }
-        // Phase 5: tracker tools.
-        let warnings = check_trackers(&cfg, &has_bin, &in_vm);
-        if !warnings.is_empty() {
-            return Preflight::TrackerWarnings(warnings);
+        // Phase 4: tracker tools. Probes the guest via `limactl shell
+        // command -v <tool>`, so it can only run with a running VM.
+        // When the VM is stopped at launch, fleet skips this check —
+        // trackers live on the VM disk and survive `limactl stop`, so
+        // missing them after a clean shutdown is rare. A user in that
+        // edge case (e.g. VM created from a template predating
+        // tracker provisioning) sees the failure via the spawn
+        // picker's per-action error and can fix it via `fleet
+        // vm-shell` or by restarting fleet.
+        if matches!(vm, VmStatus::Running) {
+            let warnings = check_trackers(&cfg, &has_bin, &in_vm);
+            if !warnings.is_empty() {
+                return Preflight::TrackerWarnings(warnings);
+            }
         }
     }
 
@@ -340,9 +363,40 @@ mod tests {
     }
 
     #[test]
-    fn vm_stopped_when_lima_reports_stopped() {
-        let result = check_with(|_| true, || VmStatus::Stopped, |_| true);
-        assert!(matches!(result, Preflight::VmStopped));
+    fn vm_stopped_falls_through_to_ok() {
+        // VmStopped used to be a hard gate with its own modal; now
+        // Shift+S inside the TUI handles starting VM + AO together,
+        // so the preflight just lets the TUI launch and skips the
+        // tracker check (which needs a running guest).
+        let xdg = tmp_xdg();
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(
+                |_| true,
+                || VmStatus::Stopped,
+                |_| panic!("tracker probe must not run when VM is stopped"),
+            )
+        });
+        assert!(matches!(result, Preflight::Ok));
+    }
+
+    #[test]
+    fn vm_stopped_with_workspace_unsafe_still_blocks() {
+        // Workspace check is local (reads the AO yaml), so it fires
+        // even when the VM isn't running.
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
+            r"
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/sandbox
+",
+        );
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(|_| true, || VmStatus::Stopped, |_| true)
+        });
+        assert!(matches!(result, Preflight::WorkspaceUnsafe { .. }));
     }
 
     #[test]
@@ -482,7 +536,6 @@ projects:
             Preflight::Ok => "Ok",
             Preflight::HostBinsMissing(_) => "HostBinsMissing",
             Preflight::VmMissing => "VmMissing",
-            Preflight::VmStopped => "VmStopped",
             Preflight::WorkspaceUnsafe { .. } => "WorkspaceUnsafe",
             Preflight::TrackerWarnings(_) => "TrackerWarnings",
         }

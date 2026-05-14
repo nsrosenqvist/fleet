@@ -115,7 +115,7 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
         Command::Start {
             no_dashboard,
             no_orchestrator,
-        } => spawn::run_start(no_dashboard, no_orchestrator),
+        } => spawn::run_start(repo_root, no_dashboard, no_orchestrator),
         Command::Stop => passthrough::run(repo_root, &["stop".to_string()]),
         Command::Spawn {
             issue,

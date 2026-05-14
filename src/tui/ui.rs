@@ -70,7 +70,7 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
     } else if let Some(setup) = &app.secret_setup {
         render_secret_setup(frame, setup);
     } else if let Some(prompt) = &app.spawn_prompt {
-        render_spawn_prompt(frame, prompt, app.ao_up);
+        render_spawn_prompt(frame, prompt);
     } else if let Some(c) = &app.confirm {
         render_confirm(frame, c);
     }
@@ -102,10 +102,7 @@ pub(super) fn render_confirm(frame: &mut Frame<'_>, c: &super::app::Confirm) {
     let footer = vec![Line::from(vec![
         modal_key("enter"),
         Span::styled(" ", muted),
-        Span::styled(
-            "Yes",
-            Style::default().fg(OK).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("Yes", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
         Span::styled("   ", muted),
         modal_key("y"),
         Span::styled(" confirm   ", muted),
@@ -1040,28 +1037,6 @@ pub(super) fn render_secret_setup(frame: &mut Frame<'_>, setup: &SecretSetup) {
     );
 }
 
-/// Soft warning lines for "AO daemon down" rendered above the issue
-/// picker inside the spawn modal. Not a gate — AO creates sessions
-/// fine without the daemon, only lifecycle polling (state transitions,
-/// PR status, CI signals) is inactive. Surface it so the user
-/// notices before spawning and knows the remediation (`Shift+S`).
-fn ao_down_warning_lines() -> Vec<Line<'static>> {
-    let muted = Style::default().fg(MUTED);
-    vec![
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("⚠ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
-            Span::styled("AO daemon not running — ", Style::default().fg(WARN)),
-            Span::styled("lifecycle tracking will be off for the new session.", muted),
-        ]),
-        Line::from(vec![
-            Span::styled("  start it with ", muted),
-            key("S"),
-            Span::styled(" before spawn, or proceed without tracking.", muted),
-        ]),
-    ]
-}
-
 /// Body of the spawn modal: the per-state rendering of the issue list
 /// (loading / unsupported tracker / error / loaded). Returns the lines
 /// to insert under the filter input; the caller composes them with
@@ -1128,7 +1103,7 @@ fn spawn_issue_lines(prompt: &SpawnPrompt) -> Vec<Line<'static>> {
     lines
 }
 
-pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt, ao_up: bool) {
+pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt) {
     let muted = Style::default().fg(MUTED);
     let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
 
@@ -1139,9 +1114,6 @@ pub(super) fn render_spawn_prompt(frame: &mut Frame<'_>, prompt: &SpawnPrompt, a
         Span::styled(prompt.buffer.clone(), bold_key),
         Span::styled("█", Style::default().fg(KEY_FG)),
     ]));
-    if !ao_up {
-        lines.extend(ao_down_warning_lines());
-    }
     lines.push(Line::raw(""));
     lines.extend(spawn_issue_lines(prompt));
 
@@ -1542,29 +1514,6 @@ pub(super) fn render_vm_missing(frame: &mut Frame<'_>) {
         )),
     ];
     draw_modal(frame, " vm setup ", WARN, lines, &footer_yn("create"));
-}
-
-/// VM stopped — instance exists, just isn't running. Offers `limactl
-/// start fleet-vm`, which is quick (boot + a small cloud-init replay).
-pub(super) fn render_vm_stopped(frame: &mut Frame<'_>) {
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("○ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                "fleet-vm",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled("Lima instance is stopped", Style::default().fg(MUTED)),
-        ]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Fleet can't reach the ao orchestrator until the VM",
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled("is running.", Style::default().fg(MUTED))),
-    ];
-    draw_modal(frame, " vm setup ", WARN, lines, &footer_yn("start"));
 }
 
 /// Live progress modal painted while [`crate::tui::bringup::BringUp`] is

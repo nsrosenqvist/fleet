@@ -26,11 +26,18 @@ mod terminal;
 mod theme;
 mod tracker_install;
 mod ui;
+mod vm_migrate;
 
 use anyhow::Result;
 use std::path::Path;
 
 pub fn run(repo_root: &Path) -> Result<i32> {
+    // One-time migration for existing fleet-vm instances that predate
+    // the idempotent-provisioning fix in templates/fleet-vm.yaml. Safe
+    // to call every launch — bails immediately when there's nothing to
+    // do. Runs before the alt-screen enters so any tracing output
+    // doesn't get swallowed by the TUI repaint.
+    vm_migrate::run();
     let mut app = app::App::new(repo_root)?;
     terminal::run(&mut app)
 }

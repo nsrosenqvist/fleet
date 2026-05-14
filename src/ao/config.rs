@@ -84,7 +84,12 @@ impl Defaults {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Project {
-    pub name: String,
+    /// Display name. Optional because newer AO schemas write
+    /// `displayName` (captured via the `extra` flatten field) and
+    /// some configs omit human-readable names entirely. Fleet falls
+    /// back to the map key (`projects.<key>:`) when this is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(
         rename = "sessionPrefix",
         default,
@@ -286,7 +291,7 @@ reactions:
         assert_eq!(cfg.defaults.agent.as_deref(), Some("claude-code"));
         assert_eq!(cfg.defaults.runtime.as_deref(), Some("tmux"));
         let sandbox = cfg.projects.get("sandbox").expect("sandbox project");
-        assert_eq!(sandbox.name, "sandbox");
+        assert_eq!(sandbox.name.as_deref(), Some("sandbox"));
         assert_eq!(sandbox.session_prefix.as_deref(), Some("sb"));
         assert_eq!(
             sandbox.tracker.as_ref().map(|t| t.plugin.as_str()),
@@ -354,7 +359,7 @@ reactions:
             projects: BTreeMap::from([(
                 "alpha".to_string(),
                 Project {
-                    name: "alpha".into(),
+                    name: Some("alpha".into()),
                     session_prefix: None,
                     path: project_dir.clone(),
                     default_branch: None,
@@ -384,7 +389,7 @@ reactions:
             projects: BTreeMap::from([(
                 "alpha".to_string(),
                 Project {
-                    name: "alpha".into(),
+                    name: Some("alpha".into()),
                     session_prefix: None,
                     path: project_dir,
                     default_branch: None,
@@ -418,7 +423,7 @@ reactions:
             projects: BTreeMap::from([(
                 "alpha".to_string(),
                 Project {
-                    name: "alpha".into(),
+                    name: Some("alpha".into()),
                     session_prefix: None,
                     path: project_dir,
                     default_branch: None,
@@ -451,7 +456,7 @@ reactions:
                 (
                     "parent".to_string(),
                     Project {
-                        name: "parent".into(),
+                        name: Some("parent".into()),
                         session_prefix: None,
                         path: parent,
                         default_branch: None,
@@ -465,7 +470,7 @@ reactions:
                 (
                     "child".to_string(),
                     Project {
-                        name: "child".into(),
+                        name: Some("child".into()),
                         session_prefix: None,
                         path: child.clone(),
                         default_branch: None,

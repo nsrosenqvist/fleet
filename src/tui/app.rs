@@ -16,9 +16,9 @@ use ratatui::layout::Rect;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::mpsc;
-use std::sync::RwLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -200,7 +200,10 @@ impl Confirm {
     pub(super) fn prompt(&self) -> Vec<String> {
         match self {
             Self::KillSession(id) => vec![format!("Kill session {id}?")],
-            Self::StopAo => vec!["Stop AO orchestrator + dashboard?".to_string()],
+            Self::StopAo => vec![
+                "Stop AO orchestrator + dashboard?".to_string(),
+                "Also shuts down the Lima VM.".to_string(),
+            ],
             Self::RestartAoForOrchestrator => vec![
                 "No orchestrator running. Restart AO to spawn one?".to_string(),
                 "Kills any running workers.".to_string(),
@@ -820,7 +823,17 @@ impl App {
     /// comes from the AO config entry for the current project;
     /// unconfigured / unrecognised plugins fall back to free-text
     /// entry without a list.
+    ///
+    /// Refuses to open when AO is down: `ao spawn` needs the daemon
+    /// running, and the tracker fetch goes through `limactl shell` so
+    /// it errors loudly when the VM is also stopped. Flash the user
+    /// at `Shift+S` instead of opening a modal whose only useful
+    /// state is "tracker error: instance is stopped".
     pub(super) fn open_spawn_prompt(&mut self) {
+        if !self.ao_up {
+            self.flash_err("AO not running — press Shift+S to start AO + VM, then retry");
+            return;
+        }
         let plugin: Option<String> = self
             .current_project_key
             .as_ref()
@@ -1448,7 +1461,7 @@ mod tests {
             projects.insert(
                 format!("k{i}"),
                 Project {
-                    name: format!("k{i}"),
+                    name: Some(format!("k{i}")),
                     session_prefix: Some((*p).to_string()),
                     path: std::path::PathBuf::from("/tmp"),
                     default_branch: None,

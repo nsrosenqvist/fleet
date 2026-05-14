@@ -92,8 +92,8 @@ impl Config {
         if !xdg.is_file() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&xdg)
-            .with_context(|| format!("reading {}", xdg.display()))?;
+        let text =
+            std::fs::read_to_string(&xdg).with_context(|| format!("reading {}", xdg.display()))?;
         toml::from_str::<Self>(&text).with_context(|| format!("parsing {}", xdg.display()))
     }
 

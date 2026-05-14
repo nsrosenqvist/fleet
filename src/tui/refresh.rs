@@ -118,7 +118,10 @@ pub fn spawn(
 
 // Args are passed by value because the thread takes ownership at spawn;
 // clippy::needless_pass_by_value doesn't account for that pattern.
-#[allow(clippy::needless_pass_by_value)]
+// too_many_lines: the loop body is a flat list of timer-gated probe
+// blocks; pulling them into helpers would just split the shared
+// `now`/`next_*` state across function boundaries for no gain.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn refresh_loop(
     _repo_root: PathBuf,
     invoker: Arc<dyn ProcessInvoker>,
@@ -145,6 +148,12 @@ fn refresh_loop(
     let mut next_vm_probe = Instant::now();
     let mut next_events_probe = Instant::now();
     let mut next_meta_probe = Instant::now();
+    // Cached VM status. Every `limactl shell` based probe is gated on
+    // this — running them against a stopped VM only produces the same
+    // "instance is stopped" fatal that drowns the status bar. Starts
+    // pessimistic (`false`) so the very first iteration runs the VM
+    // probe before anything else attempts to talk to the guest.
+    let mut vm_running = false;
     // Sessions we've already pinned to the panel width this run. The
     // orchestrator session (and any AO worker that existed before we
     // started) gets resized on its first capture; subsequent captures
@@ -194,7 +203,55 @@ fn refresh_loop(
         }
 
         let now = Instant::now();
-        if now >= next_status {
+        // VM probe runs first so subsequent probes can short-circuit
+        // when the guest is stopped. Without that gate, every
+        // `limactl shell` based probe fires a fatal-level error every
+        // 1.5s once the VM stops — which floods the status bar.
+        if now >= next_vm_probe {
+            let status = lima.status();
+            let was_running = vm_running;
+            vm_running = matches!(status, VmStatus::Running);
+            if updates.send(RefreshUpdate::VmUp(status)).is_err() {
+                return;
+            }
+            if !vm_running && was_running {
+                // VM just transitioned to stopped/missing. Sessions,
+                // events, and meta have no source of truth anymore —
+                // clear them so the sidebar doesn't carry the
+                // pre-shutdown snapshot while the user looks at it.
+                if updates.send(RefreshUpdate::Sessions(Vec::new())).is_err() {
+                    return;
+                }
+                if updates.send(RefreshUpdate::Events(Vec::new())).is_err() {
+                    return;
+                }
+                if updates
+                    .send(RefreshUpdate::SessionMeta(HashMap::new()))
+                    .is_err()
+                {
+                    return;
+                }
+                // The last status-probe error (if any) is stale now
+                // that we know the cause. Surface a single neutral
+                // line via Sessions clearing instead — refresh_error
+                // is plumbed through Error updates and cleared by the
+                // next successful Sessions snapshot, which the empty
+                // vec above provides.
+                resized.clear();
+            }
+            if vm_running && !was_running {
+                // VM just came back. Trigger every probe immediately
+                // so the UI catches up without waiting out the full
+                // cadence.
+                next_status = now;
+                next_ao_probe = now;
+                next_events_probe = now;
+                next_meta_probe = now;
+            }
+            next_vm_probe = now + VM_PROBE_INTERVAL;
+        }
+
+        if now >= next_status && vm_running {
             // Snapshot pane_size once per tick; if it's drifted since
             // we last pinned, invalidate the per-session cache so the
             // probe re-resizes every session to the new dims.
@@ -223,9 +280,11 @@ fn refresh_loop(
         }
 
         if now >= next_ao_probe {
-            // Cheap TCP probe — the AO dashboard listens on localhost:3000
-            // when `ao start` is up. 200ms timeout so a hung probe doesn't
-            // stall the refresh loop.
+            // Cheap host-side TCP probe — the AO dashboard listens on
+            // localhost:3000 when `ao start` is up. Stays unconditional
+            // (no `vm_running` gate) so it correctly reads `false`
+            // even when the VM is down. 200ms timeout so a hung probe
+            // doesn't stall the refresh loop.
             let up = std::net::TcpStream::connect_timeout(
                 &"127.0.0.1:3000".parse().unwrap(),
                 Duration::from_millis(200),
@@ -237,15 +296,7 @@ fn refresh_loop(
             next_ao_probe = now + AO_PROBE_INTERVAL;
         }
 
-        if now >= next_vm_probe {
-            let status = lima.status();
-            if updates.send(RefreshUpdate::VmUp(status)).is_err() {
-                return;
-            }
-            next_vm_probe = now + VM_PROBE_INTERVAL;
-        }
-
-        if now >= next_events_probe {
+        if now >= next_events_probe && vm_running {
             // Event log: spawns, kills, lifecycle transitions, CI
             // failures, review activity. Errors here are quiet —
             // events are nice-to-have for the bottom-pane ticker;
@@ -260,14 +311,14 @@ fn refresh_loop(
             next_events_probe = now + EVENTS_PROBE_INTERVAL;
         }
 
-        if now >= next_meta_probe {
+        if now >= next_meta_probe && vm_running {
             if run_meta_probe(&lima, &ao_workdir, updates).is_err() {
                 return;
             }
             next_meta_probe = now + META_PROBE_INTERVAL;
         }
 
-        if now >= next_cleanup {
+        if now >= next_cleanup && vm_running {
             if run_cleanup_tick(&ao_workdir, updates).is_err() {
                 return;
             }
@@ -344,12 +395,32 @@ fn run_status_probe(
         }
         Err(e) => {
             let msg = format!("{e:#}").lines().next().unwrap_or("").to_string();
+            // Swallow the "VM is stopped" fatal: it's a transient
+            // state during Shift+X teardown (the AoTask just stopped
+            // the VM but the next VM probe hasn't fired yet to flip
+            // `vm_running` false). Surfacing it as a real refresh
+            // error flashes a scary message that immediately clears
+            // on the next iteration once the VM-probe gate kicks in.
+            if is_vm_stopped_error(&msg) {
+                return Ok(());
+            }
             if updates.send(RefreshUpdate::Error(msg)).is_err() {
                 return Err(());
             }
         }
     }
     Ok(())
+}
+
+/// Pattern-match `limactl`'s "instance is stopped" fatal so we can
+/// distinguish it from a real probe failure. limactl's exact wording:
+///
+///   level=fatal msg="instance \"fleet-vm\" is stopped, run …"
+///
+/// Matching on `is stopped` (with the VM name on either side) is
+/// resilient to color codes, level tags, and locale tweaks.
+fn is_vm_stopped_error(msg: &str) -> bool {
+    msg.contains("is stopped")
 }
 
 /// One per-session meta probe — bulk read of lifecycle JSON inside

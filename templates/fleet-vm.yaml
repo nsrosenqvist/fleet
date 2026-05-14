@@ -6,9 +6,20 @@
 # missing-VM path; after that Lima copies the resolved config into
 # ~/.lima/fleet-vm/ and subsequent starts ignore this file entirely.
 #
-# To re-provision (e.g. after editing the script), the simplest path is
-# `limactl delete fleet-vm` and then re-trigger the bring-up flow.
-# Lima only runs provision blocks on first boot of an instance.
+# Re-provisioning model: Lima's `/var/lib/cloud/scripts/per-boot/00-lima.boot.sh`
+# re-runs every `provision:` block on every VM boot — *not* once, despite
+# how cloud-init usually behaves. Each script below short-circuits via a
+# marker file (`/var/lib/fleet/.system-provisioned-vN` and friends) so
+# the expensive bits (`apt update`, `npm install -g`, gh-dash) run only
+# the first time. To force a refresh after editing the script, bump the
+# `-vN` suffix on the marker so the next boot redoes the work; for a
+# clean rebuild, `limactl delete fleet-vm` and let fleet recreate it.
+#
+# Why marker-based and not "let Lima skip per-boot": Lima 2.x always runs
+# `provision:` blocks every boot — we can't opt out at the Lima layer.
+# Without the marker, every Shift+X → Shift+S cycle inside fleet costs
+# minutes of redundant `npm install` and risks corrupting the install
+# tree if the VM is SIGTERM'd mid-rename (the bug that surfaced this).
 
 images:
   - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
@@ -41,6 +52,16 @@ provision:
     script: |
       #!/bin/bash
       set -eux
+
+      # Idempotency gate. Lima re-runs this script on every boot; the
+      # marker file lets the second-and-later runs short-circuit in
+      # milliseconds instead of redoing apt + npm. Bump the version
+      # suffix when the body below adds/changes anything that needs
+      # to land on existing VMs.
+      PROVISION_MARKER="/var/lib/fleet/.system-provisioned-v1"
+      if [ -f "$PROVISION_MARKER" ]; then
+          exit 0
+      fi
 
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
@@ -81,6 +102,12 @@ provision:
         -o /usr/local/bin/git-bug
       chmod +x /usr/local/bin/git-bug
 
+      # Drop the marker last so a mid-script failure (network blip,
+      # apt mirror flaky) leaves the marker absent and the next boot
+      # retries from the top.
+      mkdir -p "$(dirname "$PROVISION_MARKER")"
+      touch "$PROVISION_MARKER"
+
   # gh-dash extension for the gh CLI. Provides the github tracker's
   # TUI preview (fleet's `t` keybind on github projects). Runs as
   # the lima user since `gh extension install` writes to the user's
@@ -90,9 +117,18 @@ provision:
     script: |
       #!/bin/bash
       set -eux
+      # Same idempotency model as the system script. User-scope marker
+      # lives in $HOME so it persists across reboots without touching
+      # /var/lib (which is system-owned).
+      PROVISION_MARKER="$HOME/.local/share/fleet/.user-provisioned-v1"
+      if [ -f "$PROVISION_MARKER" ]; then
+          exit 0
+      fi
       if command -v gh >/dev/null 2>&1; then
         gh extension install dlvhdr/gh-dash || true
       fi
+      mkdir -p "$(dirname "$PROVISION_MARKER")"
+      touch "$PROVISION_MARKER"
 
 probes:
   # Block `limactl start` from declaring the instance Ready until ao is
