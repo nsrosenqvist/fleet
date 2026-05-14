@@ -15,6 +15,7 @@ mod identity;
 mod lima;
 mod network;
 mod process;
+mod runtime;
 mod secrets;
 mod templates_sync;
 #[cfg(test)]
