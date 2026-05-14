@@ -396,7 +396,6 @@ mod tests {
     const SAMPLE_TEMPLATE: &str = r#"# header
 mounts:
   - location: "~/.agent-orchestrator"
-    mountPoint: "/home/aoworker/.agent-orchestrator"
     writable: true
   - location: "~/.config/fleet"
     writable: false

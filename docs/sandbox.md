@@ -4,39 +4,19 @@ This page covers the **filesystem-isolation** boundary fleet enforces around
 AO workers. The companion documents are [`auth.md`](./auth.md) for identity
 brokering and [`network.md`](./network.md) for egress control.
 
-## Two users in the VM
-
-The `fleet-vm` guest runs two distinct users:
-
-- **`lima`** (UID 1000) — fleet's host-side admin point. Has passwordless
-  sudo via Lima's default cloud-init. Used for `tmux attach` wrapping,
-  tinyproxy reloads, tracker-tool installs, and the ACL sync that lets
-  aoworker write to project mounts. Does **not** run AO or any agent
-  process.
-- **`aoworker`** (UID 2000, primary group `aousers`) — runs AO's
-  orchestrator, every worker tmux pane, and every agent child process.
-  Has **no sudo** and no special group membership. Compromising it
-  bounds the blast radius to aoworker's own files + the bind-mounted
-  worktrees.
-
-Both users are in the `aousers` group (lima as a supplementary), and
-the AO worktree mount has a default ACL granting that group rwx, so the
-TUI's `Enter`-to-attach `cd` flow (which lands as lima) can still walk
-the worktree before exec'ing `sudo -u aoworker tmux attach`.
-
 ## What's mounted
 
 Fleet's Lima template (`templates/fleet-vm.yaml`) bind-mounts the
 following host paths:
 
-| Host path              | Inside VM                            | Mode           | Purpose                                     |
-| ---------------------- | ------------------------------------ | -------------- | ------------------------------------------- |
-| `~/.agent-orchestrator` | `/home/aoworker/.agent-orchestrator` | **writable**   | AO worktrees + session state (matches aoworker's `$HOME` so AO's `homedir()` resolution lands here) |
-| `~/.config/fleet`      | `~/.config/fleet`                    | **read-only**  | AO catalog (`agent-orchestrator.yaml`) + worker AGENTS.md |
-| project source repos   | (same absolute path)                 | **writable**   | Auto-derived from `projects.*.path` in `agent-orchestrator.yaml`. Required so AO's worktree plugin can `git worktree add` against the host repo's `.git/`. ACL-granted to `aoworker` at `fleet start`. |
-| local plugin paths     | (same absolute path)                 | **read-only**  | Auto-derived from `plugins[].path` when `source: local`. Loaded by AO at start. |
+| Host path              | Inside VM            | Mode           | Purpose                                     |
+| ---------------------- | -------------------- | -------------- | ------------------------------------------- |
+| `~/.agent-orchestrator` | `~/.agent-orchestrator` | **writable**   | AO worktrees + session state                |
+| `~/.config/fleet`      | `~/.config/fleet`    | **read-only**  | AO catalog (`agent-orchestrator.yaml`) + worker AGENTS.md |
+| project source repos   | (same absolute path) | **writable**   | Auto-derived from `projects.*.path` in `agent-orchestrator.yaml`. Required so AO's worktree plugin can `git worktree add` against the host repo's `.git/`. |
+| local plugin paths     | (same absolute path) | **read-only**  | Auto-derived from `plugins[].path` when `source: local`. Loaded by AO at start. |
 
-Everything else under aoworker's `$HOME` inside the VM lives on the
+Everything else under the lima user's `$HOME` inside the VM lives on the
 VM's private ext4 disk and never touches the host filesystem. That
 includes:
 
@@ -99,18 +79,13 @@ operator, get to step outside it.
 
 ## What this protects against
 
-- An AO worker (running as `aoworker`) cannot read host `~/.ssh`,
-  `~/.gnupg`, browser profile data, password-manager state, or any
-  unrelated host directory outside the mount table above.
+- An AO worker cannot read host `~/.ssh`, `~/.gnupg`, browser profile
+  data, password-manager state, or any unrelated host directory outside
+  the mount table above.
 - An AO worker cannot write into the host's `~/.config/fleet/` directory.
   Specifically, it cannot append a `projects:` entry to
   `agent-orchestrator.yaml` that points at an arbitrary host path and
   thereby get a "legitimate" worktree there on the next spawn.
-- An AO worker has **no sudo** inside the VM. It cannot `apt install`
-  things, edit `/etc`, kill the tinyproxy systemd unit, or read other
-  users' files via `sudo cat`. The `lima` user retains sudo (necessary
-  for fleet's host-side admin path; see "Two users in the VM" above)
-  but is not where agent code runs.
 - The host's own `claude` CLI is unaffected by what fleet does inside the
   VM — VM-side mutations to `~/.claude/.credentials.json`, `~/.claude.json`,
   or `~/.claude/settings.json` (e.g. `skipDangerousModePermissionPrompt`)
@@ -118,8 +93,16 @@ operator, get to step outside it.
 
 ## What it does NOT protect against
 
+- **In-VM privilege escalation.** AO and every worker process run as
+  Lima's default user, which has passwordless sudo. A worker that goes
+  off-script can install packages, edit `/etc`, kill tinyproxy, etc.
+  inside the VM. Splitting AO off onto a separate non-sudo user is
+  tracked as "Drop-priv (deferred)" in `docs/security-model.md`'s
+  roadmap; it's blocked today on Lima's mount layer not exposing
+  POSIX ACLs, which a non-root second user needs to write the AO
+  worktree mount.
 - **Other workers in the same VM.** All AO sessions inside one
-  `fleet-vm` share the `aoworker` UID. fleet does not isolate workers
+  `fleet-vm` share the lima user. fleet does not isolate workers
   from each other.
 - **Network egress.** See [`network.md`](./network.md) for the (opt-in)
   egress allow-list. Phase 1 leaves the VM with unrestricted outbound
@@ -127,13 +110,6 @@ operator, get to step outside it.
 - **The Lima kernel boundary itself.** Lima is a QEMU-backed VM; a kernel
   escape would break out. fleet does not add nested sandboxing inside the
   guest (no seccomp, no AppArmor profile, no rootless container layer).
-- **A compromised `lima`.** lima keeps broad passwordless sudo. fleet's
-  threat model treats lima as host-side admin infrastructure (its only
-  actions are short, fleet-driven scripts that touch `/etc/tinyproxy/`,
-  install tracker binaries, and shell-out to aoworker). If someone
-  pivots into a lima shell via a different channel they have root
-  inside the VM. Narrowing lima's sudo to per-command allowlists is
-  tracked in the roadmap.
 
 ## Upgrading an existing VM
 

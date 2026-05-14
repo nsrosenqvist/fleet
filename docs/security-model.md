@@ -29,17 +29,16 @@ does not protect against.
 
 Three independent layers. Each is documented in its own page.
 
-### 1. Filesystem + privilege separation — [`sandbox.md`](./sandbox.md)
+### 1. Filesystem — [`sandbox.md`](./sandbox.md)
 
 - Host home **is not** bind-mounted into the VM.
 - Mounts that cross the boundary: `~/.agent-orchestrator/`,
   `~/.config/fleet/` (read-only), plus the project source repos
-  auto-derived from `projects.*.path` (writable, ACL'd) and local
-  plugin paths (read-only).
-- The VM runs two users. `lima` (uid 1000, has sudo) is fleet's
-  host-side admin point. `aoworker` (uid 2000, no sudo) runs AO and
-  every agent process. A compromised worker can't escalate inside
-  the VM.
+  auto-derived from `projects.*.path` and local plugin paths
+  (read-only).
+- AO and every worker process run as Lima's default user, which keeps
+  passwordless sudo. Splitting AO off onto a non-sudo `aoworker` user
+  is on the roadmap — see "Drop-priv (deferred)" below.
 
 **What it protects against:** an agent reading or writing host
 `~/.ssh`, `~/.gnupg`, `~/.config/gh`, host `~/.claude`, browser
@@ -88,8 +87,10 @@ These are NOT what fleet's security model promises today. Calling them
 out so users can build their own layered controls if they need them:
 
 - **Multi-tenant isolation between workers.** All AO workers inside
-  one `fleet-vm` share the `aoworker` UID. fleet does not isolate
+  one `fleet-vm` share Lima's default user. fleet does not isolate
   workers from each other.
+- **In-VM privilege escalation.** AO and worker processes run with
+  passwordless sudo today. See "Drop-priv (deferred)" below.
 - **Anti-exfiltration against a malicious agent.** The network
   allowlist is cooperative, not enforcing.
 - **Detection / auditing.** fleet does not run an in-VM intrusion
@@ -105,11 +106,18 @@ out so users can build their own layered controls if they need them:
 
 Tracked in the repo's issue tracker; the broad themes:
 
-- **Narrow lima's sudo** — replace lima's broad passwordless sudo
-  with a per-command allowlist (apt-get, install /usr/local/bin/...,
-  setfacl, systemctl reload tinyproxy, `sudo -u aoworker` for the
-  bash/tmux entries already permitted). A compromised lima could
-  still run those commands but couldn't pivot to arbitrary root.
+- **Drop-priv (deferred)** — run AO + every worker as a separate
+  non-sudo user (`aoworker`), keeping Lima's default user as fleet's
+  admin point only. Phase 5 attempted this and was blocked: neither
+  9p nor virtiofs (Lima's two mount-type options on Linux hosts) supports
+  POSIX ACL passthrough on the host bind mount in current QEMU builds,
+  so a second non-root user can't be granted write access to the AO
+  worktree dir. Likely paths forward: upstream ACL support in
+  virtiofs/QEMU, a host-side chgrp-and-chmod-g+rwx setup at fleet
+  start, or a different mount mechanism (NFS with idmap, reverse-sshfs
+  with aoworker SSH). Code-side hooks for the two-user model
+  (`sudo -u aoworker` wraps, sudoers-drop-in, mount drift detection)
+  were rolled back from Phase 5 once the ACL gap was confirmed.
 - **Kernel-level egress enforcement** (`network.md` v2) — nftables
   ruleset forcing all outbound traffic through tinyproxy (or dropping
   it), so `unset HTTPS_PROXY` no longer bypasses the allowlist.

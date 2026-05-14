@@ -34,24 +34,21 @@ cpus: 4
 memory: "4GiB"
 disk: "30GiB"
 
-# virtiofs supports POSIX ACL passthrough; 9p (Lima's default on Linux
-# in some configurations) does not. Phase 5 grants the aoworker user
-# rwx on the AO worktree mount via `setfacl`, which silently no-ops on
-# 9p with "Operation not supported". Force virtiofs so the ACL takes.
+# Force virtiofs for faster file IO than 9p on Linux hosts. (The two-user
+# experiment that originally needed this also needed POSIX ACL passthrough
+# on the mount, which neither 9p nor virtiofs supports in this Lima/QEMU
+# build — see docs/security-model.md → "Drop-priv (deferred)".)
 mountType: virtiofs
 
 # Filesystem isolation. The host home is intentionally NOT bind-mounted.
-# AO workers run as a dedicated `aoworker` user (uid 2000, no sudo)
-# inside the VM, distinct from the `lima` user that fleet's host-side
-# admin actions use. The mounts cross the boundary at exactly two paths:
+# AO + every worker process runs as the default Lima user inside the
+# guest. Only the two paths AO actually needs cross the boundary, plus
+# per-project source repos auto-spliced in by fleet's bring-up code:
 #
-#   1. ~/.agent-orchestrator/ — AO worktrees + session state. Materialized
-#      inside the VM at /home/aoworker/.agent-orchestrator/ via
-#      `mountPoint:`, so AO (which expands $HOME/.agent-orchestrator via
-#      `os.homedir()`) finds the bind-mounted host path under aoworker's
-#      $HOME. Both `aoworker` (primary group `aousers`) and `lima`
-#      (supplementary group `aousers`) can read+write via the ACL set in
-#      the aoworker provisioning step.
+#   1. ~/.agent-orchestrator/ — AO worktrees + session state. Writable.
+#      The same absolute path resolves on both host and guest so
+#      `cd ~/.agent-orchestrator/projects/<p>/worktrees/<id>` works
+#      identically from either side.
 #
 #   2. ~/.config/fleet/ — the AO catalog (agent-orchestrator.yaml) and
 #      worker AGENTS.md. **Read-only**: a worker must not be able to
@@ -66,11 +63,10 @@ mountType: virtiofs
 # Identity material (Claude OAuth, GH_TOKEN, .gitconfig) is brokered in
 # at `fleet start` time via env vars and written to VM-private files
 # inside the bootstrap script — see src/cli/spawn.rs::BOOTSTRAP_SCRIPT.
-# Everything else under aoworker's $HOME lives on the VM's private
+# Everything else under the lima user's $HOME lives on the VM's private
 # ext4 and never touches the host filesystem.
 mounts:
   - location: "~/.agent-orchestrator"
-    mountPoint: "/home/aoworker/.agent-orchestrator"
     writable: true
   - location: "~/.config/fleet"
     writable: false
@@ -279,83 +275,17 @@ provision:
       rm -f /var/lib/fleet/.user-provisioned-*
       touch "$MARKER"
 
-  # Drop-priv: create the `aoworker` user that AO + all worker processes
-  # actually run as. The `lima` user keeps passwordless sudo (Lima's
-  # default; necessary because `limactl shell` has no --user flag in
-  # 2.x) and is fleet's host-side admin point. aoworker has no sudo and
-  # no special group membership.
+  # Drop-priv (separate `aoworker` user, no sudo for agent processes)
+  # is **deferred**. Attempting it in Phase 5 hit a wall: neither
+  # Lima's 9p nor virtiofs mount type supports POSIX ACLs on the
+  # host bind mount in this Lima/QEMU build, so there's no way to
+  # grant a second in-VM user rwx on the AO worktree dir. Without
+  # that, a non-root aoworker can't write the worktrees AO needs.
   #
-  # Layout:
-  #   - group `aousers` (gid 2000): shared between lima + aoworker so
-  #     both can read+write the AO worktree mount.
-  #   - user `aoworker` (uid 2000): primary group aousers, home
-  #     /home/aoworker, no shell login keys.
-  #   - lima joined to aousers as a supplementary group.
-  #   - /etc/sudoers.d/fleet-aoworker: lima → aoworker via bash/tmux
-  #     only, with the brokered identity env vars preserved.
-  #   - ACL on /home/aoworker/.agent-orchestrator/ (the AO mount target)
-  #     so both users can rwx; default ACL inherits to new files.
-  #
-  # Idempotent via /var/lib/fleet/.aoworker-provisioned-v1; bump the
-  # suffix if the body changes to force a re-run on existing VMs.
-  - mode: system
-    script: |
-      #!/bin/bash
-      set -eu
-      PROVISION_MARKER="/var/lib/fleet/.aoworker-provisioned-v2"
-      if [ -f "$PROVISION_MARKER" ]; then
-          exit 0
-      fi
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get install -y acl
-
-      # Lima creates the default user dynamically from the host's
-      # username (typically uid 1000), with home `/home/<host-user>`
-      # or `/home/<host-user>.linux` / `.guest` if there's a naming
-      # conflict. Pin to uid 1000 rather than a hard-coded name so the
-      # provisioning works regardless of whose machine fleet runs on.
-      LIMA_USER="$(getent passwd 1000 | cut -d: -f1)"
-      if [ -z "$LIMA_USER" ]; then
-          echo "fleet-vm provisioning: no user at uid 1000 — Lima didn't create the default user" >&2
-          exit 1
-      fi
-
-      getent group aousers >/dev/null || groupadd --system --gid 2000 aousers
-      getent passwd aoworker >/dev/null || useradd \
-        --uid 2000 \
-        --gid aousers \
-        --create-home \
-        --home-dir /home/aoworker \
-        --shell /bin/bash \
-        aoworker
-
-      # lima-user needs aousers as a supplementary group so it can read
-      # the AO worktree mount (TUI `Enter`-to-attach `cd`s into the
-      # worktree before exec'ing `sudo -u aoworker tmux attach`).
-      usermod -aG aousers "$LIMA_USER"
-
-      # The bind mount lands at /home/aoworker/.agent-orchestrator
-      # because the `mounts:` block above sets `mountPoint:`. The dir
-      # is owned by the host user inside the VM (uid 1000), and the
-      # mount type is virtiofs (forced via top-level `mountType:`)
-      # which DOES support POSIX ACLs — so root can grant aousers rwx
-      # without needing to chown the mount itself.
-      setfacl -R -m  g:aousers:rwX /home/aoworker/.agent-orchestrator
-      setfacl -R -d -m g:aousers:rwX /home/aoworker/.agent-orchestrator
-
-      # Sudoers drop-in: lima-user can run /bin/bash and /usr/bin/tmux
-      # as aoworker (no other targets). env_keep preserves the env vars
-      # fleet brokers in from the host through `limactl --preserve-env`
-      # → lima → `sudo -u aoworker`.
-      cat > /etc/sudoers.d/fleet-aoworker <<SUDOERS
-      Defaults!/bin/bash, /usr/bin/tmux env_keep += "CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN FLEET_GITCONFIG_B64 AO_GLOBAL_CONFIG HTTPS_PROXY HTTP_PROXY NO_PROXY TERM LIMA_SHELLENV_ALLOW"
-      $LIMA_USER ALL=(aoworker) NOPASSWD: /bin/bash, /usr/bin/tmux
-      SUDOERS
-      chmod 0440 /etc/sudoers.d/fleet-aoworker
-      visudo -c -f /etc/sudoers.d/fleet-aoworker
-
-      mkdir -p "$(dirname "$PROVISION_MARKER")"
-      touch "$PROVISION_MARKER"
+  # See docs/security-model.md → "Drop-priv (deferred)" for the
+  # state of the art and likely future paths (Lima/virtiofs ACL
+  # support, host-side chown of the bind mount, or a different
+  # mount mechanism entirely).
 
 probes:
   # Block `limactl start` from declaring the instance Ready until

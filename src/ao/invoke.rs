@@ -20,7 +20,7 @@ impl<'a> Ao<'a> {
 
     /// `ao status --json` — all sessions, with live activity hints.
     pub fn status(&self) -> Result<AoResponse<SessionInfo>> {
-        let raw = self.lima.shell_as_aoworker(
+        let raw = self.lima.shell(
             self.workdir,
             vec!["ao".to_string(), "status".to_string(), "--json".to_string()],
         )?;
@@ -29,7 +29,7 @@ impl<'a> Ao<'a> {
 
     /// `ao session ls --json` — session metadata including worktree paths.
     pub fn session_ls(&self) -> Result<AoResponse<SessionInfo>> {
-        let raw = self.lima.shell_as_aoworker(
+        let raw = self.lima.shell(
             self.workdir,
             vec![
                 "ao".to_string(),
@@ -46,7 +46,7 @@ impl<'a> Ao<'a> {
     /// workers. Required for fleet's grouped sidebar; the plain
     /// `ao status --json` omits orchestrators.
     pub fn session_ls_all(&self) -> Result<AoResponse<SessionInfo>> {
-        let raw = self.lima.shell_as_aoworker(
+        let raw = self.lima.shell(
             self.workdir,
             vec![
                 "ao".to_string(),
@@ -78,7 +78,7 @@ impl<'a> Ao<'a> {
     /// (a fresh VM with no AO state yet). Sessions whose JSON fails
     /// to parse are skipped silently.
     pub fn session_meta_bulk(&self) -> Result<HashMap<String, SessionMeta>> {
-        let raw = self.lima.shell_as_aoworker(
+        let raw = self.lima.shell(
             self.workdir,
             vec![
                 "node".to_string(),
@@ -108,7 +108,7 @@ impl<'a> Ao<'a> {
     /// caller picks a sensible time window since the log is
     /// otherwise unbounded.
     pub fn events_list(&self, since: &str, limit: u32) -> Result<Vec<EventInfo>> {
-        let raw = self.lima.shell_as_aoworker(
+        let raw = self.lima.shell(
             self.workdir,
             vec![
                 "ao".to_string(),

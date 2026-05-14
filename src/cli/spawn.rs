@@ -26,7 +26,6 @@ const PASSTHROUGH_ENV_ALLOW: &str =
 pub fn run_start(repo_root: &Path, no_dashboard: bool, no_orchestrator: bool) -> Result<i32> {
     ensure_vm_running()?;
     sync_network_filter()?;
-    sync_aoworker_mount_acls();
     // Resolve the project from cwd so AO sets up lifecycle polling for
     // it on startup. Without an explicit project, AO's project-supervisor
     // reconcile loop is the only path that registers a project in
@@ -52,58 +51,6 @@ pub fn sync_network_filter() -> Result<()> {
         tracing::warn!(error = ?e, "tinyproxy filter sync failed; using previous filter");
     }
     Ok(())
-}
-
-/// Apply a `setfacl -m u:aoworker:rwX` (recursive + default) on every
-/// writable project source mount. Lima's bind mount maps host UID
-/// 1000 (the host user / lima) into the guest, so aoworker (UID
-/// 2000) needs explicit ACL grant to write into the worktree
-/// admin files git creates under `<host-repo>/.git/worktrees/`.
-///
-/// Idempotent — re-applying the same ACL is a no-op at the kernel
-/// level. Runs as lima via sudo (lima has passwordless sudo via
-/// Lima's default cloud-init). Best-effort: log + continue on
-/// failure, since a stale ACL just means worker commits fail in a
-/// noisy way the user can investigate, not that fleet should refuse
-/// to start.
-///
-/// ACLs are stored on the host's underlying filesystem; once
-/// applied they survive VM rebuilds. We re-apply on every start so
-/// a newly-added project (whose path joined the AO catalog after
-/// the VM was created) picks up the right ACL without a
-/// `setfacl` ritual the user has to remember.
-pub fn sync_aoworker_mount_acls() {
-    let Ok(Some((_, ao))) = crate::ao::config::AoConfig::load() else {
-        return;
-    };
-    let writable_paths: Vec<String> = ao
-        .projects
-        .values()
-        .map(|p| p.path.display().to_string())
-        .collect();
-    if writable_paths.is_empty() {
-        return;
-    }
-    let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
-    let lima = Lima::new(invoker, "fleet-vm");
-    let Some(workdir) = crate::ao::config::AoConfig::workdir() else {
-        return;
-    };
-    let quoted: Vec<String> = writable_paths
-        .iter()
-        .map(|p| shell_quote_single(p))
-        .collect();
-    let paths_argv = quoted.join(" ");
-    let script = format!(
-        r#"set -eu
-for p in {paths_argv}; do
-    sudo setfacl -R  -m  u:aoworker:rwX "$p" 2>/dev/null || true
-    sudo setfacl -R  -d  -m u:aoworker:rwX "$p" 2>/dev/null || true
-done"#
-    );
-    if let Err(e) = lima.shell(&workdir, vec!["bash".to_string(), "-c".to_string(), script]) {
-        tracing::warn!(error = ?e, "aoworker mount ACL sync failed; worker may not be able to write to project mount");
-    }
 }
 
 pub fn run_spawn(
@@ -429,7 +376,16 @@ fn build_claude_oauth_spec(
     );
     push_network_env(&mut env_set, &mut allow_keys, cfg);
     env_set.push(("LIMA_SHELLENV_ALLOW".to_string(), allow_keys.join(",")));
-    let args = build_aoworker_argv(&workdir, lima.vm_name(), &bash_script, &allow_keys);
+    let args = vec![
+        "shell".to_string(),
+        "--preserve-env".to_string(),
+        "--workdir".to_string(),
+        workdir.display().to_string(),
+        lima.vm_name().to_string(),
+        "bash".to_string(),
+        "-c".to_string(),
+        bash_script,
+    ];
     Ok(CommandSpec {
         program: "limactl".to_string(),
         args,
@@ -560,67 +516,22 @@ fn build_passthrough_spec(
     );
     push_network_env(&mut env_set, &mut allow_keys, &cfg);
     env_set.push(("LIMA_SHELLENV_ALLOW".to_string(), allow_keys.join(",")));
-    let args = build_aoworker_argv(&workdir, lima.vm_name(), &bash_script, &allow_keys);
+    let args = vec![
+        "shell".to_string(),
+        "--preserve-env".to_string(),
+        "--workdir".to_string(),
+        workdir.display().to_string(),
+        lima.vm_name().to_string(),
+        "bash".to_string(),
+        "-c".to_string(),
+        bash_script,
+    ];
     Ok(CommandSpec {
         program: "limactl".to_string(),
         args,
         env_set,
         env_unset: Vec::new(),
     })
-}
-
-/// Compose the `limactl shell` argv that lands the bootstrap script
-/// inside the VM as the `aoworker` user.
-///
-/// Today's chain (Phase 5):
-///
-/// ```text
-/// limactl shell --preserve-env --workdir <wd> fleet-vm \
-///     sudo -u aoworker --preserve-env=<keys> \
-///     bash -c '<bash_script>'
-/// ```
-///
-/// The lima user (default in `limactl shell`) has narrow sudo via
-/// `/etc/sudoers.d/fleet-aoworker` (provisioned by `templates/fleet-vm.yaml`)
-/// that allows exactly `lima ALL=(aoworker) NOPASSWD: /bin/bash, /usr/bin/tmux`.
-/// The matching `env_keep +=` in that sudoers drop-in is the *gate*
-/// for which env vars survive the sudo hop — `--preserve-env=<keys>`
-/// on the sudo command line is necessary but not sufficient unless
-/// each key is also in `env_keep`. We pass the explicit allowlist on
-/// the command line so an unexpected expansion of `allow_keys`
-/// doesn't silently grant new vars; the sudoers drop-in is the
-/// authoritative ceiling.
-///
-/// `LIMA_SHELLENV_ALLOW` itself is excluded from the sudo
-/// `--preserve-env=` list. It controls what crosses Lima's
-/// host→guest boundary, not the lima→aoworker boundary; once we're
-/// inside the guest it's just clutter that pollutes aoworker's env.
-fn build_aoworker_argv(
-    workdir: &Path,
-    vm_name: &str,
-    bash_script: &str,
-    allow_keys: &[&'static str],
-) -> Vec<String> {
-    let preserve_env = allow_keys
-        .iter()
-        .copied()
-        .filter(|k| *k != "LIMA_SHELLENV_ALLOW")
-        .collect::<Vec<_>>()
-        .join(",");
-    vec![
-        "shell".to_string(),
-        "--preserve-env".to_string(),
-        "--workdir".to_string(),
-        workdir.display().to_string(),
-        vm_name.to_string(),
-        "sudo".to_string(),
-        "-u".to_string(),
-        "aoworker".to_string(),
-        format!("--preserve-env={preserve_env}"),
-        "bash".to_string(),
-        "-c".to_string(),
-        bash_script.to_string(),
-    ]
 }
 
 /// CLI-layer precondition: the Lima VM must be running before we hand
