@@ -14,6 +14,8 @@ This file is **not** the rule sheet AO worker sessions read when they're spawned
 
 The repo also contains one Node package: `packages/tracker-git-bug/`. It's a [git-bug](https://github.com/git-bug/git-bug) tracker plugin AO loads as an ESM module at runtime. That's the only TypeScript code here; the plugin contract (`@aoagents/ao-core`'s `Tracker` interface) forces it to be TS, so it lives in its own package with its own tooling (oxc, vitest, tsc).
 
+The user-facing **security model** is documented under [`docs/`](./docs/) — start with [`docs/security-model.md`](./docs/security-model.md) for the umbrella view of the three boundaries (filesystem, identity, network) and what each does and does not protect against. The per-boundary deep-dives are [`docs/sandbox.md`](./docs/sandbox.md), [`docs/auth.md`](./docs/auth.md), and [`docs/network.md`](./docs/network.md).
+
 ## Workspace model
 
 The host repo is never an agent's cwd. Every AO worker session runs inside a dedicated git worktree on a dedicated branch (`agent/<issue-id>`), created by AO when the session is spawned.
