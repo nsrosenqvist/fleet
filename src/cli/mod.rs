@@ -15,6 +15,7 @@ pub mod config_cmd;
 pub mod init;
 pub mod passthrough;
 pub mod runtime;
+pub mod sessions;
 pub mod spawn;
 pub mod ui;
 pub mod vm;
@@ -121,6 +122,29 @@ pub enum Command {
         #[command(subcommand)]
         sub: WorkflowSub,
     },
+
+    /// v2 session inspection — list / show / logs against
+    /// `.fleet/sessions/<id>/`. Sibling to (not a replacement for)
+    /// the AO-passthrough `session` command above.
+    Sessions {
+        #[command(subcommand)]
+        sub: SessionsSub,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionsSub {
+    /// List sessions discovered under `.fleet/sessions/`.
+    List,
+    /// Print a session's metadata and the log file list.
+    Show { id: String },
+    /// Print captured logs for a session. With `--node`, only that node's
+    /// log; without, every log preceded by a `=== <node> ===` header.
+    Logs {
+        id: String,
+        #[arg(long)]
+        node: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -221,6 +245,11 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
             WorkflowSub::List => workflow::run_list(),
             WorkflowSub::Validate { name } => workflow::run_validate(&name),
             WorkflowSub::Run { name } => workflow::run_run(&name),
+        },
+        Command::Sessions { sub } => match sub {
+            SessionsSub::List => sessions::run_list(),
+            SessionsSub::Show { id } => sessions::run_show(&id),
+            SessionsSub::Logs { id, node } => sessions::run_logs(&id, node.as_deref()),
         },
     }
 }
