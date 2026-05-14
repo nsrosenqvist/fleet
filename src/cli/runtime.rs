@@ -5,14 +5,30 @@
 //! diagnostic the user runs when their pipeline is the new devcontainer +
 //! Podman/Apple Container stack.
 //!
-//! All formatting goes through a pure function ([`render_doctor`]) so the CLI
-//! is a thin wire-up over a fully-tested formatter. The `run_doctor` entry
-//! point hands in a real `ProcessInvoker`; tests hand in mocks.
+//! `runtime build/up/exec/stop/inspect` drive the chosen adapter end-to-end
+//! against the current repo's `.fleet/config.yaml`. They're the manual
+//! escape hatch users reach for when something feels off — and the surface
+//! through which fleet developers can iterate on adapter behaviour before
+//! the workflow engine wraps everything.
+//!
+//! All formatting goes through pure functions (e.g. [`render_doctor`]) so the
+//! CLI is a thin wire-up over fully-tested formatters. Entry points hand in a
+//! real `ProcessInvoker`; tests hand in mocks.
 
+use anyhow::{Context, Result, anyhow};
 use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::process::RealProcessInvoker;
+use crate::process::{ProcessInvoker, RealProcessInvoker};
+use crate::repo;
+use crate::repo_config::{AdapterChoice, RepoConfig};
+use crate::runtime::ContainerSpec;
 use crate::runtime::detect::{BackendKind, BackendStatus, ProbeReport, probe};
+use crate::runtime::devcontainer::Devcontainer;
+use crate::runtime::devcontainer_cli::{DevcontainerCli, Engine};
+use crate::runtime::factory::build_adapter;
+use crate::runtime::{ContainerId, ContainerState, ExecOpts, RuntimeAdapter};
 
 /// CLI entry point for `fleet runtime doctor`. Probes the host and writes
 /// the report to stdout. Returns the exit code: 0 if a usable engine was
@@ -26,6 +42,177 @@ pub fn run_doctor() -> i32 {
     let rendered = render_doctor(&report);
     println!("{rendered}");
     i32::from(!report.is_usable())
+}
+
+/// CLI entry point for `fleet runtime build`. Loads `.fleet/config.yaml`,
+/// probes, picks the adapter, builds the image, prints the resulting
+/// `ImageId` on a line of its own (scriptable: callers can capture stdout).
+pub fn run_build() -> Result<i32> {
+    let ctx = Context_::load()?;
+    let dc = load_devcontainer(&ctx)?;
+    let image = ctx.adapter.ensure_image(&dc)?;
+    println!("{image}");
+    Ok(0)
+}
+
+/// CLI entry point for `fleet runtime up`. Starts (or replaces) the container
+/// for the current repo's devcontainer. Prints the container id on stdout
+/// and a one-line confirmation on stderr so scripting paths can capture id
+/// while users still see what happened.
+pub fn run_up() -> Result<i32> {
+    let ctx = Context_::load()?;
+    let dc = load_devcontainer(&ctx)?;
+    let image = ctx.adapter.ensure_image(&dc)?;
+    let artifacts = ctx.artifacts_dir()?;
+    let spec = ContainerSpec {
+        image,
+        workspace: ctx.repo_root.clone(),
+        artifacts,
+        env: Vec::new(),
+        command: None,
+    };
+    let id = ctx.adapter.start_container(&spec)?;
+    eprintln!("fleet runtime up: started container in {}", ctx.repo_root.display());
+    println!("{id}");
+    Ok(0)
+}
+
+/// CLI entry point for `fleet runtime exec -- <argv>`. Bypasses the
+/// adapter trait (whose in-memory container→workspace mapping doesn't
+/// survive across CLI invocations) and addresses the running container by
+/// workspace folder through [`DevcontainerCli`] directly. Returns the exec
+/// handle's exit code so the caller can `&&`-chain with other commands.
+pub fn run_exec(argv: &[String]) -> Result<i32> {
+    if argv.is_empty() {
+        return Err(anyhow!(
+            "fleet runtime exec: missing command — pass argv after `--`"
+        ));
+    }
+    let ctx = Context_::load()?;
+    let engine = engine_for_adapter(&ctx)?;
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+    let cli = DevcontainerCli::new(invoker, engine);
+    let h = cli.exec(&ctx.repo_root, argv, ExecOpts::default())?;
+    // Forward stdout to ours; the adapter's exec handle is lossy on stderr
+    // and exit code (see DevcontainerCli::exec docs). For manual use that
+    // tradeoff is acceptable; richer streaming arrives with the workflow
+    // engine.
+    print!("{}", h.stdout);
+    if !h.stderr.is_empty() {
+        eprint!("{}", h.stderr);
+    }
+    Ok(h.exit_code)
+}
+
+/// CLI entry point for `fleet runtime stop <id>`. Idempotent — stopping
+/// an unknown container is not an error, matching the trait contract.
+pub fn run_stop(id: &str) -> Result<i32> {
+    let ctx = Context_::load()?;
+    ctx.adapter.stop(&ContainerId::new(id))?;
+    eprintln!("fleet runtime stop: {id} stopped");
+    Ok(0)
+}
+
+/// CLI entry point for `fleet runtime inspect <id>`. Prints the container
+/// state on a single line. Exit code mirrors the state:
+///   - 0 for running
+///   - 0 for exited{0}
+///   - the exit code for exited{n}
+///   - 2 for dead / unknown (caller-visible "weird state")
+pub fn run_inspect(id: &str) -> Result<i32> {
+    let ctx = Context_::load()?;
+    let state = ctx.adapter.inspect(&ContainerId::new(id))?;
+    let (line, code) = render_inspect(&state);
+    println!("{line}");
+    Ok(code)
+}
+
+/// Stable rendering + exit-code mapping for [`ContainerState`]. Pure so
+/// it's unit-testable; the CLI's `run_inspect` is a thin wrapper.
+#[must_use]
+pub fn render_inspect(state: &ContainerState) -> (String, i32) {
+    match state {
+        ContainerState::Created => ("created".to_string(), 0),
+        ContainerState::Running => ("running".to_string(), 0),
+        ContainerState::Exited { code } => (format!("exited {code}"), *code),
+        ContainerState::Dead => ("dead".to_string(), 2),
+        ContainerState::Unknown(s) => (format!("unknown ({s})"), 2),
+    }
+}
+
+/// Engine selector mirroring [`build_adapter`]'s post-resolution decision.
+/// Used by `run_exec` to construct a [`DevcontainerCli`] directly without
+/// re-running the full factory.
+fn engine_for_adapter(ctx: &Context_) -> Result<Engine> {
+    match ctx.adapter.name() {
+        "podman" => Ok(Engine::Podman),
+        "docker" => Ok(Engine::Docker),
+        "apple-container" => Ok(Engine::AppleContainer),
+        "local" => Err(anyhow!(
+            "fleet runtime exec: not supported on the `local` adapter — \
+             use plain shell since there's no container to enter"
+        )),
+        other => Err(anyhow!("internal: unrecognised adapter `{other}`")),
+    }
+}
+
+/// Resolved environment for every `fleet runtime …` command: repo root,
+/// loaded config, probe report, and a built adapter. Held in a small
+/// struct so the entry points don't repeat the same five lines.
+struct Context_ {
+    repo_root: PathBuf,
+    config: RepoConfig,
+    adapter: Box<dyn RuntimeAdapter>,
+}
+
+impl Context_ {
+    fn load() -> Result<Self> {
+        let cwd = std::env::current_dir().context("reading current directory")?;
+        let repo_root = repo::fleet_root(&cwd);
+        let config = RepoConfig::load(repo_root.join(".fleet/config.yaml"))
+            .context("loading .fleet/config.yaml")?;
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+        let report = probe(invoker.as_ref());
+        let adapter = build_adapter(&config.runtime, &report, invoker)?;
+        Ok(Self {
+            repo_root,
+            config,
+            adapter,
+        })
+    }
+
+    /// Where the adapter should bind-mount as `/artifacts` for manually-driven
+    /// containers. Per-repo location (`.fleet/sessions/manual/artifacts/`) so
+    /// it survives across CLI invocations and stays in the repo's gitignored
+    /// state.
+    fn artifacts_dir(&self) -> Result<PathBuf> {
+        let path = self.repo_root.join(".fleet/sessions/manual/artifacts");
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        Ok(path)
+    }
+}
+
+fn load_devcontainer(ctx: &Context_) -> Result<Devcontainer> {
+    let path = if ctx.config.runtime.devcontainer.is_absolute() {
+        ctx.config.runtime.devcontainer.clone()
+    } else {
+        ctx.repo_root.join(&ctx.config.runtime.devcontainer)
+    };
+    let dc = Devcontainer::from_path(&path).with_context(|| {
+        // The local adapter is fine with a "fake" devcontainer; for the
+        // others, missing file is the user's most common stumble — make
+        // the hint concrete.
+        if matches!(ctx.config.runtime.adapter, AdapterChoice::Local) {
+            format!("reading devcontainer at {}", path.display())
+        } else {
+            format!(
+                "reading devcontainer at {} — did you run `fleet init`?",
+                path.display()
+            )
+        }
+    })?;
+    Ok(dc)
 }
 
 /// Pure renderer for the doctor report. Stable wording — tests assert on it.
@@ -183,6 +370,47 @@ mod tests {
         r.recommended = Some(BackendKind::Podman);
         let rendered = render_doctor(&r);
         assert!(rendered.contains("Recommended engine: podman"));
+    }
+
+    #[test]
+    fn render_inspect_running_is_exit_zero() {
+        let (line, code) = render_inspect(&ContainerState::Running);
+        assert_eq!(line, "running");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn render_inspect_exited_carries_exit_code() {
+        let (line, code) = render_inspect(&ContainerState::Exited { code: 137 });
+        assert_eq!(line, "exited 137");
+        assert_eq!(code, 137);
+    }
+
+    #[test]
+    fn render_inspect_exited_zero_stays_zero() {
+        let (line, code) = render_inspect(&ContainerState::Exited { code: 0 });
+        assert_eq!(line, "exited 0");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn render_inspect_created_is_exit_zero() {
+        let (_, code) = render_inspect(&ContainerState::Created);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn render_inspect_dead_maps_to_exit_two() {
+        let (line, code) = render_inspect(&ContainerState::Dead);
+        assert_eq!(line, "dead");
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn render_inspect_unknown_carries_engine_text_and_exits_two() {
+        let (line, code) = render_inspect(&ContainerState::Unknown("paused".to_string()));
+        assert_eq!(line, "unknown (paused)");
+        assert_eq!(code, 2);
     }
 
     #[test]

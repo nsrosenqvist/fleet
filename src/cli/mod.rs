@@ -118,6 +118,30 @@ pub enum RuntimeSub {
     /// Probe the host for container engines and report what's usable.
     /// Exit code 0 when at least one engine is available, 1 otherwise.
     Doctor,
+
+    /// Build the image declared by the current repo's devcontainer. Prints
+    /// the resulting image id on stdout — scriptable.
+    Build,
+
+    /// Start (or replace) the container for the current repo's devcontainer.
+    /// Prints the container id on stdout.
+    Up,
+
+    /// Exec a command inside the running container. Bypasses the in-memory
+    /// adapter container-id map and addresses the workspace directly, so
+    /// it survives across separate CLI invocations.
+    Exec {
+        /// Command to run; everything after `--` is passed through.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        argv: Vec<String>,
+    },
+
+    /// Stop a container by id. Idempotent.
+    Stop { id: String },
+
+    /// Print a container's current state. Exits with the container's exit
+    /// code when it has exited, or 2 for dead/unknown states.
+    Inspect { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -162,6 +186,11 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
         },
         Command::Runtime { sub } => match sub {
             RuntimeSub::Doctor => Ok(runtime::run_doctor()),
+            RuntimeSub::Build => runtime::run_build(),
+            RuntimeSub::Up => runtime::run_up(),
+            RuntimeSub::Exec { argv } => runtime::run_exec(&argv),
+            RuntimeSub::Stop { id } => runtime::run_stop(&id),
+            RuntimeSub::Inspect { id } => runtime::run_inspect(&id),
         },
         Command::Init => init::run(),
     }
