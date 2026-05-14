@@ -51,24 +51,36 @@ includes:
   escape would break out. fleet does not add nested sandboxing inside the
   guest (no seccomp, no AppArmor profile, no rootless container layer).
 
-## Sudo lockdown
+## Sudo lockdown (deferred)
 
-Lima's cloud-init grants the `lima` user passwordless sudo by default.
-The template's final provisioning step (after npm + apt installs are
-done) removes that:
+The intended Phase 1 design also revoked the lima user's passwordless
+sudo, so a compromised worker couldn't escalate inside the VM. fleet's
+host-side admin actions (tracker-tool installs, tinyproxy filter sync)
+would then run as root via `limactl shell --user root`.
 
-```bash
-# templates/fleet-vm.yaml — last `mode: system` block
-rm -f /etc/sudoers.d/*lima* /etc/sudoers.d/99_nopasswd_sudo
-gpasswd -d lima sudo  || true
-gpasswd -d lima admin || true
-```
+**This step is currently deferred.** Lima 2.x's `limactl shell` does
+not accept a `--user` flag — there's no host-side way to invoke a
+command as root inside the VM without the lima user having sudo.
+Removing sudo would break tracker-tool installs and the network
+filter sync, both of which need to write under `/etc` and reload
+`systemd`-managed services.
 
-Once the lockdown step has run, the `lima` user has no sudo. Host-side
-admin actions fleet still needs (e.g. installing missing tracker tools via
-the preflight modal) go through `limactl shell --user root` rather than
-relying on the worker user's sudo rights — see
-[`src/tui/preflight.rs`](../src/tui/preflight.rs)'s `install_command`.
+What that means today:
+
+- The lima user retains passwordless sudo, courtesy of Lima's default
+  cloud-init.
+- A worker process that goes off-script can still `sudo` inside the
+  VM (modify `/etc`, install packages, …).
+- The VM kernel boundary is unchanged: nothing escapes onto the host.
+
+Possible future paths:
+
+- Ship a small setuid-root helper (`/usr/local/bin/fleet-admin`)
+  installed by cloud-init that exposes exactly the admin operations
+  fleet needs, refusing everything else. Drop lima's sudo afterward.
+- Wait for / contribute a `--user` flag back to upstream Lima.
+
+Tracking under "Sudo lockdown" in `docs/security-model.md`'s roadmap.
 
 ## Upgrading an existing VM
 

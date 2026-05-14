@@ -149,9 +149,11 @@ pub const IN_VM_FILTER_PATH: &str = "/etc/tinyproxy/fleet-allow.filter";
 /// filter file is empty / the proxy is unreachable from worker env
 /// because `HTTPS_PROXY` isn't set).
 ///
-/// Runs `limactl shell --user root fleet-vm bash -c '<script>'` —
-/// idempotent, safe to call on every `fleet start` invocation. The
-/// script base64-decodes the rendered filter (avoids quoting
+/// Runs `limactl shell fleet-vm bash -c '<script>'` as the default
+/// lima user and shells out to `sudo` for the file write + service
+/// reload. Lima 2.x's `limactl shell` doesn't accept `--user`, so
+/// `sudo` is the only path to root from a host-side invocation.
+/// The script base64-decodes the rendered filter (avoids quoting
 /// concerns for the parens / backslashes / dollar-anchors the
 /// regexes contain) into a tempfile under /run, atomically renames
 /// into `IN_VM_FILTER_PATH`, and `systemctl reload tinyproxy.service`.
@@ -171,12 +173,12 @@ pub fn sync_in_vm_filter(cfg: &Config, invoker: &Arc<dyn ProcessInvoker>) -> Res
     };
     let script = format!(
         r#"set -eu
-mkdir -p /etc/tinyproxy
-TMP=$(mktemp /run/fleet-allow.filter.XXXXXX)
+sudo mkdir -p /etc/tinyproxy
+TMP=$(mktemp /tmp/fleet-allow.filter.XXXXXX)
 printf '%s' '{encoded}' | base64 -d > "$TMP"
-chmod 644 "$TMP"
-mv "$TMP" {IN_VM_FILTER_PATH}
-systemctl reload tinyproxy.service 2>/dev/null || systemctl restart tinyproxy.service
+sudo install -m 644 "$TMP" {IN_VM_FILTER_PATH}
+rm -f "$TMP"
+sudo systemctl reload tinyproxy.service 2>/dev/null || sudo systemctl restart tinyproxy.service
 "#
     );
     invoker
@@ -184,8 +186,6 @@ systemctl reload tinyproxy.service 2>/dev/null || systemctl restart tinyproxy.se
             "limactl",
             vec![
                 "shell".to_string(),
-                "--user".to_string(),
-                "root".to_string(),
                 "fleet-vm".to_string(),
                 "bash".to_string(),
                 "-c".to_string(),

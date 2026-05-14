@@ -261,8 +261,8 @@ fn check_trackers(
 }
 
 /// In-VM install command for a tracker tool. Run via `limactl shell
-/// --user <as_user> fleet-vm -- bash -c '<script>'` from the preflight
-/// modal's auto-install action. Mirrors the provisioning steps in
+/// fleet-vm -- bash -c '<script>'` from the preflight modal's auto-
+/// install action. Mirrors the provisioning steps in
 /// `templates/fleet-vm.yaml` so an existing VM (created before fleet's
 /// template included these) converges on the same state without a
 /// rebuild.
@@ -272,59 +272,50 @@ fn check_trackers(
 /// apt updates) and aborts on first failure. `curl -fSL` (no `s`)
 /// shows the progress bar to a TTY.
 ///
-/// `as_user` distinguishes system-scope installs (apt, files under
-/// `/usr/local/bin`) which run as `root` via `limactl shell --user
-/// root` from user-scope ones (gh extensions land in `$HOME/.local/
-/// share/gh/extensions`). The lima user no longer has passwordless
-/// sudo — Phase 1's sudo lockdown removed that — so scripts targeting
-/// system paths can't shell-out to `sudo`; they have to be invoked as
-/// root directly.
-pub struct InstallScript {
-    pub script: &'static str,
-    pub as_user: &'static str,
-}
-
-pub fn install_command(tool: &str) -> Option<InstallScript> {
+/// Scripts run as the `lima` user — Lima 2.x's `limactl shell` has no
+/// `--user` flag, so we use the default user and shell-out to `sudo`
+/// for the system-scope steps (apt-install, /usr/local/bin writes).
+/// That depends on the lima user having sudo, which Lima's cloud-init
+/// grants by default and fleet's template does not currently revoke
+/// (see [`templates/fleet-vm.yaml`](../../../templates/fleet-vm.yaml)
+/// and docs/sandbox.md → "Sudo lockdown" for the deferred lockdown).
+pub fn install_command(tool: &str) -> Option<&'static str> {
     match tool {
         // gh extension — needs `gh` already installed. The preflight
         // probes in declaration order (gh before gh-dash), so by the
         // time the install runs, gh is present (either pre-existed or
         // just installed). `gh extension install` writes to
-        // $HOME/.local/share/gh/extensions and needs the user's gh
-        // auth (forwarded via GH_TOKEN at fleet start time), so this
-        // one runs as the lima user, not root.
-        "gh-dash" => Some(InstallScript {
-            script: r"set -ex
+        // $HOME/.local/share/gh/extensions and reads the lima user's
+        // gh auth (forwarded via GH_TOKEN at fleet start time).
+        "gh-dash" => Some(
+            r"set -ex
 gh extension install dlvhdr/gh-dash
 gh dash --version",
-            as_user: "lima",
-        }),
-        "git-bug" => Some(InstallScript {
-            script: r#"set -ex
+        ),
+        "git-bug" => Some(
+            r#"set -ex
 arch="$(dpkg --print-architecture)"
 case "$arch" in
   amd64) gb=amd64 ;;
   arm64) gb=arm64 ;;
   *)     gb="$arch" ;;
 esac
-curl -fSL "https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_${gb}" -o /usr/local/bin/git-bug
-chmod +x /usr/local/bin/git-bug
+sudo curl -fSL "https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_${gb}" -o /usr/local/bin/git-bug
+sudo chmod +x /usr/local/bin/git-bug
 git-bug --version"#,
-            as_user: "root",
-        }),
-        "gh" => Some(InstallScript {
-            script: r#"set -ex
-if ! apt-get install -y gh; then
-  mkdir -p -m 755 /etc/apt/keyrings
-  curl -fSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg
-  chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
-  apt-get update
-  apt-get install -y gh
+        ),
+        "gh" => Some(
+            r#"set -ex
+if ! sudo apt-get install -y gh; then
+  sudo mkdir -p -m 755 /etc/apt/keyrings
+  curl -fSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg
+  sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list
+  sudo apt-get update
+  sudo apt-get install -y gh
 fi
 gh --version"#,
-            as_user: "root",
-        }),
+        ),
         _ => None,
     }
 }
@@ -731,24 +722,16 @@ projects:
     }
 
     #[test]
-    fn install_command_runs_root_install_as_root() {
+    fn install_command_uses_sudo_for_system_scope_steps() {
+        // The system-scope installs (apt-install, /usr/local/bin
+        // writes) shell out to sudo since Lima 2.x's `limactl shell`
+        // can't pick a user. If a future Lima exposes `--user root`
+        // and we drop the lima user from sudo, this assertion is
+        // what we'll have to invert.
         let s = install_command("git-bug").expect("git-bug script");
-        assert_eq!(s.as_user, "root");
-        // Sudo was stripped in Phase 1; if it reappears the lockdown
-        // step in the template will cause `Permission denied` here.
-        assert!(
-            !s.script.contains("sudo "),
-            "git-bug install script still uses sudo: {}",
-            s.script
-        );
-    }
-
-    #[test]
-    fn install_command_runs_user_extension_as_lima() {
-        // gh extensions land in $HOME/.local/share/gh/extensions,
-        // owned by the lima user — must not run as root.
-        let s = install_command("gh-dash").expect("gh-dash script");
-        assert_eq!(s.as_user, "lima");
+        assert!(s.contains("sudo "), "expected sudo in: {s}");
+        let s = install_command("gh").expect("gh script");
+        assert!(s.contains("sudo "), "expected sudo in: {s}");
     }
 
     #[test]

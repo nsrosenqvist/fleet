@@ -208,34 +208,17 @@ provision:
       mkdir -p "$(dirname "$PROVISION_MARKER")"
       touch "$PROVISION_MARKER"
 
-  # Sudo lockdown. Lima's cloud-init grants the `lima` user passwordless
-  # sudo by default. Convenient for ad-hoc shells, incompatible with the
-  # security model: an AO worker running as `lima` must not be able to
-  # mutate /etc, install packages, or read other users' files via `sudo
-  # cat`. After provisioning is done we remove the sudoers drop-in Lima
-  # installed and detach the lima user from the `sudo` / `admin` groups.
+  # Sudo lockdown for the `lima` user is **deferred**. The intended
+  # design is to remove the NOPASSWD drop-in and detach lima from the
+  # sudo group, then have fleet's host-side admin actions (tracker-tool
+  # installs from preflight, tinyproxy filter sync) run as root via
+  # `limactl shell --user root`. But Lima 2.x's `limactl shell` doesn't
+  # accept `--user`, so there's no way to run those admin actions as
+  # root from the host without lima having sudo.
   #
-  # Host-side admin actions fleet still needs (tracker tool installs via
-  # the preflight modal) go through `limactl shell --user root` instead,
-  # which doesn't depend on the lima user having sudo at all.
-  - mode: system
-    script: |
-      #!/bin/bash
-      set -eu
-      PROVISION_MARKER="/var/lib/fleet/.sudo-locked-v1"
-      if [ -f "$PROVISION_MARKER" ]; then
-          exit 0
-      fi
-      # Lima's nopasswd drop-in filename has varied across versions
-      # (sudoers, 99-lima-sudo, …). Remove anything in /etc/sudoers.d/
-      # that names `lima`, plus the legacy 99-nopasswd file.
-      for f in /etc/sudoers.d/*lima* /etc/sudoers.d/99_nopasswd_sudo; do
-          [ -f "$f" ] && rm -f "$f"
-      done
-      gpasswd -d lima sudo 2>/dev/null || true
-      gpasswd -d lima admin 2>/dev/null || true
-      mkdir -p "$(dirname "$PROVISION_MARKER")"
-      touch "$PROVISION_MARKER"
+  # See docs/sandbox.md → "Sudo lockdown" for the rationale and the
+  # roadmap (likely: ship a setuid-root helper installed by cloud-init,
+  # or wait for a future Lima that exposes the SSH user knob).
 
 probes:
   # Block `limactl start` from declaring the instance Ready until ao is

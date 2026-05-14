@@ -34,7 +34,9 @@ Three independent layers. Each is documented in its own page.
 - Host home **is not** bind-mounted into the VM.
 - Only `~/.agent-orchestrator/` (worktrees) and `~/.config/fleet/`
   (AO catalog, read-only) cross the boundary.
-- The lima user has no passwordless sudo inside the VM.
+- The lima user **still** has passwordless sudo today — sudo
+  lockdown is deferred, see `sandbox.md` → "Sudo lockdown
+  (deferred)" and the roadmap below.
 
 **What it protects against:** an agent reading or writing host
 `~/.ssh`, `~/.gnupg`, `~/.config/gh`, host `~/.claude`, browser
@@ -100,6 +102,11 @@ out so users can build their own layered controls if they need them:
 
 Tracked in the repo's issue tracker; the broad themes:
 
+- **Sudo lockdown** — revoke the lima user's passwordless sudo so a
+  compromised worker can't escalate inside the VM. Blocked today on
+  Lima 2.x not exposing `--user` for `limactl shell`; will likely
+  ship as a setuid-root helper that exposes exactly the admin
+  operations fleet needs.
 - **Kernel-level egress enforcement** (`network.md` v2) — nftables
   ruleset forcing all outbound traffic through tinyproxy (or dropping
   it), so `unset HTTPS_PROXY` no longer bypasses the allowlist.
