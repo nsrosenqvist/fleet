@@ -19,6 +19,7 @@
 //! Container/image IDs are newtypes rather than bare `String`s so that the
 //! compiler can stop us from mixing them up at call sites.
 
+pub mod apple_container;
 pub mod capabilities;
 pub mod detect;
 pub mod devcontainer;

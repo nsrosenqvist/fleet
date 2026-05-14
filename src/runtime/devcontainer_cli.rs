@@ -33,16 +33,23 @@ use crate::process::ProcessInvoker;
 pub enum Engine {
     Docker,
     Podman,
+    /// Apple Containerization (macOS 26+). The `container` CLI is largely
+    /// docker-CLI compatible at the surface the devcontainer CLI uses;
+    /// per-container microVM isolation is provided by the OS, not by the
+    /// devcontainer CLI or fleet.
+    AppleContainer,
 }
 
 impl Engine {
     /// Executable name the devcontainer CLI shells out to under the hood.
-    /// Passed via `--docker-path` because podman is docker-CLI compatible
-    /// and the devcontainer CLI defaults to running `docker`.
+    /// Passed via `--docker-path` because podman + Apple's `container` are
+    /// both docker-CLI compatible and the devcontainer CLI defaults to
+    /// running `docker`.
     pub const fn binary(self) -> &'static str {
         match self {
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::AppleContainer => "container",
         }
     }
 }
@@ -346,6 +353,7 @@ mod tests {
     fn engine_binary_names_match_program_names() {
         assert_eq!(Engine::Docker.binary(), "docker");
         assert_eq!(Engine::Podman.binary(), "podman");
+        assert_eq!(Engine::AppleContainer.binary(), "container");
     }
 
     #[test]
