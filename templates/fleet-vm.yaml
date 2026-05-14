@@ -34,32 +34,44 @@ cpus: 4
 memory: "4GiB"
 disk: "30GiB"
 
-# Filesystem isolation. The host home is intentionally NOT bind-mounted:
-# AO workers run as the `lima` user inside the VM and must not see host
-# dotfiles (~/.ssh, ~/.gnupg, host ~/.claude, host ~/.config/gh, …) or
-# any unrelated host directory. Only the two paths AO actually needs
-# cross the boundary:
+# Filesystem isolation. The host home is intentionally NOT bind-mounted.
+# AO workers run as a dedicated `aoworker` user (uid 2000, no sudo)
+# inside the VM, distinct from the `lima` user that fleet's host-side
+# admin actions use. The mounts cross the boundary at exactly two paths:
 #
-#   1. ~/.agent-orchestrator/ — AO worktrees + session state. Writable
-#      so the worker can create branches and commits. Host-side `cd`
-#      still works because the path is the same on both sides. fleet
-#      ensures this directory exists on the host before bring-up.
+#   1. ~/.agent-orchestrator/ — AO worktrees + session state. Materialized
+#      inside the VM at /home/aoworker/.agent-orchestrator/ via
+#      `mountPoint:`, so AO (which expands $HOME/.agent-orchestrator via
+#      `os.homedir()`) finds the bind-mounted host path under aoworker's
+#      $HOME. Both `aoworker` (primary group `aousers`) and `lima`
+#      (supplementary group `aousers`) can read+write via the ACL set in
+#      the aoworker provisioning step.
 #
 #   2. ~/.config/fleet/ — the AO catalog (agent-orchestrator.yaml) and
 #      worker AGENTS.md. **Read-only**: a worker must not be able to
 #      append a `projects:` entry that points at an arbitrary host path
 #      and thereby escape the sandbox on the next spawn.
 #
+# Per-project source repo mounts are auto-derived from agent-orchestrator
+# .yaml's projects.*.path + plugins[].path and spliced in by fleet's
+# bring-up code (see src/tui/bringup.rs::compose_template). The static
+# block here only covers the two paths every fleet install needs.
+#
 # Identity material (Claude OAuth, GH_TOKEN, .gitconfig) is brokered in
 # at `fleet start` time via env vars and written to VM-private files
 # inside the bootstrap script — see src/cli/spawn.rs::BOOTSTRAP_SCRIPT.
-# Everything else under the lima user's $HOME lives on the VM's private
+# Everything else under aoworker's $HOME lives on the VM's private
 # ext4 and never touches the host filesystem.
 mounts:
   - location: "~/.agent-orchestrator"
+    mountPoint: "/home/aoworker/.agent-orchestrator"
     writable: true
   - location: "~/.config/fleet"
     writable: false
+  # __FLEET_EXTRA_MOUNTS__ — fleet splices project source mounts here at
+  # bring-up time, auto-derived from agent-orchestrator.yaml's
+  # projects.*.path and plugins[].path. See src/tui/bringup.rs.
+  # __FLEET_EXTRA_MOUNTS_END__
 
 provision:
   # System-level install: distro packages, Node 20 (NodeSource), gh CLI,
@@ -208,31 +220,144 @@ provision:
       mkdir -p "$(dirname "$PROVISION_MARKER")"
       touch "$PROVISION_MARKER"
 
-  # Sudo lockdown for the `lima` user is **deferred**. The intended
-  # design is to remove the NOPASSWD drop-in and detach lima from the
-  # sudo group, then have fleet's host-side admin actions (tracker-tool
-  # installs from preflight, tinyproxy filter sync) run as root via
-  # `limactl shell --user root`. But Lima 2.x's `limactl shell` doesn't
-  # accept `--user`, so there's no way to run those admin actions as
-  # root from the host without lima having sudo.
+  # User-supplied provisioning. If the host has a script at
+  # `~/.config/fleet/provision.sh` (reachable in the guest via the
+  # read-only mount above), run it as root after fleet's own
+  # provisioning. The intended use is dropping in toolchains the
+  # embedded template doesn't ship — `apt-get install -y golang-go`,
+  # `rustup`, language SDKs, etc. — so an agent inside the VM can
+  # actually build the user's project.
   #
-  # See docs/sandbox.md → "Sudo lockdown" for the rationale and the
-  # roadmap (likely: ship a setuid-root helper installed by cloud-init,
-  # or wait for a future Lima that exposes the SSH user knob).
-
-probes:
-  # Block `limactl start` from declaring the instance Ready until ao is
-  # actually on PATH. Without this, fleet's first `ao status` call would
-  # race against the npm install and the user would see a spurious
-  # "command not found" flash mid-provisioning. 10-minute ceiling
-  # comfortably covers a slow cloud-init on a constrained host.
-  - description: "ao binary installed and on PATH"
+  # Idempotency: the marker is the script's sha256. Editing
+  # provision.sh changes the hash, so the existing marker no longer
+  # matches and the next boot re-runs the script; stale markers are
+  # cleared on each successful run. A failed user script leaves no
+  # marker, so the next boot retries from the top (matching the
+  # mid-script-failure model the system blocks above use).
+  #
+  # Output: `/var/log/fleet/user-provision.log`. Run
+  # `limactl shell fleet-vm sudo cat /var/log/fleet/user-provision.log`
+  # from the host to inspect.
+  #
+  # Egress: Lima provision blocks run with no `HTTPS_PROXY` set, so
+  # the script bypasses fleet's egress allowlist by design. Anything
+  # this hook installs is whatever the user trusts apt / their own
+  # commands to fetch.
+  - mode: system
     script: |
       #!/bin/bash
-      set -eux
-      timeout 600s bash -c 'until command -v ao >/dev/null 2>&1; do sleep 3; done'
+      set -euo pipefail
+      # The mount above lands at the lima user's $HOME inside the VM.
+      # UID 1000 is Lima's default for the lima user; the fleet
+      # template doesn't override it.
+      LIMA_HOME="$(getent passwd 1000 | cut -d: -f6)"
+      USER_SCRIPT="$LIMA_HOME/.config/fleet/provision.sh"
+      if [ ! -f "$USER_SCRIPT" ]; then
+          exit 0
+      fi
+      HASH="$(sha256sum "$USER_SCRIPT" | awk '{print $1}')"
+      MARKER="/var/lib/fleet/.user-provisioned-$HASH"
+      if [ -f "$MARKER" ]; then
+          exit 0
+      fi
+      LOG="/var/log/fleet/user-provision.log"
+      mkdir -p "$(dirname "$LOG")" /var/lib/fleet
+      {
+          echo "=== fleet user-provision @ $(date -Is) hash=$HASH ==="
+          bash "$USER_SCRIPT"
+          echo "=== fleet user-provision OK ==="
+      } 2>&1 | tee -a "$LOG"
+      # Only reached on success (pipefail + set -e propagate a failed
+      # user script). Drop stale-hash markers so /var/lib/fleet doesn't
+      # accumulate one per edit.
+      rm -f /var/lib/fleet/.user-provisioned-*
+      touch "$MARKER"
+
+  # Drop-priv: create the `aoworker` user that AO + all worker processes
+  # actually run as. The `lima` user keeps passwordless sudo (Lima's
+  # default; necessary because `limactl shell` has no --user flag in
+  # 2.x) and is fleet's host-side admin point. aoworker has no sudo and
+  # no special group membership.
+  #
+  # Layout:
+  #   - group `aousers` (gid 2000): shared between lima + aoworker so
+  #     both can read+write the AO worktree mount.
+  #   - user `aoworker` (uid 2000): primary group aousers, home
+  #     /home/aoworker, no shell login keys.
+  #   - lima joined to aousers as a supplementary group.
+  #   - /etc/sudoers.d/fleet-aoworker: lima → aoworker via bash/tmux
+  #     only, with the brokered identity env vars preserved.
+  #   - ACL on /home/aoworker/.agent-orchestrator/ (the AO mount target)
+  #     so both users can rwx; default ACL inherits to new files.
+  #
+  # Idempotent via /var/lib/fleet/.aoworker-provisioned-v1; bump the
+  # suffix if the body changes to force a re-run on existing VMs.
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eu
+      PROVISION_MARKER="/var/lib/fleet/.aoworker-provisioned-v1"
+      if [ -f "$PROVISION_MARKER" ]; then
+          exit 0
+      fi
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get install -y acl
+
+      getent group aousers >/dev/null || groupadd --system --gid 2000 aousers
+      getent passwd aoworker >/dev/null || useradd \
+        --uid 2000 \
+        --gid aousers \
+        --create-home \
+        --home-dir /home/aoworker \
+        --shell /bin/bash \
+        aoworker
+
+      # lima needs aousers as a supplementary group so it can read the
+      # AO worktree mount (TUI `Enter`-to-attach `cd`s into the worktree
+      # before exec'ing `sudo -u aoworker tmux attach`).
+      usermod -aG aousers lima || true
+
+      # The bind mount lands at /home/aoworker/.agent-orchestrator
+      # because the `mounts:` block above sets `mountPoint:`. Lima
+      # creates the mount target as part of starting up — at this
+      # point in cloud-init it already exists. ACL grants aousers
+      # rwx now AND as default (so new files / dirs inherit).
+      install -d -o aoworker -g aousers -m 2775 /home/aoworker/.agent-orchestrator
+      setfacl -R -m  g:aousers:rwX /home/aoworker/.agent-orchestrator
+      setfacl -R -d -m g:aousers:rwX /home/aoworker/.agent-orchestrator
+
+      # Sudoers drop-in: lima can run /bin/bash and /usr/bin/tmux as
+      # aoworker (no other targets). env_keep preserves the env vars
+      # fleet brokers in from the host through `limactl --preserve-env`
+      # → lima → `sudo -u aoworker`.
+      cat > /etc/sudoers.d/fleet-aoworker <<'SUDOERS'
+      Defaults!/bin/bash, /usr/bin/tmux env_keep += "CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN FLEET_GITCONFIG_B64 AO_GLOBAL_CONFIG HTTPS_PROXY HTTP_PROXY NO_PROXY TERM LIMA_SHELLENV_ALLOW"
+      lima ALL=(aoworker) NOPASSWD: /bin/bash, /usr/bin/tmux
+      SUDOERS
+      chmod 0440 /etc/sudoers.d/fleet-aoworker
+      visudo -c -f /etc/sudoers.d/fleet-aoworker
+
+      mkdir -p "$(dirname "$PROVISION_MARKER")"
+      touch "$PROVISION_MARKER"
+
+probes:
+  # Block `limactl start` from declaring the instance Ready until
+  # cloud-init has finished (which means every `provision:` block has
+  # run, including the `npm install -g @aoagents/ao @anthropic-ai/
+  # claude-code` step that can take 13+ minutes on a constrained host).
+  #
+  # We wait on the canonical "is cloud-init done" signal rather than
+  # polling PATH ourselves; the `command -v ao` is a paranoia check that
+  # the provision script actually placed ao on PATH. Note that fleet
+  # passes `--timeout=30m` to `limactl start`, raising Lima's own
+  # outer ceiling so this probe has enough headroom.
+  - description: "cloud-init finished and ao on PATH"
+    script: |
+      #!/bin/bash
+      set -eu
+      cloud-init status --wait >/dev/null
+      command -v ao >/dev/null 2>&1
     hint: |
-      The ao binary is not yet on PATH. The provisioning script may
-      still be running — inside the VM:
-        sudo tail -f /var/log/cloud-init-output.log
-      to watch progress.
+      cloud-init is still running. Inside the VM:
+        sudo cat /var/log/cloud-init-output.log
+      to watch progress (or `cloud-init status --long`).

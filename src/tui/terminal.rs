@@ -863,6 +863,7 @@ fn build_start_phase(app: &App, phase_label: Option<&str>) -> Result<TaskPhase> 
     // into the AO failure-hint path. The function logs on error and
     // returns Ok regardless.
     let _ = crate::cli::spawn::sync_network_filter();
+    crate::cli::spawn::sync_aoworker_mount_acls();
     let spec = crate::cli::spawn::build_start_spec(project, false, false)?;
     Ok(spec_to_phase(spec, phase_label))
 }

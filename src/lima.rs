@@ -59,6 +59,11 @@ impl Lima {
 
     /// Run a command inside the VM via `limactl shell --workdir <wd> <vm> <argv...>`.
     /// `argv` is the in-VM command (e.g. `["ao", "status", "--json"]`).
+    ///
+    /// The command runs as the `lima` user (Lima's default). For
+    /// commands that need to touch AO state, tmux sessions, or
+    /// anything else under `aoworker`'s $HOME, see
+    /// [`Self::shell_as_aoworker`].
     pub fn shell(&self, workdir: &Path, mut argv: Vec<String>) -> Result<String> {
         let mut cmd = vec![
             "shell".to_string(),
@@ -68,6 +73,33 @@ impl Lima {
         ];
         cmd.append(&mut argv);
         self.invoker.run("limactl", cmd)
+    }
+
+    /// Run a command inside the VM as the `aoworker` user. Goes
+    /// through `sudo -u aoworker --preserve-env=TERM` — the sudoers
+    /// drop-in provisioned by `templates/fleet-vm.yaml` allows
+    /// `lima ALL=(aoworker) NOPASSWD: /bin/bash, /usr/bin/tmux` only,
+    /// so `argv[0]` must be one of those (or a path-resolved alias
+    /// that's still authorized — fleet's callers stick to the bare
+    /// names).
+    ///
+    /// Use for: tmux helpers, `ao` CLI calls, and any node/bash that
+    /// reads `~/.agent-orchestrator/projects/…` (since the bind
+    /// mount lands at aoworker's $HOME, lima sees `/home/aoworker/…`
+    /// but its own $HOME doesn't contain `.agent-orchestrator`).
+    pub fn shell_as_aoworker(&self, workdir: &Path, argv: Vec<String>) -> Result<String> {
+        let mut wrapped = vec![
+            "shell".to_string(),
+            "--workdir".to_string(),
+            workdir.display().to_string(),
+            self.vm_name.clone(),
+            "sudo".to_string(),
+            "-u".to_string(),
+            "aoworker".to_string(),
+            "--preserve-env=TERM".to_string(),
+        ];
+        wrapped.extend(argv);
+        self.invoker.run("limactl", wrapped)
     }
 }
 

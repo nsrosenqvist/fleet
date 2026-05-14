@@ -1,5 +1,10 @@
 //! Tmux helpers — list sessions, capture pane output. All run via [`Lima`]
 //! against the VM, since tmux lives inside the VM.
+//!
+//! Since Phase 5, the tmux server is anchored by AO running as the
+//! `aoworker` user; tmux state is invisible to `lima` (different uid →
+//! different socket). Every tmux call from fleet's host-side code
+//! therefore goes through [`Lima::shell_as_aoworker`].
 
 use anyhow::Result;
 use std::path::Path;
@@ -9,7 +14,7 @@ use crate::lima::Lima;
 /// `tmux list-sessions -F '#{session_name}'` inside the VM, parsed into a
 /// vector of session names.
 pub fn list_sessions(lima: &Lima, workdir: &Path) -> Result<Vec<String>> {
-    let raw = lima.shell(
+    let raw = lima.shell_as_aoworker(
         workdir,
         vec![
             "tmux".to_string(),
@@ -32,7 +37,7 @@ pub fn list_sessions(lima: &Lima, workdir: &Path) -> Result<Vec<String>> {
 /// `-e`. The caller decides what to do with it (the TUI parses ANSI to
 /// styled spans and renders the last N visible lines).
 pub fn capture_pane(lima: &Lima, workdir: &Path, target: &str, max_lines: u32) -> Result<String> {
-    lima.shell(
+    lima.shell_as_aoworker(
         workdir,
         vec![
             "tmux".to_string(),
@@ -72,7 +77,7 @@ pub fn resize_window(
         "tmux set-option -t {s} window-size manual >/dev/null 2>&1 || true; \
          tmux resize-window -t {s} -x {width} -y {height} >/dev/null 2>&1 || true"
     );
-    lima.shell(workdir, vec!["bash".to_string(), "-c".to_string(), script])
+    lima.shell_as_aoworker(workdir, vec!["bash".to_string(), "-c".to_string(), script])
         .map(|_| ())
 }
 

@@ -391,9 +391,16 @@ fn lima_yaml_path() -> Option<PathBuf> {
 /// block. Pure function over the yaml text so tests can exercise both
 /// outcomes without a real Lima install.
 ///
-/// `Stale` ⇔ any mount whose `location:` is the host home itself
-/// (i.e. ends with the literal `$HOME` value Lima resolved to, with
-/// no trailing path component). `Current` is the residual.
+/// `Stale` covers two cases:
+/// 1. Any mount whose `location:` is the host home itself (the
+///    pre-Phase-1 layout that exposed every host dotfile).
+/// 2. A project listed in the AO catalog (`projects.*.path`)
+///    whose host path is NOT among the running VM's mounts.
+///    Phase 5 auto-derives project mounts at bring-up, so a VM
+///    created before a new project was added needs a rebuild for
+///    AO's worktree plugin to reach the host repo's `.git/`.
+///
+/// `Current` is the residual.
 fn classify_mounts(yaml_text: &str) -> VmMountsKind {
     let Ok(value): Result<serde_yml::Value, _> = serde_yml::from_str(yaml_text) else {
         return VmMountsKind::Unknown;
@@ -409,15 +416,34 @@ fn classify_mounts(yaml_text: &str) -> VmMountsKind {
         return VmMountsKind::Unknown;
     };
     let home_norm = home.trim_end_matches('/');
-    for mount in mounts {
-        let Some(loc) = mount.get("location").and_then(serde_yml::Value::as_str) else {
-            continue;
-        };
-        let loc_norm = loc.trim_end_matches('/');
-        if loc_norm == home_norm || loc_norm == "~" {
+
+    // Phase 1 check: refuse if the host home itself is bind-mounted.
+    let mount_locations: Vec<String> = mounts
+        .iter()
+        .filter_map(|m| m.get("location").and_then(serde_yml::Value::as_str))
+        .map(|loc| loc.trim_end_matches('/').to_string())
+        .collect();
+    for loc in &mount_locations {
+        if loc == home_norm || loc == "~" {
             return VmMountsKind::Stale;
         }
     }
+
+    // Phase 5 check: every project listed in the AO catalog needs a
+    // matching mount entry. Lima resolves `~` and `$VAR` to absolute
+    // paths in the saved instance yaml, so we compare normalized
+    // absolute strings. Best-effort — if the AO config can't be
+    // loaded, skip this check entirely.
+    if let Ok(Some((_, ao))) = crate::ao::config::AoConfig::load() {
+        for project in ao.projects.values() {
+            let needed = project.path.display().to_string();
+            let needed_norm = needed.trim_end_matches('/');
+            if !mount_locations.iter().any(|loc| loc == needed_norm) {
+                return VmMountsKind::Stale;
+            }
+        }
+    }
+
     VmMountsKind::Current
 }
 
@@ -602,6 +628,10 @@ projects:
 
     #[test]
     fn classify_mounts_current_when_only_subdirs_mounted() {
+        // No AO config in the isolated XDG, so the Phase 5 "projects
+        // listed but not mounted" check is skipped — classify_mounts
+        // returns Current based on the absence of a host-home mount.
+        let xdg = tmp_xdg();
         let yaml = r#"
 mounts:
   - location: "~/.agent-orchestrator"
@@ -609,16 +639,19 @@ mounts:
   - location: "~/.config/fleet"
     writable: false
 "#;
-        assert_eq!(classify_mounts(yaml), VmMountsKind::Current);
+        let result = with_isolated_xdg(&xdg, || classify_mounts(yaml));
+        assert_eq!(result, VmMountsKind::Current);
     }
 
     #[test]
     fn classify_mounts_stale_when_home_bind_mounted() {
         // Lima resolves `~` to the user's HOME before saving the
         // instance yaml, so test against the resolved form.
+        let xdg = tmp_xdg();
         let home = std::env::var("HOME").expect("HOME set in test env");
         let yaml = format!("mounts:\n  - location: {home}\n    writable: true\n");
-        assert_eq!(classify_mounts(&yaml), VmMountsKind::Stale);
+        let result = with_isolated_xdg(&xdg, || classify_mounts(&yaml));
+        assert_eq!(result, VmMountsKind::Stale);
     }
 
     #[test]
@@ -626,18 +659,78 @@ mounts:
         // Defensive: a yaml that hasn't been resolved yet (just-loaded
         // template, no fleet-vm install yet) still has `~`. We treat
         // the literal tilde as a home mount too.
+        let xdg = tmp_xdg();
         let yaml = r#"
 mounts:
   - location: "~"
     writable: true
 "#;
-        assert_eq!(classify_mounts(yaml), VmMountsKind::Stale);
+        let result = with_isolated_xdg(&xdg, || classify_mounts(yaml));
+        assert_eq!(result, VmMountsKind::Stale);
     }
 
     #[test]
     fn classify_mounts_unknown_when_no_mounts_block() {
+        let xdg = tmp_xdg();
         let yaml = "cpus: 4\nmemory: 4GiB\n";
-        assert_eq!(classify_mounts(yaml), VmMountsKind::Unknown);
+        let result = with_isolated_xdg(&xdg, || classify_mounts(yaml));
+        assert_eq!(result, VmMountsKind::Unknown);
+    }
+
+    #[test]
+    fn classify_mounts_stale_when_project_path_not_mounted() {
+        // AO config registers a project at /tmp/missing-project, but
+        // the running VM's mounts list only has the base entries —
+        // the worktree plugin needs the project's .git/, so this is
+        // a rebuild-required Stale.
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
+            r"
+defaults:
+  workspace: worktree
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/missing-project
+",
+        );
+        let yaml = r#"
+mounts:
+  - location: "~/.agent-orchestrator"
+    writable: true
+  - location: "~/.config/fleet"
+    writable: false
+"#;
+        let result = with_isolated_xdg(&xdg, || classify_mounts(yaml));
+        assert_eq!(result, VmMountsKind::Stale);
+    }
+
+    #[test]
+    fn classify_mounts_current_when_project_path_is_mounted() {
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
+            r"
+defaults:
+  workspace: worktree
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/registered-project
+",
+        );
+        let yaml = r#"
+mounts:
+  - location: "~/.agent-orchestrator"
+    writable: true
+  - location: "~/.config/fleet"
+    writable: false
+  - location: "/tmp/registered-project"
+    writable: true
+"#;
+        let result = with_isolated_xdg(&xdg, || classify_mounts(yaml));
+        assert_eq!(result, VmMountsKind::Current);
     }
 
     #[test]

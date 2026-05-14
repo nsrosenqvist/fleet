@@ -181,11 +181,19 @@ pub fn sweep(
     project_key: &str,
     min_age_secs: u64,
 ) -> Result<()> {
+    // Sweep runs as aoworker (Phase 5): the script reads
+    // `$HOME/.agent-orchestrator/projects/.../sessions/` which only
+    // resolves under aoworker's $HOME (where the bind mount lands).
+    // The sudoers drop-in lets lima exec /bin/bash as aoworker
+    // without a password.
     let args = [
         "shell".to_string(),
         "--workdir".to_string(),
         ao_workdir.display().to_string(),
         VM_NAME.to_string(),
+        "sudo".to_string(),
+        "-u".to_string(),
+        "aoworker".to_string(),
         "bash".to_string(),
         "-s".to_string(),
         "--".to_string(),

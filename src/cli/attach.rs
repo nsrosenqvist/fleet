@@ -36,12 +36,23 @@ pub fn run(_repo_root: &Path, session: &str) -> Result<i32> {
     // attach handshake stays a single `limactl shell` round-trip
     // (each one is ~200-400ms cold; doing 6 of them serially is a
     // visible stall when dropping into a session).
+    //
+    // The whole script runs as `aoworker` because the tmux server AO
+    // anchors is aoworker-owned (see Phase 5 — `src/cli/spawn.rs::
+    // build_aoworker_argv`). lima-owned tmux can't see those sessions.
+    // The sudoers drop-in provisioned by templates/fleet-vm.yaml
+    // allows `lima ALL=(aoworker) NOPASSWD: /bin/bash, /usr/bin/tmux`
+    // and preserves the TERM env so xterm-256color survives the hop.
     let script = build_attach_script(session);
     let argv = vec![
         "shell".to_string(),
         "--workdir".to_string(),
         workdir.display().to_string(),
         lima.vm_name().to_string(),
+        "sudo".to_string(),
+        "-u".to_string(),
+        "aoworker".to_string(),
+        "--preserve-env=TERM".to_string(),
         "bash".to_string(),
         "-c".to_string(),
         script,

@@ -29,14 +29,17 @@ does not protect against.
 
 Three independent layers. Each is documented in its own page.
 
-### 1. Filesystem — [`sandbox.md`](./sandbox.md)
+### 1. Filesystem + privilege separation — [`sandbox.md`](./sandbox.md)
 
 - Host home **is not** bind-mounted into the VM.
-- Only `~/.agent-orchestrator/` (worktrees) and `~/.config/fleet/`
-  (AO catalog, read-only) cross the boundary.
-- The lima user **still** has passwordless sudo today — sudo
-  lockdown is deferred, see `sandbox.md` → "Sudo lockdown
-  (deferred)" and the roadmap below.
+- Mounts that cross the boundary: `~/.agent-orchestrator/`,
+  `~/.config/fleet/` (read-only), plus the project source repos
+  auto-derived from `projects.*.path` (writable, ACL'd) and local
+  plugin paths (read-only).
+- The VM runs two users. `lima` (uid 1000, has sudo) is fleet's
+  host-side admin point. `aoworker` (uid 2000, no sudo) runs AO and
+  every agent process. A compromised worker can't escalate inside
+  the VM.
 
 **What it protects against:** an agent reading or writing host
 `~/.ssh`, `~/.gnupg`, `~/.config/gh`, host `~/.claude`, browser
@@ -84,9 +87,9 @@ enforcement (nftables egress block) is roadmap'd as v2.
 These are NOT what fleet's security model promises today. Calling them
 out so users can build their own layered controls if they need them:
 
-- **Multi-tenant isolation.** All AO workers inside one `fleet-vm`
-  share the same lima user. fleet does not separate workers from each
-  other inside the VM.
+- **Multi-tenant isolation between workers.** All AO workers inside
+  one `fleet-vm` share the `aoworker` UID. fleet does not isolate
+  workers from each other.
 - **Anti-exfiltration against a malicious agent.** The network
   allowlist is cooperative, not enforcing.
 - **Detection / auditing.** fleet does not run an in-VM intrusion
@@ -102,11 +105,11 @@ out so users can build their own layered controls if they need them:
 
 Tracked in the repo's issue tracker; the broad themes:
 
-- **Sudo lockdown** — revoke the lima user's passwordless sudo so a
-  compromised worker can't escalate inside the VM. Blocked today on
-  Lima 2.x not exposing `--user` for `limactl shell`; will likely
-  ship as a setuid-root helper that exposes exactly the admin
-  operations fleet needs.
+- **Narrow lima's sudo** — replace lima's broad passwordless sudo
+  with a per-command allowlist (apt-get, install /usr/local/bin/...,
+  setfacl, systemctl reload tinyproxy, `sudo -u aoworker` for the
+  bash/tmux entries already permitted). A compromised lima could
+  still run those commands but couldn't pivot to arbitrary root.
 - **Kernel-level egress enforcement** (`network.md` v2) — nftables
   ruleset forcing all outbound traffic through tinyproxy (or dropping
   it), so `unset HTTPS_PROXY` no longer bypasses the allowlist.
