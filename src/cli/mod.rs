@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 pub mod attach;
 pub mod config_cmd;
 pub mod init;
+pub mod issues;
 pub mod passthrough;
 pub mod runtime;
 pub mod sessions;
@@ -130,6 +131,21 @@ pub enum Command {
         #[command(subcommand)]
         sub: SessionsSub,
     },
+
+    /// v2 issue tracker browser — host-side `git-bug` / `gh` via the
+    /// new `crate::tracker` module. Sibling to (not a replacement for)
+    /// the AO `session` passthrough.
+    Issues {
+        #[command(subcommand)]
+        sub: IssuesSub,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IssuesSub {
+    /// Print one line per issue from the configured tracker, with open
+    /// issues first.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -250,6 +266,9 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
             SessionsSub::List => sessions::run_list(),
             SessionsSub::Show { id } => sessions::run_show(&id),
             SessionsSub::Logs { id, node } => sessions::run_logs(&id, node.as_deref()),
+        },
+        Command::Issues { sub } => match sub {
+            IssuesSub::List => issues::run_list(),
         },
     }
 }
