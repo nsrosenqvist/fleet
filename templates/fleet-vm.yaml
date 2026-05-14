@@ -34,13 +34,32 @@ cpus: 4
 memory: "4GiB"
 disk: "30GiB"
 
+# Filesystem isolation. The host home is intentionally NOT bind-mounted:
+# AO workers run as the `lima` user inside the VM and must not see host
+# dotfiles (~/.ssh, ~/.gnupg, host ~/.claude, host ~/.config/gh, …) or
+# any unrelated host directory. Only the two paths AO actually needs
+# cross the boundary:
+#
+#   1. ~/.agent-orchestrator/ — AO worktrees + session state. Writable
+#      so the worker can create branches and commits. Host-side `cd`
+#      still works because the path is the same on both sides. fleet
+#      ensures this directory exists on the host before bring-up.
+#
+#   2. ~/.config/fleet/ — the AO catalog (agent-orchestrator.yaml) and
+#      worker AGENTS.md. **Read-only**: a worker must not be able to
+#      append a `projects:` entry that points at an arbitrary host path
+#      and thereby escape the sandbox on the next spawn.
+#
+# Identity material (Claude OAuth, GH_TOKEN, .gitconfig) is brokered in
+# at `fleet start` time via env vars and written to VM-private files
+# inside the bootstrap script — see src/cli/spawn.rs::BOOTSTRAP_SCRIPT.
+# Everything else under the lima user's $HOME lives on the VM's private
+# ext4 and never touches the host filesystem.
 mounts:
-  # Make the host's home dir visible inside the VM at the same path so
-  # `limactl shell --workdir /home/<user>/Code/<repo>` works without
-  # path translation. `writable: true` so agents can edit checked-out
-  # source.
-  - location: "~"
+  - location: "~/.agent-orchestrator"
     writable: true
+  - location: "~/.config/fleet"
+    writable: false
 
 provision:
   # System-level install: distro packages, Node 20 (NodeSource), gh CLI,
@@ -109,14 +128,15 @@ provision:
       touch "$PROVISION_MARKER"
 
   # gh-dash extension for the gh CLI. Provides the github tracker's
-  # TUI preview (fleet's `t` keybind on github projects). Runs as
-  # the lima user since `gh extension install` writes to the user's
-  # ~/.local/share/gh/extensions and reads gh's auth — the host's
-  # `gh auth login` already syncs via Lima's home bind-mount.
+  # TUI preview (fleet's `t` keybind on github projects). Runs as the
+  # lima user. With the host home no longer bind-mounted, `gh` has no
+  # auth at first-boot provisioning time, so the install is best-effort
+  # (`|| true`) and the preflight modal offers to install gh-dash on
+  # demand once GH_TOKEN brokering has supplied auth.
   - mode: user
     script: |
       #!/bin/bash
-      set -eux
+      set -eu
       # Same idempotency model as the system script. User-scope marker
       # lives in $HOME so it persists across reboots without touching
       # /var/lib (which is system-owned).
@@ -125,8 +145,37 @@ provision:
           exit 0
       fi
       if command -v gh >/dev/null 2>&1; then
-        gh extension install dlvhdr/gh-dash || true
+        gh extension install dlvhdr/gh-dash 2>/dev/null || true
       fi
+      mkdir -p "$(dirname "$PROVISION_MARKER")"
+      touch "$PROVISION_MARKER"
+
+  # Sudo lockdown. Lima's cloud-init grants the `lima` user passwordless
+  # sudo by default. Convenient for ad-hoc shells, incompatible with the
+  # security model: an AO worker running as `lima` must not be able to
+  # mutate /etc, install packages, or read other users' files via `sudo
+  # cat`. After provisioning is done we remove the sudoers drop-in Lima
+  # installed and detach the lima user from the `sudo` / `admin` groups.
+  #
+  # Host-side admin actions fleet still needs (tracker tool installs via
+  # the preflight modal) go through `limactl shell --user root` instead,
+  # which doesn't depend on the lima user having sudo at all.
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eu
+      PROVISION_MARKER="/var/lib/fleet/.sudo-locked-v1"
+      if [ -f "$PROVISION_MARKER" ]; then
+          exit 0
+      fi
+      # Lima's nopasswd drop-in filename has varied across versions
+      # (sudoers, 99-lima-sudo, …). Remove anything in /etc/sudoers.d/
+      # that names `lima`, plus the legacy 99-nopasswd file.
+      for f in /etc/sudoers.d/*lima* /etc/sudoers.d/99_nopasswd_sudo; do
+          [ -f "$f" ] && rm -f "$f"
+      done
+      gpasswd -d lima sudo 2>/dev/null || true
+      gpasswd -d lima admin 2>/dev/null || true
       mkdir -p "$(dirname "$PROVISION_MARKER")"
       touch "$PROVISION_MARKER"
 

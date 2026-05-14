@@ -16,7 +16,16 @@
 //!    checkout's working tree, which is the exact scenario fleet
 //!    exists to prevent. Surfaced as a dead-end modal until the user
 //!    edits the yaml. Local-file check, runs even with a stopped VM.
-//! 4. Tracker tools (`git-bug` inside the VM, `gh` on the host) match
+//! 4. The running VM's saved Lima config matches the current template's
+//!    mount layout. **Hard fail** when a stale VM still has the host
+//!    home bind-mounted writable: that defeats fleet's filesystem
+//!    sandbox by exposing every host dotfile (`~/.ssh`, `~/.gnupg`,
+//!    host `~/.claude`, …) to agents. The user is sent to a
+//!    "rebuild required" modal pointing at `docs/sandbox.md`. Only
+//!    fires when the VM is running (the saved config is meaningful
+//!    only post-create); stopped VMs pass through and revalidate
+//!    after Shift+S brings the stack up.
+//! 5. Tracker tools (`git-bug` inside the VM, `gh` on the host) match
 //!    the plugins configured in `agent-orchestrator.yaml`. **Advisory**
 //!    — the rest of the TUI works without these; only the spawn picker
 //!    breaks for that one project. Only fires when the VM is running
@@ -27,6 +36,7 @@
 //! through `limactl shell <vm> … tmux …`, so tmux's availability is a
 //! property of the Lima guest image, not the host.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
@@ -56,6 +66,22 @@ pub enum Preflight {
     /// modal can show exactly what's wrong.
     WorkspaceUnsafe {
         current: Option<String>,
+    },
+    /// The running VM was created on an older fleet template whose
+    /// `mounts:` block bind-mounted the whole host home writable.
+    /// fleet's current model expects only `~/.agent-orchestrator/`
+    /// writable + `~/.config/fleet/` read-only; anything else is
+    /// treated as stale because it gives agents access to host
+    /// dotfiles, SSH keys, GPG keyrings, etc. Modal sends the user
+    /// at `limactl delete fleet-vm` + a return to fleet's bring-up
+    /// flow; `~/.agent-orchestrator/` lives host-side already so
+    /// worktrees survive the rebuild.
+    VmMountsStale {
+        /// The Lima yaml path we read, for inclusion in the modal
+        /// body. `None` when we couldn't resolve `$HOME` at all
+        /// (extreme edge case; the lookup falls back to the
+        /// canonical `~/.lima/fleet-vm/lima.yaml` text).
+        lima_yaml: Option<PathBuf>,
     },
     TrackerWarnings(Vec<MissingTracker>),
 }
@@ -88,7 +114,12 @@ pub struct MissingTracker {
 /// is read from the canonical XDG path; the launch repo doesn't enter
 /// into the check.
 pub fn check() -> Preflight {
-    check_with(default_has_bin, default_vm_status, default_in_vm)
+    check_with(
+        default_has_bin,
+        default_vm_status,
+        default_in_vm,
+        default_vm_mounts,
+    )
 }
 
 /// Inner form with probe functions injected so tests can drive any
@@ -97,6 +128,7 @@ fn check_with(
     has_bin: impl Fn(&str) -> bool,
     vm_status: impl FnOnce() -> VmStatus,
     in_vm: impl Fn(&str) -> bool,
+    vm_mounts: impl FnOnce() -> VmMountsLayout,
 ) -> Preflight {
     // Phase 1: host bins.
     let mut host = Vec::new();
@@ -121,6 +153,19 @@ fn check_with(
     let vm = vm_status();
     if matches!(vm, VmStatus::Missing) {
         return Preflight::VmMissing;
+    }
+
+    // Mount-layout drift. Only meaningful once Lima has resolved the
+    // template into ~/.lima/fleet-vm/lima.yaml, which it does the first
+    // time the VM starts — so we only probe when the VM is running.
+    // Stopped VMs pass through and revalidate after Shift+S.
+    if matches!(vm, VmStatus::Running) {
+        let mounts = vm_mounts();
+        if mounts.kind == VmMountsKind::Stale {
+            return Preflight::VmMountsStale {
+                lima_yaml: mounts.path,
+            };
+        }
     }
 
     // Materialize the worker AGENTS.md to its XDG path before any AO
@@ -216,50 +261,70 @@ fn check_trackers(
 }
 
 /// In-VM install command for a tracker tool. Run via `limactl shell
-/// fleet-vm -- bash -c '...'` from the preflight modal's auto-install
-/// action. Mirrors the provisioning steps in `templates/fleet-vm.yaml`
-/// so an existing VM (created before fleet's template included these)
-/// converges on the same state without a rebuild.
+/// --user <as_user> fleet-vm -- bash -c '<script>'` from the preflight
+/// modal's auto-install action. Mirrors the provisioning steps in
+/// `templates/fleet-vm.yaml` so an existing VM (created before fleet's
+/// template included these) converges on the same state without a
+/// rebuild.
 ///
 /// `set -ex` at the top echoes each command before running it
 /// (otherwise the user sees a silent pause during long downloads /
 /// apt updates) and aborts on first failure. `curl -fSL` (no `s`)
 /// shows the progress bar to a TTY.
-pub fn install_command(tool: &str) -> Option<&'static str> {
+///
+/// `as_user` distinguishes system-scope installs (apt, files under
+/// `/usr/local/bin`) which run as `root` via `limactl shell --user
+/// root` from user-scope ones (gh extensions land in `$HOME/.local/
+/// share/gh/extensions`). The lima user no longer has passwordless
+/// sudo — Phase 1's sudo lockdown removed that — so scripts targeting
+/// system paths can't shell-out to `sudo`; they have to be invoked as
+/// root directly.
+pub struct InstallScript {
+    pub script: &'static str,
+    pub as_user: &'static str,
+}
+
+pub fn install_command(tool: &str) -> Option<InstallScript> {
     match tool {
-        // gh extension — needs `gh` already installed. The
-        // preflight probes in declaration order (gh before gh-dash),
-        // so by the time the install runs, gh is present (either
-        // pre-existed or just installed).
-        "gh-dash" => Some(
-            r"set -ex
+        // gh extension — needs `gh` already installed. The preflight
+        // probes in declaration order (gh before gh-dash), so by the
+        // time the install runs, gh is present (either pre-existed or
+        // just installed). `gh extension install` writes to
+        // $HOME/.local/share/gh/extensions and needs the user's gh
+        // auth (forwarded via GH_TOKEN at fleet start time), so this
+        // one runs as the lima user, not root.
+        "gh-dash" => Some(InstallScript {
+            script: r"set -ex
 gh extension install dlvhdr/gh-dash
 gh dash --version",
-        ),
-        "git-bug" => Some(
-            r#"set -ex
+            as_user: "lima",
+        }),
+        "git-bug" => Some(InstallScript {
+            script: r#"set -ex
 arch="$(dpkg --print-architecture)"
 case "$arch" in
   amd64) gb=amd64 ;;
   arm64) gb=arm64 ;;
   *)     gb="$arch" ;;
 esac
-sudo curl -fSL "https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_${gb}" -o /usr/local/bin/git-bug
-sudo chmod +x /usr/local/bin/git-bug
+curl -fSL "https://github.com/git-bug/git-bug/releases/latest/download/git-bug_linux_${gb}" -o /usr/local/bin/git-bug
+chmod +x /usr/local/bin/git-bug
 git-bug --version"#,
-        ),
-        "gh" => Some(
-            r#"set -ex
-if ! sudo apt-get install -y gh; then
-  sudo mkdir -p -m 755 /etc/apt/keyrings
-  curl -fSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg
-  sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list
-  sudo apt-get update
-  sudo apt-get install -y gh
+            as_user: "root",
+        }),
+        "gh" => Some(InstallScript {
+            script: r#"set -ex
+if ! apt-get install -y gh; then
+  mkdir -p -m 755 /etc/apt/keyrings
+  curl -fSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg
+  chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+  apt-get update
+  apt-get install -y gh
 fi
 gh --version"#,
-        ),
+            as_user: "root",
+        }),
         _ => None,
     }
 }
@@ -275,6 +340,94 @@ fn default_has_bin(name: &str) -> bool {
 
 fn default_vm_status() -> VmStatus {
     Lima::new(Arc::new(RealProcessInvoker), VM_NAME).status()
+}
+
+/// Result of inspecting the running VM's mount layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VmMountsLayout {
+    pub kind: VmMountsKind,
+    /// The Lima yaml path we read. Surfaced in the modal so the user
+    /// can grep / inspect the offending file.
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VmMountsKind {
+    /// Mounts match the current template — `~/.agent-orchestrator/`
+    /// writable and `~/.config/fleet/` read-only, or any forward-
+    /// compatible superset of those. Passes preflight.
+    Current,
+    /// The host home itself is bind-mounted (the layout from before
+    /// Phase 1's filesystem isolation). Hard fail.
+    Stale,
+    /// We couldn't determine the layout — yaml missing, parse error,
+    /// `$HOME` unset, etc. Treat as `Current` to avoid false positives
+    /// blocking startup. The spawn flow's other guards (worktree
+    /// workspace, etc.) still apply.
+    Unknown,
+}
+
+fn default_vm_mounts() -> VmMountsLayout {
+    let Some(path) = lima_yaml_path() else {
+        return VmMountsLayout {
+            kind: VmMountsKind::Unknown,
+            path: None,
+        };
+    };
+    let kind =
+        std::fs::read_to_string(&path).map_or(VmMountsKind::Unknown, |text| classify_mounts(&text));
+    VmMountsLayout {
+        kind,
+        path: Some(path),
+    }
+}
+
+/// Canonical location Lima writes the resolved instance yaml after
+/// `limactl start --name fleet-vm <template>`. Returns `None` only
+/// when `$HOME` is unset — the path itself isn't checked for
+/// existence here; the read-stage handles the missing-file case.
+fn lima_yaml_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".lima")
+            .join(VM_NAME)
+            .join("lima.yaml"),
+    )
+}
+
+/// Inspect a Lima-resolved instance yaml and classify its `mounts:`
+/// block. Pure function over the yaml text so tests can exercise both
+/// outcomes without a real Lima install.
+///
+/// `Stale` ⇔ any mount whose `location:` is the host home itself
+/// (i.e. ends with the literal `$HOME` value Lima resolved to, with
+/// no trailing path component). `Current` is the residual.
+fn classify_mounts(yaml_text: &str) -> VmMountsKind {
+    let Ok(value): Result<serde_yml::Value, _> = serde_yml::from_str(yaml_text) else {
+        return VmMountsKind::Unknown;
+    };
+    let Some(mounts) = value.get("mounts").and_then(serde_yml::Value::as_sequence) else {
+        // No `mounts:` at all — definitely not the current layout,
+        // but also not the stale-home-mount problem. Treat as Unknown
+        // so we don't spuriously block startup on a VM whose template
+        // skipped mounts entirely (unlikely but possible).
+        return VmMountsKind::Unknown;
+    };
+    let Ok(home) = std::env::var("HOME") else {
+        return VmMountsKind::Unknown;
+    };
+    let home_norm = home.trim_end_matches('/');
+    for mount in mounts {
+        let Some(loc) = mount.get("location").and_then(serde_yml::Value::as_str) else {
+            continue;
+        };
+        let loc_norm = loc.trim_end_matches('/');
+        if loc_norm == home_norm || loc_norm == "~" {
+            return VmMountsKind::Stale;
+        }
+    }
+    VmMountsKind::Current
 }
 
 /// Probe for a binary inside the running guest. `gh-dash` is a gh
@@ -336,11 +489,29 @@ mod tests {
         result
     }
 
+    /// Convenience: the "current template" mounts layout. Used by
+    /// almost every preflight test that doesn't specifically care
+    /// about mount drift detection.
+    fn current_mounts() -> VmMountsLayout {
+        VmMountsLayout {
+            kind: VmMountsKind::Current,
+            path: None,
+        }
+    }
+
+    fn stale_mounts() -> VmMountsLayout {
+        VmMountsLayout {
+            kind: VmMountsKind::Stale,
+            path: Some(PathBuf::from("/fake/lima.yaml")),
+        }
+    }
+
     #[test]
     fn host_missing_short_circuits_vm_check() {
         let vm_status = || panic!("vm_status must not run when host check fails");
         let in_vm = |_: &str| panic!("in_vm must not run when host check fails");
-        let result = check_with(|_| false, vm_status, in_vm);
+        let mounts = || panic!("mounts probe must not run when host check fails");
+        let result = check_with(|_| false, vm_status, in_vm, mounts);
         assert!(matches!(result, Preflight::HostBinsMissing(_)));
     }
 
@@ -352,14 +523,19 @@ mod tests {
         // real ~/.config/fleet/ and trip the new workspace gate.
         let xdg = tmp_xdg();
         let result = with_isolated_xdg(&xdg, || {
-            check_with(|_| true, || VmStatus::Running, |_| true)
+            check_with(|_| true, || VmStatus::Running, |_| true, current_mounts)
         });
         assert!(matches!(result, Preflight::Ok));
     }
 
     #[test]
     fn vm_missing_when_lima_reports_missing() {
-        let result = check_with(|_| true, || VmStatus::Missing, |_| true);
+        let result = check_with(
+            |_| true,
+            || VmStatus::Missing,
+            |_| true,
+            || panic!("mounts probe must not run when VM is missing"),
+        );
         assert!(matches!(result, Preflight::VmMissing));
     }
 
@@ -375,6 +551,7 @@ mod tests {
                 |_| true,
                 || VmStatus::Stopped,
                 |_| panic!("tracker probe must not run when VM is stopped"),
+                || panic!("mounts probe must not run when VM is stopped"),
             )
         });
         assert!(matches!(result, Preflight::Ok));
@@ -395,9 +572,81 @@ projects:
 ",
         );
         let result = with_isolated_xdg(&xdg, || {
-            check_with(|_| true, || VmStatus::Stopped, |_| true)
+            check_with(
+                |_| true,
+                || VmStatus::Stopped,
+                |_| true,
+                || panic!("mounts probe must not run when VM is stopped"),
+            )
         });
         assert!(matches!(result, Preflight::WorkspaceUnsafe { .. }));
+    }
+
+    #[test]
+    fn vm_mounts_stale_blocks_before_workspace_check() {
+        // Even when the AO yaml is fine, a VM with the stale
+        // host-home mount layout has to be rebuilt first.
+        let xdg = tmp_xdg();
+        write_ao_yaml(
+            &xdg,
+            r"
+defaults:
+  workspace: worktree
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/sandbox
+",
+        );
+        let result = with_isolated_xdg(&xdg, || {
+            check_with(|_| true, || VmStatus::Running, |_| true, stale_mounts)
+        });
+        match result {
+            Preflight::VmMountsStale { lima_yaml } => {
+                assert_eq!(lima_yaml, Some(PathBuf::from("/fake/lima.yaml")));
+            }
+            other => panic!("expected VmMountsStale, got {}", other_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn classify_mounts_current_when_only_subdirs_mounted() {
+        let yaml = r#"
+mounts:
+  - location: "~/.agent-orchestrator"
+    writable: true
+  - location: "~/.config/fleet"
+    writable: false
+"#;
+        assert_eq!(classify_mounts(yaml), VmMountsKind::Current);
+    }
+
+    #[test]
+    fn classify_mounts_stale_when_home_bind_mounted() {
+        // Lima resolves `~` to the user's HOME before saving the
+        // instance yaml, so test against the resolved form.
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let yaml = format!("mounts:\n  - location: {home}\n    writable: true\n");
+        assert_eq!(classify_mounts(&yaml), VmMountsKind::Stale);
+    }
+
+    #[test]
+    fn classify_mounts_stale_when_tilde_bind_mounted() {
+        // Defensive: a yaml that hasn't been resolved yet (just-loaded
+        // template, no fleet-vm install yet) still has `~`. We treat
+        // the literal tilde as a home mount too.
+        let yaml = r#"
+mounts:
+  - location: "~"
+    writable: true
+"#;
+        assert_eq!(classify_mounts(yaml), VmMountsKind::Stale);
+    }
+
+    #[test]
+    fn classify_mounts_unknown_when_no_mounts_block() {
+        let yaml = "cpus: 4\nmemory: 4GiB\n";
+        assert_eq!(classify_mounts(yaml), VmMountsKind::Unknown);
     }
 
     #[test]
@@ -419,7 +668,12 @@ projects:
         // Override XDG so the loader doesn't pick up the dev's real
         // ~/.config/fleet/agent-orchestrator.yaml.
         let result = with_isolated_xdg(&xdg, || {
-            check_with(|_| true, || VmStatus::Running, |tool| tool != "git-bug")
+            check_with(
+                |_| true,
+                || VmStatus::Running,
+                |tool| tool != "git-bug",
+                current_mounts,
+            )
         });
         match result {
             Preflight::TrackerWarnings(w) => {
@@ -456,6 +710,7 @@ projects:
                 |_| true,
                 || VmStatus::Running,
                 |tool| tool != "gh", // gh is what's missing in the guest
+                current_mounts,
             )
         });
         match result {
@@ -476,6 +731,27 @@ projects:
     }
 
     #[test]
+    fn install_command_runs_root_install_as_root() {
+        let s = install_command("git-bug").expect("git-bug script");
+        assert_eq!(s.as_user, "root");
+        // Sudo was stripped in Phase 1; if it reappears the lockdown
+        // step in the template will cause `Permission denied` here.
+        assert!(
+            !s.script.contains("sudo "),
+            "git-bug install script still uses sudo: {}",
+            s.script
+        );
+    }
+
+    #[test]
+    fn install_command_runs_user_extension_as_lima() {
+        // gh extensions land in $HOME/.local/share/gh/extensions,
+        // owned by the lima user — must not run as root.
+        let s = install_command("gh-dash").expect("gh-dash script");
+        assert_eq!(s.as_user, "lima");
+    }
+
+    #[test]
     fn tracker_warning_skipped_when_tool_available() {
         let xdg = tmp_xdg();
         write_ao_yaml(
@@ -492,7 +768,7 @@ projects:
 ",
         );
         let result = with_isolated_xdg(&xdg, || {
-            check_with(|_| true, || VmStatus::Running, |_| true)
+            check_with(|_| true, || VmStatus::Running, |_| true, current_mounts)
         });
         assert!(matches!(result, Preflight::Ok));
     }
@@ -517,7 +793,7 @@ projects:
 ",
         );
         let result = with_isolated_xdg(&xdg, || {
-            check_with(|_| true, || VmStatus::Running, |_| false)
+            check_with(|_| true, || VmStatus::Running, |_| false, current_mounts)
         });
         assert!(matches!(result, Preflight::Ok));
     }
@@ -538,6 +814,7 @@ projects:
             Preflight::HostBinsMissing(_) => "HostBinsMissing",
             Preflight::VmMissing => "VmMissing",
             Preflight::WorkspaceUnsafe { .. } => "WorkspaceUnsafe",
+            Preflight::VmMountsStale { .. } => "VmMountsStale",
             Preflight::TrackerWarnings(_) => "TrackerWarnings",
         }
     }
@@ -555,7 +832,7 @@ projects:
 ",
         );
         let result = with_isolated_xdg(&xdg, || {
-            check_with(|_| true, || VmStatus::Running, |_| true)
+            check_with(|_| true, || VmStatus::Running, |_| true, current_mounts)
         });
         match result {
             Preflight::WorkspaceUnsafe { current } => assert!(current.is_none()),
@@ -578,7 +855,7 @@ projects:
 ",
         );
         let result = with_isolated_xdg(&xdg, || {
-            check_with(|_| true, || VmStatus::Running, |_| true)
+            check_with(|_| true, || VmStatus::Running, |_| true, current_mounts)
         });
         match result {
             Preflight::WorkspaceUnsafe { current } => {
@@ -603,7 +880,7 @@ projects:
 ",
         );
         let result = with_isolated_xdg(&xdg, || {
-            check_with(|_| true, || VmStatus::Running, |_| true)
+            check_with(|_| true, || VmStatus::Running, |_| true, current_mounts)
         });
         assert!(matches!(result, Preflight::Ok));
     }

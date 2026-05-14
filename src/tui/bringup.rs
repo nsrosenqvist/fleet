@@ -81,6 +81,15 @@ impl BringUp {
     pub(super) fn spawn(mode: BringUpMode) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
 
+        // Lima refuses to start a VM whose `mounts:` reference a host
+        // path that doesn't exist. fleet's template mounts
+        // `~/.agent-orchestrator/` (where AO writes worktrees), so we
+        // make sure it exists on the host before either Create or
+        // StartExisting hands off to `limactl start`. Same idea for
+        // `~/.config/fleet/` though it always exists by the time we
+        // get here (the AO yaml is in there).
+        ensure_host_mount_targets()?;
+
         // `--tty=false` accepts default prompts silently. Without it,
         // Lima asks "Proceed / Open editor / Choose template" on create
         // — interactive and the wrong shape for an embedded bring-up.
@@ -205,6 +214,20 @@ fn write_template_tmpfile() -> Result<PathBuf> {
     std::fs::write(&path, FLEET_VM_TEMPLATE)
         .with_context(|| format!("write lima template to {}", path.display()))?;
     Ok(path)
+}
+
+/// Make sure the host directories fleet's Lima template bind-mounts
+/// actually exist before `limactl start` runs. Lima refuses to start
+/// otherwise — mount targets are validated up front. Cheap idempotent
+/// `mkdir -p`-style call; errors surface to the bringup modal.
+fn ensure_host_mount_targets() -> Result<()> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        anyhow::bail!("$HOME is not set; cannot resolve bind-mount targets for fleet-vm");
+    };
+    let ao_dir = home.join(".agent-orchestrator");
+    std::fs::create_dir_all(&ao_dir)
+        .with_context(|| format!("mkdir {} for AO worktrees", ao_dir.display()))?;
+    Ok(())
 }
 
 /// Read `reader` line-by-line, push each into the channel. Silent on

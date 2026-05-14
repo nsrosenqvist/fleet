@@ -1284,6 +1284,79 @@ pub(super) fn render_workspace_unsafe(frame: &mut Frame<'_>, current: Option<&st
     );
 }
 
+pub(super) fn render_vm_mounts_stale(frame: &mut Frame<'_>, lima_yaml: Option<&std::path::Path>) {
+    let muted = Style::default().fg(MUTED);
+    let bold_accent = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let path_display = lima_yaml.map_or_else(
+        || "~/.lima/fleet-vm/lima.yaml".to_string(),
+        |p| p.display().to_string(),
+    );
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("✗ ", Style::default().fg(ERR).add_modifier(Modifier::BOLD)),
+            Span::styled("fleet-vm has a stale mount layout", bold_accent),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  The running VM was created from an older fleet template",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  whose `mounts:` block bind-mounted your whole host home",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  writable into the guest. Every agent inside the VM can",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  see ~/.ssh, ~/.gnupg, host ~/.claude, and everything",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  else under your home — which defeats the sandbox.",
+            muted,
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  observed   ", muted),
+            Span::styled(
+                path_display,
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled("  Rebuild the VM:", muted)),
+        Line::raw(""),
+        Line::from(Span::styled("    limactl stop  fleet-vm", bold_accent)),
+        Line::from(Span::styled("    limactl delete fleet-vm", bold_accent)),
+        Line::from(Span::styled(
+            "    fleet ui    # re-creates from template",
+            bold_accent,
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Worktrees live in ~/.agent-orchestrator/ on the host",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  and survive the rebuild. See docs/sandbox.md.",
+            muted,
+        )),
+    ];
+    draw_modal(
+        frame,
+        " sandbox: stale VM mounts ",
+        ERR,
+        lines,
+        &[Line::from(vec![
+            modal_key("any key"),
+            Span::styled(" quit", muted),
+        ])],
+    );
+}
+
 pub(super) fn render_preflight(frame: &mut Frame<'_>, failures: &[MissingDep]) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(

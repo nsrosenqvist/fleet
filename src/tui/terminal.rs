@@ -100,6 +100,17 @@ fn settle_preflight(
                     Err(e) => return PreflightOutcome::Err(e),
                 }
             }
+            Preflight::VmMountsStale { lima_yaml } => {
+                // Dead-end modal — fleet can't rebuild the VM for the
+                // user (would lose VM-internal state silently) and the
+                // sandbox is broken until they do. Any key quits the
+                // TUI so they can run `limactl delete fleet-vm` and
+                // come back.
+                match run_vm_mounts_stale_modal(term, lima_yaml.as_deref()) {
+                    Ok(()) => return PreflightOutcome::Quit(1),
+                    Err(e) => return PreflightOutcome::Err(e),
+                }
+            }
             Preflight::TrackerWarnings(warnings) => {
                 // No prompt — tracker tools are fleet's responsibility
                 // since fleet manages the VM. Run the install with a
@@ -161,6 +172,25 @@ fn run_workspace_unsafe_modal(
                 event::KeyCode::Char('c' | 'C') => HostBinsAction::EditConfig,
                 _ => HostBinsAction::Quit,
             });
+        }
+    }
+}
+
+/// Dead-end modal for a VM that still has fleet's old wide host-home
+/// mount layout. fleet can't auto-rebuild — that would discard any
+/// VM-internal state the user might want to inspect — so we just
+/// surface the issue and the one-line remediation. Any key quits.
+fn run_vm_mounts_stale_modal(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    lima_yaml: Option<&Path>,
+) -> Result<()> {
+    loop {
+        term.draw(|f| ui::render_vm_mounts_stale(f, lima_yaml))?;
+        if event::poll(TICK_INTERVAL)?
+            && let event::Event::Key(k) = event::read()?
+            && k.kind == event::KeyEventKind::Press
+        {
+            return Ok(());
         }
     }
 }

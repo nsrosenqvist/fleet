@@ -132,7 +132,7 @@ impl TrackerInstall {
 
 fn drive_supervisor(tools: Vec<String>, tx: &Sender<InstallEvent>) {
     for tool in tools {
-        let Some(script) = preflight::install_command(&tool) else {
+        let Some(install) = preflight::install_command(&tool) else {
             let _ = tx.send(InstallEvent::Line(format!(
                 "fleet: no install command registered for `{tool}`"
             )));
@@ -142,9 +142,10 @@ fn drive_supervisor(tools: Vec<String>, tx: &Sender<InstallEvent>) {
         // Header line in the tail so the user can see which tool's
         // output is below.
         let _ = tx.send(InstallEvent::Line(format!(
-            "── installing `{tool}` inside fleet-vm ──"
+            "── installing `{tool}` inside fleet-vm (as {}) ──",
+            install.as_user
         )));
-        let code = match run_one(script, tx) {
+        let code = match run_one(install.script, install.as_user, tx) {
             Ok(c) => c,
             Err(e) => {
                 let _ = tx.send(InstallEvent::Line(format!("fleet: install failed: {e:#}")));
@@ -156,9 +157,16 @@ fn drive_supervisor(tools: Vec<String>, tx: &Sender<InstallEvent>) {
     let _ = tx.send(InstallEvent::Finished(Ok(())));
 }
 
-fn run_one(script: &str, tx: &Sender<InstallEvent>) -> Result<i32> {
+/// Spawn a single `limactl shell --user <as_user> fleet-vm bash -c
+/// '<script>'` install. `as_user` is picked by [`preflight::install_command`]
+/// — system-scope installs (apt, /usr/local/bin) run as `root` since
+/// the lima user no longer has sudo; user-scope ones (gh extensions)
+/// run as `lima` so they land in $HOME/.local/share/gh/extensions.
+fn run_one(script: &str, as_user: &str, tx: &Sender<InstallEvent>) -> Result<i32> {
     let mut child = Command::new("limactl")
         .arg("shell")
+        .arg("--user")
+        .arg(as_user)
         .arg(VM_NAME)
         .arg("bash")
         .arg("-c")
@@ -166,7 +174,7 @@ fn run_one(script: &str, tx: &Sender<InstallEvent>) -> Result<i32> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("spawn `limactl shell fleet-vm bash`")?;
+        .with_context(|| format!("spawn `limactl shell --user {as_user} fleet-vm bash`"))?;
     let stdout = child.stdout.take().context("child stdout missing")?;
     let stderr = child.stderr.take().context("child stderr missing")?;
     forward_streams(child, stdout, stderr, tx)
