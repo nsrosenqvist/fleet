@@ -13,6 +13,7 @@ mod cli;
 mod config;
 mod identity;
 mod lima;
+mod network;
 mod process;
 mod secrets;
 mod templates_sync;

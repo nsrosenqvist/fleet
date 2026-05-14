@@ -24,6 +24,56 @@ pub struct Config {
     /// only). See [`GitConfig`].
     #[serde(default)]
     pub git: GitConfig,
+    /// Optional `[network]` section. Controls the worker egress
+    /// allowlist. Default mode is `open` (no enforcement) so existing
+    /// users see no behaviour change after upgrading. See
+    /// [`NetworkConfig`].
+    #[serde(default)]
+    pub network: NetworkConfig,
+}
+
+/// Egress filtering for AO workers. Phase 3 wires this into the
+/// in-VM `tinyproxy` instance: a cooperative `HTTPS_PROXY` env var
+/// directs worker tools (`gh`, `git`, `npm`, `cargo`, `curl`,
+/// `claude`, …) at a hostname-allowlisted proxy. When `mode =
+/// "open"` the proxy isn't engaged and traffic goes direct.
+///
+/// **Cooperative, not enforcing.** A worker process that explicitly
+/// `unset HTTPS_PROXY` can still reach arbitrary hosts. fleet's
+/// kernel-level enforcement (nftables egress-block) is on the
+/// roadmap but not in this phase; see `docs/network.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub mode: NetworkMode,
+    /// Hostnames added on top of the built-in baseline (see
+    /// `network::BUILT_IN_ALLOW`). Suffix-match: an entry of
+    /// `example.com` covers `api.example.com`,
+    /// `cdn.example.com`, etc. — the proxy's `dstdomain` semantics.
+    /// Bare hostname (no `https://`); no glob characters.
+    #[serde(default)]
+    pub extra_allow: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkMode {
+    /// Worker traffic goes direct, no proxy. The default — matches
+    /// fleet's pre-Phase-3 behaviour so an upgrade doesn't quietly
+    /// start dropping connections.
+    #[default]
+    Open,
+    /// Worker traffic is routed through the in-VM tinyproxy with the
+    /// resolved allowlist applied. Anything not on the allowlist
+    /// returns a 403 from the proxy.
+    Allowlist,
+}
+
+impl NetworkConfig {
+    pub fn is_allowlist(&self) -> bool {
+        matches!(self.mode, NetworkMode::Allowlist)
+    }
 }
 
 /// Per-user git identity that fleet should bake into the worker

@@ -856,6 +856,13 @@ fn restart_ao_for_orchestrator(app: &mut App) {
 /// actually active in `running.json`.
 fn build_start_phase(app: &App, phase_label: Option<&str>) -> Result<TaskPhase> {
     let project = app.current_project_key.as_deref();
+    // Refresh the tinyproxy allowlist inside the VM before AO starts.
+    // Best-effort and synchronous — the call is cheap (one `limactl
+    // shell --user root` invocation, no AO involvement) and keeping it
+    // out of the AoTask phase chain means a failure here doesn't fall
+    // into the AO failure-hint path. The function logs on error and
+    // returns Ok regardless.
+    let _ = crate::cli::spawn::sync_network_filter();
     let spec = crate::cli::spawn::build_start_spec(project, false, false)?;
     Ok(spec_to_phase(spec, phase_label))
 }

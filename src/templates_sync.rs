@@ -20,6 +20,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
+
 /// Worker-rules markdown baked into the binary at compile time.
 /// Source of truth is `templates/AGENTS.md` at the repo root.
 const WORKER_AGENTS_MD: &str = include_str!("../templates/AGENTS.md");
@@ -41,11 +43,27 @@ pub fn worker_agents_md_path() -> Option<PathBuf> {
 /// not). A divergent on-disk copy is overwritten without prompting:
 /// the binary is the source of truth, and fleet rebuilds are the
 /// supported way to update the worker rules.
+///
+/// When fleet's `[network] mode = "allowlist"`, the embedded
+/// markdown is appended with a "Network access" section listing the
+/// resolved allowlist (built-in baseline ∪ `extra_allow`). That way
+/// the worker sees exactly which hosts are reachable and avoids
+/// retry-looping against blocked CDNs. The append is dynamic
+/// (resolved at every call) so a user editing `network.extra_allow`
+/// and re-launching fleet sees the new list on the next bring-up
+/// without rebuilding fleet itself. Config-load failures fall back
+/// to the bare template — fleet's preflight will have surfaced the
+/// underlying config error already.
 pub fn ensure_worker_agents_md() -> Result<Option<PathBuf>> {
     let Some(path) = worker_agents_md_path() else {
         return Ok(None);
     };
-    write_if_changed(&path, WORKER_AGENTS_MD)?;
+    let cfg = Config::load().unwrap_or_default();
+    let allow = crate::network::resolve_allow_list(&cfg.network);
+    let suffix = crate::network::render_agents_md_section(&allow);
+    let mut content = String::from(WORKER_AGENTS_MD);
+    content.push_str(&suffix);
+    write_if_changed(&path, &content)?;
     Ok(Some(path))
 }
 

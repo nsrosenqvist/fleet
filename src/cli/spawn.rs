@@ -25,6 +25,7 @@ const PASSTHROUGH_ENV_ALLOW: &str =
 
 pub fn run_start(repo_root: &Path, no_dashboard: bool, no_orchestrator: bool) -> Result<i32> {
     ensure_vm_running()?;
+    sync_network_filter()?;
     // Resolve the project from cwd so AO sets up lifecycle polling for
     // it on startup. Without an explicit project, AO's project-supervisor
     // reconcile loop is the only path that registers a project in
@@ -35,6 +36,21 @@ pub fn run_start(repo_root: &Path, no_dashboard: bool, no_orchestrator: bool) ->
     let project = project_for_repo(repo_root);
     let spec = build_start_spec(project.as_deref(), no_dashboard, no_orchestrator)?;
     run_interactive_spec(&spec)
+}
+
+/// Push the latest tinyproxy allowlist into the VM. Idempotent; runs
+/// before every `fleet start` so a change to `network.extra_allow` in
+/// the user's config takes effect on the next start without manual
+/// proxy reload. Best-effort: a failure here logs and continues
+/// rather than blocking AO startup, since the proxy will simply
+/// continue to serve the previous filter.
+pub fn sync_network_filter() -> Result<()> {
+    let cfg = Config::load()?;
+    let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
+    if let Err(e) = crate::network::sync_in_vm_filter(&cfg, &invoker) {
+        tracing::warn!(error = ?e, "tinyproxy filter sync failed; using previous filter");
+    }
+    Ok(())
 }
 
 pub fn run_spawn(
@@ -369,6 +385,7 @@ fn build_claude_oauth_spec(
         gh_token.as_ref(),
         gitconfig.as_deref(),
     );
+    push_network_env(&mut env_set, &mut allow_keys, cfg);
     env_set.push(("LIMA_SHELLENV_ALLOW".to_string(), allow_keys.join(",")));
     Ok(CommandSpec {
         program: "limactl".to_string(),
@@ -404,6 +421,35 @@ fn push_identity_env(
         ));
         allow_keys.push("FLEET_GITCONFIG_B64");
     }
+}
+
+/// Append egress-proxy entries (`HTTPS_PROXY`, `HTTP_PROXY`,
+/// `NO_PROXY`) when fleet's `[network] mode = "allowlist"`. The
+/// proxy itself (tinyproxy) is installed at VM provisioning time
+/// and listens on 127.0.0.1:8888. fleet writes the allowlist file
+/// via `network::sync_in_vm_filter` before this spec runs, so by
+/// the time AO connects the proxy is configured.
+///
+/// `NO_PROXY` excludes the loopback addresses so AO's
+/// dashboard / orchestrator IPC doesn't bounce back through the
+/// proxy unnecessarily (and so its `ao acknowledge`-style
+/// localhost-only HTTP calls aren't rejected as off-allowlist).
+fn push_network_env(
+    env_set: &mut Vec<(String, String)>,
+    allow_keys: &mut Vec<&'static str>,
+    cfg: &Config,
+) {
+    if !cfg.network.is_allowlist() {
+        return;
+    }
+    let proxy = "http://127.0.0.1:8888".to_string();
+    env_set.push(("HTTPS_PROXY".to_string(), proxy.clone()));
+    env_set.push(("HTTP_PROXY".to_string(), proxy));
+    env_set.push((
+        "NO_PROXY".to_string(),
+        "127.0.0.1,localhost,::1".to_string(),
+    ));
+    allow_keys.extend_from_slice(&["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]);
 }
 
 /// Pre-`ao start` flow for non-Claude agents (Codex, Aider, …) — no
@@ -469,6 +515,7 @@ fn build_passthrough_spec(
         gh_token.as_ref(),
         gitconfig.as_deref(),
     );
+    push_network_env(&mut env_set, &mut allow_keys, &cfg);
     env_set.push(("LIMA_SHELLENV_ALLOW".to_string(), allow_keys.join(",")));
     Ok(CommandSpec {
         program: "limactl".to_string(),
