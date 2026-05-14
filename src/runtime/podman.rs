@@ -129,8 +129,19 @@ impl RuntimeAdapter for PodmanAdapter {
         self.cli.exec(&workspace, argv, opts)
     }
 
-    fn attach_pty(&self, _container: &ContainerId, _argv: &[String]) -> Result<PtyHandle> {
-        bail!("podman PTY attach not yet implemented — wiring lands in a later chunk")
+    fn attach_pty(&self, container: &ContainerId, user_argv: &[String]) -> Result<PtyHandle> {
+        if user_argv.is_empty() {
+            bail!("attach_pty argv must contain at least the program name");
+        }
+        let cli_args = attach_argv(container, user_argv);
+        // Inherits the caller's stdio so the terminal *is* the PTY —
+        // podman wires the inner process's stdio to the engine's PTY
+        // when `-it` is set. Blocks until the inner exits.
+        let exit_code = crate::process::run_interactive("podman", &cli_args, &[], &[])?;
+        Ok(PtyHandle {
+            container: container.clone(),
+            exit_code,
+        })
     }
 
     fn stop(&self, container: &ContainerId) -> Result<()> {
@@ -178,6 +189,17 @@ impl RuntimeAdapter for PodmanAdapter {
         };
         Ok(parse_inspect_status(&stdout))
     }
+}
+
+/// Build the argv for `podman exec -it <id> <cmd…>`. Pure so the shape can
+/// be locked in by tests without spawning a real podman subprocess.
+fn attach_argv(container: &ContainerId, user_argv: &[String]) -> Vec<String> {
+    let mut cli_args = Vec::with_capacity(3 + user_argv.len());
+    cli_args.push("exec".to_string());
+    cli_args.push("-it".to_string());
+    cli_args.push(container.as_str().to_string());
+    cli_args.extend(user_argv.iter().cloned());
+    cli_args
 }
 
 /// Heuristic mapping from a parsed devcontainer file location to the repo root
@@ -429,12 +451,32 @@ mod tests {
     }
 
     #[test]
-    fn attach_pty_bails_not_yet_implemented() {
+    fn attach_pty_rejects_empty_argv() {
+        // The actual subprocess spawn inherits stdio and isn't unit-
+        // testable here; argv-shape coverage lives in the
+        // `attach_argv_*` tests below. Empty argv has to be caught up
+        // front so callers don't get a cryptic engine error.
         let a = PodmanAdapter::new(Arc::new(MockProcessInvoker::new()), false);
-        let err = a
-            .attach_pty(&ContainerId::new("c"), &["bash".to_string()])
-            .unwrap_err();
-        assert!(format!("{err}").contains("not yet implemented"));
+        let err = a.attach_pty(&ContainerId::new("c"), &[]).unwrap_err();
+        assert!(format!("{err}").contains("at least the program name"));
+    }
+
+    #[test]
+    fn attach_argv_wraps_exec_dash_it_with_container_id() {
+        let argv = attach_argv(
+            &ContainerId::new("c-123"),
+            &["bash".to_string()],
+        );
+        assert_eq!(argv, vec!["exec", "-it", "c-123", "bash"]);
+    }
+
+    #[test]
+    fn attach_argv_passes_through_multi_arg_commands() {
+        let argv = attach_argv(
+            &ContainerId::new("c-1"),
+            &["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+        );
+        assert_eq!(argv, vec!["exec", "-it", "c-1", "sh", "-c", "echo hi"]);
     }
 
     #[test]

@@ -104,6 +104,25 @@ pub fn run_exec(argv: &[String]) -> Result<i32> {
     Ok(h.exit_code)
 }
 
+/// CLI entry point for `fleet runtime attach <id> [-- argv…]`. Routes
+/// through the adapter's `attach_pty`, which spawns the engine's
+/// `exec -it` with inherited stdio. Blocks until the inner process exits;
+/// returns its exit code as fleet's exit code (so users can pipe-chain
+/// `fleet runtime attach … && …`).
+///
+/// When `argv` is empty, defaults to `bash`. Users can override (`sh`,
+/// `python`, etc.) via the trailing argv after `--`.
+pub fn run_attach(id: &str, argv: &[String]) -> Result<i32> {
+    let ctx = Context_::load()?;
+    let resolved: Vec<String> = if argv.is_empty() {
+        vec!["bash".to_string()]
+    } else {
+        argv.to_vec()
+    };
+    let handle = ctx.adapter.attach_pty(&ContainerId::new(id), &resolved)?;
+    Ok(handle.exit_code)
+}
+
 /// CLI entry point for `fleet runtime stop <id>`. Idempotent — stopping
 /// an unknown container is not an error, matching the trait contract.
 pub fn run_stop(id: &str) -> Result<i32> {

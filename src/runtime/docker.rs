@@ -113,8 +113,16 @@ impl RuntimeAdapter for DockerAdapter {
         self.cli.exec(&workspace, argv, opts)
     }
 
-    fn attach_pty(&self, _container: &ContainerId, _argv: &[String]) -> Result<PtyHandle> {
-        bail!("docker PTY attach not yet implemented — wiring lands in a later chunk")
+    fn attach_pty(&self, container: &ContainerId, user_argv: &[String]) -> Result<PtyHandle> {
+        if user_argv.is_empty() {
+            bail!("attach_pty argv must contain at least the program name");
+        }
+        let cli_args = attach_argv(container, user_argv);
+        let exit_code = crate::process::run_interactive("docker", &cli_args, &[], &[])?;
+        Ok(PtyHandle {
+            container: container.clone(),
+            exit_code,
+        })
     }
 
     fn stop(&self, container: &ContainerId) -> Result<()> {
@@ -158,6 +166,17 @@ impl RuntimeAdapter for DockerAdapter {
         };
         Ok(parse_inspect_status(&stdout))
     }
+}
+
+/// Build the argv for `docker exec -it <id> <cmd…>`. Pure so the shape
+/// can be locked in by tests without spawning real docker.
+fn attach_argv(container: &ContainerId, user_argv: &[String]) -> Vec<String> {
+    let mut cli_args = Vec::with_capacity(3 + user_argv.len());
+    cli_args.push("exec".to_string());
+    cli_args.push("-it".to_string());
+    cli_args.push(container.as_str().to_string());
+    cli_args.extend(user_argv.iter().cloned());
+    cli_args
 }
 
 /// Same heuristic as [`super::podman`] for mapping a parsed devcontainer file
@@ -381,12 +400,25 @@ mod tests {
     }
 
     #[test]
-    fn attach_pty_bails_not_yet_implemented() {
+    fn attach_pty_rejects_empty_argv() {
         let a = DockerAdapter::new(Arc::new(MockProcessInvoker::new()), false);
-        let err = a
-            .attach_pty(&ContainerId::new("c"), &["bash".to_string()])
-            .unwrap_err();
-        assert!(format!("{err}").contains("not yet implemented"));
+        let err = a.attach_pty(&ContainerId::new("c"), &[]).unwrap_err();
+        assert!(format!("{err}").contains("at least the program name"));
+    }
+
+    #[test]
+    fn attach_argv_wraps_exec_dash_it_with_container_id() {
+        let argv = attach_argv(&ContainerId::new("c-7"), &["bash".to_string()]);
+        assert_eq!(argv, vec!["exec", "-it", "c-7", "bash"]);
+    }
+
+    #[test]
+    fn attach_argv_passes_through_multi_arg_commands() {
+        let argv = attach_argv(
+            &ContainerId::new("c-1"),
+            &["sh".to_string(), "-c".to_string(), "ls -la".to_string()],
+        );
+        assert_eq!(argv, vec!["exec", "-it", "c-1", "sh", "-c", "ls -la"]);
     }
 
     #[test]

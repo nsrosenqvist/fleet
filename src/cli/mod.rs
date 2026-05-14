@@ -211,6 +211,16 @@ pub enum RuntimeSub {
     /// Stop a container by id. Idempotent.
     Stop { id: String },
 
+    /// Attach an interactive PTY to a running container. The caller's
+    /// terminal is inherited; the inner process's exit code becomes
+    /// fleet's. With no argv, defaults to `bash`; override via `--`.
+    Attach {
+        id: String,
+        /// Command to run inside the container; defaults to `bash`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+
     /// Print a container's current state. Exits with the container's exit
     /// code when it has exited, or 2 for dead/unknown states.
     Inspect { id: String },
@@ -263,6 +273,7 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
             RuntimeSub::Exec { argv } => runtime::run_exec(&argv),
             RuntimeSub::Stop { id } => runtime::run_stop(&id),
             RuntimeSub::Inspect { id } => runtime::run_inspect(&id),
+            RuntimeSub::Attach { id, argv } => runtime::run_attach(&id, &argv),
         },
         Command::Init => init::run(),
         Command::Workflow { sub } => match sub {

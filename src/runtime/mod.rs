@@ -113,13 +113,15 @@ pub struct ExecHandle {
     pub exit_code: i32,
 }
 
-/// Marker for an in-progress interactive PTY attach. The real fields land
-/// when adapter impls grow PTY support; for now this is an opaque handle the
-/// trait method can return so call sites can compile against the final
-/// signature.
-#[derive(Debug)]
+/// Result of an interactive PTY attach. Today's adapters spawn the engine's
+/// `exec -it` command with the user's terminal inherited as the PTY, block
+/// until the inner process exits, and return the exit code here. A future
+/// chunk that grows TUI-side attach will add a master fd field for
+/// multiplexing; the current shape is the CLI-only contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtyHandle {
     pub container: ContainerId,
+    pub exit_code: i32,
 }
 
 /// Lifecycle state of a container as reported by the adapter. `Unknown`
