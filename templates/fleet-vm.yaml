@@ -34,6 +34,12 @@ cpus: 4
 memory: "4GiB"
 disk: "30GiB"
 
+# virtiofs supports POSIX ACL passthrough; 9p (Lima's default on Linux
+# in some configurations) does not. Phase 5 grants the aoworker user
+# rwx on the AO worktree mount via `setfacl`, which silently no-ops on
+# 9p with "Operation not supported". Force virtiofs so the ACL takes.
+mountType: virtiofs
+
 # Filesystem isolation. The host home is intentionally NOT bind-mounted.
 # AO workers run as a dedicated `aoworker` user (uid 2000, no sudo)
 # inside the VM, distinct from the `lima` user that fleet's host-side
@@ -296,12 +302,23 @@ provision:
     script: |
       #!/bin/bash
       set -eu
-      PROVISION_MARKER="/var/lib/fleet/.aoworker-provisioned-v1"
+      PROVISION_MARKER="/var/lib/fleet/.aoworker-provisioned-v2"
       if [ -f "$PROVISION_MARKER" ]; then
           exit 0
       fi
       export DEBIAN_FRONTEND=noninteractive
       apt-get install -y acl
+
+      # Lima creates the default user dynamically from the host's
+      # username (typically uid 1000), with home `/home/<host-user>`
+      # or `/home/<host-user>.linux` / `.guest` if there's a naming
+      # conflict. Pin to uid 1000 rather than a hard-coded name so the
+      # provisioning works regardless of whose machine fleet runs on.
+      LIMA_USER="$(getent passwd 1000 | cut -d: -f1)"
+      if [ -z "$LIMA_USER" ]; then
+          echo "fleet-vm provisioning: no user at uid 1000 — Lima didn't create the default user" >&2
+          exit 1
+      fi
 
       getent group aousers >/dev/null || groupadd --system --gid 2000 aousers
       getent passwd aoworker >/dev/null || useradd \
@@ -312,27 +329,27 @@ provision:
         --shell /bin/bash \
         aoworker
 
-      # lima needs aousers as a supplementary group so it can read the
-      # AO worktree mount (TUI `Enter`-to-attach `cd`s into the worktree
-      # before exec'ing `sudo -u aoworker tmux attach`).
-      usermod -aG aousers lima || true
+      # lima-user needs aousers as a supplementary group so it can read
+      # the AO worktree mount (TUI `Enter`-to-attach `cd`s into the
+      # worktree before exec'ing `sudo -u aoworker tmux attach`).
+      usermod -aG aousers "$LIMA_USER"
 
       # The bind mount lands at /home/aoworker/.agent-orchestrator
-      # because the `mounts:` block above sets `mountPoint:`. Lima
-      # creates the mount target as part of starting up — at this
-      # point in cloud-init it already exists. ACL grants aousers
-      # rwx now AND as default (so new files / dirs inherit).
-      install -d -o aoworker -g aousers -m 2775 /home/aoworker/.agent-orchestrator
+      # because the `mounts:` block above sets `mountPoint:`. The dir
+      # is owned by the host user inside the VM (uid 1000), and the
+      # mount type is virtiofs (forced via top-level `mountType:`)
+      # which DOES support POSIX ACLs — so root can grant aousers rwx
+      # without needing to chown the mount itself.
       setfacl -R -m  g:aousers:rwX /home/aoworker/.agent-orchestrator
       setfacl -R -d -m g:aousers:rwX /home/aoworker/.agent-orchestrator
 
-      # Sudoers drop-in: lima can run /bin/bash and /usr/bin/tmux as
-      # aoworker (no other targets). env_keep preserves the env vars
+      # Sudoers drop-in: lima-user can run /bin/bash and /usr/bin/tmux
+      # as aoworker (no other targets). env_keep preserves the env vars
       # fleet brokers in from the host through `limactl --preserve-env`
       # → lima → `sudo -u aoworker`.
-      cat > /etc/sudoers.d/fleet-aoworker <<'SUDOERS'
+      cat > /etc/sudoers.d/fleet-aoworker <<SUDOERS
       Defaults!/bin/bash, /usr/bin/tmux env_keep += "CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN FLEET_GITCONFIG_B64 AO_GLOBAL_CONFIG HTTPS_PROXY HTTP_PROXY NO_PROXY TERM LIMA_SHELLENV_ALLOW"
-      lima ALL=(aoworker) NOPASSWD: /bin/bash, /usr/bin/tmux
+      $LIMA_USER ALL=(aoworker) NOPASSWD: /bin/bash, /usr/bin/tmux
       SUDOERS
       chmod 0440 /etc/sudoers.d/fleet-aoworker
       visudo -c -f /etc/sudoers.d/fleet-aoworker
