@@ -173,8 +173,16 @@ pub enum WorkflowSub {
 
     /// Run a workflow end-to-end against the configured adapter.
     /// Prints the session id on stdout. Exit code 0 on Completed,
-    /// 1 on Failed.
-    Run { name: String },
+    /// 1 on Failed. With `--issue <id>`, resolves the issue through
+    /// the configured tracker and exposes it to nodes via
+    /// `FLEET_ISSUE_ID` / `FLEET_ISSUE_HUMAN_ID` / `FLEET_ISSUE_TITLE`.
+    Run {
+        name: String,
+        /// Issue id to act on (matches the tracker's `human_id`:
+        /// numbers for GitHub, short hashes for git-bug).
+        #[arg(long)]
+        issue: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -260,7 +268,7 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
         Command::Workflow { sub } => match sub {
             WorkflowSub::List => workflow::run_list(),
             WorkflowSub::Validate { name } => workflow::run_validate(&name),
-            WorkflowSub::Run { name } => workflow::run_run(&name),
+            WorkflowSub::Run { name, issue } => workflow::run_run(&name, issue.as_deref()),
         },
         Command::Sessions { sub } => match sub {
             SessionsSub::List => sessions::run_list(),

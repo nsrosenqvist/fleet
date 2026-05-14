@@ -45,9 +45,22 @@ pub struct WorkflowExecutor {
     clock: ClockFn,
 }
 
+/// Issue the workflow is acting on, when one was supplied via the
+/// tracker. `None` means "no issue context" (the workflow ran without
+/// `--issue`). Both forms are first-class: not every workflow needs a
+/// tracker issue (e.g. `fleet workflow run lint`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueContext {
+    /// Opaque tracker id (`"gh:42"`, full git-bug hash).
+    pub id: String,
+    /// User-facing id (`"42"`, short git-bug hash).
+    pub human_id: String,
+    pub title: String,
+}
+
 /// What [`WorkflowExecutor::execute`] needs to run one workflow. Bundled
 /// into a struct so the function signature stays stable as Phase 2 adds
-/// fields (e.g. issue id, tracker handle, autonomous-mode bounds).
+/// fields (e.g. autonomous-mode bounds, tracker callbacks).
 pub struct ExecuteRequest<'a> {
     pub workflow: &'a Workflow,
     pub adapter: &'a dyn RuntimeAdapter,
@@ -57,6 +70,10 @@ pub struct ExecuteRequest<'a> {
     /// Repo root that gets bind-mounted as the container's workspace.
     pub workspace: &'a Path,
     pub session_id: SessionId,
+    /// Issue the workflow is acting on, if any. Surfaces to nodes via
+    /// `FLEET_ISSUE_ID` / `FLEET_ISSUE_HUMAN_ID` / `FLEET_ISSUE_TITLE`
+    /// in both agent and bash node environments.
+    pub issue: Option<IssueContext>,
 }
 
 impl WorkflowExecutor {
@@ -139,7 +156,7 @@ impl WorkflowExecutor {
                 node.id
             )
         })?;
-        let env = passthrough_env(agent);
+        let env = build_agent_env(agent, req.issue.as_ref());
 
         let image = req
             .adapter
@@ -204,9 +221,12 @@ impl WorkflowExecutor {
         // Host-side execution per the plan. Agent-isolation does not apply.
         // The script's cwd is the workspace so `gh pr create` etc. find the
         // repo's git config; we shell into it with `sh -c "cd <ws> && …"`,
-        // mirroring `local::LocalAdapter::exec`'s wrapping.
+        // mirroring `local::LocalAdapter::exec`'s wrapping. Issue env vars
+        // are spliced in *after* the cd so they live in the script's
+        // environment without polluting the outer shell.
+        let env_prefix = bash_issue_env_prefix(req.issue.as_ref());
         let cmd = format!(
-            "cd {} && {script}",
+            "cd {} && {env_prefix}{script}",
             shell_quote_path(req.workspace)
         );
         let result = self.invoker.run("sh", vec!["-c".to_string(), cmd]);
@@ -265,12 +285,55 @@ impl WorkflowExecutor {
     }
 }
 
-fn passthrough_env(agent: &AgentSpec) -> Vec<(String, String)> {
-    agent
+/// Build the env Vec the agent's container receives: the agent's
+/// `env_passthrough` whitelist (resolved against the host's environment)
+/// plus any `FLEET_ISSUE_*` vars derived from the workflow's issue
+/// context. Pure; the testable seam for `run_agent_node`.
+#[must_use]
+pub fn build_agent_env(
+    agent: &AgentSpec,
+    issue: Option<&IssueContext>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = agent
         .env_passthrough
         .iter()
         .map(|k| (k.clone(), std::env::var(k).unwrap_or_default()))
-        .collect()
+        .collect();
+    if let Some(ctx) = issue {
+        env.push(("FLEET_ISSUE_ID".to_string(), ctx.id.clone()));
+        env.push(("FLEET_ISSUE_HUMAN_ID".to_string(), ctx.human_id.clone()));
+        env.push(("FLEET_ISSUE_TITLE".to_string(), ctx.title.clone()));
+    }
+    env
+}
+
+/// Build the env-var prefix that bash node scripts get injected with:
+/// `FLEET_ISSUE_ID='…' FLEET_ISSUE_HUMAN_ID='…' FLEET_ISSUE_TITLE='…' `
+/// (with trailing space). Returns the empty string when no issue
+/// context is present so the unwrapped path is byte-identical to what
+/// it looked like before this feature landed. Pure; testable seam.
+#[must_use]
+pub fn bash_issue_env_prefix(issue: Option<&IssueContext>) -> String {
+    let Some(ctx) = issue else {
+        return String::new();
+    };
+    format!(
+        "FLEET_ISSUE_ID={} FLEET_ISSUE_HUMAN_ID={} FLEET_ISSUE_TITLE={} ",
+        shell_quote_value(&ctx.id),
+        shell_quote_value(&ctx.human_id),
+        shell_quote_value(&ctx.title),
+    )
+}
+
+/// POSIX-shell single-quote escape for an arbitrary string. Same
+/// scheme as [`shell_quote_path`] but takes `&str` because issue
+/// fields are strings, not paths.
+fn shell_quote_value(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }
 
 /// Phase 1 supports agent + bash. Reject the rest with a single, specific
@@ -437,6 +500,132 @@ mod tests {
         (dir, store)
     }
 
+    fn sample_issue() -> IssueContext {
+        IssueContext {
+            id: "gh:42".to_string(),
+            human_id: "42".to_string(),
+            title: "Fix the parser".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_agent_env_returns_passthrough_only_when_no_issue() {
+        // Empty passthrough → empty env; no issue context means no
+        // FLEET_ISSUE_* vars.
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: Vec::new(),
+        };
+        assert!(build_agent_env(&spec, None).is_empty());
+    }
+
+    #[test]
+    fn build_agent_env_resolves_passthrough_against_host_env() {
+        // SAFETY: setting test-scoped env vars on the current process is
+        // fine; tests in this file are not run in parallel against the
+        // same variable.
+        unsafe { std::env::set_var("FLEET_TEST_KEY", "secret") };
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: vec!["FLEET_TEST_KEY".to_string()],
+        };
+        let env = build_agent_env(&spec, None);
+        assert!(env.iter().any(|(k, v)| k == "FLEET_TEST_KEY" && v == "secret"));
+        unsafe { std::env::remove_var("FLEET_TEST_KEY") };
+    }
+
+    #[test]
+    fn build_agent_env_appends_issue_vars_when_present() {
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: Vec::new(),
+        };
+        let env = build_agent_env(&spec, Some(&sample_issue()));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "FLEET_ISSUE_ID" && v == "gh:42"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "FLEET_ISSUE_HUMAN_ID" && v == "42"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "FLEET_ISSUE_TITLE" && v == "Fix the parser"));
+    }
+
+    #[test]
+    fn bash_issue_env_prefix_is_empty_when_no_issue() {
+        assert_eq!(bash_issue_env_prefix(None), "");
+    }
+
+    #[test]
+    fn bash_issue_env_prefix_emits_quoted_assignments_with_trailing_space() {
+        let prefix = bash_issue_env_prefix(Some(&sample_issue()));
+        assert_eq!(
+            prefix,
+            "FLEET_ISSUE_ID='gh:42' FLEET_ISSUE_HUMAN_ID='42' FLEET_ISSUE_TITLE='Fix the parser' "
+        );
+    }
+
+    #[test]
+    fn bash_issue_env_prefix_quotes_embedded_single_quotes() {
+        let ctx = IssueContext {
+            id: "gh:1".to_string(),
+            human_id: "1".to_string(),
+            title: "Doesn't render".to_string(),
+        };
+        let prefix = bash_issue_env_prefix(Some(&ctx));
+        // `'` inside single-quoted string becomes `'\''` (close-quote,
+        // escaped quote, re-open-quote) — POSIX-portable form.
+        assert!(prefix.contains("'Doesn'\\''t render'"), "got: {prefix}");
+    }
+
+    #[test]
+    fn bash_issue_env_prefix_handles_empty_title() {
+        let ctx = IssueContext {
+            id: "gh:1".to_string(),
+            human_id: "1".to_string(),
+            title: String::new(),
+        };
+        let prefix = bash_issue_env_prefix(Some(&ctx));
+        assert!(prefix.contains("FLEET_ISSUE_TITLE='' "), "got: {prefix}");
+    }
+
+    #[test]
+    fn bash_node_script_carries_issue_env_when_issue_present() {
+        let yaml = "\
+name: with-issue
+nodes:
+  - id: print
+    type: bash
+    script: 'echo $FLEET_ISSUE_HUMAN_ID'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let expected_cmd = "cd '/repo' && FLEET_ISSUE_ID='gh:42' FLEET_ISSUE_HUMAN_ID='42' FLEET_ISSUE_TITLE='Fix the parser' echo $FLEET_ISSUE_HUMAN_ID";
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run()
+            .with(eq("sh"), eq(vec!["-c".to_string(), expected_cmd.to_string()]))
+            .returning(|_, _| Ok("42\n".to_string()));
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-iss"),
+            issue: Some(sample_issue()),
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+    }
+
     #[test]
     fn one_agent_node_workflow_completes_against_local_adapter() {
         let yaml = "\
@@ -459,6 +648,7 @@ nodes:
             devcontainer: &dc,
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-trivial"),
+            issue: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -494,6 +684,7 @@ nodes:
             devcontainer: &dc,
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fail"),
+            issue: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -525,6 +716,7 @@ nodes:
             devcontainer: &dc,
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-ghost"),
+            issue: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("unknown agent `ghost`"));
@@ -567,6 +759,7 @@ nodes:
             devcontainer: &dc,
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bash"),
+            issue: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -601,6 +794,7 @@ nodes:
             devcontainer: &dc,
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bashfail"),
+            issue: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("bash node `bad` failed"));
@@ -633,6 +827,7 @@ nodes:
             devcontainer: &dc,
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate"),
+            issue: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("does not support gate nodes"));
@@ -666,6 +861,7 @@ nodes:
             devcontainer: &dc,
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fan"),
+            issue: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("does not support fanout nodes"));
@@ -698,6 +894,7 @@ nodes:
             devcontainer: &dc,
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-loop"),
+            issue: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("does not support loop_back_to"));
@@ -772,6 +969,7 @@ nodes:
             devcontainer: &dc,
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-dia"),
+            issue: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);

@@ -21,7 +21,8 @@ use crate::runtime::devcontainer::Devcontainer;
 use crate::runtime::factory::build_adapter;
 use crate::session::{ClockIdSource, IdSource, SessionState};
 use crate::session::store::SessionStore;
-use crate::workflow::executor::{ExecuteRequest, WorkflowExecutor};
+use crate::tracker::{Issue, build as build_tracker};
+use crate::workflow::executor::{ExecuteRequest, IssueContext, WorkflowExecutor};
 use crate::workflow::spec::Workflow;
 use crate::workflow::validate::validate;
 
@@ -56,8 +57,10 @@ pub fn run_validate(name: &str) -> Result<i32> {
 /// CLI entry point for `fleet workflow run <name>`. Single-shot: build the
 /// adapter from .fleet/config.yaml + probe, mint a session, execute. Prints
 /// the session id on stdout for scripting, and a one-line status summary
-/// on stderr. Exit code: 0 on Completed, 1 on Failed.
-pub fn run_run(name: &str) -> Result<i32> {
+/// on stderr. Exit code: 0 on Completed, 1 on Failed. When `issue_id` is
+/// `Some`, resolves the human id through the configured tracker and
+/// surfaces it to nodes via `FLEET_ISSUE_*` env vars.
+pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
     let config = RepoConfig::load(root.join(".fleet/config.yaml"))
@@ -86,6 +89,11 @@ pub fn run_run(name: &str) -> Result<i32> {
     let store = SessionStore::for_repo(&root);
     let session_id = ClockIdSource.mint();
 
+    let issue = match issue_id {
+        Some(id) => Some(resolve_issue(&config, &root, Arc::clone(&invoker), id)?),
+        None => None,
+    };
+
     let executor = WorkflowExecutor::new(invoker);
     let req = ExecuteRequest {
         workflow: &wf,
@@ -95,6 +103,7 @@ pub fn run_run(name: &str) -> Result<i32> {
         devcontainer: &devcontainer,
         workspace: &root,
         session_id: session_id.clone(),
+        issue,
     };
 
     println!("{session_id}");
@@ -115,6 +124,46 @@ pub fn run_run(name: &str) -> Result<i32> {
 /// Resolve the on-disk path for a workflow name.
 fn workflow_path(root: &Path, name: &str) -> PathBuf {
     root.join(".fleet/workflows").join(format!("{name}.yaml"))
+}
+
+/// Resolve an `--issue <id>` argument through the repo's configured
+/// tracker. Exact `human_id` match wins (numbers for GitHub, short
+/// hashes for git-bug); on no match, the error suggests
+/// `fleet issues list`.
+fn resolve_issue(
+    config: &RepoConfig,
+    repo_root: &Path,
+    invoker: Arc<dyn ProcessInvoker>,
+    issue_id: &str,
+) -> Result<IssueContext> {
+    let Some(tracker) = build_tracker(config.tracker, invoker) else {
+        return Err(anyhow!(
+            "tracker `{}` is not yet implemented — cannot resolve `--issue {issue_id}`",
+            config.tracker.as_str()
+        ));
+    };
+    let issues = tracker
+        .list_issues(repo_root)
+        .with_context(|| format!("listing issues via `{}`", tracker.name()))?;
+    let found = pick_issue(&issues, issue_id).ok_or_else(|| {
+        anyhow!(
+            "issue `{issue_id}` not found in tracker `{}` — run `fleet issues list` to see available ids",
+            tracker.name()
+        )
+    })?;
+    Ok(IssueContext {
+        id: found.id.clone(),
+        human_id: found.human_id.clone(),
+        title: found.title.clone(),
+    })
+}
+
+/// Pure-function lookup so the resolution logic is testable without a
+/// real tracker subprocess. Exact `human_id` match; returns the first
+/// matching `Issue` or `None`.
+#[must_use]
+pub fn pick_issue<'a>(issues: &'a [Issue], requested: &str) -> Option<&'a Issue> {
+    issues.iter().find(|i| i.human_id == requested)
 }
 
 /// Enumerate workflows under `<root>/.fleet/workflows/`. Returns the
@@ -229,6 +278,35 @@ mod tests {
     fn workflow_path_joins_under_dot_fleet_workflows() {
         let p = workflow_path(Path::new("/repo"), "standard");
         assert_eq!(p, PathBuf::from("/repo/.fleet/workflows/standard.yaml"));
+    }
+
+    fn make_issue(human_id: &str, title: &str) -> Issue {
+        Issue {
+            id: format!("gh:{human_id}"),
+            human_id: human_id.to_string(),
+            title: title.to_string(),
+            status: "open".to_string(),
+            labels: vec![],
+        }
+    }
+
+    #[test]
+    fn pick_issue_returns_exact_human_id_match() {
+        let issues = vec![make_issue("1", "a"), make_issue("42", "b"), make_issue("100", "c")];
+        let hit = pick_issue(&issues, "42").unwrap();
+        assert_eq!(hit.title, "b");
+    }
+
+    #[test]
+    fn pick_issue_returns_none_when_no_exact_match() {
+        let issues = vec![make_issue("42", "x")];
+        // Substring match doesn't count — `4` does not match `42`.
+        assert!(pick_issue(&issues, "4").is_none());
+    }
+
+    #[test]
+    fn pick_issue_returns_none_for_empty_input() {
+        assert!(pick_issue(&[], "anything").is_none());
     }
 
     #[test]
