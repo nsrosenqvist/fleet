@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 pub mod attach;
 pub mod config_cmd;
 pub mod passthrough;
+pub mod runtime;
 pub mod spawn;
 pub mod ui;
 pub mod vm;
@@ -96,6 +97,21 @@ pub enum Command {
         #[command(subcommand)]
         sub: ConfigSub,
     },
+
+    /// v2 runtime-adapter commands (devcontainer + Podman / Apple Container
+    /// / Docker). Currently parallel to the AO path; the v2 design is in
+    /// `~/.claude/plans/declarative-wobbling-quasar.md`.
+    Runtime {
+        #[command(subcommand)]
+        sub: RuntimeSub,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuntimeSub {
+    /// Probe the host for container engines and report what's usable.
+    /// Exit code 0 when at least one engine is available, 1 otherwise.
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -137,6 +153,9 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
             ConfigSub::Show => config_cmd::run_show(),
             ConfigSub::Edit => config_cmd::run_edit(),
             ConfigSub::Init => config_cmd::run_init(),
+        },
+        Command::Runtime { sub } => match sub {
+            RuntimeSub::Doctor => Ok(runtime::run_doctor()),
         },
     }
 }
