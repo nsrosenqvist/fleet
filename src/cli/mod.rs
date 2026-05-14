@@ -18,6 +18,7 @@ pub mod runtime;
 pub mod spawn;
 pub mod ui;
 pub mod vm;
+pub mod workflow;
 
 /// fleet — host wrapper + ratatui inspector for the AO running inside Lima.
 #[derive(Debug, Parser)]
@@ -111,6 +112,29 @@ pub enum Command {
     /// in the current repo. Idempotent: re-running only fills in the
     /// pieces that are missing.
     Init,
+
+    /// v2 workflow commands — list / validate / run YAML workflows
+    /// under `.fleet/workflows/`. Phase 1 supports linear traversal
+    /// of agent + bash nodes; gate / assert / fanout / `loop_back_to`
+    /// are parsed but rejected at execute time.
+    Workflow {
+        #[command(subcommand)]
+        sub: WorkflowSub,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkflowSub {
+    /// List workflows discovered under `.fleet/workflows/`.
+    List,
+
+    /// Parse and DAG-validate a workflow without executing it.
+    Validate { name: String },
+
+    /// Run a workflow end-to-end against the configured adapter.
+    /// Prints the session id on stdout. Exit code 0 on Completed,
+    /// 1 on Failed.
+    Run { name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,5 +217,10 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
             RuntimeSub::Inspect { id } => runtime::run_inspect(&id),
         },
         Command::Init => init::run(),
+        Command::Workflow { sub } => match sub {
+            WorkflowSub::List => workflow::run_list(),
+            WorkflowSub::Validate { name } => workflow::run_validate(&name),
+            WorkflowSub::Run { name } => workflow::run_run(&name),
+        },
     }
 }
