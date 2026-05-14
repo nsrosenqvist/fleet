@@ -21,6 +21,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::agent::AgentRegistry;
+
 /// Top-level repo config. Held by callers and threaded down into the runtime
 /// factory, agent registry, etc.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -129,17 +131,20 @@ impl Tracker {
     }
 }
 
-/// `agents:` block. Phase 1 only needs `default`; the per-agent registry
-/// (commands, env passthrough) lands with the workflow engine in Phase 2.
+/// `agents:` block. `default` names the agent used when a workflow node
+/// doesn't specify one; `registry` overlays user-authored entries on top
+/// of the built-in defaults (see [`AgentRegistry::with_overrides`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentsConfig {
     pub default: String,
+    pub registry: AgentRegistry,
 }
 
 impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             default: "claude-code".to_string(),
+            registry: AgentRegistry::default(),
         }
     }
 }
@@ -215,6 +220,8 @@ struct RawRuntime {
 struct RawAgents {
     #[serde(default)]
     default: Option<String>,
+    #[serde(default)]
+    registry: Option<AgentRegistry>,
 }
 
 #[derive(Deserialize, Default)]
@@ -245,9 +252,18 @@ impl From<Raw> for RepoConfig {
         };
         let tracker = raw.tracker.unwrap_or(default_tracker);
         let agents = match raw.agents {
-            Some(a) => AgentsConfig {
-                default: a.default.unwrap_or(default_agents.default),
-            },
+            Some(a) => {
+                let default = a.default.unwrap_or(default_agents.default);
+                let registry = a
+                    .registry
+                    .map_or(default_agents.registry, |user| {
+                        // Overlay user entries on the defaults so the
+                        // built-in `claude-code` survives unless the user
+                        // explicitly replaces it.
+                        AgentRegistry::default().with_overrides(user)
+                    });
+                AgentsConfig { default, registry }
+            }
             None => default_agents,
         };
         let workflows = match raw.workflows {
@@ -399,6 +415,45 @@ autonomous:
         assert_eq!(AdapterChoice::Auto.as_str(), "auto");
         assert_eq!(HardeningChoice::Gvisor.as_str(), "gvisor");
         assert_eq!(Tracker::GitBug.as_str(), "git-bug");
+    }
+
+    #[test]
+    fn agents_default_carries_claude_code_registry_entry() {
+        let cfg = RepoConfig::default();
+        assert!(cfg.agents.registry.get("claude-code").is_some());
+    }
+
+    #[test]
+    fn user_authored_agents_registry_overlays_on_defaults() {
+        let yaml = "\
+agents:
+  default: aider
+  registry:
+    aider:
+      command: [aider]
+      env_passthrough: [OPENAI_API_KEY]
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        // User added `aider`...
+        assert!(cfg.agents.registry.get("aider").is_some());
+        // ...without dropping `claude-code` from the defaults.
+        assert!(cfg.agents.registry.get("claude-code").is_some());
+        assert_eq!(cfg.agents.default, "aider");
+    }
+
+    #[test]
+    fn user_can_redefine_the_default_claude_code_entry() {
+        let yaml = "\
+agents:
+  registry:
+    claude-code:
+      command: [my-claude]
+      env_passthrough: [MY_TOKEN]
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        let cc = cfg.agents.registry.get("claude-code").unwrap();
+        assert_eq!(cc.command, vec!["my-claude"]);
+        assert_eq!(cc.env_passthrough, vec!["MY_TOKEN"]);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 // Stage 3 lands.
 #![allow(dead_code)]
 
+mod agent;
 mod ao;
 mod cli;
 mod config;
