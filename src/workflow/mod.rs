@@ -11,9 +11,6 @@
 //! TUI's "validate this workflow file" path use the same code without
 //! pulling the adapter/session machinery in.
 
+pub mod executor;
 pub mod spec;
 pub mod validate;
-
-// Re-exports land when the executor (next chunk) consumes these types.
-// Without a consumer they trip `unused_imports` under the pedantic config —
-// callers reach for `workflow::spec::Workflow` etc. directly for now.
