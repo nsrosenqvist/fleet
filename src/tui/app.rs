@@ -752,19 +752,13 @@ impl App {
     /// only advertise the keybind for plugins that have somewhere
     /// to take the user.
     pub(super) fn current_tracker_has_web(&self) -> bool {
-        let Some(key) = self.current_project_key.as_ref() else {
+        let Some(key) = self.current_project_key.as_deref() else {
             return false;
         };
         let Some(cfg) = self.ao_config.as_ref() else {
             return false;
         };
-        let Some(project) = cfg.projects.get(key) else {
-            return false;
-        };
-        let Some(tracker) = project.tracker.as_ref() else {
-            return false;
-        };
-        matches!(tracker.plugin.as_str(), "github")
+        matches!(cfg.tracker_plugin_for(key).as_deref(), Some("github"))
     }
 
     pub(super) fn selected_session_id(&self) -> Option<String> {
@@ -836,10 +830,9 @@ impl App {
         }
         let plugin: Option<String> = self
             .current_project_key
-            .as_ref()
-            .and_then(|key| self.ao_config.as_ref()?.projects.get(key))
-            .and_then(|p| p.tracker.as_ref())
-            .map(|t| t.plugin.clone());
+            .as_deref()
+            .and_then(|key| Some((key, self.ao_config.as_ref()?)))
+            .and_then(|(key, cfg)| cfg.tracker_plugin_for(key));
 
         let (issues, rx) =
             if let Some(tracker) = plugin.as_deref().and_then(crate::ao::tracker::build) {
@@ -1478,6 +1471,7 @@ mod tests {
             port: None,
             defaults: Defaults::default(),
             projects,
+            plugins: Vec::new(),
             extra: BTreeMap::new(),
         }
     }

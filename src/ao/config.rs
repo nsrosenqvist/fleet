@@ -34,11 +34,21 @@ pub struct AoConfig {
     pub defaults: Defaults,
     #[serde(default)]
     pub projects: BTreeMap<String, Project>,
+    /// Top-level tracker / runtime / scm plugin registry. AO's newer
+    /// schema moves plugin selection here from the per-project
+    /// `tracker:` block — older configs may have neither, both, or
+    /// only the per-project block. Fleet resolves "what tracker is
+    /// active for this project" via
+    /// [`Self::tracker_plugin_for`], which prefers a per-project
+    /// `tracker.plugin` and falls back to the first entry here whose
+    /// `name` matches one of the trackers fleet knows how to drive
+    /// (`git-bug`, `github`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<Plugin>,
     /// Unknown / not-yet-modelled top-level keys (`reactions`,
-    /// `plugins`, `notifiers`, …). Round-tripped verbatim so save
-    /// doesn't drop them; the config UI will surface model'd
-    /// sections in their own panels and leave these alone until we
-    /// extend the schema.
+    /// `notifiers`, …). Round-tripped verbatim so save doesn't drop
+    /// them; the config UI will surface model'd sections in their
+    /// own panels and leave these alone until we extend the schema.
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, serde_yml::Value>,
 }
@@ -127,6 +137,28 @@ pub struct Tracker {
     pub extra: BTreeMap<String, serde_yml::Value>,
 }
 
+/// One entry in the top-level `plugins:` list. AO uses these to wire
+/// up runtime / tracker / scm backends globally. Fleet only cares
+/// about the name (to recognise known tracker plugins) and the
+/// `enabled` flag (to skip disabled entries); the rest is preserved
+/// in `extra` for round-trip saves.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Plugin {
+    pub name: String,
+    /// Optional in the schema; absent / true is the common case.
+    /// Treated as `true` when missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_yml::Value>,
+}
+
+impl Plugin {
+    fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+}
+
 impl AoConfig {
     /// Where a *new* AO config should land when nothing exists yet.
     /// XDG-style central catalog so the same file drives every fleet
@@ -197,6 +229,27 @@ impl AoConfig {
         self.defaults.agent.as_deref()
     }
 
+    /// Resolve the tracker plugin name fleet should drive for
+    /// `project_key`. Prefers the per-project `tracker.plugin` field
+    /// (older schema), then falls back to the first enabled entry in
+    /// the top-level `plugins:` list whose name fleet recognises as a
+    /// tracker (newer schema, where plugins are registered globally
+    /// and per-project blocks have no `tracker:`). Returns `None`
+    /// when neither source carries a recognised tracker — callers
+    /// should render the manual-id-entry path in that case.
+    pub fn tracker_plugin_for(&self, project_key: &str) -> Option<String> {
+        if let Some(p) = self.projects.get(project_key)
+            && let Some(t) = &p.tracker
+        {
+            return Some(t.plugin.clone());
+        }
+        self.plugins
+            .iter()
+            .filter(|p| p.is_enabled())
+            .find(|p| is_known_tracker_plugin(&p.name))
+            .map(|p| p.name.clone())
+    }
+
     /// Find the project whose `path` is an ancestor of (or equal to)
     /// `cwd`. Used by fleet to scope the per-instance UI to one
     /// project based on where the user launched it from.
@@ -223,6 +276,14 @@ impl AoConfig {
         }
         best.map(|(_, k)| k)
     }
+}
+
+/// Plugin names fleet has a [`crate::ao::tracker::Tracker`]
+/// implementation for. Mirrors the dispatch in
+/// [`crate::ao::tracker::build`] — keep both in sync when adding a
+/// new tracker.
+fn is_known_tracker_plugin(name: &str) -> bool {
+    matches!(name, "git-bug" | "github")
 }
 
 /// Heuristic mapping from a free-form agent name to the auth flow
@@ -302,6 +363,76 @@ reactions:
     }
 
     #[test]
+    fn tracker_plugin_for_prefers_per_project_block() {
+        let yaml = r"
+projects:
+  sandbox:
+    name: sandbox
+    path: /tmp/sandbox
+    tracker:
+      plugin: github
+plugins:
+  - name: git-bug
+    enabled: true
+";
+        let cfg: AoConfig = serde_yml::from_str(yaml).expect("parse");
+        // Per-project tracker wins over the global plugins list.
+        assert_eq!(cfg.tracker_plugin_for("sandbox").as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn tracker_plugin_for_falls_back_to_global_plugins() {
+        // Newer AO schema: no per-project `tracker:` block, only a
+        // top-level `plugins:` list. Fleet should still resolve the
+        // effective tracker for the project.
+        let yaml = r"
+projects:
+  fleet:
+    projectId: fleet
+    displayName: fleet
+    path: /home/niklas/Code/fleet
+    sessionPrefix: fl
+plugins:
+  - name: git-bug
+    source: local
+    enabled: true
+";
+        let cfg: AoConfig = serde_yml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.tracker_plugin_for("fleet").as_deref(), Some("git-bug"));
+    }
+
+    #[test]
+    fn tracker_plugin_for_skips_disabled_global_plugins() {
+        let yaml = r"
+projects:
+  fleet:
+    path: /home/niklas/Code/fleet
+plugins:
+  - name: git-bug
+    enabled: false
+";
+        let cfg: AoConfig = serde_yml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.tracker_plugin_for("fleet"), None);
+    }
+
+    #[test]
+    fn tracker_plugin_for_skips_unknown_plugin_names() {
+        // A plugin fleet doesn't recognise (no Tracker impl) shouldn't
+        // be returned — the spawn picker would just fall back to
+        // manual-id entry anyway.
+        let yaml = r"
+projects:
+  fleet:
+    path: /home/niklas/Code/fleet
+plugins:
+  - name: linear
+    enabled: true
+";
+        let cfg: AoConfig = serde_yml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.tracker_plugin_for("fleet"), None);
+    }
+
+    #[test]
     fn workspace_is_worktree_literal_only() {
         let mk = |w: Option<&str>| Defaults {
             workspace: w.map(str::to_string),
@@ -370,6 +501,7 @@ reactions:
                     extra: BTreeMap::new(),
                 },
             )]),
+            plugins: Vec::new(),
             extra: BTreeMap::new(),
         };
         assert_eq!(cfg.project_for_cwd(&project_dir), Some("alpha"));
@@ -400,6 +532,7 @@ reactions:
                     extra: BTreeMap::new(),
                 },
             )]),
+            plugins: Vec::new(),
             extra: BTreeMap::new(),
         };
         // cwd is a subdir of the project path — the project still
@@ -434,6 +567,7 @@ reactions:
                     extra: BTreeMap::new(),
                 },
             )]),
+            plugins: Vec::new(),
             extra: BTreeMap::new(),
         };
         assert_eq!(cfg.project_for_cwd(&unrelated), None);
@@ -482,6 +616,7 @@ reactions:
                     },
                 ),
             ]),
+            plugins: Vec::new(),
             extra: BTreeMap::new(),
         };
         assert_eq!(cfg.project_for_cwd(&child), Some("child"));

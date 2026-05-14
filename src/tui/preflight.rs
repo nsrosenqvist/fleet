@@ -179,13 +179,14 @@ fn check_trackers(
     in_vm: &impl Fn(&str) -> bool,
 ) -> Vec<MissingTracker> {
     use std::collections::BTreeMap;
+    // Resolve the effective tracker per project. `tracker_plugin_for`
+    // already handles both schemas — per-project `tracker:` block
+    // (older) and top-level `plugins:` list (newer). Projects with no
+    // recognised tracker silently drop off the install check.
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (key, project) in &cfg.projects {
-        if let Some(tracker) = &project.tracker {
-            grouped
-                .entry(tracker.plugin.clone())
-                .or_default()
-                .push(key.clone());
+    for key in cfg.projects.keys() {
+        if let Some(plugin) = cfg.tracker_plugin_for(key) {
+            grouped.entry(plugin).or_default().push(key.clone());
         }
     }
 

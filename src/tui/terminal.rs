@@ -603,12 +603,13 @@ fn tracker_web(app: &mut App) {
 
 /// `(project.path, project.tracker.plugin)` for the current project,
 /// if any. `None` when fleet was launched outside a known project, or
-/// when the project has no tracker block.
+/// when no tracker plugin is configured (neither per-project
+/// `tracker.plugin` nor a known top-level `plugins:` entry).
 fn current_project_tracker(app: &App) -> Option<(std::path::PathBuf, String)> {
-    let key = app.current_project_key.as_ref()?;
+    let key = app.current_project_key.as_deref()?;
     let cfg = app.ao_config.as_ref()?;
     let project = cfg.projects.get(key)?;
-    let plugin = project.tracker.as_ref()?.plugin.clone();
+    let plugin = cfg.tracker_plugin_for(key)?;
     Some((project.path.clone(), plugin))
 }
 
