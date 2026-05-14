@@ -22,6 +22,7 @@
 pub mod capabilities;
 pub mod detect;
 pub mod devcontainer;
+pub mod devcontainer_cli;
 pub mod local;
 
 pub use capabilities::{Capabilities, Hardening, NetworkIsolation};
