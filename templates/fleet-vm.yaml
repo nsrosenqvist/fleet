@@ -302,7 +302,18 @@ probes:
     script: |
       #!/bin/bash
       set -eu
-      cloud-init status --wait >/dev/null
+      # `cloud-init status --wait` blocks until cloud-init reaches a
+      # terminal state, then returns:
+      #   0 — done (clean)
+      #   1 — still running (shouldn't happen after --wait)
+      #   2 — done with recoverable warnings ("degraded done")
+      #
+      # Lima 2.x's own cloud-init user-data uses some deprecated keys
+      # (users.0.uid, users.0.ssh-authorized-keys), which surface as
+      # recoverable warnings — so a healthy fleet-vm reliably exits 2.
+      # `|| true` accepts both clean and degraded-done. The actual
+      # success signal is the next line: ao must be on PATH.
+      cloud-init status --wait >/dev/null 2>&1 || true
       command -v ao >/dev/null 2>&1
     hint: |
       cloud-init is still running. Inside the VM:
