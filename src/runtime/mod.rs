@@ -23,6 +23,7 @@ pub mod capabilities;
 pub mod detect;
 pub mod devcontainer;
 pub mod devcontainer_cli;
+pub mod docker;
 pub mod local;
 pub mod podman;
 
