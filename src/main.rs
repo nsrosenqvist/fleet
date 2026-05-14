@@ -22,6 +22,7 @@ mod runtime;
 mod secrets;
 mod session;
 mod templates_sync;
+mod tracker;
 mod workflow;
 #[cfg(test)]
 mod test_env;
