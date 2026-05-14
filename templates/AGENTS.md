@@ -6,12 +6,14 @@ This file is the canonical worker rules for **every** project AO manages from th
 
 ## How issues work here
 
-The issue body and metadata are supplied up front in your spawn prompt by the tracker plugin AO is configured with (e.g. git-bug, GitHub Issues). You should not need to re-fetch the issue. If you do, use the tracker CLI for this project:
+The issue body and metadata are supplied up front in your spawn prompt by the tracker plugin AO is configured with. You should not need to re-fetch the issue.
 
-- **git-bug** projects: `git-bug bug show <bug-id>` (add `--format json` for raw fields).
-- **GitHub** projects: `gh issue view <number>` (add `--json …` for raw fields).
+**Use the tracker AO told you.** Your spawn prompt has a `Project Context` block that ends with a `Tracker: <name>` line — that's authoritative. Pick the CLI section below that matches it:
 
-Confirm which tracker this project uses by reading `~/.config/fleet/agent-orchestrator.yaml` (`projects.<this-project>.tracker.plugin`).
+- `Tracker: git-bug` → `git-bug bug show <bug-id>` (add `--format json` for raw fields). Issue ids are short hex strings like `f89ea1e`. Issue refs in commits/PRs are `Closes git-bug:<bug-id>`.
+- `Tracker: github` → `gh issue view <number>` (add `--json …` for raw fields). Issue ids are integers. Issue refs are `Closes #<number>`.
+
+Do **not** run `gh issue …` against a git-bug project, or `git-bug …` against a GitHub one — they'll error or silently look in the wrong place. If the `Tracker:` line isn't in your prompt (older AO build), fall back to looking at the top-level `plugins:` block in `~/.config/fleet/agent-orchestrator.yaml` and picking the first tracker plugin listed there.
 
 ## How to record progress
 
@@ -25,7 +27,10 @@ AO tracks your lifecycle through these commands. Run them from the worker shell 
 
 Do NOT self-report `done` or `terminated`. AO owns those transitions — it observes PR merge / session-kill and writes the terminal state itself.
 
-You can also comment on the issue to leave a trail (use whichever tracker CLI applies — `git-bug bug comment new <bug-id> -m "…"` or `gh issue comment <number> -b "…"`).
+You can also comment on the issue to leave a trail using the tracker CLI matching your `Tracker: <name>`:
+
+- git-bug → `git-bug bug comment new <bug-id> -m "…"`
+- github → `gh issue comment <number> -b "…"`
 
 ## Push and open the PR
 
@@ -56,7 +61,7 @@ ao report ready-for-review
 
 Notes:
 
-- `<tracker-id>` is the issue identifier the spawn prompt gave you. For git-bug it's the human-id (`Closes git-bug:fa8098a`). For GitHub Issues it's the issue number (`Closes #123`).
+- `<tracker-id>` is the issue identifier the spawn prompt gave you, formatted per your `Tracker: <name>`: git-bug uses the human-id (`Closes git-bug:fa8098a`); github uses the issue number with a `#` prefix (`Closes #123`). Don't mix forms — `Closes git-bug:123` against a github project (or `Closes #fa8098a` against git-bug) doesn't auto-link or auto-close on merge.
 - If `gh pr create` fails (auth, no remote, branch already has a PR), **do not** call `ao report pr-created`. Instead `ao report needs-input` with a comment describing the failure and stop — a human needs to unblock the credential / remote.
 - If you have to push amended commits later, the PR updates automatically; no further `ao report pr-created` needed.
 
@@ -125,7 +130,7 @@ The full checklist:
 ## When stuck
 
 - Re-read the issue body. AO supplied it; the answer to "what does done look like?" is often there.
-- Leave a tracker comment documenting what's ambiguous (`git-bug bug comment new …` or `gh issue comment …`), then `ao report waiting`. Do not invent acceptance criteria.
+- Leave a tracker comment documenting what's ambiguous using the CLI matching your `Tracker: <name>` (`git-bug bug comment new …` or `gh issue comment …`), then `ao report waiting`. Do not invent acceptance criteria.
 
 ---
 
