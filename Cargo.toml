@@ -37,6 +37,10 @@ thiserror = "2"
 
 # Secrets handling
 secrecy = "0.10"
+# Encode the brokered .gitconfig blob for transit through Lima's
+# `--preserve-env` / `LIMA_SHELLENV_ALLOW`. Multi-line INI doesn't
+# survive env-var round-trips cleanly; base64 sidesteps quoting.
+base64 = "0.22"
 # Cross-platform credential storage: macOS Keychain via Security framework,
 # Linux Secret Service via DBus (libsecret-compatible), Windows Credential
 # Manager. `crypto-rust` swaps libsecret's optional encryption out for a

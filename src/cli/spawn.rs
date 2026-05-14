@@ -282,13 +282,22 @@ fn build_claude_oauth_spec(
              secret backend."
         )
     })?;
-    let backend = secrets::build(secret_cfg, invoker);
+    let backend = secrets::build(secret_cfg, invoker.clone());
     let token = backend.fetch().with_context(|| {
         format!(
             "resolving secret `{SECRET_KEY}` via `{}` backend",
             backend.kind()
         )
     })?;
+
+    // Brokered identity material. Both calls are best-effort: a worker
+    // can still do useful work without either, so resolution failures
+    // ("no gh login on host", "no [git] section and no host
+    // ~/.gitconfig") downgrade to None rather than aborting `fleet
+    // start`. The specific operations that need them (gh issue list,
+    // git commit) surface their own errors when they fire.
+    let gh_token = crate::identity::resolve_gh_token(cfg, &invoker)?;
+    let gitconfig = crate::identity::resolve_gitconfig(cfg);
 
     // Auth handoff to claude.
     // Three pieces have to be in place before AO's interactive `claude`
@@ -318,7 +327,8 @@ fn build_claude_oauth_spec(
     };
     let bash_script = template
         .replace("__AO_CMD__", &ao_cmd)
-        .replace("__WAIT_PROJECT__", wait_project.unwrap_or(""));
+        .replace("__WAIT_PROJECT__", wait_project.unwrap_or(""))
+        .replace("__IDENTITY_PRELUDE__", IDENTITY_PRELUDE);
 
     let args = vec![
         "shell".to_string(),
@@ -335,32 +345,65 @@ fn build_claude_oauth_spec(
     let ao_global_config = crate::ao::config::AoConfig::default_xdg_path()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    let mut env_set: Vec<(String, String)> = vec![
+        ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token_str),
+        // AO_GLOBAL_CONFIG points AO's `getGlobalConfigPath()` at
+        // fleet's XDG config. Without it, the project-supervisor
+        // reconcile loop reads ~/.agent-orchestrator/config.yaml
+        // (the upstream default), finds no project, silently
+        // bails — and `running.json.projects` stays empty so an
+        // immediate `ao spawn` fails with "AO is not polling
+        // project <foo>".
+        ("AO_GLOBAL_CONFIG".to_string(), ao_global_config),
+        // The Ubuntu 24.04 VM doesn't carry terminfo for newer host
+        // terminals (`xterm-ghostty`, `wezterm`, …); tmux bails with
+        // "missing or unsuitable terminal". Force a widely-known TERM
+        // for the in-VM bash + tmux server. Worker panes are unaffected
+        // — tmux still sets `screen-256color` inside its panes.
+        ("TERM".to_string(), "xterm-256color".to_string()),
+    ];
+    let mut allow_keys = vec!["CLAUDE_CODE_OAUTH_TOKEN", "AO_GLOBAL_CONFIG"];
+    push_identity_env(
+        &mut env_set,
+        &mut allow_keys,
+        gh_token.as_ref(),
+        gitconfig.as_deref(),
+    );
+    env_set.push(("LIMA_SHELLENV_ALLOW".to_string(), allow_keys.join(",")));
     Ok(CommandSpec {
         program: "limactl".to_string(),
         args,
-        env_set: vec![
-            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token_str),
-            // AO_GLOBAL_CONFIG points AO's `getGlobalConfigPath()` at
-            // fleet's XDG config. Without it, the project-supervisor
-            // reconcile loop reads ~/.agent-orchestrator/config.yaml
-            // (the upstream default), finds no project, silently
-            // bails — and `running.json.projects` stays empty so an
-            // immediate `ao spawn` fails with "AO is not polling
-            // project <foo>".
-            ("AO_GLOBAL_CONFIG".to_string(), ao_global_config),
-            (
-                "LIMA_SHELLENV_ALLOW".to_string(),
-                "CLAUDE_CODE_OAUTH_TOKEN,AO_GLOBAL_CONFIG".to_string(),
-            ),
-            // The Ubuntu 24.04 VM doesn't carry terminfo for newer host
-            // terminals (`xterm-ghostty`, `wezterm`, …); tmux bails with
-            // "missing or unsuitable terminal". Force a widely-known TERM
-            // for the in-VM bash + tmux server. Worker panes are unaffected
-            // — tmux still sets `screen-256color` inside its panes.
-            ("TERM".to_string(), "xterm-256color".to_string()),
-        ],
+        env_set,
         env_unset: vec!["ANTHROPIC_API_KEY".to_string()],
     })
+}
+
+/// Append brokered identity entries (`GH_TOKEN`, `FLEET_GITCONFIG_B64`)
+/// to `env_set` and the `LIMA_SHELLENV_ALLOW` allowlist. Pulled out so
+/// both `build_claude_oauth_spec` and `build_passthrough_spec` share
+/// the same surface — workers spawned under codex / aider also need
+/// git identity and gh auth.
+///
+/// `gh_token` / `gitconfig` are `Option`s: when neither is configured,
+/// nothing is added. The bootstrap scripts handle the missing case
+/// (`[ -n "${FLEET_GITCONFIG_B64:-}" ]`) so an absent var is a no-op.
+fn push_identity_env(
+    env_set: &mut Vec<(String, String)>,
+    allow_keys: &mut Vec<&'static str>,
+    gh_token: Option<&secrecy::SecretString>,
+    gitconfig: Option<&str>,
+) {
+    if let Some(token) = gh_token {
+        env_set.push(("GH_TOKEN".to_string(), crate::identity::expose(token)));
+        allow_keys.push("GH_TOKEN");
+    }
+    if let Some(rendered) = gitconfig {
+        env_set.push((
+            "FLEET_GITCONFIG_B64".to_string(),
+            crate::identity::gitconfig_env_value(rendered),
+        ));
+        allow_keys.push("FLEET_GITCONFIG_B64");
+    }
 }
 
 /// Pre-`ao start` flow for non-Claude agents (Codex, Aider, …) — no
@@ -377,10 +420,13 @@ fn build_passthrough_spec(
     wait_project: Option<&str>,
 ) -> Result<CommandSpec> {
     let invoker: Arc<dyn crate::process::ProcessInvoker> = Arc::new(RealProcessInvoker);
-    let lima = Lima::new(invoker, "fleet-vm");
+    let lima = Lima::new(invoker.clone(), "fleet-vm");
     // See note in `build_claude_oauth_spec` about why there's no
     // `ensure_vm_running` at the builder layer.
     let workdir = ao_workdir_or_bail()?;
+    let cfg = Config::load()?;
+    let gh_token = crate::identity::resolve_gh_token(&cfg, &invoker)?;
+    let gitconfig = crate::identity::resolve_gitconfig(&cfg);
 
     let ao_cmd = ao_argv
         .iter()
@@ -388,14 +434,42 @@ fn build_passthrough_spec(
         .collect::<Vec<_>>()
         .join(" ");
 
+    // The passthrough fast-path (`format!("ao {ao_cmd}")`) had no
+    // pre-AO prelude. With identity brokering in place, the prelude
+    // is required even there — gitconfig has to be decoded into
+    // $HOME/.gitconfig before AO launches the worker.
     let bash_script = if daemonize {
         PASSTHROUGH_SCRIPT_DAEMON
             .replace("__AO_CMD__", &ao_cmd)
             .replace("__WAIT_PROJECT__", wait_project.unwrap_or(""))
+            .replace("__IDENTITY_PRELUDE__", IDENTITY_PRELUDE)
     } else {
-        format!("ao {ao_cmd}")
+        format!("{IDENTITY_PRELUDE}\nao {ao_cmd}")
     };
 
+    let mut env_set: Vec<(String, String)> = vec![
+        // See `build_claude_oauth_spec` for why AO_GLOBAL_CONFIG is
+        // forwarded.
+        (
+            "AO_GLOBAL_CONFIG".to_string(),
+            crate::ao::config::AoConfig::default_xdg_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+        ("TERM".to_string(), "xterm-256color".to_string()),
+    ];
+    let allow_static: Vec<&'static str> = PASSTHROUGH_ENV_ALLOW
+        .split(',')
+        .chain(std::iter::once("AO_GLOBAL_CONFIG"))
+        .collect();
+    let mut allow_keys = allow_static;
+    push_identity_env(
+        &mut env_set,
+        &mut allow_keys,
+        gh_token.as_ref(),
+        gitconfig.as_deref(),
+    );
+    env_set.push(("LIMA_SHELLENV_ALLOW".to_string(), allow_keys.join(",")));
     Ok(CommandSpec {
         program: "limactl".to_string(),
         args: vec![
@@ -408,22 +482,7 @@ fn build_passthrough_spec(
             "-c".to_string(),
             bash_script,
         ],
-        env_set: vec![
-            // See `build_claude_oauth_spec` for why AO_GLOBAL_CONFIG is
-            // forwarded. Concatenated into LIMA_SHELLENV_ALLOW alongside
-            // the passthrough provider env so Lima admits both groups.
-            (
-                "AO_GLOBAL_CONFIG".to_string(),
-                crate::ao::config::AoConfig::default_xdg_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-            ),
-            (
-                "LIMA_SHELLENV_ALLOW".to_string(),
-                format!("{PASSTHROUGH_ENV_ALLOW},AO_GLOBAL_CONFIG"),
-            ),
-            ("TERM".to_string(), "xterm-256color".to_string()),
-        ],
+        env_set,
         env_unset: Vec::new(),
     })
 }
@@ -449,16 +508,38 @@ fn ensure_vm_running() -> Result<()> {
     }
 }
 
+/// Shared identity prelude prepended to every bootstrap variant. Today
+/// it materializes the brokered gitconfig blob into `$HOME/.gitconfig`
+/// (VM-private, since `~` is no longer bind-mounted). `GH_TOKEN` stays
+/// in the env unchanged — `gh` and any worker shell read it directly.
+///
+/// The prelude is a no-op when neither var is set (e.g. running an
+/// older script against a newer fleet), so it's safe to leave in place
+/// during rollout.
+const IDENTITY_PRELUDE: &str = r#"
+# Identity prelude (fleet Phase 2):
+#   - Decode FLEET_GITCONFIG_B64 into $HOME/.gitconfig (worker commit identity).
+#   - GH_TOKEN stays in env so gh CLI inside the worker finds it.
+if [ -n "${FLEET_GITCONFIG_B64:-}" ]; then
+    umask 077
+    printf '%s' "$FLEET_GITCONFIG_B64" | base64 -d > "$HOME/.gitconfig"
+    unset FLEET_GITCONFIG_B64
+fi
+"#;
+
 /// In-VM bootstrap: write claude's credentials file + onboarding marker,
 /// scrub the OAuth env, anchor a tmux server, then run `ao __AO_CMD__`.
 /// `__AO_CMD__` is replaced by [`build_claude_oauth_spec`] with the shell-escaped
 /// argv to pass to `ao`. We intentionally use a sentinel rather than
 /// `format!()` so the JSON / printf / Node literals don't need brace
-/// escaping.
+/// escaping. `__IDENTITY_PRELUDE__` is replaced with [`IDENTITY_PRELUDE`]
+/// at build time.
 const BOOTSTRAP_SCRIPT: &str = r#"
 set -e
 mkdir -p "$HOME/.claude"
 umask 077
+
+__IDENTITY_PRELUDE__
 
 # 1. Credentials file (claude reads this in interactive mode).
 printf '{"claudeAiOauth":{"accessToken":"%s","scopes":["user:inference"],"subscriptionType":"subscription"}}\n' "$CLAUDE_CODE_OAUTH_TOKEN" > "$HOME/.claude/.credentials.json"
@@ -525,6 +606,8 @@ const BOOTSTRAP_SCRIPT_DAEMON: &str = r#"
 set -e
 mkdir -p "$HOME/.claude"
 umask 077
+
+__IDENTITY_PRELUDE__
 
 # 1. Credentials file (claude reads this in interactive mode).
 printf '{"claudeAiOauth":{"accessToken":"%s","scopes":["user:inference"],"subscriptionType":"subscription"}}\n' "$CLAUDE_CODE_OAUTH_TOKEN" > "$HOME/.claude/.credentials.json"
@@ -622,6 +705,8 @@ exit 1
 /// credentials prefix and OAuth env scrub.
 const PASSTHROUGH_SCRIPT_DAEMON: &str = r#"
 set -e
+
+__IDENTITY_PRELUDE__
 
 # Anchor tmux server (no trap — see BOOTSTRAP_SCRIPT_DAEMON).
 if ! tmux has-session 2>/dev/null; then

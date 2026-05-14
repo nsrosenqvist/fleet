@@ -821,6 +821,7 @@ version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
+ "base64",
  "clap",
  "crossterm",
  "directories",

@@ -18,6 +18,52 @@ pub struct Config {
     /// running `ao start`. See [`AgentAuthMode`].
     #[serde(default)]
     pub agent_auth: AgentAuthMode,
+    /// Optional `[git]` section. Materialized into the worker VM's
+    /// `$HOME/.gitconfig` at fleet start. When empty, fleet falls
+    /// back to the host's own `~/.gitconfig` (`user.name`/`user.email`
+    /// only). See [`GitConfig`].
+    #[serde(default)]
+    pub git: GitConfig,
+}
+
+/// Per-user git identity that fleet should bake into the worker
+/// `$HOME/.gitconfig` inside the VM. Required because the host home
+/// is no longer bind-mounted — workers can't see `~/.gitconfig`
+/// directly.
+///
+/// Resolution order at `fleet start`:
+/// 1. This struct, if either field is set in `~/.config/fleet/config.toml`.
+/// 2. The host's own `~/.gitconfig` (`user.name` + `user.email` only —
+///    signing keys and any other section are intentionally not copied,
+///    since they often reference host-side paths and may be sensitive).
+/// 3. Skipped: workers commit with whatever defaults git falls back to
+///    (host `gh` configures `user.name`/`user.email` lazily, but with
+///    no source we leave it alone).
+///
+/// Signing keys (`signingkey`, `commit.gpgsign`) are not forwarded.
+/// They're typically tied to a hardware key or host gpg-agent that
+/// doesn't exist inside the VM; even if the user wanted to forward
+/// them, doing so silently would mis-sign worker commits with the
+/// host user's identity. A future `forward_signing = true` opt-in
+/// can add this when needed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitConfig {
+    /// `user.name` for worker commits.
+    #[serde(default)]
+    pub user_name: Option<String>,
+    /// `user.email` for worker commits.
+    #[serde(default)]
+    pub user_email: Option<String>,
+}
+
+impl GitConfig {
+    /// True when neither field is configured; the fleet start path
+    /// uses this to decide whether to fall back to the host
+    /// `~/.gitconfig`.
+    pub fn is_empty(&self) -> bool {
+        self.user_name.is_none() && self.user_email.is_none()
+    }
 }
 
 /// Pre-`ao start` auth handoff strategy.

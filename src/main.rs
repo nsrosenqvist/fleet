@@ -11,6 +11,7 @@
 mod ao;
 mod cli;
 mod config;
+mod identity;
 mod lima;
 mod process;
 mod secrets;
