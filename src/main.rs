@@ -16,6 +16,7 @@ mod lima;
 mod network;
 mod process;
 mod repo;
+mod repo_config;
 mod runtime;
 mod secrets;
 mod session;

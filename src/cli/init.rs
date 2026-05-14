@@ -168,6 +168,15 @@ crashed/
 *.tmp
 ";
 
+/// Test-only accessor for the default config.yaml template. Lets the
+/// `repo_config` parser tests assert that the template scaffolded by
+/// `fleet init` round-trips to `RepoConfig::default()`.
+#[cfg(test)]
+#[must_use]
+pub fn default_fleet_config_yaml_for_tests() -> &'static str {
+    DEFAULT_FLEET_CONFIG_YAML
+}
+
 /// Default `.fleet/config.yaml`. Commented and minimal — the full schema
 /// is in the v2 plan. Consumers are still being implemented, so we keep
 /// only the fields whose meaning is already settled.
