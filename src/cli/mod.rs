@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 
 pub mod attach;
 pub mod config_cmd;
+pub mod init;
 pub mod passthrough;
 pub mod runtime;
 pub mod spawn;
@@ -105,6 +106,11 @@ pub enum Command {
         #[command(subcommand)]
         sub: RuntimeSub,
     },
+
+    /// Scaffold `.fleet/` + a minimal `.devcontainer/devcontainer.json`
+    /// in the current repo. Idempotent: re-running only fills in the
+    /// pieces that are missing.
+    Init,
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,5 +163,6 @@ pub fn dispatch(cli: Cli, repo_root: &std::path::Path) -> anyhow::Result<i32> {
         Command::Runtime { sub } => match sub {
             RuntimeSub::Doctor => Ok(runtime::run_doctor()),
         },
+        Command::Init => init::run(),
     }
 }
