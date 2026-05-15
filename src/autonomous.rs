@@ -200,7 +200,7 @@ pub enum AutonomousOutcome {
     WaitedFor(PauseReason),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCommand {
     pub workflow: String,
     pub issue: IssueContext,

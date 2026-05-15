@@ -7,6 +7,7 @@
 
 use clap::{Parser, Subcommand};
 
+pub mod autonomous;
 pub mod init;
 pub mod issues;
 pub mod runtime;
@@ -56,6 +57,13 @@ pub enum Command {
     Issues {
         #[command(subcommand)]
         sub: IssuesSub,
+    },
+
+    /// Autonomous-mode supervisor as a CLI. Same engine the TUI's
+    /// `Shift+A` mode uses, but driveable from scripts/cron.
+    Autonomous {
+        #[command(subcommand)]
+        sub: AutonomousSub,
     },
 
     /// Launch the ratatui session browser.
@@ -155,6 +163,20 @@ pub enum IssuesSub {
     List,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum AutonomousSub {
+    /// Tick the supervisor. `--once` runs a single tick and exits
+    /// (suitable for cron). `--watch` loops, sleeping
+    /// `autonomous.scan_interval_secs` between ticks, until killed.
+    /// Exactly one of the flags must be present.
+    Run {
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        watch: bool,
+    },
+}
+
 /// Dispatch the parsed CLI. Returns the exit code to propagate.
 pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
     let command = cli.command.unwrap_or(Command::Ui);
@@ -184,6 +206,9 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         },
         Command::Issues { sub } => match sub {
             IssuesSub::List => issues::run_list(),
+        },
+        Command::Autonomous { sub } => match sub {
+            AutonomousSub::Run { once, watch } => autonomous::run(once, watch),
         },
     }
 }
