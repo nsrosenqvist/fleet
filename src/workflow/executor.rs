@@ -29,12 +29,40 @@ use super::expr::{self, OutputMap};
 use super::spec::{Node, NodeKind, Workflow};
 use super::validate::validate;
 use crate::agent::AgentRegistry;
+use crate::agent::cost::parse_agent_cost_usd;
 use crate::agent::registry::AgentSpec;
 use crate::process::ProcessInvoker;
 use crate::runtime::devcontainer::Devcontainer;
 use crate::runtime::{ContainerSpec, ExecOpts, RuntimeAdapter};
 use crate::session::store::SessionStore;
 use crate::session::{IssueContext, Session, SessionId, SessionState, now_ms};
+
+/// What a node's run produced *besides* a Result. Today carries any
+/// parsed agent-cost figures; future entries (resource usage, exit
+/// reason) follow the same shape. Returned from [`WorkflowExecutor::run_node`]
+/// and [`WorkflowExecutor::run_fanout_node`] so the run loop — which
+/// owns `&mut Session` — can apply the outcome without the inner
+/// functions needing mutable access. The pattern matters most for
+/// fanout, whose siblings run in `std::thread::scope` with shared
+/// access to Session only.
+#[derive(Debug, Default, Clone)]
+struct NodeOutcome {
+    /// `(node_id, usd)` pairs. Usually 0 or 1 entry; a fanout returns
+    /// one per agent sibling that produced a parseable cost line.
+    node_costs: Vec<(String, f64)>,
+}
+
+impl NodeOutcome {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    fn with_cost(node_id: impl Into<String>, usd: f64) -> Self {
+        Self {
+            node_costs: vec![(node_id.into(), usd)],
+        }
+    }
+}
 
 /// Trait-bound closure type for the clock. Boxed so a single executor can
 /// be reused across runs with different test clocks.
@@ -242,9 +270,24 @@ impl WorkflowExecutor {
             } else {
                 self.run_node(req, node, session, &outputs)
             };
-            if let Err(err) = run_result {
-                self.mark_failed(req, session, &err);
-                return Err(err);
+            let outcome = match run_result {
+                Ok(o) => o,
+                Err(err) => {
+                    self.mark_failed(req, session, &err);
+                    return Err(err);
+                }
+            };
+
+            // Fold any cost figures the node produced into the
+            // session and flush. The extra save is one disk write per
+            // agent node — negligible — and means a crash between this
+            // node and the next still leaves the just-fired node's
+            // cost visible in the TUI / `fleet sessions show`.
+            if !outcome.node_costs.is_empty() {
+                for (nid, usd) in outcome.node_costs {
+                    session.record_node_cost(nid, usd, (self.clock)());
+                }
+                req.store.save(session)?;
             }
 
             // After a successful run, extract any declared `outputs:`.
@@ -349,7 +392,7 @@ impl WorkflowExecutor {
         node: &Node,
         session: &Session,
         outputs: &OutputMap,
-    ) -> Result<()> {
+    ) -> Result<NodeOutcome> {
         // Input artifact contract: declared `artifacts.in:` must exist
         // before the node runs. Detected here so a downstream node that
         // depends on an upstream-produced file fails loudly with a
@@ -358,10 +401,16 @@ impl WorkflowExecutor {
         let artifacts_dir = req.store.session_dir(&session.id).join("artifacts");
         verify_inputs(&artifacts_dir, node)?;
 
-        let inner = match &node.kind {
-            NodeKind::Agent { agent, .. } => self.run_agent_node(req, node, agent, session),
-            NodeKind::Bash { script } => self.run_bash_node(req, node, script, session),
-            NodeKind::Assert { expr } => self.run_assert_node(req, node, expr, session, outputs),
+        let outcome = match &node.kind {
+            NodeKind::Agent { agent, .. } => self.run_agent_node(req, node, agent, session)?,
+            NodeKind::Bash { script } => {
+                self.run_bash_node(req, node, script, session)?;
+                NodeOutcome::empty()
+            }
+            NodeKind::Assert { expr } => {
+                self.run_assert_node(req, node, expr, session, outputs)?;
+                NodeOutcome::empty()
+            }
             // Unsupported kinds were rejected earlier in `execute`; this
             // branch is just an exhaustiveness guard.
             other => bail!(
@@ -369,14 +418,13 @@ impl WorkflowExecutor {
                 node.id
             ),
         };
-        inner?;
 
         // Output contract: declared `artifacts.out:` must be produced.
         // We check after the inner run so a failing node surfaces its
         // own error first; output-contract violations are reported as
         // node failures with their own clear wording.
         verify_outputs(&artifacts_dir, node)?;
-        Ok(())
+        Ok(outcome)
     }
 
     fn run_agent_node(
@@ -385,7 +433,7 @@ impl WorkflowExecutor {
         node: &Node,
         agent_name: &str,
         session: &Session,
-    ) -> Result<()> {
+    ) -> Result<NodeOutcome> {
         let agent = req.agents.get(agent_name).ok_or_else(|| {
             anyhow!(
                 "workflow node `{}` references unknown agent `{agent_name}` (not in agents.registry)",
@@ -467,7 +515,25 @@ impl WorkflowExecutor {
                 log_path.display()
             );
         }
-        Ok(())
+
+        // Parse the agent's reported cost from captured stdio. A
+        // `None` here is informational, not an error: the agent might
+        // not have printed a cost line at all, or its format may have
+        // changed since the parser was last updated. We surface the
+        // signal in the UI; nothing else acts on it.
+        let outcome = parse_agent_cost_usd(agent_name, &handle.stdout, &handle.stderr)
+            .map_or_else(
+                || {
+                    tracing::debug!(
+                        agent = agent_name,
+                        node = %node.id,
+                        "agent cost parser found no match in output"
+                    );
+                    NodeOutcome::empty()
+                },
+                |usd| NodeOutcome::with_cost(&node.id, usd),
+            );
+        Ok(outcome)
     }
 
     fn run_bash_node(
@@ -574,7 +640,7 @@ impl WorkflowExecutor {
         siblings: &[String],
         session: &Session,
         outputs: &OutputMap,
-    ) -> Result<()> {
+    ) -> Result<NodeOutcome> {
         let sibling_nodes: Vec<&Node> = siblings
             .iter()
             .map(|sid| {
@@ -601,7 +667,7 @@ impl WorkflowExecutor {
 
         let log_path = self.node_log_path(req, session, &node.id);
 
-        let results: Vec<Result<()>> = std::thread::scope(|scope| {
+        let results: Vec<Result<NodeOutcome>> = std::thread::scope(|scope| {
             // The `collect()` between spawn and join is deliberate, not
             // wasteful: fusing the iterators would join each thread
             // before spawning the next, serialising the slate. Suppress
@@ -621,9 +687,15 @@ impl WorkflowExecutor {
         });
 
         let mut failed: Vec<(String, String)> = Vec::new();
+        let mut aggregate = NodeOutcome::empty();
         for (sib, res) in sibling_nodes.iter().zip(results) {
-            if let Err(err) = res {
-                failed.push((sib.id.clone(), format!("{err:#}")));
+            match res {
+                Ok(outcome) => {
+                    aggregate.node_costs.extend(outcome.node_costs);
+                }
+                Err(err) => {
+                    failed.push((sib.id.clone(), format!("{err:#}")));
+                }
             }
         }
 
@@ -640,7 +712,7 @@ impl WorkflowExecutor {
             if let Err(err) = std::fs::write(&log_path, body) {
                 tracing::warn!(?err, log = %log_path.display(), "writing fanout log failed");
             }
-            Ok(())
+            Ok(aggregate)
         } else {
             let combined = failed
                 .iter()
@@ -1575,6 +1647,75 @@ nodes:
         // Log was captured.
         let log = store.session_dir(&session.id).join("logs").join("only.log");
         assert!(log.is_file(), "expected log at {}", log.display());
+    }
+
+    #[test]
+    fn agent_node_records_parsed_cost_on_session() {
+        // The local adapter wraps the invoker's stdout into the exec
+        // handle verbatim, so we stage stdout that contains a Claude
+        // Code-style cost line and assert it lands on Session.
+        let yaml = "\
+name: trivial
+nodes:
+  - id: only
+    agent: claude-code
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("working...\nTotal cost (USD): $0.42\n");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-cost"),
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+        assert_eq!(session.node_costs.get("only"), Some(&0.42));
+        assert_eq!(session.total_cost_usd(), Some(0.42));
+        // Cost survives the round-trip to disk.
+        let loaded = store.load(&SessionId::new("s-cost")).unwrap();
+        assert_eq!(loaded.node_costs.get("only"), Some(&0.42));
+    }
+
+    #[test]
+    fn agent_node_without_parseable_cost_leaves_node_costs_empty() {
+        // Agent ran fine but printed nothing the parser recognises.
+        // Session must NOT show a $0.00 entry — that would
+        // misrepresent "didn't parse" as "cost zero".
+        let yaml = "\
+name: trivial
+nodes:
+  - id: only
+    agent: claude-code
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("nothing to see here\n");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-noparse"),
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+        assert!(session.node_costs.is_empty());
+        assert_eq!(session.total_cost_usd(), None);
     }
 
     #[test]

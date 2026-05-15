@@ -14,7 +14,12 @@ use super::{IssueContext, SessionId, SessionState};
 
 /// One session row. Owned by the store; mutated only via [`Session::transition_to`]
 /// so the state-machine rules are the single gate for state changes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Note: `Eq` is intentionally *not* derived — [`Self::node_costs`]'s
+/// `f64` values exclude `Eq`. Callers compare with `PartialEq`, which
+/// is enough for `assert_eq!` in tests; nothing in the binary stores
+/// `Session` in a hash-set or treats `==` as a total equivalence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Session {
     pub id: SessionId,
     /// Workflow this run is bound to. Today: the basename (without
@@ -50,6 +55,13 @@ pub struct Session {
     /// left the state stuck in `Running`.
     #[serde(default)]
     pub driver_pid: Option<u32>,
+    /// Per-node LLM cost in USD, populated after each agent node
+    /// completes. A node is *in* this map iff fleet successfully
+    /// parsed a cost figure from the agent's captured output —
+    /// absent ≠ "$0.00", absent = "no parse / didn't run". UIs
+    /// preserve the distinction.
+    #[serde(default)]
+    pub node_costs: BTreeMap<String, f64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -69,6 +81,7 @@ impl Session {
             issue: None,
             loop_counts: BTreeMap::new(),
             driver_pid: None,
+            node_costs: BTreeMap::new(),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }
@@ -116,6 +129,30 @@ impl Session {
     pub fn clear_driver_pid(&mut self, now_ms: u64) {
         self.driver_pid = None;
         self.updated_at_ms = now_ms;
+    }
+
+    /// Record an agent's reported USD cost for one workflow node.
+    /// Overwrites the previous value if a node fires more than once
+    /// (e.g. via `loop_back_to`) — the latest run is the one the user
+    /// cares about for "what did this session cost me?" framing.
+    pub fn record_node_cost(&mut self, node_id: impl Into<String>, usd: f64, now_ms: u64) {
+        self.node_costs.insert(node_id.into(), usd);
+        self.updated_at_ms = now_ms;
+    }
+
+    /// Sum across [`Self::node_costs`]. Returns `None` only when the
+    /// map is empty (no agent ran or no parse succeeded); a session
+    /// that genuinely cost zero returns `Some(0.0)`. Consumed by the
+    /// display layer (TUI sidebar, `fleet sessions show`); landed
+    /// ahead of those callers so the data contract is one commit.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn total_cost_usd(&self) -> Option<f64> {
+        if self.node_costs.is_empty() {
+            None
+        } else {
+            Some(self.node_costs.values().sum())
+        }
     }
 }
 
@@ -280,6 +317,79 @@ mod tests {
         }"#;
         let s: Session = serde_json::from_str(json).unwrap();
         assert_eq!(s.driver_pid, None);
+    }
+
+    #[test]
+    fn new_session_has_empty_node_costs() {
+        assert!(fresh().node_costs.is_empty());
+    }
+
+    #[test]
+    fn record_node_cost_inserts_and_bumps_timestamp() {
+        let mut s = fresh();
+        s.record_node_cost("plan", 0.42, 2_000);
+        assert_eq!(s.node_costs.get("plan"), Some(&0.42));
+        assert_eq!(s.updated_at_ms, 2_000);
+    }
+
+    #[test]
+    fn record_node_cost_overwrites_on_repeat() {
+        // A `loop_back_to` cycle re-runs the same node. The latest
+        // cost is what we keep — earlier figures already showed up in
+        // the user's run.
+        let mut s = fresh();
+        s.record_node_cost("review", 0.10, 2_000);
+        s.record_node_cost("review", 0.25, 3_000);
+        assert_eq!(s.node_costs.get("review"), Some(&0.25));
+    }
+
+    #[test]
+    fn total_cost_usd_returns_none_when_no_nodes_recorded() {
+        assert_eq!(fresh().total_cost_usd(), None);
+    }
+
+    #[test]
+    fn total_cost_usd_returns_some_zero_when_agent_reported_zero() {
+        // The "agent ran and cost zero" case must not collapse into
+        // the same Option::None as "agent never ran". Lock the
+        // distinction.
+        let mut s = fresh();
+        s.record_node_cost("plan", 0.0, 2_000);
+        assert_eq!(s.total_cost_usd(), Some(0.0));
+    }
+
+    #[test]
+    fn total_cost_usd_sums_every_node() {
+        let mut s = fresh();
+        s.record_node_cost("plan", 0.10, 2_000);
+        s.record_node_cost("implement", 0.30, 3_000);
+        s.record_node_cost("review", 0.05, 4_000);
+        let total = s.total_cost_usd().unwrap();
+        assert!((total - 0.45).abs() < 1e-9, "got {total}");
+    }
+
+    #[test]
+    fn node_costs_round_trip_through_json() {
+        let mut s = fresh();
+        s.record_node_cost("plan", 0.42, 2_000);
+        s.record_node_cost("review", 0.13, 3_000);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+        assert_eq!(back.node_costs.get("plan"), Some(&0.42));
+    }
+
+    #[test]
+    fn missing_node_costs_defaults_to_empty_on_load() {
+        let json = r#"{
+            "id": "s-1",
+            "workflow": "standard",
+            "state": "running",
+            "created_at_ms": 1,
+            "updated_at_ms": 1
+        }"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert!(s.node_costs.is_empty());
     }
 
     #[test]

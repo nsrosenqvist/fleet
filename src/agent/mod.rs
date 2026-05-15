@@ -12,6 +12,7 @@
 //! file under `#[cfg(test)]`-light tests; the run-time helpers will be a
 //! sibling module so spec evolution doesn't drag the spawn path along.
 
+pub mod cost;
 pub mod registry;
 
 // `AgentSpec` is re-exported when the workflow executor (sibling module)
