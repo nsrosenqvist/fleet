@@ -121,6 +121,11 @@ pub enum WorkflowSub {
         #[arg(long)]
         issue: Option<String>,
     },
+
+    /// Resume a workflow paused at a gate. Loads the persisted session,
+    /// re-parses its workflow YAML, and continues from the node after
+    /// the gate.
+    Resume { session: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -164,6 +169,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             WorkflowSub::List => workflow::run_list(),
             WorkflowSub::Validate { name } => workflow::run_validate(&name),
             WorkflowSub::Run { name, issue } => workflow::run_run(&name, issue.as_deref()),
+            WorkflowSub::Resume { session } => workflow::run_resume(&session),
         },
         Command::Sessions { sub } => match sub {
             SessionsSub::List => sessions::run_list(),

@@ -21,6 +21,7 @@ use crate::runtime::devcontainer::Devcontainer;
 use crate::runtime::factory::build_adapter;
 use crate::session::{ClockIdSource, IdSource, SessionState};
 use crate::session::store::SessionStore;
+use crate::session::SessionId;
 use crate::tracker::{Issue, build as build_tracker};
 use crate::workflow::executor::{ExecuteRequest, IssueContext, WorkflowExecutor};
 use crate::workflow::spec::Workflow;
@@ -119,6 +120,68 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
         }
         Err(err) => Err(err),
     }
+}
+
+/// CLI entry point for `fleet workflow resume <session-id>`. Loads the
+/// persisted session, re-loads the workflow YAML named in its
+/// `meta.json`, rebuilds the adapter, and continues execution from the
+/// node *after* the gate. Exit code: 0 on Completed, 1 on Failed or
+/// another `AwaitingGate` (still paused).
+pub fn run_resume(session_id: &str) -> Result<i32> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let config = RepoConfig::load(root.join(".fleet/config.yaml"))
+        .context("loading .fleet/config.yaml")?;
+
+    let store = SessionStore::for_repo(&root);
+    let id = SessionId::new(session_id);
+    // Load the session first so we know which workflow to re-parse.
+    let session = store
+        .load(&id)
+        .with_context(|| format!("loading session `{session_id}`"))?;
+
+    let wf_path = workflow_path(&root, &session.workflow);
+    let wf = Workflow::from_path(&wf_path).with_context(|| {
+        format!(
+            "loading workflow `{}` for session `{session_id}`",
+            session.workflow
+        )
+    })?;
+
+    let dc_path = if config.runtime.devcontainer.is_absolute() {
+        config.runtime.devcontainer.clone()
+    } else {
+        root.join(&config.runtime.devcontainer)
+    };
+    let devcontainer = Devcontainer::from_path(&dc_path)
+        .with_context(|| format!("loading devcontainer at {}", dc_path.display()))?;
+
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+    let report = probe(invoker.as_ref());
+    let adapter = build_adapter(&config.runtime, &report, Arc::clone(&invoker))?;
+
+    let executor = WorkflowExecutor::new(invoker);
+    let req = ExecuteRequest {
+        workflow: &wf,
+        adapter: adapter.as_ref(),
+        agents: &config.agents.registry,
+        store: &store,
+        devcontainer: &devcontainer,
+        workspace: &root,
+        session_id: id,
+        // Resume doesn't re-resolve issue context — the user's original
+        // `--issue` is lost across processes today. Workflows that
+        // depend on `FLEET_ISSUE_*` post-resume should re-spawn instead.
+        issue: None,
+    };
+    println!("{session_id}");
+    let resumed = executor.resume(&req)?;
+    eprintln!(
+        "fleet workflow resume: `{session_id}` {} (last node: {})",
+        state_word(resumed.state),
+        resumed.current_node.as_deref().unwrap_or("none"),
+    );
+    Ok(i32::from(resumed.state != SessionState::Completed))
 }
 
 /// Resolve the on-disk path for a workflow name.

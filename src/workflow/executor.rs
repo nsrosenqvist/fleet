@@ -93,17 +93,20 @@ impl WorkflowExecutor {
     }
 
     /// Run the workflow end-to-end. Mints the session row on disk, drives
-    /// it through `Running` to a terminal state, returns the final
-    /// snapshot. Node-level errors transition the session to `Failed` and
-    /// propagate; the on-disk state always reflects the last successful
-    /// transition.
+    /// it through `Running` to a terminal state (or to `AwaitingGate`,
+    /// for workflows that pause on a gate), and returns the final
+    /// snapshot. Node-level errors transition the session to `Failed`
+    /// and propagate.
     ///
     /// `loop_back_to` is honoured: after a node with `loop_back_to: X`
     /// succeeds, the executor jumps back to `X` and replays the slice
     /// `[X ..= current]` in topological order. The cycle repeats up to
-    /// `max_loops` times (default 1 when the field is omitted). The
-    /// per-loop counter is held in memory; persistence-across-resume
-    /// lands with the gate-resume work in a later commit.
+    /// `max_loops` times (default 1 when omitted). The per-loop counter
+    /// is held in memory only — `resume`-after-gate restarts the
+    /// counter, which is acceptable in v1.
+    ///
+    /// Gate nodes transition the session to `AwaitingGate` and return.
+    /// Continue from the next node via [`Self::resume`].
     pub fn execute(&self, req: &ExecuteRequest<'_>) -> Result<Session> {
         validate(req.workflow).context("workflow failed static validation")?;
         let order = topological_order(req.workflow)?;
@@ -118,8 +121,63 @@ impl WorkflowExecutor {
         session.transition_to(SessionState::Running, (self.clock)())?;
         req.store.save(&session)?;
 
+        self.run_loop(req, &mut session, &order, 0)?;
+        self.finalize(req, &mut session)?;
+        Ok(session)
+    }
+
+    /// Resume a workflow paused at a gate. Loads the persisted session,
+    /// verifies it's in `AwaitingGate`, and continues from the node
+    /// *after* the gate. The workflow YAML is re-parsed by the caller
+    /// (held by `req.workflow`); the topological order is recomputed
+    /// from scratch so a workflow edited between pause and resume is
+    /// honoured.
+    pub fn resume(&self, req: &ExecuteRequest<'_>) -> Result<Session> {
+        validate(req.workflow).context("workflow failed static validation")?;
+        let order = topological_order(req.workflow)?;
+        reject_unsupported_node_kinds(req.workflow)?;
+
+        let mut session = req
+            .store
+            .load(&req.session_id)
+            .with_context(|| format!("loading session `{}` for resume", req.session_id))?;
+        if session.state != SessionState::AwaitingGate {
+            bail!(
+                "cannot resume session `{}`: state is {:?}, expected awaiting_gate",
+                session.id,
+                session.state
+            );
+        }
+        // Resume picks up *after* the gate. Find the gate node's
+        // position; an unknown current_node (shouldn't happen but
+        // guard) means we restart from index 0.
+        let start = session
+            .current_node
+            .as_ref()
+            .and_then(|node_id| order.iter().position(|id| id == node_id))
+            .map_or(0, |i| i + 1);
+        session.transition_to(SessionState::Running, (self.clock)())?;
+        req.store.save(&session)?;
+        self.run_loop(req, &mut session, &order, start)?;
+        self.finalize(req, &mut session)?;
+        Ok(session)
+    }
+
+    /// The shared inner loop driving both `execute` and `resume`. Walks
+    /// `order` from `start_idx`, runs each node, and honours
+    /// `loop_back_to` and gate-pause transitions. Returns Ok with the
+    /// session left in `Running` (caller transitions to `Completed`) or
+    /// in `AwaitingGate` (caller leaves it alone). Errors propagate
+    /// after marking the session `Failed`.
+    fn run_loop(
+        &self,
+        req: &ExecuteRequest<'_>,
+        session: &mut Session,
+        order: &[String],
+        start_idx: usize,
+    ) -> Result<()> {
         let mut loop_counts: HashMap<String, u32> = HashMap::new();
-        let mut i: usize = 0;
+        let mut i = start_idx;
         while i < order.len() {
             let node_id = order[i].clone();
             let node = req
@@ -127,24 +185,57 @@ impl WorkflowExecutor {
                 .node(&node_id)
                 .expect("topological_order only returns ids from the workflow's nodes");
             session.set_current_node(Some(node_id.clone()), (self.clock)());
-            req.store.save(&session)?;
-            if let Err(err) = self.run_node(req, node, &session) {
-                self.mark_failed(req, &mut session, &err);
+            req.store.save(session)?;
+
+            // Gate: pause the workflow and let the user resume later.
+            // We persist the gate's summary as the node's "log" so the
+            // TUI / `fleet sessions logs` surfaces it.
+            if let NodeKind::Gate { summary } = &node.kind {
+                if let Err(err) = self.handle_gate(req, session, &node_id, summary) {
+                    self.mark_failed(req, session, &err);
+                    return Err(err);
+                }
+                return Ok(());
+            }
+
+            if let Err(err) = self.run_node(req, node, session) {
+                self.mark_failed(req, session, &err);
                 return Err(err);
             }
-            // loop_back_to dispatch — only on success. `max_loops`
-            // defaults to 1 (one revision pass) when omitted: setting
-            // `loop_back_to` without an explicit bound is almost
-            // certainly a user wanting "one cycle", and unbounded loops
-            // are a footgun we don't enable implicitly.
-            i = resolve_loop_back(node, &order, &mut loop_counts).map_or(i + 1, |t| t);
+            i = resolve_loop_back(node, order, &mut loop_counts).map_or(i + 1, |t| t);
         }
+        Ok(())
+    }
 
-        // Last-node id stays as `current_node` for diagnostic value — it
-        // gives the TUI a reasonable "finished at" pointer.
-        session.transition_to(SessionState::Completed, (self.clock)())?;
-        req.store.save(&session)?;
-        Ok(session)
+    /// Drive a gate-node visit: transition the session to `AwaitingGate`,
+    /// persist a gate-summary log so the user sees why the workflow
+    /// paused. Pure save semantics; no adapter interaction.
+    fn handle_gate(
+        &self,
+        req: &ExecuteRequest<'_>,
+        session: &mut Session,
+        node_id: &str,
+        summary: &str,
+    ) -> Result<()> {
+        session.transition_to(SessionState::AwaitingGate, (self.clock)())?;
+        req.store.save(session)?;
+        let log_path = self.node_log_path(req, session, node_id);
+        let body = format!("--- gate ---\n{summary}\n");
+        if let Err(err) = std::fs::write(&log_path, body) {
+            tracing::warn!(?err, log = %log_path.display(), "writing gate log failed");
+        }
+        Ok(())
+    }
+
+    /// Transition the session to `Completed` when the loop ended on a
+    /// natural finish (state still `Running`). If it ended in
+    /// `AwaitingGate` we leave it as-is so the resume path can pick up.
+    fn finalize(&self, req: &ExecuteRequest<'_>, session: &mut Session) -> Result<()> {
+        if session.state == SessionState::Running {
+            session.transition_to(SessionState::Completed, (self.clock)())?;
+            req.store.save(session)?;
+        }
+        Ok(())
     }
 
     fn run_node(&self, req: &ExecuteRequest<'_>, node: &Node, session: &Session) -> Result<()> {
@@ -491,13 +582,7 @@ fn shell_quote_value(s: &str) -> String {
 fn reject_unsupported_node_kinds(wf: &Workflow) -> Result<()> {
     for n in &wf.nodes {
         match &n.kind {
-            NodeKind::Agent { .. } | NodeKind::Bash { .. } => {}
-            NodeKind::Gate { .. } => bail!(
-                "executor does not yet support gate nodes (workflow `{}`, node `{}`); \
-                 human-gate handling lands in a later commit",
-                wf.name,
-                n.id
-            ),
+            NodeKind::Agent { .. } | NodeKind::Bash { .. } | NodeKind::Gate { .. } => {}
             NodeKind::Assert { .. } => bail!(
                 "executor does not yet support assert nodes (workflow `{}`, node `{}`); \
                  expression evaluation lands in a later commit",
@@ -1288,13 +1373,21 @@ nodes:
     }
 
     #[test]
-    fn gate_node_is_rejected_before_session_creation() {
+    fn gate_node_pauses_workflow_in_awaiting_gate_state() {
         let yaml = "\
 name: with-gate
 nodes:
+  - id: setup
+    type: bash
+    script: 'echo setup'
   - id: g
+    depends_on: [setup]
     type: gate
-    summary: 'human'
+    summary: 'PR ready for human review'
+  - id: cleanup
+    depends_on: [g]
+    type: bash
+    script: 'echo cleanup'
 ";
         let wf = Workflow::from_str_at(yaml, "/x").unwrap();
         let adapter = local_adapter_with_stdout("");
@@ -1312,11 +1405,132 @@ nodes:
             session_id: SessionId::new("s-gate"),
             issue: None,
         };
-        let err = executor.execute(&req).unwrap_err();
-        assert!(format!("{err:#}").contains("does not yet support gate nodes"));
-        // Session row must NOT have been created — the failure happened
-        // before persistence kicked in.
-        assert!(store.load(&SessionId::new("s-gate")).is_err());
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::AwaitingGate);
+        assert_eq!(session.current_node.as_deref(), Some("g"));
+        // The gate's summary lands in the gate's log file so the TUI /
+        // `fleet sessions logs` can show why the workflow paused.
+        let log = store.session_dir(&session.id).join("logs/g.log");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(body.contains("PR ready for human review"), "got: {body}");
+        // The cleanup node must NOT have run yet.
+        let cleanup_log = store.session_dir(&session.id).join("logs/cleanup.log");
+        assert!(!cleanup_log.exists());
+    }
+
+    #[test]
+    fn resume_continues_workflow_past_the_gate() {
+        let yaml = "\
+name: with-gate
+nodes:
+  - id: setup
+    type: bash
+    script: 'echo setup'
+  - id: g
+    depends_on: [setup]
+    type: gate
+    summary: 'human gate'
+  - id: cleanup
+    depends_on: [g]
+    type: bash
+    script: 'echo cleanup'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-resume"),
+            issue: None,
+        };
+        // First execute pauses at the gate.
+        let paused = executor.execute(&req).unwrap();
+        assert_eq!(paused.state, SessionState::AwaitingGate);
+
+        // Resume picks up after the gate and runs cleanup, then
+        // transitions to Completed.
+        let resumed = executor.resume(&req).unwrap();
+        assert_eq!(resumed.state, SessionState::Completed);
+        assert_eq!(resumed.current_node.as_deref(), Some("cleanup"));
+        // cleanup's log file now exists.
+        let cleanup_log = store.session_dir(&resumed.id).join("logs/cleanup.log");
+        assert!(cleanup_log.exists());
+    }
+
+    #[test]
+    fn resume_rejects_non_paused_session() {
+        let yaml = "\
+name: simple
+nodes:
+  - id: x
+    type: bash
+    script: 'echo x'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-done"),
+            issue: None,
+        };
+        // First run completes (no gate).
+        let done = executor.execute(&req).unwrap();
+        assert_eq!(done.state, SessionState::Completed);
+        // Resume should refuse — session is already terminal.
+        let err = executor.resume(&req).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("expected awaiting_gate"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn resume_rejects_when_session_directory_is_missing() {
+        let yaml = "\
+name: simple
+nodes:
+  - id: x
+    type: bash
+    script: 'echo x'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-ghost"),
+            issue: None,
+        };
+        let err = executor.resume(&req).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("loading session `s-ghost`"),
+            "got: {err:#}"
+        );
     }
 
     #[test]
