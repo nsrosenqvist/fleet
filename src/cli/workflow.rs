@@ -25,9 +25,10 @@ use crate::session::SessionId;
 use crate::session::store::SessionStore;
 use crate::session::{ClockIdSource, IdSource, SessionState};
 use crate::tracker::{Issue, build as build_tracker};
-use crate::workflow::executor::{ExecuteRequest, WorkflowExecutor};
+use crate::workflow::executor::{ExecuteRequest, WorkflowExecutor, WorktreeMeta};
 use crate::workflow::spec::Workflow;
 use crate::workflow::validate::validate;
+use crate::worktree;
 
 /// CLI entry point for `fleet workflow list`. Walks
 /// `.fleet/workflows/` and prints discovered workflow YAMLs.
@@ -95,6 +96,21 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
         None => None,
     };
 
+    // Provision the per-session worktree if the workspace is a git
+    // repo. On non-git workspaces (the `Local` adapter, scratch dirs)
+    // fall back to running directly against the repo root — without
+    // isolation between parallel sessions and without replay's
+    // code-state snapshot guarantee. We log loudly so users don't
+    // wonder why two sessions stomp on each other's files.
+    let provision = provision_worktree(invoker.as_ref(), &root, &store, &session_id)?;
+    let workspace_path: &Path = provision
+        .as_ref()
+        .map_or(root.as_path(), |p| p.path.as_path());
+    let worktree_meta = provision.as_ref().map(|p| WorktreeMeta {
+        path: p.path.as_path(),
+        branch: p.branch.as_str(),
+    });
+
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let executor = WorkflowExecutor::new(invoker);
     let req = ExecuteRequest {
@@ -103,9 +119,10 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
         agents: &config.agents.registry,
         store: &store,
         devcontainer: &devcontainer,
-        workspace: &root,
+        workspace: workspace_path,
         session_id: session_id.clone(),
         issue,
+        worktree: worktree_meta,
         egress: enforcer.as_ref(),
     };
 
@@ -176,6 +193,10 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         // `--issue` is lost across processes today. Workflows that
         // depend on `FLEET_ISSUE_*` post-resume should re-spawn instead.
         issue: None,
+        // Resume re-uses the original session's worktree; commit 5
+        // wires that through. For now the field is None and resume
+        // continues to run against the repo root.
+        worktree: None,
         egress: enforcer.as_ref(),
     };
     println!("{session_id}");
@@ -251,6 +272,10 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
         // run via `workflow run --issue` is the supported path when
         // `FLEET_ISSUE_*` matters.
         issue: None,
+        // Replay provisions its own worktree off the src session's
+        // branch tip in commit 4. For now the field is None and
+        // replay continues to run against the repo root.
+        worktree: None,
         egress: enforcer.as_ref(),
     };
 
@@ -273,6 +298,54 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
 /// Resolve the on-disk path for a workflow name.
 fn workflow_path(root: &Path, name: &str) -> PathBuf {
     root.join(".fleet/workflows").join(format!("{name}.yaml"))
+}
+
+/// Per-session worktree provisioned for a fresh `workflow run`. Owned
+/// strings rather than borrows so the CLI can hold this across the
+/// executor call without lifetime gymnastics.
+pub struct WorktreeProvision {
+    pub path: PathBuf,
+    pub branch: String,
+}
+
+/// Create a per-session git worktree under
+/// `<root>/.fleet/sessions/<id>/worktree` on a new
+/// `fleet/session-<short-id>` branch based off the host's current
+/// `HEAD`. Returns `None` (with a warning logged) when `root` is not
+/// inside a git working tree — the caller falls back to the shared
+/// repo root.
+///
+/// Pre-creates the per-session directory because `git worktree add`
+/// requires the *parent* of the target path to exist. `store.create`
+/// (called later by the executor) tolerates the pre-existing dir.
+fn provision_worktree(
+    invoker: &dyn ProcessInvoker,
+    root: &Path,
+    store: &SessionStore,
+    session_id: &SessionId,
+) -> Result<Option<WorktreeProvision>> {
+    if !worktree::is_git_repo(invoker, root) {
+        tracing::warn!(
+            workspace = %root.display(),
+            "workspace is not a git repo — running session against the shared working tree \
+             (no per-session isolation, replay loses its code-state snapshot guarantees)"
+        );
+        return Ok(None);
+    }
+    let session_dir = store.session_dir(session_id);
+    std::fs::create_dir_all(&session_dir).with_context(|| {
+        format!(
+            "creating per-session directory at {} for the worktree parent",
+            session_dir.display()
+        )
+    })?;
+    let wt_path = session_dir.join("worktree");
+    let branch = worktree::session_branch_name(session_id.as_str());
+    worktree::create_worktree(invoker, root, &wt_path, &branch, "HEAD")?;
+    Ok(Some(WorktreeProvision {
+        path: wt_path,
+        branch,
+    }))
 }
 
 /// Build the egress enforcer for a workflow run. Single helper used

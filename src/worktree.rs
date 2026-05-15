@@ -41,14 +41,12 @@ use crate::process::ProcessInvoker;
 
 /// Conventional branch-name prefix for fleet-managed session branches.
 /// Users can grep / clean up with `git branch -D 'fleet/session-*'`.
-#[allow(dead_code)] // wired in subsequent commits
 pub const SESSION_BRANCH_PREFIX: &str = "fleet/session-";
 
 /// Build the branch name fleet uses for a session. Truncates long
 /// session ids to keep `git` output readable; sessions are id-unique
 /// already, so a short prefix is collision-safe in practice.
 #[must_use]
-#[allow(dead_code)] // wired in subsequent commits
 pub fn session_branch_name(session_id: &str) -> String {
     let short: String = session_id.chars().take(12).collect();
     format!("{SESSION_BRANCH_PREFIX}{short}")
@@ -58,7 +56,6 @@ pub fn session_branch_name(session_id: &str) -> String {
 /// on any error (no git installed, dir doesn't exist, not a repo) —
 /// callers treat the result as "can we use worktrees here, yes/no",
 /// not as a hard error condition.
-#[allow(dead_code)] // wired in subsequent commits
 pub fn is_git_repo(invoker: &dyn ProcessInvoker, dir: &Path) -> bool {
     let out = invoker.run(
         "git",
@@ -95,7 +92,6 @@ pub fn head_sha(invoker: &dyn ProcessInvoker, dir: &Path) -> Result<String> {
 /// `repo_root` is the path *of the main repo* — `git -C <root>
 /// worktree add …`. `target_path` is where the new working tree
 /// lands. The directory must not exist yet (git refuses otherwise).
-#[allow(dead_code)] // wired in subsequent commits
 pub fn create_worktree(
     invoker: &dyn ProcessInvoker,
     repo_root: &Path,

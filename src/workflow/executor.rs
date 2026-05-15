@@ -88,13 +88,22 @@ pub struct ExecuteRequest<'a> {
     pub agents: &'a AgentRegistry,
     pub store: &'a SessionStore,
     pub devcontainer: &'a Devcontainer,
-    /// Repo root that gets bind-mounted as the container's workspace.
+    /// Directory bind-mounted as the container's `/workspace`. For
+    /// git-isolated runs this is the per-session worktree path; for
+    /// the non-git fallback it's the repo root. The executor itself
+    /// is agnostic about which — it just bind-mounts what it's given.
     pub workspace: &'a Path,
     pub session_id: SessionId,
     /// Issue the workflow is acting on, if any. Surfaces to nodes via
     /// `FLEET_ISSUE_ID` / `FLEET_ISSUE_HUMAN_ID` / `FLEET_ISSUE_TITLE`
     /// in both agent and bash node environments.
     pub issue: Option<IssueContext>,
+    /// Per-session worktree metadata (path + branch) to stamp onto
+    /// the session's `meta.json` for later replay/inspection. `None`
+    /// for non-git workspaces or when the caller chose not to isolate.
+    /// The CLI provisions the worktree on disk; this only carries the
+    /// resulting bookkeeping into persistence.
+    pub worktree: Option<WorktreeMeta<'a>>,
     /// Egress policy enforcer. The executor calls `setup` once per
     /// `execute` / `resume` / `replay` invocation, threads the
     /// returned `proxy_env` and `network_name` into every agent
@@ -102,6 +111,19 @@ pub struct ExecuteRequest<'a> {
     /// transitions. Callers that don't need enforcement pass a
     /// [`crate::egress::NoopEnforcer`] reference.
     pub egress: &'a dyn crate::egress::EgressEnforcer,
+}
+
+/// Per-session worktree bookkeeping, threaded into [`ExecuteRequest`]
+/// so the executor stamps it onto the new session's `meta.json`. Used
+/// by `replay` to read the prior session's branch back as the git
+/// ref for the new session's worktree.
+#[derive(Debug, Clone, Copy)]
+pub struct WorktreeMeta<'a> {
+    /// Absolute path to the worktree directory the CLI provisioned.
+    pub path: &'a Path,
+    /// Branch checked out in the worktree
+    /// (`fleet/session-<short-id>`).
+    pub branch: &'a str,
 }
 
 impl WorkflowExecutor {
@@ -145,6 +167,13 @@ impl WorkflowExecutor {
         // subsequent `fleet workflow resume` after a gate doesn't
         // lose `FLEET_ISSUE_*` env on downstream nodes.
         session.issue.clone_from(&req.issue);
+        // Stamp the per-session worktree the CLI provisioned (if any)
+        // before persistence — without this, a crash between create()
+        // and the next save() would lose the pointer the prune command
+        // needs to find the worktree later.
+        if let Some(wt) = req.worktree {
+            session.set_worktree(wt.path.to_path_buf(), wt.branch, (self.clock)());
+        }
         req.store.create(&session)?;
         session.transition_to(SessionState::Running, (self.clock)())?;
         session.set_driver_pid(std::process::id(), (self.clock)());
@@ -1533,9 +1562,7 @@ nodes:
         let session_id = SessionId::new("s-chain");
         // Path the executor will create via store.create(); compute it
         // upfront so the mock closure has a stable target to side-effect
-        // into when it sees the maker script. The dir itself is created
-        // by the executor (don't pre-create — store.create rejects
-        // pre-existing dirs).
+        // into when it sees the maker script.
         let artifacts_dir = store.session_dir(&session_id).join("artifacts");
         let mut mock = MockProcessInvoker::new();
         mock.expect_run().returning(move |_, args| {
@@ -1560,6 +1587,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -1591,6 +1619,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-missin"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -1631,6 +1660,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-liar"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -1880,6 +1910,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-iss"),
             issue: Some(sample_issue()),
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -1909,6 +1940,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-trivial"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -1917,6 +1949,86 @@ nodes:
         // Log was captured.
         let log = store.session_dir(&session.id).join("logs").join("only.log");
         assert!(log.is_file(), "expected log at {}", log.display());
+    }
+
+    #[test]
+    fn execute_stamps_worktree_meta_onto_session() {
+        // When the CLI provisions a worktree and passes it as `worktree`,
+        // the executor must stamp the path + branch onto the session's
+        // meta.json so a subsequent `replay` can read the branch back.
+        let yaml = "\
+name: with-worktree
+nodes:
+  - id: only
+    agent: claude-code
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("ok\n");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let wt_path = std::path::PathBuf::from("/repo/.fleet/sessions/s-wt/worktree");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: &wt_path,
+            session_id: SessionId::new("s-wt"),
+            issue: None,
+            worktree: Some(WorktreeMeta {
+                path: &wt_path,
+                branch: "fleet/session-s-wt",
+            }),
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.worktree_path.as_deref(), Some(wt_path.as_path()));
+        assert_eq!(session.branch.as_deref(), Some("fleet/session-s-wt"));
+
+        // The persisted meta.json must carry both fields too — the
+        // prune command and replay both read off disk, not off the
+        // in-memory session value.
+        let reloaded = store.load(&session.id).unwrap();
+        assert_eq!(reloaded.worktree_path.as_deref(), Some(wt_path.as_path()));
+        assert_eq!(reloaded.branch.as_deref(), Some("fleet/session-s-wt"));
+    }
+
+    #[test]
+    fn execute_without_worktree_leaves_session_worktree_fields_none() {
+        // Backward compat: the Local adapter and non-git workspaces
+        // pass `worktree: None`, and the resulting session has
+        // `worktree_path = None` / `branch = None`. Old TUIs / pruners
+        // that ignore these fields keep working.
+        let yaml = "\
+name: no-worktree
+nodes:
+  - id: only
+    agent: claude-code
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("ok\n");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-no-wt"),
+            issue: None,
+            worktree: None,
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert!(session.worktree_path.is_none());
+        assert!(session.branch.is_none());
     }
 
     /// Stub enforcer that hands back a fixed setup so we can verify
@@ -2010,6 +2122,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-egress-env"),
             issue: None,
+            worktree: None,
             egress: &enforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2067,6 +2180,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-lifecycle"),
             issue: None,
+            worktree: None,
             egress: &enforcer,
         };
         executor.execute(&req).unwrap();
@@ -2100,6 +2214,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-cost"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2137,6 +2252,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-clean-marker"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2174,6 +2290,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-noparse"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2209,6 +2326,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fail"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -2242,6 +2360,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-ghost"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -2288,6 +2407,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bash"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2324,6 +2444,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bashfail"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -2366,6 +2487,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2425,6 +2547,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let final_session = executor.execute(&req).unwrap();
@@ -2479,6 +2602,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate-pid"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2513,6 +2637,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fail-pid"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let _ = executor.execute(&req).unwrap_err();
@@ -2553,6 +2678,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-resume"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         // First execute pauses at the gate.
@@ -2593,6 +2719,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-done"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         // First run completes (no gate).
@@ -2630,6 +2757,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-ghost"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.resume(&req).unwrap_err();
@@ -2711,6 +2839,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -2764,6 +2893,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-bad"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -2802,6 +2932,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-no-src"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor
@@ -2867,6 +2998,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-top"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -2913,6 +3045,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-empty"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let replayed = executor.replay(&req, &src_id, "only").unwrap();
@@ -2990,6 +3123,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate-outputs"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -3083,6 +3217,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-with-outputs"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let replayed = executor.replay(&req, &src_id, "act").unwrap();
@@ -3206,6 +3341,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fanout-fail"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -3285,6 +3421,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -3330,6 +3467,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fan-gate"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -3372,6 +3510,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new(session_id),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -3676,6 +3815,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-dia"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -3865,6 +4005,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -3941,6 +4082,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -3990,6 +4132,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bad-fork"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -4057,6 +4200,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4132,6 +4276,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4190,6 +4335,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4244,6 +4390,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -4290,6 +4437,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-assert-unknown"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -4403,6 +4551,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-loop-resume"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let paused = executor.execute(&req).unwrap();
@@ -4474,6 +4623,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-issue-resume"),
             issue: Some(sample_issue()),
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let paused = executor.execute(&exec_req).unwrap();
@@ -4496,6 +4646,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-issue-resume"),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let resumed = executor.resume(&resume_req).unwrap();
@@ -4552,6 +4703,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-override"),
             issue: Some(original.clone()),
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         executor.execute(&exec_req).unwrap();
@@ -4571,6 +4723,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-override"),
             issue: Some(replacement.clone()),
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let resumed = executor.resume(&resume_req).unwrap();
@@ -4626,6 +4779,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            worktree: None,
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();

@@ -61,16 +61,22 @@ impl SessionStore {
 
     /// Materialise a brand-new session on disk: create the per-session
     /// directory, the empty `artifacts/` and `logs/` subdirs, and write
-    /// `meta.json`. Errors if a session with the same id already exists
+    /// `meta.json`. Errors if a `meta.json` already exists for the id
     /// — the caller decides whether to mint a new id or surface the
     /// collision.
+    ///
+    /// The per-session *directory* may pre-exist (e.g. the workflow CLI
+    /// created it to host a `git worktree` before calling into the
+    /// executor). The collision check is the meta.json specifically;
+    /// the subdirs are created idempotently.
     pub fn create(&self, session: &Session) -> Result<()> {
         let dir = self.session_dir(&session.id);
-        if dir.exists() {
+        let meta = self.meta_path(&session.id);
+        if meta.exists() {
             bail!(
                 "session {} already exists on disk at {}",
                 session.id,
-                dir.display()
+                meta.display()
             );
         }
         std::fs::create_dir_all(dir.join("artifacts"))
@@ -194,12 +200,32 @@ mod tests {
     }
 
     #[test]
-    fn create_refuses_to_clobber_existing_directory() {
+    fn create_refuses_to_clobber_existing_meta() {
         let (_dir, s) = store();
         let session = session("s-1");
         s.create(&session).unwrap();
         let err = s.create(&session).unwrap_err();
         assert!(format!("{err}").contains("already exists"));
+    }
+
+    #[test]
+    fn create_tolerates_pre_existing_session_dir() {
+        // Workflow CLI may have created the per-session dir already
+        // (e.g. to host a `git worktree` before the executor mints
+        // meta.json). create() must accept the existing dir and
+        // proceed to write artifacts/, logs/, and meta.json.
+        let (_dir, s) = store();
+        let session = session("s-1");
+        let sdir = s.session_dir(&session.id);
+        std::fs::create_dir_all(&sdir).unwrap();
+        // Stash something into the dir to prove create() doesn't
+        // clobber pre-existing contents (e.g. a worktree).
+        std::fs::write(sdir.join("placeholder"), b"hi").unwrap();
+        s.create(&session).unwrap();
+        assert!(sdir.join("artifacts").is_dir());
+        assert!(sdir.join("logs").is_dir());
+        assert!(sdir.join("meta.json").is_file());
+        assert!(sdir.join("placeholder").is_file());
     }
 
     #[test]

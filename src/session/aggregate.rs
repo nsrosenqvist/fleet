@@ -171,7 +171,6 @@ impl Session {
     /// this session. Atomic write so a reader (TUI / reaper) never
     /// sees one half-populated. Bumps `updated_at_ms` so the sidebar
     /// reflects the activity.
-    #[allow(dead_code)] // wired by the workflow CLI in a subsequent commit
     pub fn set_worktree(&mut self, path: PathBuf, branch: impl Into<String>, now_ms: u64) {
         self.worktree_path = Some(path);
         self.branch = Some(branch.into());
