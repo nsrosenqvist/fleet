@@ -75,7 +75,6 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 /// RAII for cleanup. `url_for_container` is what the executor pipes
 /// to the in-container agent; `loopback_url` is what tests speak to
 /// directly (the listener actually binds to `127.0.0.1`).
-#[allow(dead_code)]
 pub struct Bridge {
     join: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -83,7 +82,6 @@ pub struct Bridge {
     port: u16,
 }
 
-#[allow(dead_code)]
 impl Bridge {
     /// Start the bridge for `session`. The tracker handle is shared
     /// with the listener thread; the bridge holds it for the
@@ -122,7 +120,9 @@ impl Bridge {
         format!("http://{BRIDGE_HOST}:{}", self.port)
     }
 
-    /// URL the host-side loopback uses. Tests connect here directly.
+    /// URL the host-side loopback uses. Tests connect here directly;
+    /// production callers only need [`Self::url_for_container`].
+    #[allow(dead_code)]
     pub fn loopback_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }

@@ -24,7 +24,7 @@ use crate::session::IssueContext;
 use crate::session::SessionId;
 use crate::session::store::SessionStore;
 use crate::session::{ClockIdSource, IdSource, Session, SessionState, now_ms};
-use crate::tracker::{Issue, build as build_tracker};
+use crate::tracker::{Issue, Tracker, build as build_tracker};
 use crate::workflow::executor::{ExecuteRequest, WorkflowExecutor, WorktreeMeta};
 use crate::workflow::spec::Workflow;
 use crate::workflow::validate::validate;
@@ -112,7 +112,8 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
     });
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
-    let executor = WorkflowExecutor::new(Arc::clone(&invoker));
+    let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
+    let executor = WorkflowExecutor::new(Arc::clone(&invoker)).with_tracker(tracker);
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -204,7 +205,8 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
     };
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
-    let executor = WorkflowExecutor::new(Arc::clone(&invoker));
+    let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
+    let executor = WorkflowExecutor::new(Arc::clone(&invoker)).with_tracker(tracker);
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -330,7 +332,8 @@ pub fn run_replay(
     });
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
-    let executor = WorkflowExecutor::new(Arc::clone(&invoker));
+    let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
+    let executor = WorkflowExecutor::new(Arc::clone(&invoker)).with_tracker(tracker);
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -476,6 +479,22 @@ fn auto_prune_completed_session(
 
 /// Build the egress enforcer for a workflow run. Single helper used
 /// by execute / resume / replay so the wiring stays in lockstep.
+/// Build an `Arc<dyn Tracker>` for the bridge to share with the
+/// listener thread. Returns `None` when the configured tracker plugin
+/// isn't implemented yet (Linear, Jira). The bridge is fine being
+/// disabled — `fleet-tracker` calls inside the container will fail
+/// fast with a clear error.
+///
+/// `Arc::from(Box<dyn Tracker>)` upcasts the box into an Arc without
+/// reboxing the concrete impl; the bridge holds it and the executor
+/// holds it for the duration of the run.
+fn build_tracker_arc(
+    config: &RepoConfig,
+    invoker: Arc<dyn ProcessInvoker>,
+) -> Option<Arc<dyn Tracker>> {
+    build_tracker(config.tracker, invoker).map(Arc::from)
+}
+
 fn build_workflow_enforcer(
     config: &RepoConfig,
     adapter: &dyn crate::runtime::RuntimeAdapter,

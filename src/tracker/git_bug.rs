@@ -245,6 +245,7 @@ pub fn parse_git_bug_show_output(stdout: &str) -> Result<IssueDetail> {
 /// shape that doesn't have a non-empty first whitespace-separated
 /// token, so callers can produce their own error.
 #[must_use]
+#[allow(dead_code)] // Production caller is `Tracker::create`, dead until Phase 2.
 pub fn parse_git_bug_add_output(stdout: &str) -> Option<String> {
     stdout
         .split_whitespace()

@@ -31,11 +31,13 @@ use super::validate::validate;
 use crate::agent::AgentRegistry;
 use crate::agent::cost::parse_agent_cost_usd;
 use crate::agent::registry::AgentSpec;
+use crate::bridge::{BRIDGE_HOST, Bridge};
 use crate::process::ProcessInvoker;
 use crate::runtime::devcontainer::Devcontainer;
 use crate::runtime::{ContainerSpec, ExecOpts, RuntimeAdapter};
 use crate::session::store::SessionStore;
 use crate::session::{IssueContext, Session, SessionId, SessionState, now_ms};
+use crate::tracker::Tracker;
 
 /// What a node's run produced *besides* a Result. Today carries any
 /// parsed agent-cost figures; future entries (resource usage, exit
@@ -77,6 +79,14 @@ pub struct WorkflowExecutor {
     /// own invoker.
     invoker: Arc<dyn ProcessInvoker>,
     clock: ClockFn,
+    /// Tracker handle shared with the per-agent-node bridge listener.
+    /// `None` disables the bridge entirely — agent containers run
+    /// without `FLEET_BRIDGE_URL` / `FLEET_BRIDGE_TOKEN` env, which
+    /// in turn makes `fleet-tracker` calls inside the container fail
+    /// fast. Tests default to `None`; the production CLI builds a
+    /// tracker from `.fleet/config.yaml` and threads it in via
+    /// [`Self::with_tracker`].
+    tracker: Option<Arc<dyn Tracker>>,
 }
 
 /// What [`WorkflowExecutor::execute`] needs to run one workflow. Bundled
@@ -153,6 +163,7 @@ impl WorkflowExecutor {
         Self {
             invoker,
             clock: Box::new(now_ms),
+            tracker: None,
         }
     }
 
@@ -163,6 +174,17 @@ impl WorkflowExecutor {
     #[allow(dead_code)]
     pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.clock = Box::new(clock);
+        self
+    }
+
+    /// Enable the per-agent-node bridge by passing a tracker handle.
+    /// `None` (the default) keeps the bridge off; `Some` causes
+    /// `run_agent_node` to start a bridge before each agent run and
+    /// tear it down after, exposing `FLEET_BRIDGE_URL` and
+    /// `FLEET_BRIDGE_TOKEN` to the agent's container.
+    #[must_use]
+    pub fn with_tracker(mut self, tracker: Option<Arc<dyn Tracker>>) -> Self {
+        self.tracker = tracker;
         self
     }
 
@@ -669,6 +691,27 @@ impl WorkflowExecutor {
         Ok(outcome)
     }
 
+    /// Start a per-agent-node bridge when the executor was built with a
+    /// tracker. The returned handle's Drop tears the listener down; the
+    /// caller binds it to a local so it stays alive for the run.
+    /// Returns `Ok(None)` when no tracker is configured — the agent
+    /// runs without `FLEET_BRIDGE_*` and `fleet-tracker` calls inside
+    /// the container fail fast.
+    fn start_bridge_for_agent(
+        &self,
+        session: &Session,
+        workspace: &Path,
+        node_id: &str,
+    ) -> Result<Option<Bridge>> {
+        self.tracker
+            .as_ref()
+            .map(|tracker| {
+                Bridge::start(session, Arc::clone(tracker), workspace.to_path_buf())
+                    .with_context(|| format!("starting bridge for agent node `{node_id}`"))
+            })
+            .transpose()
+    }
+
     fn run_agent_node(
         &self,
         req: &ExecuteRequest<'_>,
@@ -721,6 +764,14 @@ impl WorkflowExecutor {
         for (k, v) in &egress.proxy_env {
             env.push((k.clone(), v.clone()));
         }
+
+        // Per-agent-node bridge: when the executor was built with a
+        // tracker, spin up a fresh bridge for this run. The handle is
+        // bound to a local variable so Drop tears the listener down
+        // when this function returns — whether through ?-propagation
+        // or the happy path.
+        let bridge = self.start_bridge_for_agent(session, req.workspace, &node.id)?;
+        push_bridge_env(&mut env, bridge.as_ref());
 
         let image = req
             .adapter
@@ -1243,6 +1294,20 @@ pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String
         env.push(("FLEET_ISSUE_TITLE".to_string(), issue.title.clone()));
     }
     env
+}
+
+/// Append `FLEET_BRIDGE_URL`, `FLEET_BRIDGE_TOKEN`, and `NO_PROXY` to
+/// the agent's env when a bridge is active. `NO_PROXY` keeps the
+/// agent's HTTP client from routing the bridge request through the
+/// egress tinyproxy (the proxy would refuse the loopback hostname).
+/// No-op when `bridge` is `None`.
+pub fn push_bridge_env(env: &mut Vec<(String, String)>, bridge: Option<&Bridge>) {
+    let Some(b) = bridge else {
+        return;
+    };
+    env.push(("FLEET_BRIDGE_URL".to_string(), b.url_for_container()));
+    env.push(("FLEET_BRIDGE_TOKEN".to_string(), b.token().to_string()));
+    env.push(("NO_PROXY".to_string(), BRIDGE_HOST.to_string()));
 }
 
 /// Read the agent node's `prompt_file:` (if any) into a [`PromptArtifact`].

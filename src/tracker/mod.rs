@@ -86,7 +86,8 @@ impl Issue {
 }
 
 /// Plugin-agnostic tracker query. `Send + Sync` because callers may
-/// dispatch into a worker thread for async UX.
+/// dispatch into a worker thread for async UX (and because the bridge
+/// listener holds an `Arc<dyn Tracker>` shared across thread bounds).
 ///
 /// Write methods (`comment`, `set_status`, `add_label`, `remove_label`,
 /// `create`, `link_parent`) and the rich-read method (`read`) carry
@@ -94,12 +95,6 @@ impl Issue {
 /// concrete support (e.g. a stub used in a test) get the bail-by-name
 /// behaviour for free; the two production impls (`GitBugTracker` and
 /// `GitHubTracker`) override every method.
-///
-/// `#[allow(dead_code)]` stays on the trait until the bridge HTTP
-/// server (commit 7 of this phase) calls these methods in production —
-/// today the impl bodies are unreachable from `main()`, so the dead-code
-/// chain reaches every method and every helper type the methods name.
-#[allow(dead_code)]
 pub trait Tracker: Send + Sync {
     fn name(&self) -> &'static str;
     /// Issues for the project rooted at `repo_root`. Sorted with open
@@ -146,6 +141,7 @@ pub trait Tracker: Send + Sync {
     /// never reachable through the bridge. The trait surface lives here
     /// because `tracker-create` workflow nodes (Phase 2) and brainstorm
     /// tool endpoints (Phase 5) both consume it.
+    #[allow(dead_code)]
     fn create(
         &self,
         _repo_root: &Path,
@@ -159,6 +155,7 @@ pub trait Tracker: Send + Sync {
     /// Link `child_id` to `parent_id`. Mapping varies per tracker —
     /// GitHub appends a task-list line to the parent's body; git-bug
     /// records a `parent:<id>` label on the child.
+    #[allow(dead_code)]
     fn link_parent(&self, _repo_root: &Path, _parent_id: &str, _child_id: &str) -> Result<()> {
         bail!("tracker `{}` does not implement link_parent", self.name())
     }

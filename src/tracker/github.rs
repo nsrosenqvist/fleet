@@ -246,6 +246,7 @@ pub fn parse_gh_view_output(stdout: &str) -> Result<IssueDetail> {
 /// `https://github.com/owner/repo/issues/42`. The trailing path
 /// component after the final `/` is the number.
 #[must_use]
+#[allow(dead_code)] // Production caller is `Tracker::create`, dead until Phase 2.
 pub fn parse_gh_create_output(stdout: &str) -> Option<u64> {
     let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty())?;
     let last_segment = last_line.trim().rsplit('/').next()?;
@@ -255,6 +256,7 @@ pub fn parse_gh_create_output(stdout: &str) -> Option<u64> {
 /// Parse the `body` field out of a `gh issue view --json body` payload.
 /// Returns the body as a String, or an error when the payload doesn't
 /// shape-match (missing field, malformed JSON, …).
+#[allow(dead_code)] // Caller is `link_parent`, dead until Phase 2's tracker-create.
 fn parse_gh_body_field(stdout: &str) -> Result<String> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -275,6 +277,7 @@ fn parse_gh_body_field(stdout: &str) -> Result<String> {
 /// trailing newline is normalised so the appended line always lives
 /// on its own row even if the parent's body didn't end in `\n`.
 #[must_use]
+#[allow(dead_code)] // Caller is `link_parent`, dead until Phase 2's tracker-create.
 fn append_task_list_line(current: &str, child_id: &str) -> String {
     let needle = format!("#{child_id}");
     // Whole-token match — a body that mentions `#43` shouldn't be
