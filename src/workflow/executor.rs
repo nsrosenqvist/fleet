@@ -172,7 +172,27 @@ impl WorkflowExecutor {
                 node.id
             )
         })?;
-        let env = build_agent_env(agent, req.issue.as_ref());
+        // Pull persona + prompt_file out of the node. We just matched
+        // NodeKind::Agent in run_node, but the borrow there has already
+        // gone away — re-match here. The plain `_` arm is unreachable
+        // because run_node dispatches on kind before calling us.
+        let (persona, prompt_file) = match &node.kind {
+            NodeKind::Agent {
+                persona,
+                prompt_file,
+                ..
+            } => (persona.as_deref(), prompt_file.as_ref()),
+            _ => unreachable!("run_agent_node only reached via NodeKind::Agent"),
+        };
+        let prompt = resolve_prompt_artifact(req.workspace, prompt_file).with_context(|| {
+            format!("preparing prompt for agent node `{}`", node.id)
+        })?;
+        let agent_ctx = AgentContext {
+            persona,
+            prompt: prompt.as_ref(),
+            issue: req.issue.as_ref(),
+        };
+        let env = build_agent_env(agent, &agent_ctx);
 
         let image = req
             .adapter
@@ -337,26 +357,85 @@ pub fn verify_outputs(artifacts_dir: &Path, node: &Node) -> Result<()> {
     Ok(())
 }
 
+/// Per-node context that flows into the agent's environment alongside
+/// its base `env_passthrough` whitelist. Held by reference fields so the
+/// caller can reuse the underlying strings; tests construct one inline
+/// via [`Default`] and tweak the fields they care about.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AgentContext<'a> {
+    /// Optional persona name. Exposed as `FLEET_PERSONA` when set.
+    pub persona: Option<&'a str>,
+    /// Optional prompt file (source path + body). Exposed as
+    /// `FLEET_PROMPT_FILE` (path as authored) + `FLEET_PROMPT` (file
+    /// contents) when set. Env-var delivery is the lowest common
+    /// denominator across agent backends.
+    pub prompt: Option<&'a PromptArtifact>,
+    /// Optional issue the workflow is acting on. Exposed as the
+    /// `FLEET_ISSUE_*` trio when set.
+    pub issue: Option<&'a IssueContext>,
+}
+
+/// Resolved prompt file: the user-authored source path (for
+/// `FLEET_PROMPT_FILE`) and the on-disk body (for `FLEET_PROMPT`).
+/// Built by [`resolve_prompt_artifact`] before
+/// [`WorkflowExecutor::run_agent_node`] runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptArtifact {
+    pub source: String,
+    pub body: String,
+}
+
 /// Build the env Vec the agent's container receives: the agent's
 /// `env_passthrough` whitelist (resolved against the host's environment)
-/// plus any `FLEET_ISSUE_*` vars derived from the workflow's issue
-/// context. Pure; the testable seam for `run_agent_node`.
+/// plus any persona / prompt / issue context. Pure; the testable seam
+/// for `run_agent_node`.
 #[must_use]
 pub fn build_agent_env(
     agent: &AgentSpec,
-    issue: Option<&IssueContext>,
+    ctx: &AgentContext<'_>,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = agent
         .env_passthrough
         .iter()
         .map(|k| (k.clone(), std::env::var(k).unwrap_or_default()))
         .collect();
-    if let Some(ctx) = issue {
-        env.push(("FLEET_ISSUE_ID".to_string(), ctx.id.clone()));
-        env.push(("FLEET_ISSUE_HUMAN_ID".to_string(), ctx.human_id.clone()));
-        env.push(("FLEET_ISSUE_TITLE".to_string(), ctx.title.clone()));
+    if let Some(persona) = ctx.persona {
+        env.push(("FLEET_PERSONA".to_string(), persona.to_string()));
+    }
+    if let Some(prompt) = ctx.prompt {
+        env.push(("FLEET_PROMPT_FILE".to_string(), prompt.source.clone()));
+        env.push(("FLEET_PROMPT".to_string(), prompt.body.clone()));
+    }
+    if let Some(issue) = ctx.issue {
+        env.push(("FLEET_ISSUE_ID".to_string(), issue.id.clone()));
+        env.push(("FLEET_ISSUE_HUMAN_ID".to_string(), issue.human_id.clone()));
+        env.push(("FLEET_ISSUE_TITLE".to_string(), issue.title.clone()));
     }
     env
+}
+
+/// Read the agent node's `prompt_file:` (if any) into a [`PromptArtifact`].
+/// Relative paths resolve against `workspace`. Missing-file is surfaced as
+/// a Result error — the workflow author declared the file, so we don't
+/// want the agent to silently run without it.
+pub fn resolve_prompt_artifact(
+    workspace: &Path,
+    prompt_file: Option<&PathBuf>,
+) -> Result<Option<PromptArtifact>> {
+    let Some(pf) = prompt_file else {
+        return Ok(None);
+    };
+    let absolute = if pf.is_absolute() {
+        pf.clone()
+    } else {
+        workspace.join(pf)
+    };
+    let body = std::fs::read_to_string(&absolute)
+        .with_context(|| format!("reading prompt_file at {}", absolute.display()))?;
+    Ok(Some(PromptArtifact {
+        source: pf.display().to_string(),
+        body,
+    }))
 }
 
 /// Build the env-var prefix that bash node scripts get injected with:
@@ -772,14 +851,13 @@ nodes:
     }
 
     #[test]
-    fn build_agent_env_returns_passthrough_only_when_no_issue() {
-        // Empty passthrough → empty env; no issue context means no
-        // FLEET_ISSUE_* vars.
+    fn build_agent_env_returns_passthrough_only_when_context_empty() {
+        // Empty passthrough + empty context → empty env.
         let spec = AgentSpec {
             command: vec!["agent".to_string()],
             env_passthrough: Vec::new(),
         };
-        assert!(build_agent_env(&spec, None).is_empty());
+        assert!(build_agent_env(&spec, &AgentContext::default()).is_empty());
     }
 
     #[test]
@@ -792,7 +870,7 @@ nodes:
             command: vec!["agent".to_string()],
             env_passthrough: vec!["FLEET_TEST_KEY".to_string()],
         };
-        let env = build_agent_env(&spec, None);
+        let env = build_agent_env(&spec, &AgentContext::default());
         assert!(env.iter().any(|(k, v)| k == "FLEET_TEST_KEY" && v == "secret"));
         unsafe { std::env::remove_var("FLEET_TEST_KEY") };
     }
@@ -803,7 +881,12 @@ nodes:
             command: vec!["agent".to_string()],
             env_passthrough: Vec::new(),
         };
-        let env = build_agent_env(&spec, Some(&sample_issue()));
+        let issue = sample_issue();
+        let ctx = AgentContext {
+            issue: Some(&issue),
+            ..AgentContext::default()
+        };
+        let env = build_agent_env(&spec, &ctx);
         assert!(env
             .iter()
             .any(|(k, v)| k == "FLEET_ISSUE_ID" && v == "gh:42"));
@@ -813,6 +896,113 @@ nodes:
         assert!(env
             .iter()
             .any(|(k, v)| k == "FLEET_ISSUE_TITLE" && v == "Fix the parser"));
+    }
+
+    #[test]
+    fn build_agent_env_appends_persona_when_present() {
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: Vec::new(),
+        };
+        let ctx = AgentContext {
+            persona: Some("planner"),
+            ..AgentContext::default()
+        };
+        let env = build_agent_env(&spec, &ctx);
+        assert!(env.iter().any(|(k, v)| k == "FLEET_PERSONA" && v == "planner"));
+    }
+
+    #[test]
+    fn build_agent_env_appends_prompt_artifact_when_present() {
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: Vec::new(),
+        };
+        let prompt = PromptArtifact {
+            source: "prompts/planner.md".to_string(),
+            body: "You are the planner.\nThink step by step.".to_string(),
+        };
+        let ctx = AgentContext {
+            prompt: Some(&prompt),
+            ..AgentContext::default()
+        };
+        let env = build_agent_env(&spec, &ctx);
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "FLEET_PROMPT_FILE" && v == "prompts/planner.md"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "FLEET_PROMPT" && v.contains("You are the planner.")));
+    }
+
+    #[test]
+    fn build_agent_env_combines_all_context_fields() {
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: Vec::new(),
+        };
+        let issue = sample_issue();
+        let prompt = PromptArtifact {
+            source: "p.md".to_string(),
+            body: "body".to_string(),
+        };
+        let ctx = AgentContext {
+            persona: Some("reviewer"),
+            prompt: Some(&prompt),
+            issue: Some(&issue),
+        };
+        let env = build_agent_env(&spec, &ctx);
+        let keys: std::collections::HashSet<&str> =
+            env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains("FLEET_PERSONA"));
+        assert!(keys.contains("FLEET_PROMPT_FILE"));
+        assert!(keys.contains("FLEET_PROMPT"));
+        assert!(keys.contains("FLEET_ISSUE_ID"));
+        assert!(keys.contains("FLEET_ISSUE_HUMAN_ID"));
+        assert!(keys.contains("FLEET_ISSUE_TITLE"));
+    }
+
+    #[test]
+    fn resolve_prompt_artifact_returns_none_when_no_prompt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = resolve_prompt_artifact(tmp.path(), None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_prompt_artifact_reads_relative_path_under_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("prompts")).unwrap();
+        std::fs::write(tmp.path().join("prompts/planner.md"), "be the planner").unwrap();
+        let pf = PathBuf::from("prompts/planner.md");
+        let result = resolve_prompt_artifact(tmp.path(), Some(&pf))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.source, "prompts/planner.md");
+        assert_eq!(result.body, "be the planner");
+    }
+
+    #[test]
+    fn resolve_prompt_artifact_propagates_absolute_path_intact() {
+        // Absolute paths bypass workspace joining; useful for shared
+        // prompt directories under $HOME or system locations.
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = tmp.path().join("global.md");
+        std::fs::write(&abs, "global").unwrap();
+        let result = resolve_prompt_artifact(Path::new("/some/other/workspace"), Some(&abs))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.body, "global");
+        assert!(result.source.ends_with("global.md"));
+    }
+
+    #[test]
+    fn resolve_prompt_artifact_surfaces_missing_file_with_path_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pf = PathBuf::from("nope.md");
+        let err = resolve_prompt_artifact(tmp.path(), Some(&pf)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nope.md"), "msg = {msg}");
     }
 
     #[test]
