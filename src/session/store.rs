@@ -163,6 +163,23 @@ impl SessionStore {
         std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
+
+    /// Sum every session's per-node USD costs into a single lifetime
+    /// figure. Unreadable sessions (bad meta.json) are skipped silently
+    /// — surfaces in `fleet sessions list` separately and shouldn't
+    /// trip up budget arithmetic. Returns `0.0` for a fresh repo with
+    /// no sessions.
+    pub fn sum_costs(&self) -> Result<f64> {
+        let mut total = 0.0;
+        for id in self.list()? {
+            if let Ok(s) = self.load(&id) {
+                if let Some(c) = s.total_cost_usd() {
+                    total += c;
+                }
+            }
+        }
+        Ok(total)
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +341,33 @@ mod tests {
         // Sanity check the wallclock helper used by the production path.
         // Not deterministic; just check it isn't always 0.
         assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn sum_costs_returns_zero_for_empty_store() {
+        let (_dir, s) = store();
+        assert!((s.sum_costs().unwrap() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sum_costs_aggregates_across_sessions_skipping_cost_less_ones() {
+        let (_dir, s) = store();
+        // Session with cost.
+        let mut a = session("s-a");
+        a.record_node_cost("plan", 0.10, 2);
+        a.record_node_cost("review", 0.32, 3);
+        s.create(&a).unwrap();
+        // Session with cost.
+        let mut b = session("s-b");
+        b.record_node_cost("only", 0.05, 4);
+        s.create(&b).unwrap();
+        // Session with no costs recorded — should contribute 0 to
+        // the lifetime sum (total_cost_usd() returns None, sum_costs
+        // skips it).
+        let c = session("s-c");
+        s.create(&c).unwrap();
+        let total = s.sum_costs().unwrap();
+        // 0.10 + 0.32 + 0.05 = 0.47
+        assert!((total - 0.47).abs() < 1e-9, "got {total}");
     }
 }

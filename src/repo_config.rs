@@ -24,7 +24,7 @@ use crate::agent::AgentRegistry;
 
 /// Top-level repo config. Held by callers and threaded down into the runtime
 /// factory, agent registry, etc.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RepoConfig {
     pub runtime: RuntimeConfig,
     pub tracker: Tracker,
@@ -32,6 +32,7 @@ pub struct RepoConfig {
     pub workflows: WorkflowsConfig,
     pub autonomous: AutonomousConfig,
     pub cleanup: CleanupConfig,
+    pub cost: CostConfig,
 }
 
 /// `runtime:` block — which adapter to instantiate, how to harden it, where
@@ -335,6 +336,27 @@ pub struct CleanupConfig {
     pub auto_prune_completed: bool,
 }
 
+/// `cost:` block — spend guardrails. Both fields default to `None`
+/// (no budget). Budgets are *hard stops on new agent spawns*; an
+/// in-flight agent isn't interrupted mid-run when the budget is
+/// crossed. Honest scope: no projection logic — fleet counts
+/// reported cost after each agent finishes; the next agent's start
+/// checks the totals.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CostConfig {
+    /// Maximum USD this *session* may spend across all its agent
+    /// nodes. The next agent node's start is refused when the
+    /// session's `total_cost_usd()` already meets or exceeds this
+    /// value. `None` = unlimited.
+    pub per_session_budget_usd: Option<f64>,
+    /// Maximum USD all sessions in this repo may have spent in
+    /// total. The next agent node's start is refused when the
+    /// lifetime sum already meets or exceeds this value. Computed
+    /// at agent-start time by walking the session store, so the
+    /// check sees real costs (not projections). `None` = unlimited.
+    pub lifetime_budget_usd: Option<f64>,
+}
+
 impl RepoConfig {
     /// Parse a config from a string. `path_hint` is used purely for error
     /// context (so the user sees which file failed); it does not have to
@@ -379,12 +401,22 @@ struct Raw {
     autonomous: Option<RawAutonomous>,
     #[serde(default)]
     cleanup: Option<RawCleanup>,
+    #[serde(default)]
+    cost: Option<RawCost>,
 }
 
 #[derive(Deserialize, Default)]
 struct RawCleanup {
     #[serde(default)]
     auto_prune_completed: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawCost {
+    #[serde(default)]
+    per_session_budget_usd: Option<f64>,
+    #[serde(default)]
+    lifetime_budget_usd: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -457,6 +489,7 @@ impl From<Raw> for RepoConfig {
             workflows: default_workflows,
             autonomous: default_autonomous,
             cleanup: default_cleanup,
+            cost: default_cost,
         } = Self::default();
 
         let runtime = match raw.runtime {
@@ -527,6 +560,15 @@ impl From<Raw> for RepoConfig {
             },
             None => default_cleanup,
         };
+        let cost = match raw.cost {
+            Some(c) => CostConfig {
+                per_session_budget_usd: c
+                    .per_session_budget_usd
+                    .or(default_cost.per_session_budget_usd),
+                lifetime_budget_usd: c.lifetime_budget_usd.or(default_cost.lifetime_budget_usd),
+            },
+            None => default_cost,
+        };
         Self {
             runtime,
             tracker,
@@ -534,6 +576,7 @@ impl From<Raw> for RepoConfig {
             workflows,
             autonomous,
             cleanup,
+            cost,
         }
     }
 }
@@ -579,6 +622,38 @@ mod tests {
         let yaml = "tracker: github\n";
         let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
         assert!(!cfg.cleanup.auto_prune_completed);
+    }
+
+    #[test]
+    fn parses_cost_budgets_both_fields() {
+        let yaml = "\
+cost:
+  per_session_budget_usd: 5.0
+  lifetime_budget_usd: 100.0
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.cost.per_session_budget_usd, Some(5.0));
+        assert_eq!(cfg.cost.lifetime_budget_usd, Some(100.0));
+    }
+
+    #[test]
+    fn parses_cost_budgets_partial() {
+        // Only lifetime — per-session stays unlimited.
+        let yaml = "\
+cost:
+  lifetime_budget_usd: 50.0
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.cost.per_session_budget_usd, None);
+        assert_eq!(cfg.cost.lifetime_budget_usd, Some(50.0));
+    }
+
+    #[test]
+    fn missing_cost_block_falls_back_to_unlimited_defaults() {
+        let yaml = "tracker: github\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.cost.per_session_budget_usd, None);
+        assert_eq!(cfg.cost.lifetime_budget_usd, None);
     }
 
     #[test]

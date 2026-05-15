@@ -111,6 +111,13 @@ pub struct ExecuteRequest<'a> {
     /// transitions. Callers that don't need enforcement pass a
     /// [`crate::egress::NoopEnforcer`] reference.
     pub egress: &'a dyn crate::egress::EgressEnforcer,
+    /// Cost budgets. The executor checks these *before each agent
+    /// node starts*: if either limit is already met by the
+    /// session's accumulated cost or the lifetime sum across the
+    /// store, the node is refused and the session transitions to
+    /// `Failed`. `CostConfig::default()` (`None`/`None`) opts every
+    /// session out — historical behaviour.
+    pub cost: &'a crate::repo_config::CostConfig,
 }
 
 /// Per-session worktree bookkeeping, threaded into [`ExecuteRequest`]
@@ -670,6 +677,12 @@ impl WorkflowExecutor {
         session: &Session,
         egress: &crate::egress::EgressSetup,
     ) -> Result<NodeOutcome> {
+        // Budget guardrail: refuse to start this agent if the session
+        // or lifetime cost has already hit a configured budget. We
+        // compute lifetime *here* (not once per session) because
+        // earlier nodes in this same session may have just rolled
+        // into the totals. Failure here propagates → mark_failed.
+        check_cost_budget(req.cost, session, req.store, &node.id)?;
         let agent = req.agents.get(agent_name).ok_or_else(|| {
             anyhow!(
                 "workflow node `{}` references unknown agent `{agent_name}` (not in agents.registry)",
@@ -1029,6 +1042,46 @@ impl WorkflowExecutor {
             tracing::warn!(?save_err, session = %session.id, original = %err, "saving Failed session failed");
         }
     }
+}
+
+/// Refuse to start an agent node if a configured spend budget has
+/// already been met. Pure with respect to the session store +
+/// session — separated from `run_agent_node` so the predicate can be
+/// unit-tested without spinning up containers.
+///
+/// Reads the session's accumulated cost from memory; queries the
+/// store for the lifetime total. A `None` budget is "unlimited" and
+/// always passes. Returns a user-facing error with the specific
+/// limit + actual figure so the user knows which knob to bump.
+pub fn check_cost_budget(
+    cost: &crate::repo_config::CostConfig,
+    session: &Session,
+    store: &crate::session::store::SessionStore,
+    node_id: &str,
+) -> Result<()> {
+    if let Some(limit) = cost.per_session_budget_usd {
+        let actual = session.total_cost_usd().unwrap_or(0.0);
+        if actual >= limit {
+            return Err(anyhow!(
+                "cost budget exceeded: per-session limit ${limit:.2} reached by session \
+                 (${actual:.4} already spent); refused to start agent node `{node_id}`. \
+                 Raise `cost.per_session_budget_usd` in .fleet/config.yaml, or run \
+                 `fleet workflow replay --rerun-only <node>` after the budget is loosened."
+            ));
+        }
+    }
+    if let Some(limit) = cost.lifetime_budget_usd {
+        let actual = store.sum_costs().context("computing lifetime cost")?;
+        if actual >= limit {
+            return Err(anyhow!(
+                "cost budget exceeded: lifetime limit ${limit:.2} reached by repo \
+                 (${actual:.4} already spent across all sessions); refused to start \
+                 agent node `{node_id}`. Raise `cost.lifetime_budget_usd` in \
+                 .fleet/config.yaml, or prune historical sessions to free room."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Confirm that every path declared in `node.artifacts.in` exists under
@@ -1544,6 +1597,65 @@ mod tests {
     }
 
     #[test]
+    fn check_cost_budget_passes_when_both_budgets_unlimited() {
+        let cost = crate::repo_config::CostConfig::default(); // None, None
+        let (_d, store) = build_store();
+        let session = Session::new(SessionId::new("s-x"), "wf", 1);
+        check_cost_budget(&cost, &session, &store, "n").unwrap();
+    }
+
+    #[test]
+    fn check_cost_budget_refuses_when_session_budget_already_met() {
+        let cost = crate::repo_config::CostConfig {
+            per_session_budget_usd: Some(0.5),
+            lifetime_budget_usd: None,
+        };
+        let (_d, store) = build_store();
+        let mut session = Session::new(SessionId::new("s-x"), "wf", 1);
+        // Prior nodes in this session pushed the cost above the limit.
+        session.record_node_cost("plan", 0.30, 2);
+        session.record_node_cost("review", 0.25, 3);
+        let err = check_cost_budget(&cost, &session, &store, "next-node").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("per-session limit"), "got: {msg}");
+        assert!(msg.contains("$0.50"));
+        assert!(msg.contains("next-node"));
+    }
+
+    #[test]
+    fn check_cost_budget_passes_when_session_under_budget() {
+        let cost = crate::repo_config::CostConfig {
+            per_session_budget_usd: Some(1.0),
+            lifetime_budget_usd: None,
+        };
+        let (_d, store) = build_store();
+        let mut session = Session::new(SessionId::new("s-x"), "wf", 1);
+        session.record_node_cost("plan", 0.30, 2);
+        check_cost_budget(&cost, &session, &store, "next-node").unwrap();
+    }
+
+    #[test]
+    fn check_cost_budget_refuses_when_lifetime_budget_already_met() {
+        let cost = crate::repo_config::CostConfig {
+            per_session_budget_usd: None,
+            lifetime_budget_usd: Some(1.0),
+        };
+        let (_d, store) = build_store();
+        // Stage some prior sessions with costs that already saturate
+        // the lifetime budget.
+        let mut prior = Session::new(SessionId::new("s-prior"), "wf", 1);
+        prior.record_node_cost("a", 0.60, 2);
+        prior.record_node_cost("b", 0.50, 3);
+        store.create(&prior).unwrap();
+        // The new (in-memory) session is itself cost-free; the
+        // lifetime sum from the store is what trips the guard.
+        let session = Session::new(SessionId::new("s-new"), "wf", 4);
+        let err = check_cost_budget(&cost, &session, &store, "next-node").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("lifetime limit"), "got: {msg}");
+    }
+
+    #[test]
     fn verify_inputs_passes_when_no_inputs_declared() {
         let tmp = tempfile::tempdir().unwrap();
         verify_inputs(tmp.path(), &agent_node("n", &[], &[])).unwrap();
@@ -1665,6 +1777,10 @@ nodes:
             session_id,
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -1697,6 +1813,10 @@ nodes:
             session_id: SessionId::new("s-missin"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -1738,6 +1858,10 @@ nodes:
             session_id: SessionId::new("s-liar"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -1988,6 +2112,10 @@ nodes:
             session_id: SessionId::new("s-iss"),
             issue: Some(sample_issue()),
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2018,6 +2146,10 @@ nodes:
             session_id: SessionId::new("s-trivial"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2059,6 +2191,10 @@ nodes:
                 path: &wt_path,
                 branch: "fleet/session-s-wt",
             }),
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2101,6 +2237,10 @@ nodes:
             session_id: SessionId::new("s-no-wt"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2202,6 +2342,10 @@ nodes:
             session_id: SessionId::new("s-egress-env"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &enforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2260,6 +2404,10 @@ nodes:
             session_id: SessionId::new("s-lifecycle"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &enforcer,
         };
         executor.execute(&req).unwrap();
@@ -2294,6 +2442,10 @@ nodes:
             session_id: SessionId::new("s-cost"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2332,6 +2484,10 @@ nodes:
             session_id: SessionId::new("s-clean-marker"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2370,6 +2526,10 @@ nodes:
             session_id: SessionId::new("s-noparse"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2406,6 +2566,10 @@ nodes:
             session_id: SessionId::new("s-fail"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -2440,6 +2604,10 @@ nodes:
             session_id: SessionId::new("s-ghost"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -2487,6 +2655,10 @@ nodes:
             session_id: SessionId::new("s-bash"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2524,6 +2696,10 @@ nodes:
             session_id: SessionId::new("s-bashfail"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -2567,6 +2743,10 @@ nodes:
             session_id: SessionId::new("s-gate"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2627,6 +2807,10 @@ nodes:
             session_id: session_id.clone(),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let final_session = executor.execute(&req).unwrap();
@@ -2682,6 +2866,10 @@ nodes:
             session_id: SessionId::new("s-gate-pid"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -2717,6 +2905,10 @@ nodes:
             session_id: SessionId::new("s-fail-pid"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let _ = executor.execute(&req).unwrap_err();
@@ -2758,6 +2950,10 @@ nodes:
             session_id: SessionId::new("s-resume"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         // First execute pauses at the gate.
@@ -2815,6 +3011,10 @@ nodes:
                 path: &wt,
                 branch: "fleet/session-s-resume-wt",
             }),
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let paused = executor.execute(&req).unwrap();
@@ -2862,6 +3062,10 @@ nodes:
             session_id: SessionId::new("s-done"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         // First run completes (no gate).
@@ -2900,6 +3104,10 @@ nodes:
             session_id: SessionId::new("s-ghost"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.resume(&req).unwrap_err();
@@ -2982,6 +3190,10 @@ nodes:
             session_id: SessionId::new("s-replay"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -3056,6 +3268,10 @@ nodes:
             session_id: SessionId::new("s-only"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -3123,6 +3339,10 @@ nodes:
             session_id: SessionId::new("s-loop"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -3177,6 +3397,10 @@ nodes:
             session_id: SessionId::new("s-bad"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor
@@ -3226,6 +3450,10 @@ nodes:
                 path: &new_wt,
                 branch: "fleet/session-s-replay-wt",
             }),
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -3267,6 +3495,10 @@ nodes:
             session_id: SessionId::new("s-replay-bad"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -3306,6 +3538,10 @@ nodes:
             session_id: SessionId::new("s-replay-no-src"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor
@@ -3372,6 +3608,10 @@ nodes:
             session_id: SessionId::new("s-replay-top"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -3419,6 +3659,10 @@ nodes:
             session_id: SessionId::new("s-replay-empty"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let replayed = executor.replay(&req, &src_id, "only").unwrap();
@@ -3497,6 +3741,10 @@ nodes:
             session_id: SessionId::new("s-gate-outputs"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
 
@@ -3591,6 +3839,10 @@ nodes:
             session_id: SessionId::new("s-replay-with-outputs"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let replayed = executor.replay(&req, &src_id, "act").unwrap();
@@ -3715,6 +3967,10 @@ nodes:
             session_id: SessionId::new("s-fanout-fail"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -3795,6 +4051,10 @@ nodes:
             session_id: session_id.clone(),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -3841,6 +4101,10 @@ nodes:
             session_id: SessionId::new("s-fan-gate"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -3884,6 +4148,10 @@ nodes:
             session_id: SessionId::new(session_id),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4189,6 +4457,10 @@ nodes:
             session_id: SessionId::new("s-dia"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4379,6 +4651,10 @@ nodes:
             session_id: session_id.clone(),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4456,6 +4732,10 @@ nodes:
             session_id: session_id.clone(),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4506,6 +4786,10 @@ nodes:
             session_id: SessionId::new("s-bad-fork"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -4574,6 +4858,10 @@ nodes:
             session_id,
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4650,6 +4938,10 @@ nodes:
             session_id,
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4709,6 +5001,10 @@ nodes:
             session_id: session_id.clone(),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
@@ -4764,6 +5060,10 @@ nodes:
             session_id: session_id.clone(),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -4811,6 +5111,10 @@ nodes:
             session_id: SessionId::new("s-assert-unknown"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
@@ -4925,6 +5229,10 @@ nodes:
             session_id: SessionId::new("s-loop-resume"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let paused = executor.execute(&req).unwrap();
@@ -4997,6 +5305,10 @@ nodes:
             session_id: SessionId::new("s-issue-resume"),
             issue: Some(sample_issue()),
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let paused = executor.execute(&exec_req).unwrap();
@@ -5020,6 +5332,10 @@ nodes:
             session_id: SessionId::new("s-issue-resume"),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let resumed = executor.resume(&resume_req).unwrap();
@@ -5077,6 +5393,10 @@ nodes:
             session_id: SessionId::new("s-override"),
             issue: Some(original.clone()),
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         executor.execute(&exec_req).unwrap();
@@ -5097,6 +5417,10 @@ nodes:
             session_id: SessionId::new("s-override"),
             issue: Some(replacement.clone()),
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let resumed = executor.resume(&resume_req).unwrap();
@@ -5153,6 +5477,10 @@ nodes:
             session_id: session_id.clone(),
             issue: None,
             worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();

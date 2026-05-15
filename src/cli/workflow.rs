@@ -123,6 +123,7 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
         session_id: session_id.clone(),
         issue,
         worktree: worktree_meta,
+        cost: &config.cost,
         egress: enforcer.as_ref(),
     };
 
@@ -220,6 +221,7 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         // resume must not re-stamp (would bump updated_at_ms with no
         // change) and the executor's resume() doesn't read it.
         worktree: None,
+        cost: &config.cost,
         egress: enforcer.as_ref(),
     };
     println!("{session_id}");
@@ -342,6 +344,7 @@ pub fn run_replay(
         // `FLEET_ISSUE_*` matters.
         issue: None,
         worktree: worktree_meta,
+        cost: &config.cost,
         egress: enforcer.as_ref(),
     };
 
