@@ -36,6 +36,17 @@ The per-boundary deep-dives:
   tip, and how `fleet sessions prune` reclaims disk while keeping
   agent commits inspectable.
 
+## Orchestration & planning
+
+- [`orchestration.md`](./orchestration.md) — plans, blocked-outcome
+  handling, the `tracker-create` workflow node, the bridge CLI that
+  gives agents scoped tracker write access, and the `fleet brainstorm`
+  interactive planning agent. The full sequencing model:
+  *plan = preference, blocked-on = requirement, brainstorm = the
+  planning surface, supervisor = the execution surface*. Currently
+  designed; phased delivery underway (status table at the bottom of
+  the page).
+
 ## Verification
 
 - [`SMOKE_EGRESS.md`](./SMOKE_EGRESS.md) — manual smoke checklist
