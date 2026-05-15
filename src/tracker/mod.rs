@@ -10,7 +10,7 @@
 pub mod git_bug;
 pub mod github;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -29,9 +29,8 @@ pub use github::GitHubTracker;
 /// specifics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-// Consumed by `Tracker::set_status` in the next commit; the bridge HTTP
-// route + fleet-tracker CLI use the same kebab-case JSON encoding the
-// serde test above pins.
+// Production callers (concrete tracker impls + bridge HTTP routes) land
+// in the next commits.
 #[allow(dead_code)]
 pub enum Status {
     Open,
@@ -93,12 +92,81 @@ impl Issue {
 
 /// Plugin-agnostic tracker query. `Send + Sync` because callers may
 /// dispatch into a worker thread for async UX.
+///
+/// Write methods (`comment`, `set_status`, `add_label`, `remove_label`,
+/// `create`, `link_parent`) and the rich-read method (`read`) carry
+/// default impls that bail with a clear error. Concrete trackers
+/// override the methods they support in later commits; the default
+/// keeps the trait Liskov-substitutable through Phase 1 even when an
+/// impl hasn't been extended yet.
+///
+/// `#[allow(dead_code)]` on the new methods is short-lived — the
+/// follow-up commits in this phase wire production callers (concrete
+/// tracker impls, then the bridge HTTP server) and the allow falls off
+/// per-method as each gains a non-test caller.
+#[allow(dead_code)]
 pub trait Tracker: Send + Sync {
     fn name(&self) -> &'static str;
     /// Issues for the project rooted at `repo_root`. Sorted with open
     /// issues first, then closed, then alphabetic by `human_id` — single
     /// order all plugins share so UI code stays plugin-agnostic.
     fn list_issues(&self, repo_root: &Path) -> Result<Vec<Issue>>;
+
+    /// Read a single ticket with its body and comment thread. Used by
+    /// the bridge's `GET /read` route to feed an agent the context it
+    /// needs about its bound ticket.
+    fn read(&self, _repo_root: &Path, _issue_id: &str) -> Result<IssueDetail> {
+        bail!("tracker `{}` does not implement read", self.name())
+    }
+
+    /// Append a comment to `issue_id`. The bridge writes the agent's
+    /// summary / progress notes via this method; the workflow engine
+    /// uses it for cross-link comments produced by `tracker-create`.
+    fn comment(&self, _repo_root: &Path, _issue_id: &str, _body: &str) -> Result<()> {
+        bail!("tracker `{}` does not implement comment", self.name())
+    }
+
+    /// Move `issue_id` to `status`. The trait abstracts over each
+    /// tracker's native primitive: GitHub uses `gh issue close/reopen`
+    /// for Open/Closed and an `in-progress` label for `InProgress`;
+    /// git-bug has first-class status verbs plus its own label
+    /// convention.
+    fn set_status(&self, _repo_root: &Path, _issue_id: &str, _status: Status) -> Result<()> {
+        bail!("tracker `{}` does not implement set_status", self.name())
+    }
+
+    /// Add a single label. Idempotent on both backends: re-adding an
+    /// existing label is not an error.
+    fn add_label(&self, _repo_root: &Path, _issue_id: &str, _label: &str) -> Result<()> {
+        bail!("tracker `{}` does not implement add_label", self.name())
+    }
+
+    /// Remove a single label. Idempotent on both backends: removing a
+    /// label the ticket doesn't have is not an error.
+    fn remove_label(&self, _repo_root: &Path, _issue_id: &str, _label: &str) -> Result<()> {
+        bail!("tracker `{}` does not implement remove_label", self.name())
+    }
+
+    /// Create a new ticket. Supervisor / brainstorm authority only —
+    /// never reachable through the bridge. The trait surface lives here
+    /// because `tracker-create` workflow nodes (Phase 2) and brainstorm
+    /// tool endpoints (Phase 5) both consume it.
+    fn create(
+        &self,
+        _repo_root: &Path,
+        _title: &str,
+        _body: &str,
+        _labels: &[String],
+    ) -> Result<Issue> {
+        bail!("tracker `{}` does not implement create", self.name())
+    }
+
+    /// Link `child_id` to `parent_id`. Mapping varies per tracker —
+    /// GitHub appends a task-list line to the parent's body; git-bug
+    /// records a `parent:<id>` label on the child.
+    fn link_parent(&self, _repo_root: &Path, _parent_id: &str, _child_id: &str) -> Result<()> {
+        bail!("tracker `{}` does not implement link_parent", self.name())
+    }
 }
 
 /// Build the tracker selected by `.fleet/config.yaml`. Returns `None` for
@@ -176,6 +244,47 @@ mod tests {
         assert_eq!(gb.name(), "git-bug");
         let gh = build(TrackerChoice::Github, Arc::clone(&invoker)).unwrap();
         assert_eq!(gh.name(), "github");
+    }
+
+    /// Bare-bones `Tracker` that only implements the two required
+    /// methods. Used to assert the default impl of every write method
+    /// bails with a clear error rather than panicking.
+    struct StubTracker;
+    impl Tracker for StubTracker {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn list_issues(&self, _repo_root: &Path) -> Result<Vec<Issue>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn default_write_methods_bail_with_tracker_name_in_message() {
+        let t = StubTracker;
+        let repo = Path::new("/repo");
+        for (op, err) in [
+            ("read", t.read(repo, "1").err()),
+            ("comment", t.comment(repo, "1", "hi").err()),
+            ("set_status", t.set_status(repo, "1", Status::Closed).err()),
+            ("add_label", t.add_label(repo, "1", "x").err()),
+            ("remove_label", t.remove_label(repo, "1", "x").err()),
+            ("create", t.create(repo, "t", "b", &[]).err()),
+            ("link_parent", t.link_parent(repo, "p", "c").err()),
+        ] {
+            let msg = format!(
+                "{:#}",
+                err.unwrap_or_else(|| panic!("expected {op} to bail"))
+            );
+            assert!(
+                msg.contains("stub"),
+                "{op}: tracker name missing from message — {msg}"
+            );
+            assert!(
+                msg.contains(op),
+                "{op}: operation name missing from message — {msg}"
+            );
+        }
     }
 
     #[test]
