@@ -14,7 +14,7 @@
 //! allowlist covers tracker host, prompt files exist) is Phase 2 work and
 //! lives in the executor or a separate `semantic.rs` later.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
 
 use super::spec::{NodeKind, Workflow};
@@ -136,13 +136,6 @@ fn dfs<'a>(
         }
     }
     None
-}
-
-/// Helper used by callers that already have a `Workflow` and want a single
-/// `?`-able call. Equivalent to [`validate`] but takes ownership-friendly
-/// args.
-pub fn validate_workflow(wf: &Workflow) -> Result<()> {
-    validate(wf).map_err(|e| anyhow!("{e}"))
 }
 
 #[cfg(test)]
@@ -342,9 +335,4 @@ nodes:
         validate(&wf).unwrap();
     }
 
-    #[test]
-    fn validate_workflow_wrapper_is_equivalent_to_validate() {
-        let wf = parse("name: x\nnodes:\n  - id: a\n    agent: claude\n");
-        validate_workflow(&wf).unwrap();
-    }
 }

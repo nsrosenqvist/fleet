@@ -227,13 +227,6 @@ const fn state_word(s: SessionState) -> &'static str {
     }
 }
 
-/// Helper for the unsupported-on-Linux test path: callers (e.g. CI) may
-/// want to assert that `workflow_path` produces the documented layout.
-#[must_use]
-pub fn workflow_path_for_tests(root: &Path, name: &str) -> PathBuf {
-    workflow_path(root, name)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

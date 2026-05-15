@@ -1,36 +1,37 @@
-//! fleet — host-side wrapper + ratatui inspector for the Composio Agent
-//! Orchestrator (AO) running inside a Lima VM named `fleet-vm`.
-//!
-//! See `/Users/niklas/.claude/plans/tranquil-bubbling-charm.md` for the plan.
+//! fleet — standalone Rust binary for running devcontainer-based agent
+//! workflows in any repo. See `~/.claude/plans/declarative-wobbling-quasar.md`
+//! for the design.
 
-// TEMP: ao/state, ao/invoke, lima methods, tmux helpers are wired into the
-// TUI in Stage 3. The CLI doesn't reference them yet. Lift this allow when
-// Stage 3 lands.
+// Temporary: the v2 TUI rewires `Capabilities` / `Issue::matches` /
+// `SessionState::is_terminal` / `AgentRegistry::iter` in the very next
+// commit. They look dead in this AO-removal snapshot — lift this when
+// the TUI rebuild lands.
 #![allow(dead_code)]
+//!
+//! Module layout:
+//! - `repo` / `repo_config` — per-repo state location + `.fleet/config.yaml`
+//! - `runtime` — adapter trait + Local/Podman/Docker/AppleContainer impls,
+//!   devcontainer CLI helper, host probing
+//! - `session` — value object + on-disk store under `.fleet/sessions/<id>/`
+//! - `agent` — named agent specs (command + env passthrough)
+//! - `tracker` — host-side `git-bug` / `gh` issue listing
+//! - `workflow` — YAML DSL + DAG validator + Phase-1 executor
+//! - `tui` — minimal ratatui session browser
+//! - `cli` — clap surface + dispatch
+//! - `process` — `ProcessInvoker` trait + `RealProcessInvoker` + helpers
 
 mod agent;
-mod ao;
 mod cli;
-mod config;
-mod identity;
-mod lima;
-mod network;
 mod process;
 mod repo;
 mod repo_config;
 mod runtime;
-mod secrets;
 mod session;
-mod templates_sync;
 mod tracker;
-mod workflow;
-#[cfg(test)]
-mod test_env;
-mod tmux;
 mod tui;
+mod workflow;
 
 use clap::Parser;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -44,9 +45,7 @@ fn main() -> ExitCode {
         .try_init();
 
     let cli = cli::Cli::parse();
-    let repo_root = repo_root();
-
-    match cli::dispatch(cli, &repo_root) {
+    match cli::dispatch(cli) {
         // `u8::try_from` fails when `code` is negative (e.g. -1 from
         // `Command::status` when killed by signal) or >255 — both unusual.
         // Fold those into generic failure.
@@ -56,18 +55,4 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-/// Best-effort repo root: ancestor that contains both `Cargo.toml` and
-/// `agent-orchestrator.yaml`. Falls back to the current working directory.
-fn repo_root() -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for ancestor in cwd.ancestors() {
-        if ancestor.join("Cargo.toml").is_file()
-            && ancestor.join("agent-orchestrator.yaml").is_file()
-        {
-            return ancestor.to_path_buf();
-        }
-    }
-    cwd
 }
