@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::process::RealProcessInvoker;
 use crate::repo;
+use crate::runtime::detect::{BootstrapHint, ProbeReport, probe};
 
 /// What `fleet init` did (or would have done — the structure lets us add
 /// a `--dry-run` later without reshaping the call sites).
@@ -155,13 +157,48 @@ pub fn render_init_summary(root: &Path, plan: &InitPlan) -> String {
     out
 }
 
+/// Render the bootstrap section appended to `fleet init`'s output:
+/// per-missing-tool, OS-tailored install commands the user can
+/// copy-paste. When everything is present, returns an empty string
+/// — the section is opt-in based on probe results.
+#[must_use]
+pub fn render_bootstrap_section(report: &ProbeReport, os: &str) -> String {
+    let hints = report.install_hints_for_os(os);
+    if hints.is_empty() {
+        return String::new();
+    }
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    out.push_str("\nBootstrap your environment:\n");
+    out.push_str("  (fleet runtime doctor found tools missing for the configurations below)\n");
+    for BootstrapHint {
+        tool,
+        command,
+        note,
+    } in &hints
+    {
+        let _ = writeln!(out, "\n  ✗ {tool}");
+        let _ = writeln!(out, "      {command}");
+        let _ = writeln!(out, "      ({note})");
+    }
+    out
+}
+
 /// CLI entry point. Resolves the fleet root via [`crate::repo::fleet_root`],
-/// scaffolds, prints the summary, returns exit code 0.
+/// scaffolds, prints the summary + bootstrap hints, returns exit code 0.
 pub fn run() -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
     let plan = perform_init(&root)?;
     print!("{}", render_init_summary(&root, &plan));
+    // First-run bootstrap: probe the host and surface OS-tailored
+    // install commands for whatever's missing. Silent when nothing
+    // needs installing.
+    let report = probe(&RealProcessInvoker);
+    print!(
+        "{}",
+        render_bootstrap_section(&report, std::env::consts::OS)
+    );
     Ok(0)
 }
 
@@ -708,5 +745,113 @@ mod tests {
         let p = Path::new("/elsewhere/file");
         let r = Path::new("/r");
         assert_eq!(relativise(p, r), PathBuf::from("/elsewhere/file"));
+    }
+
+    // Test helpers for bootstrap-section rendering: pure
+    // ProbeReport fixtures, no need for a real probe.
+    fn missing(kind: crate::runtime::detect::BackendKind) -> crate::runtime::detect::BackendStatus {
+        // Reach into detect's status shape via a value-only path —
+        // BackendStatus is `pub`, fields are `pub`. This mirrors the
+        // helper in cli::runtime tests; duplicating to keep the test
+        // module self-contained.
+        crate::runtime::detect::BackendStatus {
+            kind,
+            present: false,
+            version: None,
+            notes: Vec::new(),
+        }
+    }
+
+    fn present_b(
+        kind: crate::runtime::detect::BackendKind,
+        v: &str,
+    ) -> crate::runtime::detect::BackendStatus {
+        crate::runtime::detect::BackendStatus {
+            kind,
+            present: true,
+            version: Some(v.to_string()),
+            notes: Vec::new(),
+        }
+    }
+
+    fn report_with_all_missing() -> ProbeReport {
+        use crate::runtime::detect::BackendKind as K;
+        ProbeReport {
+            podman: missing(K::Podman),
+            docker: missing(K::Docker),
+            apple_container: missing(K::AppleContainer),
+            gvisor: missing(K::GVisor),
+            devcontainer_cli: missing(K::DevcontainerCli),
+            git_bug: missing(K::GitBug),
+            tinyproxy: missing(K::Tinyproxy),
+            recommended: None,
+        }
+    }
+
+    #[test]
+    fn bootstrap_section_is_empty_when_everything_present() {
+        use crate::runtime::detect::BackendKind as K;
+        let r = ProbeReport {
+            podman: present_b(K::Podman, "5.0.1"),
+            docker: missing(K::Docker),
+            apple_container: missing(K::AppleContainer),
+            gvisor: missing(K::GVisor),
+            devcontainer_cli: present_b(K::DevcontainerCli, "0.1.12"),
+            git_bug: present_b(K::GitBug, "0.10.0"),
+            tinyproxy: present_b(K::Tinyproxy, "1.11.1"),
+            recommended: Some(K::Podman),
+        };
+        assert_eq!(render_bootstrap_section(&r, "linux"), String::new());
+    }
+
+    #[test]
+    fn bootstrap_section_macos_emits_brew_commands() {
+        let r = report_with_all_missing();
+        let s = render_bootstrap_section(&r, "macos");
+        assert!(s.contains("Bootstrap your environment:"));
+        assert!(s.contains("brew install podman"));
+        assert!(s.contains("brew install git-bug"));
+        assert!(s.contains("brew install tinyproxy"));
+        // Linux-only commands should NOT appear on macOS.
+        assert!(!s.contains("apt install tinyproxy"));
+        assert!(!s.contains("dnf install podman"));
+    }
+
+    #[test]
+    fn bootstrap_section_linux_emits_apt_dnf_commands() {
+        let r = report_with_all_missing();
+        let s = render_bootstrap_section(&r, "linux");
+        assert!(s.contains("sudo dnf install podman"));
+        assert!(s.contains("sudo apt install tinyproxy"));
+        // macOS-only commands should NOT appear on Linux.
+        assert!(!s.contains("brew install podman"));
+        assert!(!s.contains("brew install tinyproxy"));
+    }
+
+    #[test]
+    fn bootstrap_section_each_hint_carries_tool_command_and_note() {
+        let r = report_with_all_missing();
+        let s = render_bootstrap_section(&r, "linux");
+        // Three-line shape per hint: `✗ tool`, `    command`, `    (note)`.
+        assert!(s.contains("✗ container engine"));
+        assert!(s.contains("(fleet cannot start a container without one of these)"));
+        assert!(s.contains("✗ devcontainer CLI"));
+        assert!(s.contains("(required — fleet builds images via this CLI)"));
+        assert!(s.contains("✗ git-bug"));
+        assert!(s.contains("(only needed when `tracker: git-bug`"));
+        assert!(s.contains("✗ tinyproxy"));
+        assert!(s.contains("(only needed on macOS with `policy: allowlist`"));
+    }
+
+    #[test]
+    fn bootstrap_section_devcontainer_cli_command_is_os_agnostic() {
+        // cargo install / npm install -g work on any OS; the hint is
+        // the same regardless of platform.
+        let r = report_with_all_missing();
+        let linux = render_bootstrap_section(&r, "linux");
+        let mac = render_bootstrap_section(&r, "macos");
+        for s in [&linux, &mac] {
+            assert!(s.contains("cargo install devcontainer"));
+        }
     }
 }

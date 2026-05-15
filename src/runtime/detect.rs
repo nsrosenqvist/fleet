@@ -147,6 +147,73 @@ impl ProbeReport {
         }
         hints
     }
+
+    /// OS-tailored variant of [`Self::install_hints`]. Drops the
+    /// platform suffixes that don't apply on the current host so
+    /// `fleet init`'s first-run bootstrap surface is copy-pasteable.
+    /// `os` is `std::env::consts::OS` (`"linux"` / `"macos"`); pass
+    /// it explicitly so tests can pin either.
+    pub fn install_hints_for_os(&self, os: &str) -> Vec<BootstrapHint> {
+        let mut hints = Vec::new();
+        if !self.podman.present && !self.docker.present && !self.apple_container.present {
+            hints.push(BootstrapHint {
+                tool: "container engine".to_string(),
+                command: match os {
+                    "macos" => {
+                        "brew install podman    # or: brew install --cask container (macOS 26+)"
+                            .to_string()
+                    }
+                    "linux" => {
+                        "sudo dnf install podman   # or: sudo apt install podman".to_string()
+                    }
+                    _ => "install Podman, Docker, or Apple Container (macOS 26+)".to_string(),
+                },
+                note: "fleet cannot start a container without one of these".to_string(),
+            });
+        }
+        if !self.devcontainer_cli.present {
+            hints.push(BootstrapHint {
+                tool: "devcontainer CLI".to_string(),
+                command: "cargo install devcontainer    # or: npm install -g @devcontainers/cli"
+                    .to_string(),
+                note: "required — fleet builds images via this CLI".to_string(),
+            });
+        }
+        if !self.git_bug.present {
+            hints.push(BootstrapHint {
+                tool: "git-bug".to_string(),
+                command: match os {
+                    "macos" => "brew install git-bug".to_string(),
+                    _ => "cargo install git-bug".to_string(),
+                },
+                note: "only needed when `tracker: git-bug` in .fleet/config.yaml".to_string(),
+            });
+        }
+        if !self.tinyproxy.present {
+            hints.push(BootstrapHint {
+                tool: "tinyproxy".to_string(),
+                command: match os {
+                    "macos" => "brew install tinyproxy".to_string(),
+                    "linux" => {
+                        "sudo apt install tinyproxy    # or: sudo dnf install tinyproxy".to_string()
+                    }
+                    _ => "install tinyproxy from your distro's repos".to_string(),
+                },
+                note: "only needed on macOS with `policy: allowlist` (Linux uses a sidecar)"
+                    .to_string(),
+            });
+        }
+        hints
+    }
+}
+
+/// One install hint, OS-tailored. Used by `fleet init`'s bootstrap
+/// section so the user can copy/paste the install command directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapHint {
+    pub tool: String,
+    pub command: String,
+    pub note: String,
 }
 
 /// Probe the host. Pure with respect to the invoker — for tests, hand in a
