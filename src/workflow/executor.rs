@@ -305,6 +305,12 @@ impl WorkflowExecutor {
         let mut session = Session::new(req.session_id.clone(), &req.workflow.name, (self.clock)());
         session.issue.clone_from(&req.issue);
         session.outputs.clone_from(&src.outputs);
+        // Mirror execute()'s pre-create stamp so the prune command +
+        // a subsequent replay-of-this-replay can find the worktree
+        // even if we crash before the next save().
+        if let Some(wt) = req.worktree {
+            session.set_worktree(wt.path.to_path_buf(), wt.branch, (self.clock)());
+        }
         req.store.create(&session)?;
 
         // Stage the src run's artifacts into the new session before
@@ -2865,6 +2871,61 @@ nodes:
                 .join("logs/review.log")
                 .exists()
         );
+    }
+
+    #[test]
+    fn replay_stamps_worktree_meta_onto_new_session() {
+        // Mirror execute()'s stamp: when the CLI passes a worktree
+        // (basing off the src session's branch tip), the executor
+        // must persist the new session's path + branch onto its own
+        // meta.json. This is what makes replay-of-replay work.
+        let yaml = "\
+name: replay-worktree
+nodes:
+  - id: plan
+    type: bash
+    script: 'echo plan'
+  - id: review
+    depends_on: [plan]
+    type: bash
+    script: 'echo review'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let src_id = stage_src_session(&store, "s-src-wt", "replay-worktree", &[]);
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(|_, _| Ok(String::new()));
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let new_wt = std::path::PathBuf::from("/repo/.fleet/sessions/s-replay-wt/worktree");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: &new_wt,
+            session_id: SessionId::new("s-replay-wt"),
+            issue: None,
+            worktree: Some(WorktreeMeta {
+                path: &new_wt,
+                branch: "fleet/session-s-replay-wt",
+            }),
+            egress: &crate::egress::NoopEnforcer,
+        };
+
+        let replayed = executor.replay(&req, &src_id, "review").unwrap();
+        assert_eq!(replayed.worktree_path.as_deref(), Some(new_wt.as_path()));
+        assert_eq!(
+            replayed.branch.as_deref(),
+            Some("fleet/session-s-replay-wt")
+        );
+        // Persistence too — the prune command reads off disk.
+        let reloaded = store.load(&replayed.id).unwrap();
+        assert_eq!(reloaded.worktree_path.as_deref(), Some(new_wt.as_path()));
     }
 
     #[test]

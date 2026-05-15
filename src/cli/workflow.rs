@@ -102,7 +102,7 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
     // isolation between parallel sessions and without replay's
     // code-state snapshot guarantee. We log loudly so users don't
     // wonder why two sessions stomp on each other's files.
-    let provision = provision_worktree(invoker.as_ref(), &root, &store, &session_id)?;
+    let provision = provision_worktree(invoker.as_ref(), &root, &store, &session_id, "HEAD")?;
     let workspace_path: &Path = provision
         .as_ref()
         .map_or(root.as_path(), |p| p.path.as_path());
@@ -258,6 +258,30 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
     let adapter = build_adapter(&config.runtime, &report, Arc::clone(&invoker))?;
 
     let new_id = ClockIdSource.mint();
+
+    // Replay provisions a fresh worktree off the src session's
+    // branch tip. When src ran without a branch (non-git workspace,
+    // or pre-worktree-feature meta.json), replay falls back to the
+    // shared repo root — same behaviour the src session had, so
+    // replay's contract isn't surprising.
+    let provision = if let Some(branch) = src.branch.as_deref() {
+        provision_worktree(invoker.as_ref(), &root, &store, &new_id, branch)?
+    } else {
+        tracing::warn!(
+            src = %session_id,
+            "source session has no recorded branch — replay runs against the shared \
+             working tree without code-state isolation"
+        );
+        None
+    };
+    let workspace_path: &Path = provision
+        .as_ref()
+        .map_or(root.as_path(), |p| p.path.as_path());
+    let worktree_meta = provision.as_ref().map(|p| WorktreeMeta {
+        path: p.path.as_path(),
+        branch: p.branch.as_str(),
+    });
+
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let executor = WorkflowExecutor::new(invoker);
     let req = ExecuteRequest {
@@ -266,16 +290,13 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
         agents: &config.agents.registry,
         store: &store,
         devcontainer: &devcontainer,
-        workspace: &root,
+        workspace: workspace_path,
         session_id: new_id.clone(),
         // Issue context is not carried forward — re-spawning a fresh
         // run via `workflow run --issue` is the supported path when
         // `FLEET_ISSUE_*` matters.
         issue: None,
-        // Replay provisions its own worktree off the src session's
-        // branch tip in commit 4. For now the field is None and
-        // replay continues to run against the repo root.
-        worktree: None,
+        worktree: worktree_meta,
         egress: enforcer.as_ref(),
     };
 
@@ -310,19 +331,25 @@ pub struct WorktreeProvision {
 
 /// Create a per-session git worktree under
 /// `<root>/.fleet/sessions/<id>/worktree` on a new
-/// `fleet/session-<short-id>` branch based off the host's current
-/// `HEAD`. Returns `None` (with a warning logged) when `root` is not
-/// inside a git working tree — the caller falls back to the shared
-/// repo root.
+/// `fleet/session-<short-id>` branch based off `base` (a branch
+/// name, tag, or sha). Returns `None` (with a warning logged) when
+/// `root` is not inside a git working tree — the caller falls back
+/// to the shared repo root.
 ///
 /// Pre-creates the per-session directory because `git worktree add`
 /// requires the *parent* of the target path to exist. `store.create`
 /// (called later by the executor) tolerates the pre-existing dir.
+///
+/// `base` is what makes this function reusable across run and
+/// replay: a fresh run bases off `HEAD`, replay bases off the src
+/// session's branch tip so the new worktree starts at the same
+/// commit the prior run ended at.
 fn provision_worktree(
     invoker: &dyn ProcessInvoker,
     root: &Path,
     store: &SessionStore,
     session_id: &SessionId,
+    base: &str,
 ) -> Result<Option<WorktreeProvision>> {
     if !worktree::is_git_repo(invoker, root) {
         tracing::warn!(
@@ -341,7 +368,7 @@ fn provision_worktree(
     })?;
     let wt_path = session_dir.join("worktree");
     let branch = worktree::session_branch_name(session_id.as_str());
-    worktree::create_worktree(invoker, root, &wt_path, &branch, "HEAD")?;
+    worktree::create_worktree(invoker, root, &wt_path, &branch, base)?;
     Ok(Some(WorktreeProvision {
         path: wt_path,
         branch,
