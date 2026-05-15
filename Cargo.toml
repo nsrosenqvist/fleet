@@ -11,6 +11,14 @@ description = "Standalone Rust binary for running devcontainer-based agent workf
 name = "fleet"
 path = "src/main.rs"
 
+# In-container client for the per-session bridge. Bind-mounted into
+# agent containers at /usr/local/bin/fleet-tracker (commit 9 of this
+# phase) so an agent can `fleet-tracker comment "…"` against its
+# bound ticket.
+[[bin]]
+name = "fleet-tracker"
+path = "src/bin/fleet-tracker.rs"
+
 [dependencies]
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
