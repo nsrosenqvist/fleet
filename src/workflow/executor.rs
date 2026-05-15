@@ -131,7 +131,15 @@ impl WorkflowExecutor {
     }
 
     fn run_node(&self, req: &ExecuteRequest<'_>, node: &Node, session: &Session) -> Result<()> {
-        match &node.kind {
+        // Input artifact contract: declared `artifacts.in:` must exist
+        // before the node runs. Detected here so a downstream node that
+        // depends on an upstream-produced file fails loudly with a
+        // pointer at the missing path rather than silently running on
+        // empty inputs.
+        let artifacts_dir = req.store.session_dir(&session.id).join("artifacts");
+        verify_inputs(&artifacts_dir, node)?;
+
+        let inner = match &node.kind {
             NodeKind::Agent { agent, .. } => self.run_agent_node(req, node, agent, session),
             NodeKind::Bash { script } => self.run_bash_node(req, node, script, session),
             // Unsupported kinds were rejected earlier in `execute`; this
@@ -140,7 +148,15 @@ impl WorkflowExecutor {
                 "internal: node `{}` of kind {other:?} reached run_node — should have been rejected upstream",
                 node.id
             ),
-        }
+        };
+        inner?;
+
+        // Output contract: declared `artifacts.out:` must be produced.
+        // We check after the inner run so a failing node surfaces its
+        // own error first; output-contract violations are reported as
+        // node failures with their own clear wording.
+        verify_outputs(&artifacts_dir, node)?;
+        Ok(())
     }
 
     fn run_agent_node(
@@ -283,6 +299,42 @@ impl WorkflowExecutor {
             tracing::warn!(?save_err, session = %session.id, original = %err, "saving Failed session failed");
         }
     }
+}
+
+/// Confirm that every path declared in `node.artifacts.in` exists under
+/// `artifacts_dir`. Returns an error naming the first missing path so
+/// users get an actionable pointer instead of a silent run on empty
+/// inputs. Empty `in:` list (the common case) is a no-op.
+pub fn verify_inputs(artifacts_dir: &Path, node: &Node) -> Result<()> {
+    for rel in &node.artifacts.r#in {
+        let path = artifacts_dir.join(rel);
+        if !path.exists() {
+            bail!(
+                "node `{}` requires input artifact `{rel}` but it is missing from {}",
+                node.id,
+                artifacts_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Confirm that every path declared in `node.artifacts.out` was produced
+/// under `artifacts_dir`. Empty `out:` list is a no-op. A missing output
+/// is reported as the node failing — the inner run already returned Ok
+/// at this point so the user sees the contract-violation wording.
+pub fn verify_outputs(artifacts_dir: &Path, node: &Node) -> Result<()> {
+    for rel in &node.artifacts.out {
+        let path = artifacts_dir.join(rel);
+        if !path.exists() {
+            bail!(
+                "node `{}` was expected to produce output artifact `{rel}` but it is missing from {}",
+                node.id,
+                artifacts_dir.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Build the env Vec the agent's container receives: the agent's
@@ -506,6 +558,217 @@ mod tests {
             human_id: "42".to_string(),
             title: "Fix the parser".to_string(),
         }
+    }
+
+    fn agent_node(id: &str, inputs: &[&str], outputs: &[&str]) -> Node {
+        use crate::workflow::spec::{ArtifactsSpec, NodeKind};
+        Node {
+            id: id.to_string(),
+            depends_on: Vec::new(),
+            when: None,
+            kind: NodeKind::Agent {
+                agent: "x".to_string(),
+                persona: None,
+                prompt_file: None,
+            },
+            artifacts: ArtifactsSpec {
+                r#in: inputs.iter().map(|s| (*s).to_string()).collect(),
+                out: outputs.iter().map(|s| (*s).to_string()).collect(),
+            },
+            outputs: std::collections::BTreeMap::new(),
+            loop_back_to: None,
+            max_loops: None,
+        }
+    }
+
+    #[test]
+    fn verify_inputs_passes_when_no_inputs_declared() {
+        let tmp = tempfile::tempdir().unwrap();
+        verify_inputs(tmp.path(), &agent_node("n", &[], &[])).unwrap();
+    }
+
+    #[test]
+    fn verify_inputs_passes_when_all_inputs_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("plan.md"), "p").unwrap();
+        std::fs::write(tmp.path().join("notes.md"), "n").unwrap();
+        verify_inputs(tmp.path(), &agent_node("n", &["plan.md", "notes.md"], &[])).unwrap();
+    }
+
+    #[test]
+    fn verify_inputs_fails_with_specific_path_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("plan.md"), "p").unwrap();
+        let err = verify_inputs(tmp.path(), &agent_node("code", &["plan.md", "review.md"], &[]))
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("node `code` requires input artifact `review.md`"), "got: {msg}");
+    }
+
+    #[test]
+    fn verify_inputs_reports_first_missing_only() {
+        // Stable wording: report the first missing artifact (per the
+        // declared order in the YAML) so error messages stay
+        // deterministic regardless of filesystem walk order.
+        let tmp = tempfile::tempdir().unwrap();
+        let err = verify_inputs(tmp.path(), &agent_node("n", &["first.md", "second.md"], &[]))
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("first.md"), "got: {msg}");
+        assert!(!msg.contains("second.md"), "got: {msg}");
+    }
+
+    #[test]
+    fn verify_outputs_passes_when_no_outputs_declared() {
+        let tmp = tempfile::tempdir().unwrap();
+        verify_outputs(tmp.path(), &agent_node("n", &[], &[])).unwrap();
+    }
+
+    #[test]
+    fn verify_outputs_passes_when_all_outputs_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("out.md"), "o").unwrap();
+        verify_outputs(tmp.path(), &agent_node("n", &[], &["out.md"])).unwrap();
+    }
+
+    #[test]
+    fn verify_outputs_fails_with_specific_path_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = verify_outputs(tmp.path(), &agent_node("plan", &[], &["plan.md"]))
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("node `plan` was expected to produce output artifact `plan.md`"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bash_node_with_satisfied_input_contract_completes() {
+        let yaml = "\
+name: chain
+nodes:
+  - id: maker
+    type: bash
+    script: 'echo plan > $ARTIFACTS/plan.md'
+  - id: consumer
+    depends_on: [maker]
+    type: bash
+    script: 'cat $ARTIFACTS/plan.md > /dev/null'
+    artifacts: { in: [plan.md] }
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        // Stub invoker that writes the artifact for `maker` and is a
+        // no-op for `consumer`. ARTIFACTS is the bind-mounted dir; for
+        // bash nodes the executor passes the host-side path directly.
+        let session_id = SessionId::new("s-chain");
+        // Path the executor will create via store.create(); compute it
+        // upfront so the mock closure has a stable target to side-effect
+        // into when it sees the maker script. The dir itself is created
+        // by the executor (don't pre-create — store.create rejects
+        // pre-existing dirs).
+        let artifacts_dir = store.session_dir(&session_id).join("artifacts");
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            // First call: maker. We side-effect the artifact since the
+            // bash script's `$ARTIFACTS` isn't actually substituted in
+            // this synthetic test (no real bash exec via the mock).
+            // Recognise maker by the literal "plan > $ARTIFACTS" in the
+            // wrapped script.
+            let script = args.iter().find(|a| a.contains("$ARTIFACTS")).cloned();
+            if script.is_some() {
+                std::fs::write(artifacts_dir.join("plan.md"), "plan\n").unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+    }
+
+    #[test]
+    fn missing_input_artifact_fails_the_node_before_run() {
+        let yaml = "\
+name: needs-input
+nodes:
+  - id: consumer
+    type: bash
+    script: 'echo'
+    artifacts: { in: [missing.md] }
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-missin"),
+            issue: None,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("requires input artifact `missing.md`"), "got: {msg}");
+        // Session ends Failed.
+        assert_eq!(
+            store.load(&SessionId::new("s-missin")).unwrap().state,
+            SessionState::Failed
+        );
+    }
+
+    #[test]
+    fn missing_output_artifact_fails_the_node_after_run() {
+        let yaml = "\
+name: must-produce
+nodes:
+  - id: liar
+    type: bash
+    script: 'echo not-writing-anything'
+    artifacts: { out: [plan.md] }
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-liar"),
+            issue: None,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expected to produce output artifact `plan.md`"),
+            "got: {msg}"
+        );
     }
 
     #[test]
