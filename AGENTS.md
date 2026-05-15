@@ -33,7 +33,8 @@ Non-git workspaces are supported but lose isolation between parallel sessions an
 .
 ├── Cargo.toml          single binary crate — fleet
 ├── Cargo.lock
-├── Makefile            unified verify (Rust + legacy TS plugin)
+├── Makefile            verify / build / test / clean
+├── ARCHITECTURE.md     contributor-facing system view
 │
 ├── src/                Rust source
 │   ├── main.rs         clap entry → cli::dispatch
@@ -43,7 +44,7 @@ Non-git workspaces are supported but lose isolation between parallel sessions an
 │   ├── session/        Session value object, state machine, on-disk store, reaper
 │   ├── runtime/        adapter trait + Podman / AppleContainer / Docker / Local impls
 │   ├── agent/          agent registry, prompt-prefix builder, cost parsing
-│   ├── tracker/        git-bug / gh / (no-op) host-side trackers
+│   ├── tracker/        git-bug / gh host-side trackers
 │   ├── egress.rs       per-workflow egress enforcer + tinyproxy / HostProxy backends
 │   ├── worktree.rs     per-session `git worktree` helpers
 │   ├── autonomous.rs   supervisor engine driving TUI `Shift+A` + `fleet autonomous run`
@@ -51,22 +52,13 @@ Non-git workspaces are supported but lose isolation between parallel sessions an
 │   ├── repo_config.rs  `.fleet/config.yaml` parsing
 │   └── process.rs      ProcessInvoker trait + RealProcessInvoker + run_interactive
 │
-├── docs/               user-facing docs (security-model, network, sandbox, auth,
-│                       worktrees, SMOKE_EGRESS)
-│
-├── packages/
-│   └── tracker-git-bug/   LEGACY: AO plugin from the pre-v2 era. Nothing in `src/`
-│                          links to it; the live git-bug integration is
-│                          `src/tracker/git_bug.rs`. Slated for removal.
-│
-└── scripts/
-    └── fleet-postcreate-trust-cwd.cjs   LEGACY: AO-era postCreate helper.
-                                          Slated for removal.
+└── docs/               user-facing docs (security-model, sandbox, auth,
+                        network, worktrees, SMOKE_EGRESS)
 ```
 
-## Stack defaults
+## Stack
 
-**Rust is the only live stack.** New CLIs, inspectors, harness code, or supporting binaries → add a module under `src/` (single binary crate, not a workspace; split only if a second binary is genuinely needed). The TypeScript package under `packages/` is legacy — do not extend it; do not add new TS code.
+Rust only. Single binary crate (Edition 2024). No workspaces, no polyglot stacks, no TypeScript anywhere — the v2 architecture removed every non-Rust dependency. If a second binary is genuinely needed in future, split into a workspace at that point — not before.
 
 ## Verification
 
@@ -78,7 +70,7 @@ cargo test                                    # 670+ tests at last count
 
 Every gate is a hard requirement before commit. No "fix forward" by stacking commits on top of broken verification. Lint warnings are errors.
 
-The `Makefile` still has `make verify` which also runs the legacy TS package's checks; CI runs the Rust gates directly. If a clippy rule is genuinely wrong for this codebase, change the rule in `Cargo.toml`'s `[lints]` block — don't sprinkle `#[allow]` per file. Per-call-site allows are fine when they're documenting an intentional exception (e.g. `#[allow(dead_code)] // wired by <subsequent commit>`).
+`make verify` runs all three gates together. If a clippy rule is genuinely wrong for this codebase, change the rule in `Cargo.toml`'s `[lints]` block — don't sprinkle `#[allow]` per file. Per-call-site allows are fine when they're documenting an intentional exception (e.g. `#[allow(dead_code)] // wired by <subsequent commit>`).
 
 ## Commit messages
 
