@@ -212,15 +212,21 @@ impl WorkflowExecutor {
     /// are excluded from that order; start from the owning fanout node
     /// instead.
     ///
-    /// Caveats (same gap as `resume`):
-    /// - The `outputs:` accumulator is rebuilt empty for the rerun. If
-    ///   `rerun_from` or a downstream node carries a `when:` predicate
-    ///   gated on an upstream `outputs:` declaration, the predicate
-    ///   sees the default — typically `false`, which means the gated
-    ///   node skips. Land outputs persistence as a follow-up when a
-    ///   real workflow exercises this.
-    /// - `loop_counts` resets to zero for the new session: replay
-    ///   does not inherit the src session's cycle progress.
+    /// Carries forward from the src session:
+    /// - `outputs:` from upstream nodes — so a `when:`-gated
+    ///   `rerun_from` (or any node downstream of it) sees the same
+    ///   accumulator the original run had at that point. Without this,
+    ///   any predicate gated on an upstream declaration would skip.
+    /// - `issue` context (overridable by `req.issue`).
+    ///
+    /// Does *not* carry forward:
+    /// - `loop_counts`: replay resets cycle progress for the new
+    ///   session. If the user wants to re-exercise a cycle from
+    ///   scratch, that's the right default; if they want the existing
+    ///   progress preserved, they should use `resume` instead.
+    /// - `node_costs`: the src session's cost figures are kept in the
+    ///   src's `meta.json`; the new session reports only what it
+    ///   actually paid for.
     pub fn replay(
         &self,
         req: &ExecuteRequest<'_>,
@@ -237,11 +243,12 @@ impl WorkflowExecutor {
             )
         })?;
 
-        // Touch the src session to validate it exists and parses — fail
-        // fast on a bogus id before we mint a new directory we'd then
-        // have to clean up. The loaded value itself is discarded; the
-        // caller already re-parsed the workflow YAML by name.
-        let _src = req.store.load(src_session_id).with_context(|| {
+        // Load the src session — fail fast on a bogus id before we
+        // mint a new directory we'd then have to clean up. We also
+        // hand the src's `outputs` map forward so the new run starts
+        // with the same upstream context the original had at this
+        // point in the schedule.
+        let src = req.store.load(src_session_id).with_context(|| {
             format!("loading source session `{src_session_id}` for replay")
         })?;
 
@@ -251,6 +258,7 @@ impl WorkflowExecutor {
             (self.clock)(),
         );
         session.issue.clone_from(&req.issue);
+        session.outputs.clone_from(&src.outputs);
         req.store.create(&session)?;
 
         // Stage the src run's artifacts into the new session before
@@ -290,12 +298,13 @@ impl WorkflowExecutor {
         order: &[String],
         start_idx: usize,
     ) -> Result<()> {
-        // `loop_counts` lives on the session so a resume after a gate
-        // doesn't reset cycle progress. Outputs aren't persisted today:
-        // workflows that gate *between* an output-producing node and a
-        // `when:`-gated downstream consumer would lose context on
-        // resume. Land that fix when a workflow exercises it.
-        let mut outputs: OutputMap = HashMap::new();
+        // `loop_counts` and `outputs` both live on the session so a
+        // resume after a gate (or a replay carrying upstream context)
+        // doesn't reset cycle progress *or* lose the `when:`
+        // accumulator. Hydrate the in-memory map from the persisted
+        // shape; every successful extraction below mirrors back into
+        // session.outputs so a subsequent gate boundary preserves it.
+        let mut outputs: OutputMap = outputs_from_persisted(&session.outputs);
         let mut i = start_idx;
         while i < order.len() {
             let node_id = order[i].clone();
@@ -382,11 +391,25 @@ impl WorkflowExecutor {
                     .collect(),
                 _ => vec![node],
             };
+            let mut produced_outputs = false;
             for target in extract_targets {
+                if !target.outputs.is_empty() {
+                    produced_outputs = true;
+                }
                 if let Err(err) = extract_outputs(&artifacts_dir, target, &mut outputs) {
                     self.mark_failed(req, session, &err);
                     return Err(err);
                 }
+            }
+            // Mirror the in-memory accumulator back onto the session
+            // when *any* target declared outputs (the accumulator may
+            // have new entries) so a future gate boundary or replay
+            // sees them. Skipping the save when nothing was declared
+            // keeps the no-outputs workflow's disk traffic at the
+            // pre-persistence level.
+            if produced_outputs {
+                session.outputs = outputs_to_persisted(&outputs);
+                req.store.save(session)?;
             }
 
             i = match resolve_loop_back(node, order, &mut session.loop_counts) {
@@ -1197,6 +1220,37 @@ fn topological_order(wf: &Workflow) -> Result<Vec<String>> {
         );
     }
     Ok(order)
+}
+
+/// Flatten the session's persisted nested outputs map into the
+/// in-memory [`OutputMap`] the executor's expression engine consumes.
+/// Pure; tests assert the round-trip with [`outputs_to_persisted`].
+fn outputs_from_persisted(
+    persisted: &BTreeMap<String, BTreeMap<String, String>>,
+) -> OutputMap {
+    let mut out = HashMap::new();
+    for (node_id, names) in persisted {
+        for (name, value) in names {
+            out.insert((node_id.clone(), name.clone()), value.clone());
+        }
+    }
+    out
+}
+
+/// Nest the in-memory [`OutputMap`] back into the `BTreeMap` shape
+/// that rides on `Session`. Stable ordering thanks to `BTreeMap` so
+/// the persisted JSON is byte-stable across runs with the same data.
+fn outputs_to_persisted(
+    outputs: &OutputMap,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut nested: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for ((node_id, name), value) in outputs {
+        nested
+            .entry(node_id.clone())
+            .or_default()
+            .insert(name.clone(), value.clone());
+    }
+    nested
 }
 
 /// Recursively copy regular files (and the directory structure that
@@ -2640,6 +2694,178 @@ nodes:
         };
         let replayed = executor.replay(&req, &src_id, "only").unwrap();
         assert_eq!(replayed.state, SessionState::Completed);
+    }
+
+    // === outputs persistence ===
+
+    #[test]
+    fn outputs_to_and_from_persisted_round_trip() {
+        let mut flat: OutputMap = HashMap::new();
+        flat.insert(("plan".to_string(), "decision".to_string()), "yes".to_string());
+        flat.insert(("plan".to_string(), "score".to_string()), "5".to_string());
+        flat.insert(("review".to_string(), "decision".to_string()), "no".to_string());
+        let nested = outputs_to_persisted(&flat);
+        assert_eq!(
+            nested.get("plan").unwrap().get("decision").map(String::as_str),
+            Some("yes")
+        );
+        let back = outputs_from_persisted(&nested);
+        assert_eq!(back, flat);
+    }
+
+    #[test]
+    fn outputs_from_persisted_handles_empty() {
+        let empty: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        assert!(outputs_from_persisted(&empty).is_empty());
+    }
+
+    #[test]
+    fn outputs_survive_resume_across_a_gate() {
+        // The key correctness check: a workflow that gates between an
+        // output-producing node and a `when:`-gated consumer must see
+        // the upstream decision after resume. Pre-persistence this
+        // test would have failed — the consumer would have skipped.
+        let yaml = "\
+name: outputs-across-gate
+nodes:
+  - id: decide
+    type: bash
+    script: 'true'
+    outputs:
+      decision: pick
+  - id: g
+    depends_on: [decide]
+    type: gate
+    summary: 'pause for human'
+  - id: act
+    depends_on: [g]
+    when: 'decide.decision == \"go\"'
+    type: bash
+    script: 'true'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-gate-outputs"),
+            issue: None,
+        };
+
+        // The `decide` bash node "produces" its declared outputs as a
+        // side effect of being invoked: the mocked invoker writes the
+        // JSON file into the session's artifacts dir before returning,
+        // modelling the real shape where a node drops its outputs
+        // file alongside whatever else it does.
+        let store_ref = store.clone();
+        let target_id = req.session_id.clone();
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            let path = store_ref
+                .session_dir(&target_id)
+                .join("artifacts/decide.outputs.json");
+            if !path.exists() {
+                std::fs::write(&path, br#"{"pick": "go"}"#).unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+
+        // First execute pauses at the gate; the persisted outputs
+        // map must already carry `decide.decision` before the gate.
+        let paused = executor.execute(&req).unwrap();
+        assert_eq!(paused.state, SessionState::AwaitingGate);
+        assert_eq!(
+            paused
+                .outputs
+                .get("decide")
+                .and_then(|m| m.get("decision"))
+                .map(String::as_str),
+            Some("go"),
+            "outputs must be persisted onto the session before the gate"
+        );
+
+        // Resume: the `act` node's `when:` must evaluate against the
+        // persisted upstream decision. Pre-persistence the predicate
+        // would have seen the default and skipped; with persistence
+        // the node fires and the workflow completes.
+        let resumed = executor.resume(&req).unwrap();
+        assert_eq!(resumed.state, SessionState::Completed);
+        assert_eq!(resumed.current_node.as_deref(), Some("act"));
+        assert!(
+            store.session_dir(&resumed.id).join("logs/act.log").exists()
+        );
+    }
+
+    #[test]
+    fn outputs_carry_forward_into_replay_from_src() {
+        // Replay starting at a `when:`-gated node must see the src
+        // session's persisted outputs. Stage a src session by hand
+        // with a populated `outputs` map and a matching artifacts
+        // file (so `verify_inputs` is happy), then replay against
+        // it.
+        let yaml = "\
+name: replay-outputs
+nodes:
+  - id: decide
+    type: bash
+    script: 'true'
+    outputs:
+      decision: pick
+  - id: act
+    depends_on: [decide]
+    when: 'decide.decision == \"go\"'
+    type: bash
+    script: 'true'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+
+        // Stage the src session with persisted outputs as if it
+        // had completed the `decide` node.
+        let src_id = SessionId::new("s-src-with-outputs");
+        let mut src = Session::new(src_id.clone(), "replay-outputs", 1);
+        src.outputs.insert(
+            "decide".to_string(),
+            std::iter::once(("decision".to_string(), "go".to_string())).collect(),
+        );
+        store.create(&src).unwrap();
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-replay-with-outputs"),
+            issue: None,
+        };
+        let replayed = executor.replay(&req, &src_id, "act").unwrap();
+        assert_eq!(replayed.state, SessionState::Completed);
+        // act fired — its log exists. Pre-persistence the when:
+        // predicate would have skipped this node.
+        assert!(store.session_dir(&replayed.id).join("logs/act.log").exists());
+        // The carried-forward outputs are present on the new session.
+        assert_eq!(
+            replayed
+                .outputs
+                .get("decide")
+                .and_then(|m| m.get("decision"))
+                .map(String::as_str),
+            Some("go"),
+        );
     }
 
     // === fanout ===

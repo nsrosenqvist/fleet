@@ -62,6 +62,15 @@ pub struct Session {
     /// preserve the distinction.
     #[serde(default)]
     pub node_costs: BTreeMap<String, f64>,
+    /// Resolved `outputs:` from upstream workflow nodes, keyed by
+    /// `node_id → local_name → value`. Persisted so a `fleet workflow
+    /// resume` after a gate, or a `fleet workflow replay --rerun-from`
+    /// downstream of an output-producing node, sees the same
+    /// upstream context the original run did. Without it, a `when:`
+    /// predicate gated on an upstream `outputs:` would always read
+    /// the default after a resume/replay boundary.
+    #[serde(default)]
+    pub outputs: BTreeMap<String, BTreeMap<String, String>>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -82,6 +91,7 @@ impl Session {
             loop_counts: BTreeMap::new(),
             driver_pid: None,
             node_costs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }
