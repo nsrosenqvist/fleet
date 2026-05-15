@@ -197,6 +197,86 @@ impl WorkflowExecutor {
         Ok(session)
     }
 
+    /// Replay a workflow against a prior session's artifacts. Mints a
+    /// fresh session, copies `<src>/artifacts/` into the new session's
+    /// `artifacts/`, and runs the workflow starting from `rerun_from`.
+    ///
+    /// Use case: iterate on a reviewer prompt without re-paying for the
+    /// planner + implementer agents that produced its inputs.
+    ///
+    /// Contract: `req.workflow` must be the workflow `src_session_id`
+    /// originally ran — the caller (CLI) reads `src.workflow` from
+    /// disk and re-parses the current YAML. `req.session_id` is the
+    /// *new* session id, minted by the caller. `rerun_from` must
+    /// appear in `req.workflow`'s topological order. Fanout siblings
+    /// are excluded from that order; start from the owning fanout node
+    /// instead.
+    ///
+    /// Caveats (same gap as `resume`):
+    /// - The `outputs:` accumulator is rebuilt empty for the rerun. If
+    ///   `rerun_from` or a downstream node carries a `when:` predicate
+    ///   gated on an upstream `outputs:` declaration, the predicate
+    ///   sees the default — typically `false`, which means the gated
+    ///   node skips. Land outputs persistence as a follow-up when a
+    ///   real workflow exercises this.
+    /// - `loop_counts` resets to zero for the new session: replay
+    ///   does not inherit the src session's cycle progress.
+    pub fn replay(
+        &self,
+        req: &ExecuteRequest<'_>,
+        src_session_id: &SessionId,
+        rerun_from: &str,
+    ) -> Result<Session> {
+        validate(req.workflow).context("workflow failed static validation")?;
+        let order = topological_order(req.workflow)?;
+        let start = order.iter().position(|id| id == rerun_from).ok_or_else(|| {
+            anyhow!(
+                "node `{rerun_from}` is not in workflow `{}`'s topological order \
+                 (fanout siblings are excluded — start from the owning fanout node)",
+                req.workflow.name
+            )
+        })?;
+
+        // Touch the src session to validate it exists and parses — fail
+        // fast on a bogus id before we mint a new directory we'd then
+        // have to clean up. The loaded value itself is discarded; the
+        // caller already re-parsed the workflow YAML by name.
+        let _src = req.store.load(src_session_id).with_context(|| {
+            format!("loading source session `{src_session_id}` for replay")
+        })?;
+
+        let mut session = Session::new(
+            req.session_id.clone(),
+            &req.workflow.name,
+            (self.clock)(),
+        );
+        session.issue.clone_from(&req.issue);
+        req.store.create(&session)?;
+
+        // Stage the src run's artifacts into the new session before
+        // we start running. Missing src `artifacts/` is not an error
+        // (workflows with no agent nodes legitimately have nothing to
+        // carry); `store.create` already materialised the empty dst.
+        let src_artifacts = req.store.session_dir(src_session_id).join("artifacts");
+        let dst_artifacts = req.store.session_dir(&session.id).join("artifacts");
+        if src_artifacts.is_dir() {
+            copy_dir_contents(&src_artifacts, &dst_artifacts).with_context(|| {
+                format!(
+                    "copying artifacts from session `{src_session_id}` to `{}`",
+                    session.id
+                )
+            })?;
+        }
+
+        session.transition_to(SessionState::Running, (self.clock)())?;
+        session.set_driver_pid(std::process::id(), (self.clock)());
+        req.store.save(&session)?;
+
+        self.run_loop(req, &mut session, &order, start)?;
+        self.finalize(req, &mut session)?;
+        Ok(session)
+    }
+
     /// The shared inner loop driving both `execute` and `resume`. Walks
     /// `order` from `start_idx`, runs each node, and honours
     /// `loop_back_to` and gate-pause transitions. Returns Ok with the
@@ -1119,6 +1199,36 @@ fn topological_order(wf: &Workflow) -> Result<Vec<String>> {
     Ok(order)
 }
 
+/// Recursively copy regular files (and the directory structure that
+/// contains them) from `src` into `dst`. `dst` is created on demand at
+/// each level via `create_dir_all`; symlinks and special files are
+/// skipped silently. Used by `replay` to stage a prior session's
+/// `artifacts/` into a new session.
+fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
+    let entries = std::fs::read_dir(src)
+        .with_context(|| format!("reading directory {}", src.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("scanning {}", src.display()))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("statting {}", from.display()))?;
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&to)
+                .with_context(|| format!("creating {}", to.display()))?;
+            copy_dir_contents(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to).with_context(|| {
+                format!("copying {} → {}", from.display(), to.display())
+            })?;
+        }
+        // Symlinks/specials: skip silently. Artifacts/ holds generated
+        // text files in practice; nothing else should be there.
+    }
+    Ok(())
+}
+
 /// POSIX-shell single-quote escaping. Same shape as
 /// `local::shell_escape` — duplicated rather than re-exported because the
 /// local adapter's version is private and small enough that DRY here would
@@ -1222,6 +1332,38 @@ mod tests {
             loop_back_to: None,
             max_loops: None,
         }
+    }
+
+    #[test]
+    fn copy_dir_contents_recursively_copies_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("top.txt"), "t").unwrap();
+        std::fs::create_dir_all(src.path().join("nested/deeper")).unwrap();
+        std::fs::write(src.path().join("nested/inner.md"), "i").unwrap();
+        std::fs::write(src.path().join("nested/deeper/leaf.log"), "l").unwrap();
+
+        copy_dir_contents(src.path(), dst.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dst.path().join("top.txt")).unwrap(), "t");
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("nested/inner.md")).unwrap(),
+            "i"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("nested/deeper/leaf.log")).unwrap(),
+            "l"
+        );
+    }
+
+    #[test]
+    fn copy_dir_contents_overwrites_existing_files_in_dst() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), "new").unwrap();
+        std::fs::write(dst.path().join("a.txt"), "old").unwrap();
+        copy_dir_contents(src.path(), dst.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(dst.path().join("a.txt")).unwrap(), "new");
     }
 
     #[test]
@@ -2219,6 +2361,285 @@ nodes:
             format!("{err:#}").contains("loading session `s-ghost`"),
             "got: {err:#}"
         );
+    }
+
+    // === replay ===
+
+    /// Stage a "completed src run" on disk by directly creating a
+    /// session row in the store and writing a fake artifact. Lets the
+    /// replay tests skip the cost of actually running a workflow to
+    /// produce the source state.
+    fn stage_src_session(
+        store: &SessionStore,
+        id: &str,
+        workflow: &str,
+        artifacts: &[(&str, &str)],
+    ) -> SessionId {
+        let sid = SessionId::new(id);
+        let session = Session::new(sid.clone(), workflow, 1);
+        store.create(&session).unwrap();
+        let artifacts_dir = store.session_dir(&sid).join("artifacts");
+        for (name, body) in artifacts {
+            std::fs::write(artifacts_dir.join(name), body).unwrap();
+        }
+        sid
+    }
+
+    #[test]
+    fn replay_copies_artifacts_and_runs_only_the_rerun_from_node() {
+        // Two-node workflow: `plan` then `review`. Replay starts from
+        // `review`, so the bash invoker should fire exactly once — for
+        // the rerun node — and `review`'s log should exist on the new
+        // session while `plan`'s log should not (its bash never ran on
+        // the new session).
+        let yaml = "\
+name: replay-basic
+nodes:
+  - id: plan
+    type: bash
+    script: 'echo plan'
+  - id: review
+    depends_on: [plan]
+    type: bash
+    script: 'echo review'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        // Stage a fake src session with a pre-existing `plan.md`.
+        let src_id = stage_src_session(
+            &store,
+            "s-src",
+            "replay-basic",
+            &[("plan.md", "from the src run")],
+        );
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls_for_mock = Arc::clone(&calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            calls_for_mock.lock().unwrap().push(s);
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-replay"),
+            issue: None,
+        };
+
+        let replayed = executor.replay(&req, &src_id, "review").unwrap();
+        assert_eq!(replayed.state, SessionState::Completed);
+        assert_eq!(replayed.current_node.as_deref(), Some("review"));
+        // The plan node was skipped (start_idx = 1), so the only bash
+        // call should be the review one.
+        let bashed = calls.lock().unwrap().clone();
+        let review_count = bashed.iter().filter(|s| s.contains("echo review")).count();
+        let plan_count = bashed.iter().filter(|s| s.contains("echo plan")).count();
+        assert_eq!(review_count, 1, "review ran once; got: {bashed:?}");
+        assert_eq!(plan_count, 0, "plan was skipped; got: {bashed:?}");
+        // Src artifact carried over to the new session.
+        let copied = store
+            .session_dir(&replayed.id)
+            .join("artifacts/plan.md");
+        assert!(copied.is_file(), "src artifact should be staged");
+        let body = std::fs::read_to_string(&copied).unwrap();
+        assert_eq!(body, "from the src run");
+        // review's log exists on the new session.
+        assert!(
+            store
+                .session_dir(&replayed.id)
+                .join("logs/review.log")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn replay_rejects_unknown_rerun_from() {
+        let yaml = "\
+name: replay-bad-target
+nodes:
+  - id: only
+    type: bash
+    script: 'echo only'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let src_id = stage_src_session(&store, "s-src", "replay-bad-target", &[]);
+
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-replay-bad"),
+            issue: None,
+        };
+
+        let err = executor.replay(&req, &src_id, "nope").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`nope`"), "got: {msg}");
+        assert!(
+            msg.contains("not in workflow `replay-bad-target`"),
+            "got: {msg}"
+        );
+        // Failed before minting; no new session directory exists.
+        assert!(!store.session_dir(&SessionId::new("s-replay-bad")).exists());
+    }
+
+    #[test]
+    fn replay_rejects_missing_src_session() {
+        let yaml = "\
+name: replay-no-src
+nodes:
+  - id: only
+    type: bash
+    script: 'echo only'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-replay-no-src"),
+            issue: None,
+        };
+        let err = executor
+            .replay(&req, &SessionId::new("s-does-not-exist"), "only")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("loading source session `s-does-not-exist`"),
+            "got: {msg}"
+        );
+        // Failed before minting; no new session directory exists.
+        assert!(
+            !store
+                .session_dir(&SessionId::new("s-replay-no-src"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn replay_rerun_from_first_node_replays_full_workflow() {
+        // rerun_from == first node is the "expensive fresh run with
+        // pre-staged artifacts" mode. The whole workflow should run
+        // (both bash calls) and any staged src artifact still gets
+        // copied so the new session sees the same starting state.
+        let yaml = "\
+name: replay-from-top
+nodes:
+  - id: a
+    type: bash
+    script: 'echo a'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'echo b'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let src_id = stage_src_session(
+            &store,
+            "s-src",
+            "replay-from-top",
+            &[("staged.txt", "carried")],
+        );
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls_for_mock = Arc::clone(&calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            calls_for_mock.lock().unwrap().push(s);
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-replay-top"),
+            issue: None,
+        };
+
+        let replayed = executor.replay(&req, &src_id, "a").unwrap();
+        assert_eq!(replayed.state, SessionState::Completed);
+        let bashed = calls.lock().unwrap().clone();
+        let a_count = bashed.iter().filter(|s| s.contains("echo a")).count();
+        let b_count = bashed.iter().filter(|s| s.contains("echo b")).count();
+        assert_eq!(a_count, 1, "a ran once; got: {bashed:?}");
+        assert_eq!(b_count, 1, "b ran once; got: {bashed:?}");
+        let staged = store
+            .session_dir(&replayed.id)
+            .join("artifacts/staged.txt");
+        assert!(staged.is_file(), "staged artifact carried over");
+    }
+
+    #[test]
+    fn replay_handles_missing_src_artifacts_dir() {
+        // If a src session never produced an artifacts/ dir (e.g. it
+        // crashed before any agent node), replay should still mint
+        // the new session and run cleanly — there's just nothing to
+        // copy.
+        let yaml = "\
+name: replay-empty
+nodes:
+  - id: only
+    type: bash
+    script: 'echo only'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let src_id = stage_src_session(&store, "s-src", "replay-empty", &[]);
+        // Remove the artifacts/ subdir to simulate a crashed src run.
+        std::fs::remove_dir_all(store.session_dir(&src_id).join("artifacts")).unwrap();
+
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-replay-empty"),
+            issue: None,
+        };
+        let replayed = executor.replay(&req, &src_id, "only").unwrap();
+        assert_eq!(replayed.state, SessionState::Completed);
     }
 
     // === fanout ===
