@@ -177,6 +177,9 @@ struct AppState {
     /// construction happens then, not at TUI startup, so users who
     /// never use autonomous mode aren't blocked by tracker setup.
     tracker: TrackerState,
+    /// Active transient overlay (confirm dialog or error message).
+    /// Rendered on top of whatever `view` is currently drawing.
+    overlay: Overlay,
 }
 
 /// Lifecycle of the lazily-built tracker. Three states because the
@@ -202,6 +205,35 @@ enum View {
     Sessions,
     Doctor,
     Spawn,
+}
+
+/// Transient overlay rendered on top of the current view.
+/// Mutually-exclusive with itself but layered above the view's
+/// normal render. The spawn picker is its own [`View`] for historical
+/// reasons — the rest of the modal-style flows route through here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Overlay {
+    None,
+    /// Yes/no confirm dialog. `y` runs the action, `n`/`Esc` cancels.
+    Confirm {
+        prompt: String,
+        action: ConfirmAction,
+    },
+    /// Error message — any key dismisses. Used when an action failed
+    /// hard (kill rejected, spawn refused) and a flash on the status
+    /// line would be too easy to miss.
+    Error {
+        message: String,
+    },
+}
+
+/// What a confirm overlay executes when the user accepts. New entries
+/// land here as the TUI grows additional destructive actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfirmAction {
+    /// Mark the currently-selected session as `Failed` (the "kill"
+    /// affordance bound to `Shift+K`).
+    KillSelected,
 }
 
 /// Resolved snapshot for the doctor pane. Computed by
@@ -270,6 +302,7 @@ impl AppState {
             config,
             autonomous: autonomous::AutonomousEngine::new(),
             tracker: TrackerState::Pending,
+            overlay: Overlay::None,
         };
         state.reload(store)?;
         Ok(state)
@@ -354,6 +387,13 @@ impl AppState {
     }
 
     fn handle_key(&mut self, key: KeyEvent, store: &SessionStore) -> Action {
+        // Overlays intercept input first. A confirm dialog or error
+        // overlay owns the keymap until dismissed — otherwise an
+        // accidental `q` while a Confirm is up would quit the app
+        // mid-decision.
+        if !matches!(self.overlay, Overlay::None) {
+            return self.handle_key_overlay(key, store);
+        }
         // Shift+K is the kill affordance — match before the plain-k arm
         // so the modifier discriminates. Disabled in non-Sessions views
         // (those don't have a selection to kill).
@@ -361,7 +401,7 @@ impl AppState {
             && matches!(key.code, KeyCode::Char('K'))
             && self.view == View::Sessions
         {
-            self.mark_selected_failed(store);
+            self.prompt_kill_selected();
             return Action::None;
         }
         // Shift+A toggles autonomous mode from any view. Building the
@@ -379,6 +419,58 @@ impl AppState {
             View::Sessions => self.handle_key_sessions(key, store),
             View::Doctor => self.handle_key_doctor(key, store),
             View::Spawn => self.handle_key_spawn(key),
+        }
+    }
+
+    /// Overlay keymap: `y` runs a confirm action; `n`/`Esc`/any other
+    /// key dismisses the overlay without acting. Error overlays
+    /// dismiss on any key.
+    fn handle_key_overlay(&mut self, key: KeyEvent, store: &SessionStore) -> Action {
+        match self.overlay.clone() {
+            Overlay::Confirm { action, .. } => {
+                self.overlay = Overlay::None;
+                if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                    self.run_confirm_action(&action, store);
+                } else {
+                    // n, Esc, q — all cancel. Match user mental model:
+                    // anything-other-than-y means "no."
+                    self.status_line = " kill cancelled ".to_string();
+                }
+            }
+            Overlay::Error { .. } => {
+                // Any key dismisses; the message has been read.
+                self.overlay = Overlay::None;
+            }
+            Overlay::None => unreachable!("handle_key_overlay called with Overlay::None"),
+        }
+        Action::None
+    }
+
+    /// Queue a kill-selected confirm dialog. The actual mark-failed
+    /// runs from [`Self::run_confirm_action`] once the user accepts.
+    /// Short-circuits on already-terminal sessions — confirming a
+    /// kill on a Completed session would be theatre.
+    fn prompt_kill_selected(&mut self) {
+        let Some(session) = self.selected() else {
+            self.status_line = " kill: no session selected ".to_string();
+            return;
+        };
+        if session.state.is_terminal() {
+            self.status_line = format!(" {} already {:?} ", session.id, session.state);
+            return;
+        }
+        self.overlay = Overlay::Confirm {
+            prompt: format!(
+                "Mark session {} ({}) as failed?\n\nThis is non-recoverable.",
+                session.id, session.workflow,
+            ),
+            action: ConfirmAction::KillSelected,
+        };
+    }
+
+    fn run_confirm_action(&mut self, action: &ConfirmAction, store: &SessionStore) {
+        match action {
+            ConfirmAction::KillSelected => self.mark_selected_failed(store),
         }
     }
 
@@ -630,15 +722,25 @@ impl AppState {
             return;
         };
         if session.state.is_terminal() {
+            // Already-terminal isn't an error per se — the user might
+            // have hit `Shift+K` on a Completed session by mistake.
+            // Keep the brief status-line note rather than escalating
+            // to a modal.
             self.status_line = format!(" {} already {:?} ", session.id, session.state);
             return;
         }
         if let Err(err) = session.transition_to(SessionState::Failed, now_ms()) {
-            self.status_line = format!(" kill rejected: {err:#} ");
+            // Hard failures (state-machine rejection, disk write) get
+            // an overlay so they're impossible to miss.
+            self.overlay = Overlay::Error {
+                message: format!("kill rejected: {err:#}"),
+            };
             return;
         }
         if let Err(err) = store.save(session) {
-            self.status_line = format!(" kill save failed: {err:#} ");
+            self.overlay = Overlay::Error {
+                message: format!("kill save failed: {err:#}"),
+            };
             return;
         }
         self.status_line = format!(" {} → failed ", session.id);
@@ -857,7 +959,59 @@ fn render(f: &mut Frame<'_>, state: &AppState) {
         f.render_widget(Clear, modal);
         render_spawn(f, modal, state);
     }
+    // Transient overlay (confirm / error) — drawn last so it sits on
+    // top of everything else, including the spawn picker.
+    match &state.overlay {
+        Overlay::Confirm { prompt, .. } => {
+            let modal = centered_rect(outer[0], 50, 30);
+            f.render_widget(Clear, modal);
+            render_confirm(f, modal, prompt);
+        }
+        Overlay::Error { message } => {
+            let modal = centered_rect(outer[0], 50, 25);
+            f.render_widget(Clear, modal);
+            render_error(f, modal, message);
+        }
+        Overlay::None => {}
+    }
     render_status(f, outer[1], state);
+}
+
+fn render_confirm(f: &mut Frame<'_>, area: Rect, prompt: &str) {
+    let mut lines: Vec<Line<'static>> = prompt.lines().map(|l| Line::from(l.to_string())).collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[y] yes    [n / Esc] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+    let body = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirm ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(body, area);
+}
+
+fn render_error(f: &mut Frame<'_>, area: Rect, message: &str) {
+    let mut lines: Vec<Line<'static>> =
+        message.lines().map(|l| Line::from(l.to_string())).collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "press any key to dismiss",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let body = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Error ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(body, area);
 }
 
 /// Centred sub-rectangle of `parent`, sized to `pct_x`% wide and
@@ -1495,7 +1649,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_shift_k_marks_running_session_failed() {
+    fn handle_key_shift_k_opens_confirm_overlay_without_immediate_kill() {
+        // Shift+K is now a two-step affordance: the first press opens
+        // a confirm overlay; the session is unchanged until the user
+        // explicitly presses `y`. Protects against fat-fingering a
+        // kill in the middle of `j/k` nav.
         let tmp = tempfile::tempdir().unwrap();
         let store = SessionStore::at(tmp.path().to_path_buf());
         store
@@ -1506,12 +1664,98 @@ mod tests {
             KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
             &store,
         );
-        // The in-memory session reflects the transition...
+        // Overlay is up; session unchanged on disk and in memory.
+        assert!(matches!(state.overlay, Overlay::Confirm { .. }));
+        assert_eq!(state.selected().unwrap().state, SessionState::Running);
+    }
+
+    #[test]
+    fn confirm_overlay_y_executes_the_kill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-r", "wf", SessionState::Running, 100))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        // Open the confirm.
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert!(matches!(state.overlay, Overlay::Confirm { .. }));
+        // Confirm → kill runs.
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &store,
+        );
         assert_eq!(state.selected().unwrap().state, SessionState::Failed);
-        // ...and it was persisted.
+        assert!(matches!(state.overlay, Overlay::None));
         let loaded_id = SessionId::new(state.selected().unwrap().id.as_str());
         let loaded = store.load(&loaded_id).unwrap();
         assert_eq!(loaded.state, SessionState::Failed);
+    }
+
+    #[test]
+    fn confirm_overlay_n_cancels_without_kill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-r", "wf", SessionState::Running, 100))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            &store,
+        );
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.selected().unwrap().state, SessionState::Running);
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(state.status_line.contains("cancelled"));
+    }
+
+    #[test]
+    fn confirm_overlay_esc_cancels_without_kill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-r", "wf", SessionState::Running, 100))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            &store,
+        );
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &store);
+        assert_eq!(state.selected().unwrap().state, SessionState::Running);
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn confirm_overlay_q_during_confirm_cancels_does_not_quit() {
+        // Regression guard: pressing `q` while a confirm is up must
+        // not quit the app — overlays own input until dismissed.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-r", "wf", SessionState::Running, 100))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            &store,
+        );
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+            &store,
+        );
+        assert!(
+            matches!(action, Action::None),
+            "q must not quit during confirm"
+        );
+        assert!(matches!(state.overlay, Overlay::None));
     }
 
     #[test]
@@ -1526,9 +1770,11 @@ mod tests {
             KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
             &store,
         );
-        // State unchanged; status line records the rejection.
+        // Already-terminal short-circuits before the confirm even
+        // opens — status line gets the note; no overlay.
         assert_eq!(state.selected().unwrap().state, SessionState::Completed);
         assert!(state.status_line.contains("already"));
+        assert!(matches!(state.overlay, Overlay::None));
     }
 
     #[test]
