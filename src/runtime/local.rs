@@ -282,6 +282,7 @@ mod tests {
             command: None,
             network: None,
             dns: None,
+            extra_mounts: vec![],
         }
     }
 

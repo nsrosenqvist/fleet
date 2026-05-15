@@ -71,6 +71,7 @@ pub fn run_up() -> Result<i32> {
         command: None,
         network: None,
         dns: None,
+        extra_mounts: Vec::new(),
     };
     let id = ctx.adapter.start_container(&spec)?;
     eprintln!(

@@ -24,7 +24,9 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
-use super::{ContainerId, Devcontainer, ExecHandle, ExecOpts, ImageId, devcontainer::ImageSource};
+use super::{
+    ContainerId, Devcontainer, ExecHandle, ExecOpts, ImageId, MountSpec, devcontainer::ImageSource,
+};
 use crate::process::ProcessInvoker;
 
 /// Which container engine the devcontainer CLI should drive. Selected per
@@ -73,6 +75,11 @@ pub struct UpRequest<'a> {
     /// Pass-through to the engine's `run` command, e.g. `--runtime=runsc` for
     /// Podman + gVisor. Each entry becomes one `--run-args` flag.
     pub extra_run_args: &'a [String],
+    /// Additional bind mounts beyond the implicit `/artifacts` mount.
+    /// Each entry becomes a separate `--mount` flag rendered via
+    /// [`MountSpec::to_mount_arg`]. Adapters thread this through from
+    /// `ContainerSpec.extra_mounts`.
+    pub extra_mounts: &'a [MountSpec],
 }
 
 /// Typed wrapper around `devcontainer build/up/exec`. Stateless: every call
@@ -178,6 +185,13 @@ impl DevcontainerCli {
             "type=bind,source={},target=/artifacts",
             req.artifacts.display()
         ));
+        // Additional bind mounts (e.g. the fleet-tracker binary). Rendered
+        // after `/artifacts` so the test-asserted argv order stays
+        // predictable: implicit mounts first, then caller-supplied.
+        for mount in req.extra_mounts {
+            args.push("--mount".to_string());
+            args.push(mount.to_mount_arg());
+        }
         for (k, v) in req.env {
             args.push("--remote-env".to_string());
             args.push(format!("{k}={v}"));
@@ -332,6 +346,7 @@ mod tests {
     use crate::runtime::devcontainer::Devcontainer;
     use anyhow::anyhow;
     use mockall::predicate::eq;
+    use std::path::PathBuf;
 
     fn sample_dc() -> Devcontainer {
         Devcontainer::from_str_at(
@@ -476,9 +491,55 @@ mod tests {
             artifacts: Path::new("/sessions/s1/artifacts"),
             env: &env,
             extra_run_args: &extra,
+            extra_mounts: &[],
         };
         let id = cli.up(&req).unwrap();
         assert_eq!(id.as_str(), "abc123");
+    }
+
+    #[test]
+    fn up_emits_one_mount_flag_per_extra_mount_in_order() {
+        let extra_mounts = vec![
+            MountSpec {
+                host_path: PathBuf::from("/host/bin/fleet-tracker"),
+                container_path: PathBuf::from("/usr/local/bin/fleet-tracker"),
+                read_only: true,
+            },
+            MountSpec {
+                host_path: PathBuf::from("/host/work"),
+                container_path: PathBuf::from("/extra"),
+                read_only: false,
+            },
+        ];
+        let expected_args = vec![
+            "up".to_string(),
+            "--workspace-folder".to_string(),
+            "/repo".to_string(),
+            "--remove-existing-container".to_string(),
+            "--docker-path".to_string(),
+            "podman".to_string(),
+            "--mount".to_string(),
+            "type=bind,source=/art,target=/artifacts".to_string(),
+            // Extra mounts follow the artifacts mount in input order so
+            // tests assert against a stable argv. Read-only first to
+            // pin both flag-variants in one test.
+            "--mount".to_string(),
+            "type=bind,source=/host/bin/fleet-tracker,target=/usr/local/bin/fleet-tracker,readonly"
+                .to_string(),
+            "--mount".to_string(),
+            "type=bind,source=/host/work,target=/extra".to_string(),
+        ];
+        let stdout = r#"{"outcome":"success","containerId":"c-mounts"}"#;
+        let cli = helper_with(expected_args, stdout, Engine::Podman);
+        let req = UpRequest {
+            workspace: Path::new("/repo"),
+            config: None,
+            artifacts: Path::new("/art"),
+            env: &[],
+            extra_run_args: &[],
+            extra_mounts: &extra_mounts,
+        };
+        cli.up(&req).unwrap();
     }
 
     #[test]
@@ -503,6 +564,7 @@ mod tests {
             artifacts: Path::new("/art"),
             env: &[],
             extra_run_args: &[],
+            extra_mounts: &[],
         };
         cli.up(&req).unwrap();
     }
@@ -519,6 +581,7 @@ mod tests {
             artifacts: Path::new("/art"),
             env: &[],
             extra_run_args: &[],
+            extra_mounts: &[],
         };
         let err = cli.up(&req).unwrap_err();
         assert!(format!("{err}").contains("non-success outcome"));

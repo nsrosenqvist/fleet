@@ -115,6 +115,44 @@ pub struct ContainerSpec {
     /// pre-resolved allowlist host. Adapters without DNS-pinning
     /// support ignore this.
     pub dns: Option<String>,
+    /// Additional bind mounts beyond `workspace` and `artifacts`. Used
+    /// by the bridge plumbing to drop the `fleet-tracker` binary into
+    /// the container at `/usr/local/bin/fleet-tracker`. Each entry is
+    /// rendered into the engine's `--mount type=bind,...` syntax by
+    /// adapters that go through the devcontainer CLI; adapters without
+    /// container isolation (Local) ignore the field.
+    pub extra_mounts: Vec<MountSpec>,
+}
+
+/// A single host-to-container bind mount. Read-only is opt-in because
+/// it's the safe default for trust-boundary mounts (a poisoned agent
+/// shouldn't be able to rewrite `fleet-tracker` underneath itself)
+/// but workflows occasionally need read-write side-channels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct MountSpec {
+    pub host_path: PathBuf,
+    pub container_path: PathBuf,
+    pub read_only: bool,
+}
+
+impl MountSpec {
+    /// Render as a single `--mount` argument for the devcontainer CLI's
+    /// `--mount` flag (which the CLI forwards verbatim to `docker run`
+    /// / `podman run`). Path values are embedded literally; callers are
+    /// expected to feed in absolute paths the engine can resolve.
+    #[must_use]
+    pub fn to_mount_arg(&self) -> String {
+        let mut out = format!(
+            "type=bind,source={},target={}",
+            self.host_path.display(),
+            self.container_path.display()
+        );
+        if self.read_only {
+            out.push_str(",readonly");
+        }
+        out
+    }
 }
 
 /// Per-exec overrides. Empty defaults mean "inherit from the container."
@@ -283,6 +321,29 @@ mod tests {
         assert_ne!(ImageId::new("a"), ImageId::new("b"));
         assert_eq!(ContainerId::new("c"), ContainerId::new("c"));
         assert_ne!(ContainerId::new("c"), ContainerId::new("d"));
+    }
+
+    #[test]
+    fn mount_spec_renders_read_only_flag_when_set() {
+        let m = MountSpec {
+            host_path: PathBuf::from("/host/bin/fleet-tracker"),
+            container_path: PathBuf::from("/usr/local/bin/fleet-tracker"),
+            read_only: true,
+        };
+        assert_eq!(
+            m.to_mount_arg(),
+            "type=bind,source=/host/bin/fleet-tracker,target=/usr/local/bin/fleet-tracker,readonly"
+        );
+    }
+
+    #[test]
+    fn mount_spec_omits_read_only_flag_when_unset() {
+        let m = MountSpec {
+            host_path: PathBuf::from("/h"),
+            container_path: PathBuf::from("/c"),
+            read_only: false,
+        };
+        assert_eq!(m.to_mount_arg(), "type=bind,source=/h,target=/c");
     }
 
     #[test]

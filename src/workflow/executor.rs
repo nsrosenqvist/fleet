@@ -735,6 +735,9 @@ impl WorkflowExecutor {
             command: None,
             network: egress.network_name.clone(),
             dns: egress.dns_ip.clone(),
+            // Bridge plumbing (commit 9 of this phase) bind-mounts the
+            // fleet-tracker binary here; until then no extras flow.
+            extra_mounts: Vec::new(),
         };
         let container_id = req
             .adapter
