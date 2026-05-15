@@ -11,6 +11,7 @@ pub mod git_bug;
 pub mod github;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -20,8 +21,49 @@ use crate::repo_config::Tracker as TrackerChoice;
 pub use git_bug::GitBugTracker;
 pub use github::GitHubTracker;
 
+/// Normalised lifecycle state for a ticket. Trackers map this onto
+/// whatever native primitive they have: GitHub treats `InProgress` as
+/// an `in-progress` label (no first-class state); git-bug uses its
+/// own status verbs plus label conventions. The trait hides the
+/// difference so workflow + bridge code never reaches for tracker
+/// specifics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+// Consumed by `Tracker::set_status` in the next commit; the bridge HTTP
+// route + fleet-tracker CLI use the same kebab-case JSON encoding the
+// serde test above pins.
+#[allow(dead_code)]
+pub enum Status {
+    Open,
+    InProgress,
+    Closed,
+}
+
+/// A single comment on a ticket as returned by [`Tracker::read`].
+/// `created_at` is the tracker's own timestamp string (ISO-8601 in
+/// practice); fleet does not parse it because the only consumer today
+/// is the agent prompt context, which displays it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct Comment {
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// A ticket plus its rendered description and the comment thread.
+/// Returned by [`Tracker::read`] and surfaced verbatim to bridge
+/// callers so agents see the same story a human would.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct IssueDetail {
+    pub issue: Issue,
+    pub body: String,
+    pub comments: Vec<Comment>,
+}
+
 /// Uniform issue shape across plugins.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issue {
     /// Stable opaque id (full hash for git-bug, `"gh:<number>"` for
     /// GitHub).
@@ -141,6 +183,49 @@ mod tests {
         let invoker = Arc::new(MockProcessInvoker::new()) as Arc<dyn ProcessInvoker>;
         assert!(build(TrackerChoice::Linear, Arc::clone(&invoker)).is_none());
         assert!(build(TrackerChoice::Jira, invoker).is_none());
+    }
+
+    #[test]
+    fn status_round_trips_through_kebab_case_serde() {
+        // Bridge HTTP routes encode status as kebab-case JSON
+        // (`"in-progress"` not `"InProgress"`). Lock the encoding so
+        // a future serde-rename slip can't silently break the wire
+        // contract between fleet-tracker and the bridge server.
+        assert_eq!(serde_json::to_string(&Status::Open).unwrap(), "\"open\"");
+        assert_eq!(
+            serde_json::to_string(&Status::InProgress).unwrap(),
+            "\"in-progress\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Status::Closed).unwrap(),
+            "\"closed\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Status>("\"in-progress\"").unwrap(),
+            Status::InProgress
+        );
+    }
+
+    #[test]
+    fn issue_detail_round_trips_through_serde() {
+        let detail = IssueDetail {
+            issue: Issue {
+                id: "gh:42".into(),
+                human_id: "42".into(),
+                title: "fix parser".into(),
+                status: "open".into(),
+                labels: vec!["bug".into()],
+            },
+            body: "long description".into(),
+            comments: vec![Comment {
+                author: "alice".into(),
+                body: "first take".into(),
+                created_at: "2026-05-15T10:00:00Z".into(),
+            }],
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        let back: IssueDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(detail, back);
     }
 
     #[test]
