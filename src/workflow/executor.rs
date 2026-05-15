@@ -34,7 +34,7 @@ use crate::agent::registry::AgentSpec;
 use crate::bridge::{BRIDGE_HOST, Bridge};
 use crate::process::ProcessInvoker;
 use crate::runtime::devcontainer::Devcontainer;
-use crate::runtime::{ContainerSpec, ExecOpts, RuntimeAdapter};
+use crate::runtime::{ContainerSpec, ExecOpts, MountSpec, RuntimeAdapter};
 use crate::session::store::SessionStore;
 use crate::session::{IssueContext, Session, SessionId, SessionState, now_ms};
 use crate::tracker::Tracker;
@@ -712,6 +712,12 @@ impl WorkflowExecutor {
             .transpose()
     }
 
+    // `run_agent_node` accumulates state from many sources (cost
+    // budget, agent registry, prompt artifact, egress env, bridge
+    // env, fleet-tracker mount, container start/exec/stop, log
+    // capture, cost parse). Further extraction starts to read worse
+    // than the sequential narrative; allow the line count.
+    #[allow(clippy::too_many_lines)]
     fn run_agent_node(
         &self,
         req: &ExecuteRequest<'_>,
@@ -778,6 +784,16 @@ impl WorkflowExecutor {
             .ensure_image(req.devcontainer)
             .with_context(|| format!("building image for node `{}`", node.id))?;
         let artifacts_dir = req.store.session_dir(&session.id).join("artifacts");
+        // Bind-mount fleet-tracker into the agent container when the
+        // bridge is active and a host binary is locatable. The mount
+        // is read-only because the agent shouldn't be able to rewrite
+        // its own write-authority binary mid-run. See
+        // `fleet_tracker_mount` for the cross-arch caveat.
+        let extra_mounts = if bridge.is_some() {
+            fleet_tracker_mount().map_or_else(Vec::new, |m| vec![m])
+        } else {
+            Vec::new()
+        };
         let spec = ContainerSpec {
             image,
             workspace: req.workspace.to_path_buf(),
@@ -786,9 +802,7 @@ impl WorkflowExecutor {
             command: None,
             network: egress.network_name.clone(),
             dns: egress.dns_ip.clone(),
-            // Bridge plumbing (commit 9 of this phase) bind-mounts the
-            // fleet-tracker binary here; until then no extras flow.
-            extra_mounts: Vec::new(),
+            extra_mounts,
         };
         let container_id = req
             .adapter
@@ -1294,6 +1308,45 @@ pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String
         env.push(("FLEET_ISSUE_TITLE".to_string(), issue.title.clone()));
     }
     env
+}
+
+/// Locate the sibling `fleet-tracker` binary and render it as a
+/// read-only bind mount at `/usr/local/bin/fleet-tracker`. Returns
+/// `None` when:
+///
+/// - The host isn't Linux. macOS / other-OS fleet builds produce a
+///   non-ELF `fleet-tracker` binary that the in-container Linux
+///   loader can't exec; rather than surface a cryptic "exec format
+///   error" inside the agent, the executor skips the mount and the
+///   agent's `fleet-tracker` calls fail at the missing-binary layer
+///   with a clearer error.
+/// - The sibling binary isn't where `current_exe()` says it should
+///   be (e.g. fleet was installed via cargo and the user only
+///   installed `fleet`, not `fleet-tracker`).
+///
+/// Cross-arch caveat: a linux/amd64 fleet host running a linux/arm64
+/// container (or vice versa) would still try to mount the
+/// non-matching `fleet-tracker`. Detection would require shelling out
+/// to `docker image inspect`; deferred to a follow-up. The honest
+/// failure mode in that case is the same "exec format error" the
+/// agent sees if it tries to run the binary, which is recoverable
+/// (the bridge HTTP endpoint still works; the agent's tool just
+/// fails).
+fn fleet_tracker_mount() -> Option<MountSpec> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidate = dir.join("fleet-tracker");
+    if !candidate.is_file() {
+        return None;
+    }
+    Some(MountSpec {
+        host_path: candidate,
+        container_path: PathBuf::from("/usr/local/bin/fleet-tracker"),
+        read_only: true,
+    })
 }
 
 /// Append `FLEET_BRIDGE_URL`, `FLEET_BRIDGE_TOKEN`, and `NO_PROXY` to

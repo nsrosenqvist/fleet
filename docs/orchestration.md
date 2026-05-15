@@ -123,6 +123,27 @@ a fleet-issued bearer that only authenticates against the bridge.
 See [`auth.md`](./auth.md#how-a-secret-gets-to-the-agent) for the broader
 secrets story.
 
+**How `fleet-tracker` reaches the container** (v1 limitation): the
+binary is bind-mounted read-only at `/usr/local/bin/fleet-tracker`
+from the fleet host's own install location. The mount fires only when:
+
+- The host is Linux. macOS fleet builds produce a Mach-O binary the
+  container's Linux loader can't exec, so the mount is skipped and
+  `fleet-tracker` calls inside the container fail with a clear
+  "command not found" instead of a cryptic "exec format error". The
+  bridge HTTP endpoint still works — agents that hit it directly via
+  curl continue to function.
+- The `fleet-tracker` binary is installed alongside `fleet` (e.g.
+  `cargo install --path . --bin fleet --bin fleet-tracker`, or both
+  binaries are dropped together by your packaging). Installations
+  that only ship `fleet` skip the mount.
+
+Cross-arch is best-effort: a linux/amd64 fleet host running a
+linux/arm64 container (or vice versa) bind-mounts a non-matching
+binary that fails the same "exec format error" the agent's
+`fleet-tracker` call would otherwise see. The bridge's HTTP endpoint
+remains reachable. Container-arch detection is on the v2 list.
+
 ## Recommending new tickets
 
 When an agent's `outcome` is `blocked` and it would need a new ticket
