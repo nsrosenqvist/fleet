@@ -181,9 +181,19 @@ impl Session {
     /// off-disk. Branch name is *kept* — the branch may persist after
     /// the worktree is gone (the user can still `git checkout`/`merge`
     /// it). Bumps `updated_at_ms`.
-    #[allow(dead_code)] // wired by `fleet sessions prune` in a subsequent commit
     pub fn clear_worktree_path(&mut self, now_ms: u64) {
         self.worktree_path = None;
+        self.updated_at_ms = now_ms;
+    }
+
+    /// Drop the branch pointer once the branch has been deleted from
+    /// git (e.g. via `fleet sessions prune --with-branch`). Paired
+    /// with [`Self::clear_worktree_path`] but kept separate because
+    /// the two reclaims happen independently — a user may delete the
+    /// branch by hand while the worktree pointer survives, or vice
+    /// versa. Bumps `updated_at_ms`.
+    pub fn clear_branch(&mut self, now_ms: u64) {
+        self.branch = None;
         self.updated_at_ms = now_ms;
     }
 

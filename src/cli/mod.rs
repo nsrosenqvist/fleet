@@ -195,6 +195,13 @@ pub enum SessionsSub {
         /// Failed, Crashed).
         #[arg(long, conflicts_with = "completed")]
         all: bool,
+        /// Also delete the `fleet/session-<id>` git branch after
+        /// removing the worktree. Off by default — branches survive
+        /// prune so commits an agent made can be inspected or merged.
+        /// Use this to drop branches en masse after a batch of
+        /// failed/abandoned sessions.
+        #[arg(long = "with-branch")]
+        with_branch: bool,
     },
 }
 
@@ -250,9 +257,12 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             SessionsSub::Show { id } => sessions::run_show(&id),
             SessionsSub::Logs { id, node } => sessions::run_logs(&id, node.as_deref()),
             SessionsSub::Reap => sessions::run_reap(),
-            SessionsSub::Prune { id, completed, all } => {
-                sessions::run_prune(id.as_deref(), completed, all)
-            }
+            SessionsSub::Prune {
+                id,
+                completed,
+                all,
+                with_branch,
+            } => sessions::run_prune(id.as_deref(), completed, all, with_branch),
         },
         Command::Issues { sub } => match sub {
             IssuesSub::List => issues::run_list(),

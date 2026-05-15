@@ -124,10 +124,12 @@ pub fn run_reap() -> Result<i32> {
 /// CLI entry point for `fleet sessions prune [id|--completed|--all]`.
 /// Removes the per-session git worktree, clears
 /// `worktree_path` on the session's meta.json, and leaves everything
-/// else (logs, artifacts, the branch) intact. Returns 0 unless at
-/// least one prune attempt failed; per-session errors are surfaced
-/// in the report.
-pub fn run_prune(id: Option<&str>, completed: bool, all: bool) -> Result<i32> {
+/// else (logs, artifacts, the branch) intact. With
+/// `with_branch == true`, also deletes the `fleet/session-<id>`
+/// branch (force-deletes — unmerged work on that branch is lost).
+/// Returns 0 unless at least one prune attempt failed; per-session
+/// errors are surfaced in the report.
+pub fn run_prune(id: Option<&str>, completed: bool, all: bool, with_branch: bool) -> Result<i32> {
     if id.is_none() && !completed && !all {
         bail!(
             "fleet sessions prune: specify a session id, --completed, or --all \
@@ -158,7 +160,7 @@ pub fn run_prune(id: Option<&str>, completed: bool, all: bool) -> Result<i32> {
     let mut report = PruneReport::default();
     let now = now_ms();
     for id in targets {
-        match prune_one(invoker.as_ref(), &root, &store, &id, now) {
+        match prune_one(invoker.as_ref(), &root, &store, &id, now, with_branch) {
             Ok(PruneOutcome::Pruned) => report.pruned.push(id),
             Ok(PruneOutcome::AlreadyClean) => report.skipped.push(id),
             Err(err) => report.failed.push((id, format!("{err:#}"))),
@@ -187,7 +189,9 @@ pub struct PruneReport {
 }
 
 /// Prune one session: remove its worktree (if any), clear the meta
-/// pointer, leave logs/artifacts/branch alone.
+/// pointer, leave logs/artifacts alone. When `with_branch` is true,
+/// also delete the `fleet/session-<id>` git branch (force-delete;
+/// unmerged work is lost).
 ///
 /// Refuses to prune a still-`Running` session — kill or reap first.
 /// All other states (including `AwaitingGate`) are fair game: the
@@ -198,6 +202,7 @@ pub fn prune_one(
     store: &SessionStore,
     id: &SessionId,
     now: u64,
+    with_branch: bool,
 ) -> Result<PruneOutcome> {
     let mut session = store
         .load(id)
@@ -209,6 +214,18 @@ pub fn prune_one(
         );
     }
     let Some(wt_path) = session.worktree_path.clone() else {
+        // No worktree to prune — but the user may still want the
+        // branch dropped. Honour `with_branch` in that case so
+        // `prune --all --with-branch` reaps every fleet/session-*
+        // branch even from already-pruned sessions.
+        if with_branch {
+            if let Some(branch) = session.branch.clone() {
+                worktree::delete_branch(invoker, root, &branch, true)?;
+                session.clear_branch(now);
+                store.save(&session)?;
+                return Ok(PruneOutcome::Pruned);
+            }
+        }
         return Ok(PruneOutcome::AlreadyClean);
     };
     if wt_path.is_dir() {
@@ -224,6 +241,16 @@ pub fn prune_one(
         }
     }
     session.clear_worktree_path(now);
+    if with_branch {
+        if let Some(branch) = session.branch.clone() {
+            // Branch deletion failure is hard — the user asked for
+            // it explicitly. Surface so they know the branch is
+            // still around and they can investigate (uncommitted
+            // ref? someone else's checkout? deleted manually?).
+            worktree::delete_branch(invoker, root, &branch, true)?;
+            session.clear_branch(now);
+        }
+    }
     store.save(&session)?;
     Ok(PruneOutcome::Pruned)
 }
@@ -814,7 +841,7 @@ mod tests {
             })
             .returning(|_, _| Ok(String::new()));
 
-        let outcome = prune_one(&mock, dir.path(), &store, &id, 99).unwrap();
+        let outcome = prune_one(&mock, dir.path(), &store, &id, 99, false).unwrap();
         assert_eq!(outcome, PruneOutcome::Pruned);
 
         let reloaded = store.load(&id).unwrap();
@@ -841,7 +868,7 @@ mod tests {
         store.create(&s).unwrap();
 
         let mock = MockProcessInvoker::new(); // no expect_run() — must not be called.
-        let outcome = prune_one(&mock, dir.path(), &store, &sid, 99).unwrap();
+        let outcome = prune_one(&mock, dir.path(), &store, &sid, 99, false).unwrap();
         assert_eq!(outcome, PruneOutcome::AlreadyClean);
     }
 
@@ -858,7 +885,7 @@ mod tests {
         store.create(&s).unwrap();
 
         let mock = MockProcessInvoker::new(); // must not be called.
-        let err = prune_one(&mock, dir.path(), &store, &sid, 99).unwrap_err();
+        let err = prune_one(&mock, dir.path(), &store, &sid, 99, false).unwrap_err();
         assert!(format!("{err:#}").contains("still running"));
     }
 
@@ -896,10 +923,134 @@ mod tests {
             })
             .returning(|_, _| Ok(String::new()));
 
-        let outcome = prune_one(&mock, dir.path(), &store, &sid, 99).unwrap();
+        let outcome = prune_one(&mock, dir.path(), &store, &sid, 99, false).unwrap();
         assert_eq!(outcome, PruneOutcome::Pruned);
         let reloaded = store.load(&sid).unwrap();
         assert!(reloaded.worktree_path.is_none());
+    }
+
+    #[test]
+    fn prune_one_with_branch_removes_worktree_and_deletes_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let (id, wt_path) = stage_completed_with_worktree(&store, "s-wb", "fleet/session-s-wb");
+
+        let mut mock = MockProcessInvoker::new();
+        // First call: remove the worktree.
+        let expected_wt = wt_path.to_string_lossy().into_owned();
+        let root1 = dir.path().to_string_lossy().into_owned();
+        mock.expect_run()
+            .withf(move |prog, args| {
+                prog == "git"
+                    && args
+                        == &[
+                            "-C".to_string(),
+                            root1.clone(),
+                            "worktree".to_string(),
+                            "remove".to_string(),
+                            "--force".to_string(),
+                            expected_wt.clone(),
+                        ]
+            })
+            .returning(|_, _| Ok(String::new()));
+        // Second call: delete the branch with -D (force).
+        let root2 = dir.path().to_string_lossy().into_owned();
+        mock.expect_run()
+            .withf(move |prog, args| {
+                prog == "git"
+                    && args
+                        == &[
+                            "-C".to_string(),
+                            root2.clone(),
+                            "branch".to_string(),
+                            "-D".to_string(),
+                            "fleet/session-s-wb".to_string(),
+                        ]
+            })
+            .returning(|_, _| Ok(String::new()));
+
+        let outcome = prune_one(&mock, dir.path(), &store, &id, 99, true).unwrap();
+        assert_eq!(outcome, PruneOutcome::Pruned);
+
+        let reloaded = store.load(&id).unwrap();
+        assert!(reloaded.worktree_path.is_none());
+        assert!(
+            reloaded.branch.is_none(),
+            "--with-branch must clear the branch field too"
+        );
+    }
+
+    #[test]
+    fn prune_one_with_branch_alone_drops_branch_when_worktree_already_gone() {
+        // Already-pruned session (worktree_path = None, branch =
+        // Some) — `--with-branch` should still reap the branch.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let sid = SessionId::new("s-onlybranch");
+        let mut s = Session::new(sid.clone(), "standard", 1);
+        s.transition_to(SessionState::Running, 2).unwrap();
+        s.transition_to(SessionState::Completed, 3).unwrap();
+        // Manually populate just the branch — simulates a session
+        // that was already pruned-without-branch previously.
+        s.branch = Some("fleet/session-s-onlybranch".to_string());
+        store.create(&s).unwrap();
+
+        let mut mock = MockProcessInvoker::new();
+        let root_str = dir.path().to_string_lossy().into_owned();
+        mock.expect_run()
+            .withf(move |prog, args| {
+                prog == "git"
+                    && args
+                        == &[
+                            "-C".to_string(),
+                            root_str.clone(),
+                            "branch".to_string(),
+                            "-D".to_string(),
+                            "fleet/session-s-onlybranch".to_string(),
+                        ]
+            })
+            .returning(|_, _| Ok(String::new()));
+
+        let outcome = prune_one(&mock, dir.path(), &store, &sid, 99, true).unwrap();
+        assert_eq!(outcome, PruneOutcome::Pruned);
+        let reloaded = store.load(&sid).unwrap();
+        assert!(reloaded.branch.is_none());
+    }
+
+    #[test]
+    fn prune_one_with_branch_off_keeps_branch_intact() {
+        // Regression guard: default `with_branch = false` must leave
+        // the branch on git and on meta.json — matches the contract
+        // shipped in commit 6.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let (id, wt_path) = stage_completed_with_worktree(&store, "s-keep", "fleet/session-s-keep");
+
+        let mut mock = MockProcessInvoker::new();
+        let expected_wt = wt_path.to_string_lossy().into_owned();
+        let root_str = dir.path().to_string_lossy().into_owned();
+        // Only the worktree-remove call should fire; no branch
+        // deletion. mockall's MockProcessInvoker fails the test on
+        // an unexpected call, so the absence of an expectation here
+        // is the assertion.
+        mock.expect_run()
+            .withf(move |prog, args| {
+                prog == "git"
+                    && args
+                        == &[
+                            "-C".to_string(),
+                            root_str.clone(),
+                            "worktree".to_string(),
+                            "remove".to_string(),
+                            "--force".to_string(),
+                            expected_wt.clone(),
+                        ]
+            })
+            .returning(|_, _| Ok(String::new()));
+
+        prune_one(&mock, dir.path(), &store, &id, 99, false).unwrap();
+        let reloaded = store.load(&id).unwrap();
+        assert_eq!(reloaded.branch.as_deref(), Some("fleet/session-s-keep"));
     }
 
     #[test]

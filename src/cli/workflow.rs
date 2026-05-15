@@ -453,7 +453,10 @@ fn auto_prune_completed_session(
     if session.state != SessionState::Completed {
         return;
     }
-    match crate::cli::sessions::prune_one(invoker, root, store, &session.id, now_ms()) {
+    // Auto-prune intentionally keeps the branch — config-driven
+    // cleanup should be conservative. Users who want branches reaped
+    // run `fleet sessions prune --with-branch` explicitly.
+    match crate::cli::sessions::prune_one(invoker, root, store, &session.id, now_ms(), false) {
         Ok(crate::cli::sessions::PruneOutcome::Pruned) => {
             tracing::info!(session = %session.id, "auto-pruned worktree after completion");
         }
