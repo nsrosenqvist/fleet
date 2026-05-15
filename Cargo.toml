@@ -33,6 +33,12 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Per-session bridge HTTP server. Synchronous; no async runtime
+# dragged in. tiny_http handles request parsing + response framing;
+# fleet owns route dispatch, bearer auth, and per-session scoping
+# on top.
+tiny_http = "0.12"
+
 [dev-dependencies]
 # Mocks `ProcessInvoker` and other traits so tests don't shell out.
 mockall = "0.13"
