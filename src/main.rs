@@ -14,6 +14,7 @@
 //! - `cli` — clap surface + dispatch
 //! - `process` — `ProcessInvoker` trait + `RealProcessInvoker` + helpers
 //! - `autonomous` — supervisor engine driving the TUI's `Shift+A` mode
+//! - `worktree` — per-session git worktree management
 
 mod agent;
 mod autonomous;
@@ -27,6 +28,7 @@ mod session;
 mod tracker;
 mod tui;
 mod workflow;
+mod worktree;
 
 use clap::Parser;
 use std::process::ExitCode;
