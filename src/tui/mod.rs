@@ -11,13 +11,18 @@
 //! - `Shift+K` — mark the selected session `Failed` (the Phase-1 "kill"
 //!   affordance: persists the transition; container-side stop is the
 //!   operator's job via `fleet runtime stop <id>`)
-//! - `n` — print a hint pointing at `fleet workflow run` (full spawn
-//!   picker is Phase 2 work)
+//! - `n` — open the spawn picker: shows the workflows under
+//!   `.fleet/workflows/`; Enter detaches a `fleet workflow run <name>`
+//!   subprocess (inherits env + cwd), Esc cancels. The TUI itself
+//!   doesn't drive the run — `r` reloads when you want to see the new
+//!   session row.
+//! - `d` — toggle the doctor pane.
 //!
 //! The TUI is a *browser*, not a workflow driver — it does not run
-//! containers itself. Spawning is `fleet workflow run`, attaching is
-//! `fleet runtime attach`. Keeps the TUI's surface area small enough
-//! that the implementation fits in one file.
+//! containers itself. Spawning shells out to the fleet binary so the
+//! TUI's event loop stays responsive; attaching is `fleet runtime
+//! attach`. Keeps the TUI's surface area small enough that the
+//! implementation fits in one file.
 //!
 //! Pure render helpers (`state_word`, `state_marker`, `sort_sessions`,
 //! `tail_lines`) are unit-tested. The ratatui draw cycle and event loop
@@ -116,14 +121,25 @@ struct AppState {
     /// the doctor view at least once; refreshed on every entry so the
     /// pane reflects current config + host probe state.
     doctor: Option<DoctorSnapshot>,
+    /// Workflow names available to launch from this repo. Refreshed
+    /// each time the spawn picker opens so a newly-added workflow
+    /// file appears without restarting the TUI. Empty when no
+    /// `.fleet/workflows/` exists.
+    spawn_workflows: Vec<String>,
+    /// Cursor for the spawn picker. Independent of `list_state` (which
+    /// tracks the sessions sidebar) so reopening the picker doesn't
+    /// nuke the session selection.
+    spawn_list_state: ListState,
 }
 
 /// Top-level view enum. `Sessions` is the default; `Doctor` shows the
-/// adapter + tracker + agents introspection pane.
+/// adapter + tracker + agents introspection pane; `Spawn` shows the
+/// workflow picker for kicking off a new `fleet workflow run`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Sessions,
     Doctor,
+    Spawn,
 }
 
 /// Resolved snapshot for the doctor pane. Computed by
@@ -186,6 +202,8 @@ impl AppState {
             status_line: " ready ".to_string(),
             view: View::Sessions,
             doctor: None,
+            spawn_workflows: Vec::new(),
+            spawn_list_state: ListState::default(),
         };
         state.reload(store)?;
         Ok(state)
@@ -264,42 +282,38 @@ impl AppState {
 
     fn handle_key(&mut self, key: KeyEvent, store: &SessionStore) -> Action {
         // Shift+K is the kill affordance — match before the plain-k arm
-        // so the modifier discriminates.
-        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('K')) {
+        // so the modifier discriminates. Disabled in non-Sessions views
+        // (those don't have a selection to kill).
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('K'))
+            && self.view == View::Sessions
+        {
             self.mark_selected_failed(store);
             return Action::None;
         }
-        // `Esc` while in doctor view returns to sessions; from sessions
-        // it quits. `q` always quits.
+        // Dispatch by view. Each view owns its own keybindings; common
+        // ones (`q` quit, `Esc` close) are handled per-view so an `Esc`
+        // out of a modal doesn't also quit the app.
+        match self.view {
+            View::Sessions => self.handle_key_sessions(key, store),
+            View::Doctor => self.handle_key_doctor(key, store),
+            View::Spawn => self.handle_key_spawn(key),
+        }
+    }
+
+    fn handle_key_sessions(&mut self, key: KeyEvent, store: &SessionStore) -> Action {
         match key.code {
-            KeyCode::Char('q') => Action::Quit,
-            KeyCode::Esc => {
-                if self.view == View::Doctor {
-                    self.view = View::Sessions;
-                    Action::None
-                } else {
-                    Action::Quit
-                }
-            }
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
             KeyCode::Char('d') => {
-                // Toggle doctor view. On entry, re-probe so the pane is
-                // always current rather than showing stale state.
-                self.view = match self.view {
-                    View::Sessions => {
-                        self.doctor = Some(DoctorSnapshot::probe(self.root.clone()));
-                        View::Doctor
-                    }
-                    View::Doctor => View::Sessions,
-                };
+                // Enter doctor view. Re-probe so the pane is always
+                // current rather than showing stale state.
+                self.doctor = Some(DoctorSnapshot::probe(self.root.clone()));
+                self.view = View::Doctor;
                 Action::None
             }
             KeyCode::Char('r') => {
                 if let Err(err) = self.reload(store) {
                     self.status_line = format!(" reload failed: {err:#} ");
-                }
-                // In doctor view, refresh re-probes so config edits land.
-                if self.view == View::Doctor {
-                    self.doctor = Some(DoctorSnapshot::probe(self.root.clone()));
                 }
                 Action::None
             }
@@ -312,13 +326,124 @@ impl AppState {
                 Action::None
             }
             KeyCode::Char('n') => {
-                self.status_line =
-                    " spawn: use `fleet workflow run <name> [--issue <id>]` from the shell "
-                        .to_string();
+                self.open_spawn_picker();
                 Action::None
             }
             _ => Action::None,
         }
+    }
+
+    fn handle_key_doctor(&mut self, key: KeyEvent, store: &SessionStore) -> Action {
+        match key.code {
+            KeyCode::Char('q') => Action::Quit,
+            KeyCode::Esc | KeyCode::Char('d') => {
+                self.view = View::Sessions;
+                Action::None
+            }
+            KeyCode::Char('r') => {
+                if let Err(err) = self.reload(store) {
+                    self.status_line = format!(" reload failed: {err:#} ");
+                }
+                self.doctor = Some(DoctorSnapshot::probe(self.root.clone()));
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn handle_key_spawn(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.view = View::Sessions;
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_spawn_selection(1);
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_spawn_selection(-1);
+                Action::None
+            }
+            KeyCode::Enter => {
+                self.spawn_selected();
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Refresh the workflow list and switch to the spawn picker. Empty
+    /// list is fine — the renderer shows a hint instead of a picker
+    /// and Enter is a no-op.
+    fn open_spawn_picker(&mut self) {
+        self.spawn_workflows = list_workflows_dir(&self.root);
+        let select = if self.spawn_workflows.is_empty() {
+            None
+        } else {
+            // Restore the previous selection if it still exists; default
+            // to the first row otherwise.
+            self.spawn_list_state
+                .selected()
+                .filter(|i| *i < self.spawn_workflows.len())
+                .or(Some(0))
+        };
+        self.spawn_list_state.select(select);
+        self.view = View::Spawn;
+    }
+
+    fn move_spawn_selection(&mut self, delta: isize) {
+        if self.spawn_workflows.is_empty() {
+            return;
+        }
+        let len = isize::try_from(self.spawn_workflows.len()).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.spawn_list_state.selected().unwrap_or(0))
+            .unwrap_or(0);
+        let next = (current + delta).rem_euclid(len);
+        let next_usize = usize::try_from(next).unwrap_or(0);
+        self.spawn_list_state.select(Some(next_usize));
+    }
+
+    /// Spawn `fleet workflow run <selected>` as a detached subprocess so
+    /// the TUI's event loop isn't blocked by the workflow run. The
+    /// child inherits the user's environment (API keys, etc.) and runs
+    /// in the same cwd, writing its session row into the same
+    /// `.fleet/sessions/` the TUI is browsing. After spawning, return
+    /// to the Sessions view; the user presses `r` to see the new row.
+    fn spawn_selected(&mut self) {
+        let Some(idx) = self.spawn_list_state.selected() else {
+            self.status_line = " spawn: no workflow selected ".to_string();
+            self.view = View::Sessions;
+            return;
+        };
+        let Some(name) = self.spawn_workflows.get(idx).cloned() else {
+            self.status_line = " spawn: selection out of range ".to_string();
+            self.view = View::Sessions;
+            return;
+        };
+        let Ok(binary) = std::env::current_exe() else {
+            self.status_line =
+                " spawn failed: cannot resolve fleet binary path (current_exe) "
+                    .to_string();
+            self.view = View::Sessions;
+            return;
+        };
+        let mut cmd = build_spawn_command(&binary, &name);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(_child) => {
+                // Intentionally don't `wait()`: detaching is the point.
+                // The child runs to Completed/AwaitingGate/Failed on
+                // its own; the user sees the row on next `r` reload.
+                self.status_line = format!(" spawned `{name}` — press `r` to refresh ");
+            }
+            Err(err) => {
+                self.status_line = format!(" spawn `{name}` failed: {err:#} ");
+            }
+        }
+        self.view = View::Sessions;
     }
 
     fn mark_selected_failed(&mut self, store: &SessionStore) {
@@ -348,6 +473,54 @@ impl AppState {
 enum Action {
     None,
     Quit,
+}
+
+/// List the workflows available to launch from this repo. Returns the
+/// basenames (no `.yaml` extension) of every `.yaml` file directly under
+/// `<root>/.fleet/workflows/`, sorted alphabetically for stable display
+/// in the spawn picker.
+///
+/// Missing directory returns an empty Vec — a not-yet-`init`'d repo
+/// shouldn't error the picker, just leave it empty. Non-YAML files,
+/// subdirectories, and hidden files are skipped.
+#[must_use]
+pub fn list_workflows_dir(root: &Path) -> Vec<String> {
+    let dir = root.join(".fleet/workflows");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("yaml") {
+                return None;
+            }
+            let stem = path.file_stem().and_then(|s| s.to_str())?.to_string();
+            if stem.starts_with('.') {
+                return None;
+            }
+            Some(stem)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Build the `fleet workflow run <name>` command that the spawn picker
+/// kicks off when the user hits Enter. Pure: doesn't actually call
+/// `spawn()`; the caller does that and can choose how to detach
+/// stdio. `fleet_binary` is the path to the fleet executable
+/// (typically `std::env::current_exe()`) so the spawned child is the
+/// same binary the TUI is running from.
+#[must_use]
+pub fn build_spawn_command(fleet_binary: &Path, workflow_name: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(fleet_binary);
+    cmd.args(["workflow", "run", workflow_name]);
+    cmd
 }
 
 /// Sort sessions newest-first (descending `created_at_ms`). Ties broken
@@ -448,6 +621,9 @@ fn render(f: &mut Frame<'_>, state: &AppState) {
         View::Doctor => {
             render_doctor(f, outer[0], state);
         }
+        View::Spawn => {
+            render_spawn(f, outer[0], state);
+        }
     }
     render_status(f, outer[1], state);
 }
@@ -521,6 +697,38 @@ fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(body, area);
+}
+
+fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let block = Block::default()
+        .title(" Spawn workflow ")
+        .borders(Borders::ALL);
+    if state.spawn_workflows.is_empty() {
+        let body = Paragraph::new(
+            "(no workflows found under .fleet/workflows/)\n\n\
+             Run `fleet init` to scaffold the default standard / hotfix / review-only\n\
+             workflows, or drop a `<name>.yaml` into `.fleet/workflows/` by hand.",
+        )
+        .block(block)
+        .wrap(Wrap { trim: false });
+        f.render_widget(body, area);
+        return;
+    }
+    let items: Vec<ListItem<'_>> = state
+        .spawn_workflows
+        .iter()
+        .map(|name| ListItem::new(Line::from(name.clone())))
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    let mut list_state = state.spawn_list_state;
+    f.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -604,8 +812,9 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let help = match state.view {
-        View::Sessions => "[q] quit  [j/k] nav  [r] reload  [d] doctor  [Shift+K] kill  [n] spawn-hint",
+        View::Sessions => "[q] quit  [j/k] nav  [r] reload  [d] doctor  [Shift+K] kill  [n] spawn",
         View::Doctor => "[q] quit  [Esc/d] back  [r] re-probe",
+        View::Spawn => "[Esc/q] cancel  [j/k] nav  [Enter] spawn",
     };
     let bar = format!("{help} —{}", state.status_line);
     let p = Paragraph::new(bar).style(
@@ -932,5 +1141,163 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()), &store);
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.selected().unwrap().id.as_str(), "s-new");
+    }
+
+    // === spawn picker ===
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, body).unwrap();
+    }
+
+    #[test]
+    fn list_workflows_dir_returns_empty_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `.fleet/workflows/` at all — picker should open empty
+        // rather than error.
+        assert!(list_workflows_dir(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn list_workflows_dir_returns_yaml_basenames_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/standard.yaml", "name: standard\n");
+        write(tmp.path(), ".fleet/workflows/hotfix.yaml", "name: hotfix\n");
+        write(tmp.path(), ".fleet/workflows/review-only.yaml", "name: review-only\n");
+        let names = list_workflows_dir(tmp.path());
+        assert_eq!(names, vec!["hotfix", "review-only", "standard"]);
+    }
+
+    #[test]
+    fn list_workflows_dir_skips_non_yaml_and_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/keeper.yaml", "name: keeper\n");
+        write(tmp.path(), ".fleet/workflows/notes.md", "stuff\n");
+        write(tmp.path(), ".fleet/workflows/.dotfile.yaml", "name: hidden\n");
+        std::fs::create_dir_all(tmp.path().join(".fleet/workflows/nested-dir")).unwrap();
+        let names = list_workflows_dir(tmp.path());
+        assert_eq!(names, vec!["keeper"]);
+    }
+
+    #[test]
+    fn build_spawn_command_targets_fleet_workflow_run() {
+        let cmd = build_spawn_command(Path::new("/usr/local/bin/fleet"), "standard");
+        // std::process::Command doesn't expose a nice equality API, but
+        // its Debug repr contains the program + args.
+        let dbg = format!("{cmd:?}");
+        assert!(dbg.contains("/usr/local/bin/fleet"), "got: {dbg}");
+        assert!(dbg.contains("workflow"), "got: {dbg}");
+        assert!(dbg.contains("run"), "got: {dbg}");
+        assert!(dbg.contains("standard"), "got: {dbg}");
+    }
+
+    #[test]
+    fn n_key_in_sessions_view_opens_spawn_picker() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/standard.yaml", "name: standard\n");
+        write(tmp.path(), ".fleet/workflows/hotfix.yaml", "name: hotfix\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.view, View::Spawn);
+        assert_eq!(state.spawn_workflows, vec!["hotfix", "standard"]);
+        assert_eq!(state.spawn_list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn n_key_with_no_workflows_opens_empty_picker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        // View transitions even when empty; the renderer shows a hint.
+        // Selection stays None.
+        assert_eq!(state.view, View::Spawn);
+        assert!(state.spawn_workflows.is_empty());
+        assert_eq!(state.spawn_list_state.selected(), None);
+    }
+
+    #[test]
+    fn esc_in_spawn_view_returns_to_sessions_without_spawning() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/standard.yaml", "name: standard\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.view, View::Spawn);
+        let action = state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &store);
+        // Esc cancels — it must NOT quit.
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.view, View::Sessions);
+        // No session was created.
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn jk_in_spawn_view_wraps_through_workflow_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/a.yaml", "name: a\n");
+        write(tmp.path(), ".fleet/workflows/b.yaml", "name: b\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn_list_state.selected(), Some(0));
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn_list_state.selected(), Some(1));
+        // Wrap: j past the end returns to 0.
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn_list_state.selected(), Some(0));
+        // k before 0 wraps to the end.
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn_list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn shift_k_in_spawn_view_does_not_mark_session_failed() {
+        // Per-view dispatch: Shift+K only applies in Sessions. If the
+        // user has a session selected, hits `n` to open the picker,
+        // then accidentally Shift+K, the session must NOT be killed.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-r", "wf", SessionState::Running, 100))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.view, View::Spawn);
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            &store,
+        );
+        // Session stays Running — the kill was filtered out.
+        let loaded = store.load(&SessionId::new("s-r")).unwrap();
+        assert_eq!(loaded.state, SessionState::Running);
     }
 }
