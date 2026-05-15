@@ -35,7 +35,7 @@ pub struct RepoConfig {
 }
 
 /// `runtime:` block — which adapter to instantiate, how to harden it, where
-/// the devcontainer lives.
+/// the devcontainer lives, and the network egress policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub adapter: AdapterChoice,
@@ -43,6 +43,11 @@ pub struct RuntimeConfig {
     /// Relative to the repo root. `fleet init` defaults to
     /// `.devcontainer/devcontainer.json`.
     pub devcontainer: PathBuf,
+    /// `runtime.network` — egress policy applied to every workflow
+    /// container. Default is `open` (no enforcement) so a fresh
+    /// install still works; security-conscious users opt into
+    /// `allowlist` per-repo.
+    pub network: NetworkConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -51,6 +56,77 @@ impl Default for RuntimeConfig {
             adapter: AdapterChoice::Auto,
             hardening: HardeningChoice::Auto,
             devcontainer: PathBuf::from(".devcontainer/devcontainer.json"),
+            network: NetworkConfig::default(),
+        }
+    }
+}
+
+/// `runtime.network:` block — per-workflow egress enforcement.
+///
+/// - `policy: open` (default): no enforcement; the container has full
+///   outbound access (whatever the engine and host allow). Matches the
+///   pre-Phase 3 behaviour.
+/// - `policy: none`: hard-block all egress. Useful for fully-offline
+///   workflows that should never touch the network. Implementation:
+///   the adapter pins the container to an isolated network with no
+///   route to the outside.
+/// - `policy: allowlist`: route egress through a proxy that admits
+///   only the hosts in `extra_hosts` plus fleet's built-in defaults
+///   (tracker host + LLM provider host the configured agents need).
+///
+/// The set of "built-in defaults" is derived at proxy-setup time from
+/// the rest of the config — see [`NetworkConfig::resolved_allowlist`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkConfig {
+    pub policy: NetworkPolicy,
+    /// Hosts admitted in addition to the built-in defaults. Wildcards
+    /// are *not* expanded; `*.crates.io` is a literal string match
+    /// against the SNI / Host header. The proxy implementation may
+    /// or may not honour wildcards depending on backend.
+    pub extra_hosts: Vec<String>,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            policy: NetworkPolicy::Open,
+            extra_hosts: Vec::new(),
+        }
+    }
+}
+
+impl NetworkConfig {
+    /// Effective allowlist for the current run: `extra_hosts` plus
+    /// fleet-supplied defaults (LLM provider hosts implied by the
+    /// agents registry, tracker host). The defaults are computed
+    /// elsewhere; this getter is the call site we'd extend if the
+    /// schema later supports `omit_defaults: true`.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn extra_hosts(&self) -> &[String] {
+        &self.extra_hosts
+    }
+}
+
+/// Egress policy variants. Surfaced verbatim in the doctor view so
+/// users can see what's in force on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkPolicy {
+    #[default]
+    Open,
+    None,
+    Allowlist,
+}
+
+impl NetworkPolicy {
+    #[must_use]
+    #[allow(dead_code)]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::None => "none",
+            Self::Allowlist => "allowlist",
         }
     }
 }
@@ -319,6 +395,16 @@ struct RawRuntime {
     hardening: Option<HardeningChoice>,
     #[serde(default)]
     devcontainer: Option<PathBuf>,
+    #[serde(default)]
+    network: Option<RawNetwork>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawNetwork {
+    #[serde(default)]
+    policy: Option<NetworkPolicy>,
+    #[serde(default)]
+    extra_hosts: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -349,11 +435,23 @@ impl From<Raw> for RepoConfig {
         } = Self::default();
 
         let runtime = match raw.runtime {
-            Some(r) => RuntimeConfig {
-                adapter: r.adapter.unwrap_or(default_runtime.adapter),
-                hardening: r.hardening.unwrap_or(default_runtime.hardening),
-                devcontainer: r.devcontainer.unwrap_or(default_runtime.devcontainer),
-            },
+            Some(r) => {
+                let network = match r.network {
+                    Some(n) => NetworkConfig {
+                        policy: n.policy.unwrap_or(default_runtime.network.policy),
+                        extra_hosts: n
+                            .extra_hosts
+                            .unwrap_or(default_runtime.network.extra_hosts),
+                    },
+                    None => default_runtime.network,
+                };
+                RuntimeConfig {
+                    adapter: r.adapter.unwrap_or(default_runtime.adapter),
+                    hardening: r.hardening.unwrap_or(default_runtime.hardening),
+                    devcontainer: r.devcontainer.unwrap_or(default_runtime.devcontainer),
+                    network,
+                }
+            }
             None => default_runtime,
         };
         let tracker = raw.tracker.unwrap_or(default_tracker);
@@ -668,18 +766,69 @@ workflows:
 
     #[test]
     fn tolerates_unknown_top_level_keys() {
-        // The plan's schema is evolving — `network`, `autonomous`, etc.
-        // aren't modelled yet. The parser must not refuse to read them.
         let yaml = "\
 runtime:
   adapter: docker
-  network:
-    policy: allowlist
 autonomous:
   max_parallel: 3
+unknown_root_key:
+  whatever: 42
 ";
         let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
         assert_eq!(cfg.runtime.adapter, AdapterChoice::Docker);
+    }
+
+    #[test]
+    fn defaults_network_policy_to_open() {
+        // No network block in YAML → no enforcement, no extra hosts.
+        // Matches pre-Phase 3 behaviour exactly.
+        let cfg = RepoConfig::from_str_at("runtime:\n  adapter: docker\n", "/x").unwrap();
+        assert_eq!(cfg.runtime.network.policy, NetworkPolicy::Open);
+        assert!(cfg.runtime.network.extra_hosts.is_empty());
+    }
+
+    #[test]
+    fn parses_network_allowlist_block() {
+        let yaml = "\
+runtime:
+  adapter: podman
+  network:
+    policy: allowlist
+    extra_hosts:
+      - api.github.com
+      - crates.io
+      - pypi.org
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.runtime.network.policy, NetworkPolicy::Allowlist);
+        assert_eq!(
+            cfg.runtime.network.extra_hosts,
+            vec![
+                "api.github.com".to_string(),
+                "crates.io".to_string(),
+                "pypi.org".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_network_policy_none_with_no_hosts() {
+        // `none` means "hard-block egress"; extra_hosts is informational
+        // but the policy itself wins.
+        let yaml = "\
+runtime:
+  network:
+    policy: none
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.runtime.network.policy, NetworkPolicy::None);
+    }
+
+    #[test]
+    fn network_policy_as_str_is_stable_for_doctor() {
+        assert_eq!(NetworkPolicy::Open.as_str(), "open");
+        assert_eq!(NetworkPolicy::None.as_str(), "none");
+        assert_eq!(NetworkPolicy::Allowlist.as_str(), "allowlist");
     }
 
     #[test]

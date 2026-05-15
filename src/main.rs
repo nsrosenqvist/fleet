@@ -18,6 +18,7 @@
 mod agent;
 mod autonomous;
 mod cli;
+mod egress;
 mod process;
 mod repo;
 mod repo_config;
