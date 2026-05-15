@@ -721,6 +721,7 @@ impl WorkflowExecutor {
             env,
             command: None,
             network: egress.network_name.clone(),
+            dns: egress.dns_ip.clone(),
         };
         let container_id = req
             .adapter
@@ -2135,6 +2136,8 @@ nodes:
                 proxy_env: self.env.clone(),
                 network_name: self.network.clone(),
                 proxy_container: None,
+                dns_ip: None,
+                dns_container: None,
             })
         }
         fn teardown(&self, _setup: &crate::egress::EgressSetup) -> Result<()> {

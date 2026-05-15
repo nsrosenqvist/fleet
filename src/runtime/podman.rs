@@ -110,6 +110,15 @@ impl RuntimeAdapter for PodmanAdapter {
         if let Some(network) = &spec.network {
             extra.push(format!("--network={network}"));
         }
+        // DNS stub: when present, pin the container's resolver to the
+        // stub sidecar's IP. Combined with the stub returning NXDOMAIN
+        // for anything outside the pre-resolved allowlist, this closes
+        // the DNS-exfiltration gap aardvark-dns would otherwise leave
+        // open (queries forwarded to the host's resolver before failing
+        // at the IP layer leak the query content).
+        if let Some(dns_ip) = &spec.dns {
+            extra.push(format!("--dns={dns_ip}"));
+        }
         let req = UpRequest {
             workspace: &spec.workspace,
             config: None,
@@ -291,6 +300,7 @@ mod tests {
             env: vec![],
             command: None,
             network: None,
+            dns: None,
         }
     }
 
@@ -404,6 +414,37 @@ mod tests {
         spec.network = Some("fleet-s-egress".to_string());
         let id = a.start_container(&spec).unwrap();
         assert_eq!(id.as_str(), "c-net-1");
+    }
+
+    #[test]
+    fn start_container_appends_dns_flag_when_spec_has_dns() {
+        // DNS stub: when the executor passes spec.dns (the DNS sidecar's
+        // IP), the Podman adapter must add `--dns=<ip>` to the
+        // devcontainer CLI's `--run-args` chain so the container's
+        // resolv.conf points only at the stub.
+        let dc = sample_dc();
+        let up_args = vec![
+            "up".to_string(),
+            "--workspace-folder".to_string(),
+            "/repo".to_string(),
+            "--remove-existing-container".to_string(),
+            "--docker-path".to_string(),
+            "podman".to_string(),
+            "--mount".to_string(),
+            "type=bind,source=/repo/.fleet/sessions/s1/artifacts,target=/artifacts".to_string(),
+            "--run-args".to_string(),
+            "--network=fleet-s-egress".to_string(),
+            "--run-args".to_string(),
+            "--dns=10.89.0.5".to_string(),
+        ];
+        let stdout = r#"{"outcome":"success","containerId":"c-dns-1"}"#.to_string();
+        let invoker = invoker_with(vec![("devcontainer", up_args, stdout)]);
+        let a = PodmanAdapter::new(invoker, false);
+        let mut spec = sample_spec(ImageId::new(DevcontainerCli::mint_image_name(&dc)));
+        spec.network = Some("fleet-s-egress".to_string());
+        spec.dns = Some("10.89.0.5".to_string());
+        let id = a.start_container(&spec).unwrap();
+        assert_eq!(id.as_str(), "c-dns-1");
     }
 
     #[test]

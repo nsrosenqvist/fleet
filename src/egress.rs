@@ -88,11 +88,25 @@ pub trait EgressEnforcer: Send + Sync {
 /// pairs the adapter must inject. `network_name` is the engine-level
 /// network the workflow container must be pinned to; `proxy_container`
 /// is the sidecar id for diagnostics + targeted teardown.
+///
+/// `dns_ip` and `dns_container` extend the model with the DNS-stub
+/// sidecar (Linux + Podman): when present, the workflow container's
+/// resolver is overridden via `--dns=<dns_ip>` so it can only resolve
+/// names the allowlist pre-resolved. NXDOMAIN for everything else —
+/// closes the DNS-exfiltration gap that an unfiltered upstream
+/// resolver would otherwise leak through.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EgressSetup {
     pub proxy_env: Vec<(String, String)>,
     pub network_name: Option<String>,
     pub proxy_container: Option<String>,
+    /// IP of the DNS-stub sidecar (when one was started). The runtime
+    /// adapter passes this to the engine as `--dns=<ip>` so the
+    /// workflow container's resolv.conf points only at the stub.
+    pub dns_ip: Option<String>,
+    /// Container id of the DNS sidecar, for diagnostics + targeted
+    /// teardown.
+    pub dns_container: Option<String>,
 }
 
 impl EgressSetup {
@@ -280,6 +294,8 @@ impl EgressEnforcer for PodmanTinyproxyEnforcer {
             ],
             network_name: Some(network),
             proxy_container: Some(proxy_name),
+            dns_ip: None,
+            dns_container: None,
         })
     }
 
@@ -436,6 +452,12 @@ impl EgressEnforcer for HostProxyEnforcer {
             // teardown needs" rather than literally "a container id";
             // host-proxy stores its pidfile path here.
             proxy_container: Some(pidfile_path.display().to_string()),
+            // No DNS sidecar on the host-proxy path (Apple Container /
+            // Docker). Closing the DNS gap on macOS requires Apple
+            // Container's network-internal primitive, which doesn't
+            // exist yet — flagged in docs/network.md as honest non-goal.
+            dns_ip: None,
+            dns_container: None,
         })
     }
 
@@ -669,6 +691,8 @@ mod tests {
             proxy_env: vec![("X".to_string(), "Y".to_string())],
             network_name: Some("net".to_string()),
             proxy_container: Some("c".to_string()),
+            dns_ip: None,
+            dns_container: None,
         })
         .unwrap();
     }
@@ -801,6 +825,8 @@ mod tests {
             proxy_env: vec![],
             network_name: Some("fleet-s-down".to_string()),
             proxy_container: Some("fleet-proxy-s-down".to_string()),
+            dns_ip: None,
+            dns_container: None,
         };
         enf.teardown(&setup).unwrap();
         let invocations = calls.lock().unwrap().clone();
@@ -846,6 +872,8 @@ mod tests {
             proxy_env: vec![],
             network_name: Some("fleet-x".to_string()),
             proxy_container: Some("fleet-proxy-x".to_string()),
+            dns_ip: None,
+            dns_container: None,
         };
         // Should return Ok despite both inner calls failing.
         enf.teardown(&setup).unwrap();
@@ -966,6 +994,8 @@ mod tests {
             proxy_env: vec![],
             network_name: None,
             proxy_container: Some(pidfile.display().to_string()),
+            dns_ip: None,
+            dns_container: None,
         };
         enf.teardown(&setup).unwrap();
         let invocations = calls.lock().unwrap().clone();
@@ -990,6 +1020,8 @@ mod tests {
             proxy_env: vec![],
             network_name: None,
             proxy_container: Some("/nonexistent/path/to/pidfile".to_string()),
+            dns_ip: None,
+            dns_container: None,
         };
         enf.teardown(&setup).unwrap();
     }

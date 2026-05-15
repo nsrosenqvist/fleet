@@ -281,6 +281,7 @@ mod tests {
             env: vec![],
             command: None,
             network: None,
+            dns: None,
         }
     }
 

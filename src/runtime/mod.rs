@@ -108,6 +108,13 @@ pub struct ContainerSpec {
     /// workflow container through a sidecar proxy. Adapters without
     /// network-pinning support (Local, today's Docker) ignore this.
     pub network: Option<String>,
+    /// Engine-level DNS server override (`--dns=<ip>`). `None` lets the
+    /// engine use its default resolver; `Some(ip)` pins the container's
+    /// resolv.conf to that single nameserver — used by the egress
+    /// enforcer's DNS-stub sidecar to refuse any lookup that isn't a
+    /// pre-resolved allowlist host. Adapters without DNS-pinning
+    /// support ignore this.
+    pub dns: Option<String>,
 }
 
 /// Per-exec overrides. Empty defaults mean "inherit from the container."
