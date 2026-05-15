@@ -267,15 +267,18 @@ const DEFAULT_DEVCONTAINER_JSON: &str = "\
 ";
 
 /// `.fleet/workflows/standard.yaml` — the canonical planner → coder →
-/// reviewer flow. Three agent nodes with persona + `prompt_file` wired;
-/// the artifact contract chains `plan.md` from `plan` into `implement`'s
-/// inputs. Review opens unbounded for now — `loop_back_to` + gates land
-/// in the executor in subsequent commits.
-const DEFAULT_WORKFLOW_STANDARD: &str = "\
-# Default `standard` workflow shipped by `fleet init`.
-# Planner → Coder → Reviewer. Edit freely.
+/// reviewer flow. Three agent nodes plus a bounded revision cycle and
+/// a final `gh pr create` step that only fires on an `approve`
+/// verdict. The artifact contract chains `plan.md` from `plan` into
+/// `implement`'s inputs; the reviewer's `outputs: { decision: … }`
+/// feeds the `when:`-gated fork.
+const DEFAULT_WORKFLOW_STANDARD: &str = r#"# Default `standard` workflow shipped by `fleet init`.
+# Planner -> Coder -> Reviewer -> (Revise loop | Open PR).
+# Edit freely; the reviewer is expected to write a flat-JSON
+# `review.outputs.json` under /artifacts with a `decision` key whose
+# value is either "approve" or "changes_requested".
 name: standard
-description: Plan → Code → Review
+description: Plan -> Code -> Review (+revise loop, +open PR on approve)
 trigger:
   manual: true
   autonomous: true
@@ -298,7 +301,22 @@ nodes:
     agent: claude-code
     persona: reviewer
     prompt_file: .fleet/prompts/reviewer.md
-";
+    outputs:
+      decision: decision
+  - id: revise
+    depends_on: [review]
+    when: 'review.decision == "changes_requested"'
+    agent: claude-code
+    persona: implementer
+    prompt_file: .fleet/prompts/implementer.md
+    loop_back_to: review
+    max_loops: 2
+  - id: open_pr
+    depends_on: [review]
+    when: 'review.decision == "approve"'
+    type: bash
+    script: 'gh pr create --title "${FLEET_ISSUE_TITLE:-fleet change}" --body "Automated PR for issue ${FLEET_ISSUE_HUMAN_ID:-?}"'
+"#;
 
 /// `.fleet/workflows/hotfix.yaml` — minimal two-step flow for small
 /// fixes. Skips the planner pass.
@@ -366,8 +384,7 @@ response so the reviewer can audit it.
 ";
 
 /// Default reviewer persona prompt.
-const DEFAULT_PROMPT_REVIEWER: &str = "\
-You are the reviewer.
+const DEFAULT_PROMPT_REVIEWER: &str = r#"You are the reviewer.
 
 Inspect the diff against the workspace's main branch (or the working
 tree). Look for:
@@ -377,9 +394,26 @@ tree). Look for:
   - security issues (injection, secret handling, etc.)
   - mismatch with /artifacts/plan.md (if it exists)
 
-Produce `review.md` under /artifacts with a short verdict
-(approve / changes_requested) and the specifics. Be concise.
-";
+Produce two artifacts under /artifacts:
+
+  1. `review.md` — a short human-readable verdict and the specifics.
+  2. `review.outputs.json` — a flat JSON object that fleet reads to
+     steer the workflow. The standard workflow's `revise` /
+     `open_pr` fork keys off `decision`:
+
+         {"decision": "approve"}
+
+     or
+
+         {"decision": "changes_requested"}
+
+     `approve` triggers `gh pr create`; `changes_requested` triggers
+     the bounded revise loop. Any other value falls through both
+     branches — useful when you want neither side to fire (e.g. a
+     manual hold).
+
+Be concise.
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -498,6 +532,57 @@ mod tests {
             validate(&wf)
                 .unwrap_or_else(|e| panic!("default workflow `{name}` must validate: {e:#}"));
         }
+    }
+
+    #[test]
+    fn default_standard_workflow_wires_the_when_outputs_fork() {
+        // The shipped `standard.yaml` is the canonical worked example
+        // of `outputs:` + `when:` + `loop_back_to`. If a future edit
+        // drops any of those, the standard flow silently degrades
+        // back to "run every branch unconditionally". Catch it here.
+        use crate::workflow::spec::{NodeKind, Workflow};
+        let wf = Workflow::from_str_at(DEFAULT_WORKFLOW_STANDARD, "/standard.yaml").unwrap();
+
+        let review = wf.node("review").expect("review node");
+        assert_eq!(
+            review.outputs.get("decision").map(String::as_str),
+            Some("decision"),
+            "review must declare outputs: {{ decision: decision }}"
+        );
+
+        let revise = wf.node("revise").expect("revise node");
+        assert_eq!(
+            revise.when.as_deref(),
+            Some("review.decision == \"changes_requested\""),
+            "revise must gate on changes_requested"
+        );
+        assert_eq!(revise.loop_back_to.as_deref(), Some("review"));
+        assert_eq!(revise.max_loops, Some(2));
+
+        let open_pr = wf.node("open_pr").expect("open_pr node");
+        assert_eq!(
+            open_pr.when.as_deref(),
+            Some("review.decision == \"approve\""),
+            "open_pr must gate on approve"
+        );
+        assert!(matches!(open_pr.kind, NodeKind::Bash { .. }));
+    }
+
+    #[test]
+    fn default_reviewer_prompt_documents_the_outputs_contract() {
+        // The reviewer agent is the source of `review.outputs.json`.
+        // The shipped prompt must spell out that contract or the
+        // fork-via-when downstream of `review` becomes a guessing game.
+        assert!(
+            DEFAULT_PROMPT_REVIEWER.contains("review.outputs.json"),
+            "reviewer prompt must mention review.outputs.json"
+        );
+        assert!(
+            DEFAULT_PROMPT_REVIEWER.contains("decision")
+                && DEFAULT_PROMPT_REVIEWER.contains("approve")
+                && DEFAULT_PROMPT_REVIEWER.contains("changes_requested"),
+            "reviewer prompt must document the `decision` values"
+        );
     }
 
     #[test]

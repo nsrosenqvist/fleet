@@ -20,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::expr::{self, OutputMap};
 use super::spec::{Node, NodeKind, Workflow};
 use super::validate::validate;
 use crate::agent::AgentRegistry;
@@ -179,6 +180,10 @@ impl WorkflowExecutor {
         start_idx: usize,
     ) -> Result<()> {
         let mut loop_counts: HashMap<String, u32> = HashMap::new();
+        // Accumulated outputs from upstream nodes. Re-runs (via
+        // `loop_back_to`) overwrite their own entries, so downstream
+        // `when:` predicates see the freshest decision each pass.
+        let mut outputs: OutputMap = HashMap::new();
         let mut i = start_idx;
         while i < order.len() {
             let node_id = order[i].clone();
@@ -186,6 +191,31 @@ impl WorkflowExecutor {
                 .workflow
                 .node(&node_id)
                 .expect("topological_order only returns ids from the workflow's nodes");
+
+            // `when:` is evaluated *before* anything else — a when-false
+            // node leaves no state change, no log, no gate, no
+            // current_node bump. This is how the planner →
+            // implement → review → (revise | open_pr) fork in
+            // standard.yaml is steered: only one of the sibling
+            // branches actually runs each pass.
+            if let Some(expr_str) = node.when.as_deref() {
+                match expr::evaluate(expr_str, &outputs) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.write_skipped_log(req, session, &node_id, expr_str);
+                        i += 1;
+                        continue;
+                    }
+                    Err(err) => {
+                        let wrapped = err.context(format!(
+                            "evaluating `when:` for node `{node_id}`"
+                        ));
+                        self.mark_failed(req, session, &wrapped);
+                        return Err(wrapped);
+                    }
+                }
+            }
+
             session.set_current_node(Some(node_id.clone()), (self.clock)());
             req.store.save(session)?;
 
@@ -204,9 +234,42 @@ impl WorkflowExecutor {
                 self.mark_failed(req, session, &err);
                 return Err(err);
             }
+
+            // After a successful run, extract any declared `outputs:`
+            // from the node's `<node_id>.outputs.json` so downstream
+            // `when:` predicates can see them. Missing file or missing
+            // key when outputs are declared is a node failure.
+            let artifacts_dir = req.store.session_dir(&session.id).join("artifacts");
+            if let Err(err) = extract_outputs(&artifacts_dir, node, &mut outputs) {
+                self.mark_failed(req, session, &err);
+                return Err(err);
+            }
+
             i = resolve_loop_back(node, order, &mut loop_counts).map_or(i + 1, |t| t);
         }
         Ok(())
+    }
+
+    /// Drop a one-line log file explaining why a node was skipped. The
+    /// TUI / `fleet sessions logs` surfaces this so users don't have to
+    /// guess why a branch never ran.
+    fn write_skipped_log(
+        &self,
+        req: &ExecuteRequest<'_>,
+        session: &Session,
+        node_id: &str,
+        when_expr: &str,
+    ) {
+        let _ = self; // method form keeps the surface symmetric with run_*_node.
+        let log_path = req
+            .store
+            .session_dir(&session.id)
+            .join("logs")
+            .join(format!("{node_id}.log"));
+        let body = format!("--- skipped: when `{when_expr}` evaluated false ---\n");
+        if let Err(err) = std::fs::write(&log_path, body) {
+            tracing::warn!(?err, log = %log_path.display(), "writing skipped log failed");
+        }
     }
 
     /// Drive a gate-node visit: transition the session to `AwaitingGate`,
@@ -445,6 +508,78 @@ pub fn verify_inputs(artifacts_dir: &Path, node: &Node) -> Result<()> {
                 artifacts_dir.display()
             );
         }
+    }
+    Ok(())
+}
+
+/// Extract a node's declared `outputs:` from
+/// `<artifacts_dir>/<node_id>.outputs.json` and stash them into `acc`
+/// keyed by `(node_id, local_name)`. The file format is a flat JSON
+/// object whose keys are referenced by the RHS of each `outputs:`
+/// entry; scalar values (string / number / bool) are coerced to
+/// strings.
+///
+/// Contract:
+/// - `node.outputs` empty (the common case) → no-op.
+/// - File missing while outputs are declared → error pointing at the
+///   path so the agent author knows what to produce.
+/// - File present but a referenced key is missing → error naming the
+///   key + the local name.
+/// - Non-scalar value → error naming the offending key.
+///
+/// Re-runs (via `loop_back_to`) overwrite the prior entry under the
+/// same `(node_id, local_name)`, which is exactly what downstream
+/// `when:` predicates want — they see the latest pass's decision.
+pub fn extract_outputs(
+    artifacts_dir: &Path,
+    node: &Node,
+    acc: &mut OutputMap,
+) -> Result<()> {
+    if node.outputs.is_empty() {
+        return Ok(());
+    }
+    let path = artifacts_dir.join(format!("{}.outputs.json", node.id));
+    let body = std::fs::read_to_string(&path).map_err(|e| {
+        anyhow!(
+            "node `{}` declares outputs but cannot read `{}`: {e} \
+             (the agent is expected to write a top-level JSON object here)",
+            node.id,
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        anyhow!(
+            "node `{}`: parsing outputs JSON at {}: {e}",
+            node.id,
+            path.display()
+        )
+    })?;
+    let obj = value.as_object().ok_or_else(|| {
+        anyhow!(
+            "node `{}`: outputs JSON at {} must be a top-level object",
+            node.id,
+            path.display()
+        )
+    })?;
+    for (local_name, source_key) in &node.outputs {
+        let raw = obj.get(source_key.as_str()).ok_or_else(|| {
+            anyhow!(
+                "node `{}`: outputs JSON at {} is missing key `{source_key}` \
+                 (declared as local output `{local_name}`)",
+                node.id,
+                path.display()
+            )
+        })?;
+        let s = match raw {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            other => bail!(
+                "node `{}`: output key `{source_key}` must be a scalar (string/bool/number); got: {other}",
+                node.id
+            ),
+        };
+        acc.insert((node.id.clone(), local_name.clone()), s);
     }
     Ok(())
 }
@@ -1915,5 +2050,451 @@ nodes:
                 .join(format!("{n}.log"));
             assert!(log.is_file(), "missing log: {}", log.display());
         }
+    }
+
+    // === outputs extraction + `when:` predicate evaluation ===
+
+    /// Build a node with the same shape as [`agent_node`] but with an
+    /// `outputs:` map declared. The test driver writes the
+    /// corresponding JSON file into the artifacts dir.
+    fn agent_node_with_outputs(id: &str, outputs: &[(&str, &str)]) -> Node {
+        let mut node = agent_node(id, &[], &[]);
+        node.outputs = outputs
+            .iter()
+            .map(|(local, source)| ((*local).to_string(), (*source).to_string()))
+            .collect();
+        node
+    }
+
+    #[test]
+    fn extract_outputs_no_op_when_node_declares_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut acc: OutputMap = HashMap::new();
+        let node = agent_node("review", &[], &[]);
+        extract_outputs(tmp.path(), &node, &mut acc).unwrap();
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn extract_outputs_reads_flat_keys_into_acc() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("review.outputs.json"),
+            r#"{"decision":"approve","summary":"lgtm"}"#,
+        )
+        .unwrap();
+        let mut acc: OutputMap = HashMap::new();
+        let node = agent_node_with_outputs("review", &[("decision", "decision"), ("note", "summary")]);
+        extract_outputs(tmp.path(), &node, &mut acc).unwrap();
+        assert_eq!(
+            acc.get(&("review".to_string(), "decision".to_string())),
+            Some(&"approve".to_string())
+        );
+        assert_eq!(
+            acc.get(&("review".to_string(), "note".to_string())),
+            Some(&"lgtm".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_outputs_coerces_scalar_types_to_strings() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("n.outputs.json"),
+            r#"{"flag":true,"count":3}"#,
+        )
+        .unwrap();
+        let mut acc: OutputMap = HashMap::new();
+        let node = agent_node_with_outputs("n", &[("flag", "flag"), ("count", "count")]);
+        extract_outputs(tmp.path(), &node, &mut acc).unwrap();
+        assert_eq!(
+            acc.get(&("n".to_string(), "flag".to_string())),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            acc.get(&("n".to_string(), "count".to_string())),
+            Some(&"3".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_outputs_errors_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut acc: OutputMap = HashMap::new();
+        let node = agent_node_with_outputs("review", &[("decision", "decision")]);
+        let err = extract_outputs(tmp.path(), &node, &mut acc).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("declares outputs but cannot read"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("review.outputs.json"), "got: {msg}");
+    }
+
+    #[test]
+    fn extract_outputs_errors_when_referenced_key_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("review.outputs.json"),
+            r#"{"summary":"lgtm"}"#,
+        )
+        .unwrap();
+        let mut acc: OutputMap = HashMap::new();
+        let node = agent_node_with_outputs("review", &[("decision", "decision")]);
+        let err = extract_outputs(tmp.path(), &node, &mut acc).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing key `decision`"), "got: {msg}");
+    }
+
+    #[test]
+    fn extract_outputs_errors_when_top_level_is_not_an_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("n.outputs.json"), r#"["a","b"]"#).unwrap();
+        let mut acc: OutputMap = HashMap::new();
+        let node = agent_node_with_outputs("n", &[("x", "x")]);
+        let err = extract_outputs(tmp.path(), &node, &mut acc).unwrap_err();
+        assert!(format!("{err:#}").contains("top-level object"));
+    }
+
+    #[test]
+    fn extract_outputs_errors_when_value_is_non_scalar() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("n.outputs.json"),
+            r#"{"x":{"nested":"oops"}}"#,
+        )
+        .unwrap();
+        let mut acc: OutputMap = HashMap::new();
+        let node = agent_node_with_outputs("n", &[("x", "x")]);
+        let err = extract_outputs(tmp.path(), &node, &mut acc).unwrap_err();
+        assert!(format!("{err:#}").contains("must be a scalar"));
+    }
+
+    #[test]
+    fn when_false_skips_node_and_records_skip_log() {
+        // First a bash node writes a review.outputs.json (the simulated
+        // reviewer's verdict), then the executor reaches the
+        // `when:-approve` branch, which must run, and the
+        // `when:-changes_requested` branch, which must skip.
+        let yaml = "\
+name: fork
+nodes:
+  - id: review
+    type: bash
+    script: 'write outputs'
+    outputs: { decision: decision }
+  - id: open_pr
+    depends_on: [review]
+    when: 'review.decision == \"approve\"'
+    type: bash
+    script: 'echo open_pr'
+  - id: revise
+    depends_on: [review]
+    when: 'review.decision == \"changes_requested\"'
+    type: bash
+    script: 'echo revise'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let session_id = SessionId::new("s-fork-approve");
+        let af = store.session_dir(&session_id).join("artifacts");
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            // The review script side-effects the outputs file; later
+            // scripts are no-ops.
+            let s = args.last().cloned().unwrap_or_default();
+            if s.contains("write outputs") {
+                std::fs::write(af.join("review.outputs.json"), r#"{"decision":"approve"}"#)
+                    .unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: session_id.clone(),
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+
+        // open_pr ran (its log is the bash stdout, empty here).
+        let open_pr_log = store.session_dir(&session_id).join("logs/open_pr.log");
+        assert!(open_pr_log.is_file());
+        let open_pr_body = std::fs::read_to_string(&open_pr_log).unwrap();
+        assert!(
+            !open_pr_body.contains("--- skipped"),
+            "open_pr should have run; got log: {open_pr_body}"
+        );
+
+        // revise skipped — log present with skip marker.
+        let revise_log = store.session_dir(&session_id).join("logs/revise.log");
+        let revise_body = std::fs::read_to_string(&revise_log).unwrap();
+        assert!(
+            revise_body.contains("--- skipped:")
+                && revise_body.contains("review.decision"),
+            "expected skip marker, got: {revise_body}"
+        );
+    }
+
+    #[test]
+    fn when_true_runs_node_and_when_false_sibling_is_skipped_other_decision() {
+        // Symmetric to the approve case: decision=changes_requested →
+        // revise runs, open_pr skipped.
+        let yaml = "\
+name: fork
+nodes:
+  - id: review
+    type: bash
+    script: 'write outputs'
+    outputs: { decision: decision }
+  - id: open_pr
+    depends_on: [review]
+    when: 'review.decision == \"approve\"'
+    type: bash
+    script: 'echo open_pr'
+  - id: revise
+    depends_on: [review]
+    when: 'review.decision == \"changes_requested\"'
+    type: bash
+    script: 'echo revise'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let session_id = SessionId::new("s-fork-changes");
+        let af = store.session_dir(&session_id).join("artifacts");
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            if s.contains("write outputs") {
+                std::fs::write(
+                    af.join("review.outputs.json"),
+                    r#"{"decision":"changes_requested"}"#,
+                )
+                .unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: session_id.clone(),
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+
+        let open_pr_log = store.session_dir(&session_id).join("logs/open_pr.log");
+        let body = std::fs::read_to_string(&open_pr_log).unwrap();
+        assert!(body.contains("--- skipped:"), "got: {body}");
+
+        let revise_log = store.session_dir(&session_id).join("logs/revise.log");
+        let revise_body = std::fs::read_to_string(&revise_log).unwrap();
+        assert!(
+            !revise_body.contains("--- skipped"),
+            "revise should have run, got: {revise_body}"
+        );
+    }
+
+    #[test]
+    fn when_evaluation_error_fails_the_session_with_clear_pointer() {
+        // `review` declares no outputs, so the downstream `when:`
+        // reference is an unknown-output error. The whole session
+        // ends Failed with an actionable pointer.
+        let yaml = "\
+name: bad-fork
+nodes:
+  - id: review
+    type: bash
+    script: 'echo r'
+  - id: open_pr
+    depends_on: [review]
+    when: 'review.decision == \"approve\"'
+    type: bash
+    script: 'echo p'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-bad-fork"),
+            issue: None,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("evaluating `when:` for node `open_pr`"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("unknown output `review.decision`"),
+            "got: {msg}"
+        );
+        assert_eq!(
+            store.load(&SessionId::new("s-bad-fork")).unwrap().state,
+            SessionState::Failed
+        );
+    }
+
+    #[test]
+    fn when_skip_does_not_fire_loop_back_to() {
+        // A skipped node with `loop_back_to` must not loop — the skip
+        // is final. Otherwise a gated revise step would still re-enter
+        // its target despite being filtered out.
+        let yaml = "\
+name: skip-loop
+nodes:
+  - id: setup
+    type: bash
+    script: 'write outputs'
+    outputs: { decision: decision }
+  - id: revise
+    depends_on: [setup]
+    when: 'setup.decision == \"changes_requested\"'
+    type: bash
+    script: 'echo revise'
+    loop_back_to: setup
+    max_loops: 5
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let session_id = SessionId::new("s-skip-loop");
+        let af = store.session_dir(&session_id).join("artifacts");
+        let mut mock = MockProcessInvoker::new();
+        let setup_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let setup_calls2 = Arc::clone(&setup_calls);
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            if s.contains("write outputs") {
+                setup_calls2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::fs::write(af.join("setup.outputs.json"), r#"{"decision":"approve"}"#)
+                    .unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+        // setup ran exactly once — the would-be loop never fired
+        // because revise was filtered out by its `when:`.
+        assert_eq!(
+            setup_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "skipped revise must not loop back to setup"
+        );
+    }
+
+    #[test]
+    fn outputs_refresh_across_loop_back_iterations() {
+        // setup writes outputs, then a revise node loops back. On the
+        // second pass the outputs file changes; the third-pass `when:`
+        // sees the fresh decision and exits. Verifies the executor
+        // re-runs `extract_outputs` after each pass instead of caching
+        // the first one.
+        let yaml = "\
+name: refresh
+nodes:
+  - id: setup
+    type: bash
+    script: 'write outputs'
+    outputs: { decision: decision }
+  - id: revise
+    depends_on: [setup]
+    when: 'setup.decision == \"changes_requested\"'
+    type: bash
+    script: 'echo revise'
+    loop_back_to: setup
+    max_loops: 3
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let session_id = SessionId::new("s-refresh");
+        let af = store.session_dir(&session_id).join("artifacts");
+        // First two setup runs: changes_requested (drives a loop). Third
+        // run: approve. Fourth run shouldn't happen.
+        let setup_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let setup_calls2 = Arc::clone(&setup_calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            if s.contains("write outputs") {
+                let n = setup_calls2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let decision = if n < 2 { "changes_requested" } else { "approve" };
+                std::fs::write(
+                    af.join("setup.outputs.json"),
+                    format!(r#"{{"decision":"{decision}"}}"#),
+                )
+                .unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+        // setup ran 3 times: pass1 (changes_requested) → loop → pass2
+        // (changes_requested) → loop → pass3 (approve) → revise
+        // skipped → done.
+        assert_eq!(
+            setup_calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "expected three setup runs across two revision cycles"
+        );
     }
 }

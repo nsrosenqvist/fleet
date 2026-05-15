@@ -12,5 +12,6 @@
 //! pulling the adapter/session machinery in.
 
 pub mod executor;
+pub mod expr;
 pub mod spec;
 pub mod validate;
