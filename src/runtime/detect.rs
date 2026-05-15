@@ -22,17 +22,39 @@ pub enum BackendKind {
     /// The Rust `devcontainer` CLI (preferred). MS's Node `devcontainer` is
     /// the fallback, detected separately.
     DevcontainerCli,
+    /// `git-bug` host binary — needed when `tracker: git-bug` in the repo
+    /// config. fleet shells `git-bug bug --format json` directly; missing
+    /// binary surfaces as the first `fleet issues list` error today.
+    GitBug,
+    /// `tinyproxy` host binary — needed by `HostProxyEnforcer` on macOS
+    /// (Apple Container / Docker) when `network.policy: allowlist` is in
+    /// force. Not used by the Linux Podman path, which runs tinyproxy
+    /// inside a sidecar container.
+    Tinyproxy,
 }
 
 impl BackendKind {
     pub const fn program(self) -> &'static str {
-        use BackendKind::{AppleContainer, DevcontainerCli, Docker, GVisor, Podman};
+        use BackendKind::{
+            AppleContainer, DevcontainerCli, Docker, GVisor, GitBug, Podman, Tinyproxy,
+        };
         match self {
             Podman => "podman",
             Docker => "docker",
             AppleContainer => "container",
             GVisor => "runsc",
             DevcontainerCli => "devcontainer",
+            GitBug => "git-bug",
+            Tinyproxy => "tinyproxy",
+        }
+    }
+
+    /// Argv to invoke for the presence-probe. Most tools accept
+    /// `--version`; tinyproxy is the exception (uses `-v`).
+    pub const fn probe_arg(self) -> &'static str {
+        match self {
+            Self::Tinyproxy => "-v",
+            _ => "--version",
         }
     }
 }
@@ -69,6 +91,12 @@ pub struct ProbeReport {
     pub apple_container: BackendStatus,
     pub gvisor: BackendStatus,
     pub devcontainer_cli: BackendStatus,
+    /// `git-bug` binary (host-side, needed when `tracker: git-bug`).
+    pub git_bug: BackendStatus,
+    /// `tinyproxy` binary (host-side, needed when `HostProxyEnforcer`
+    /// is the chosen egress backend — macOS Apple Container / Docker
+    /// with `policy: allowlist`).
+    pub tinyproxy: BackendStatus,
     /// Recommended *engine* (not hardening or devcontainer CLI). `None`
     /// when nothing usable was found — `fleet doctor` surfaces install hints
     /// in that case.
@@ -83,6 +111,9 @@ impl ProbeReport {
 
     /// Install hints for missing tools, in priority order. Kept here (rather
     /// than in the TUI) so unit tests can assert on hint stability.
+    /// Hints for conditionally-needed tools (git-bug, tinyproxy) always
+    /// surface when absent — they're cheap to install if needed and
+    /// silent-on-config is worse than slightly noisy.
     pub fn install_hints(&self) -> Vec<&'static str> {
         let mut hints = Vec::new();
         if !self.podman.present && !self.docker.present && !self.apple_container.present {
@@ -98,6 +129,22 @@ impl ProbeReport {
                  (Rust) or `npm install -g @devcontainers/cli` (Node fallback).",
             );
         }
+        if !self.git_bug.present {
+            hints.push(
+                "git-bug missing — `brew install git-bug` (macOS) or \
+                 `cargo install git-bug` (anywhere). Only needed when \
+                 `tracker: git-bug` in `.fleet/config.yaml`.",
+            );
+        }
+        if !self.tinyproxy.present {
+            hints.push(
+                "tinyproxy missing — `brew install tinyproxy` (macOS) or \
+                 `apt install tinyproxy` (Debian/Ubuntu) / `dnf install tinyproxy` \
+                 (Fedora). Only needed on macOS Apple Container / Docker with \
+                 `runtime.network.policy: allowlist`; Linux Podman uses a sidecar \
+                 container instead.",
+            );
+        }
         hints
     }
 }
@@ -110,6 +157,8 @@ pub fn probe(invoker: &dyn ProcessInvoker) -> ProbeReport {
     let apple_container = probe_one(invoker, BackendKind::AppleContainer);
     let gvisor = probe_one(invoker, BackendKind::GVisor);
     let devcontainer_cli = probe_one(invoker, BackendKind::DevcontainerCli);
+    let git_bug = probe_one(invoker, BackendKind::GitBug);
+    let tinyproxy = probe_one(invoker, BackendKind::Tinyproxy);
 
     // Preference order: Apple Container (strongest isolation, native on
     // macOS 26+) > Podman (rootless + optional gVisor on Linux) > Docker
@@ -126,6 +175,8 @@ pub fn probe(invoker: &dyn ProcessInvoker) -> ProbeReport {
         apple_container,
         gvisor,
         devcontainer_cli,
+        git_bug,
+        tinyproxy,
         recommended,
     }
 }
@@ -133,7 +184,7 @@ pub fn probe(invoker: &dyn ProcessInvoker) -> ProbeReport {
 fn probe_one(invoker: &dyn ProcessInvoker, kind: BackendKind) -> BackendStatus {
     let program = kind.program();
     invoker
-        .run(program, vec!["--version".to_string()])
+        .run(program, vec![kind.probe_arg().to_string()])
         .map_or_else(
             |_| BackendStatus::missing(kind),
             |stdout| BackendStatus {
@@ -157,8 +208,10 @@ mod tests {
         let mut mock = MockProcessInvoker::new();
         for (prog, out) in present {
             let out_owned = (*out).to_string();
+            // Match on program name only; per-tool argv differs
+            // (`tinyproxy -v` vs `--version` for everything else).
             mock.expect_run()
-                .with(eq(*prog), eq(vec!["--version".to_string()]))
+                .with(eq(*prog), mockall::predicate::always())
                 .returning(move |_, _| Ok(out_owned.clone()));
         }
         // Everything else: error.
@@ -261,8 +314,45 @@ mod tests {
         let r = probe(&invoker_with(&[
             ("podman", "podman version 5.0.1"),
             ("devcontainer", "devcontainer 0.1.12"),
+            ("git-bug", "git-bug version: 0.10.0"),
+            ("tinyproxy", "tinyproxy 1.11.1"),
         ]));
         assert!(r.install_hints().is_empty());
+    }
+
+    #[test]
+    fn probe_picks_up_git_bug_and_tinyproxy_independently_of_engine() {
+        // The two host-tool probes are wholly independent of the engine
+        // selection: they appear in the report regardless of whether
+        // any container runtime is present.
+        let mock = invoker_with(&[
+            ("git-bug", "git-bug version: 0.10.0"),
+            ("tinyproxy", "tinyproxy 1.11.1"),
+        ]);
+        let r = probe(&mock);
+        assert!(r.git_bug.present);
+        assert_eq!(
+            r.git_bug.version.as_deref(),
+            Some("git-bug version: 0.10.0")
+        );
+        assert!(r.tinyproxy.present);
+        assert_eq!(r.tinyproxy.version.as_deref(), Some("tinyproxy 1.11.1"));
+        // No engine present → still recommended=None.
+        assert_eq!(r.recommended, None);
+    }
+
+    #[test]
+    fn install_hints_flag_missing_git_bug() {
+        let r = probe(&invoker_with(&[("podman", "podman version 5.0.1")]));
+        let hints = r.install_hints();
+        assert!(hints.iter().any(|h| h.contains("git-bug missing")));
+    }
+
+    #[test]
+    fn install_hints_flag_missing_tinyproxy() {
+        let r = probe(&invoker_with(&[("podman", "podman version 5.0.1")]));
+        let hints = r.install_hints();
+        assert!(hints.iter().any(|h| h.contains("tinyproxy missing")));
     }
 
     #[test]
@@ -272,5 +362,23 @@ mod tests {
         assert_eq!(BackendKind::AppleContainer.program(), "container");
         assert_eq!(BackendKind::GVisor.program(), "runsc");
         assert_eq!(BackendKind::DevcontainerCli.program(), "devcontainer");
+        assert_eq!(BackendKind::GitBug.program(), "git-bug");
+        assert_eq!(BackendKind::Tinyproxy.program(), "tinyproxy");
+    }
+
+    #[test]
+    fn backend_kind_probe_arg_is_dash_v_for_tinyproxy_otherwise_dash_dash_version() {
+        // tinyproxy is the lone exception — it predates --version.
+        assert_eq!(BackendKind::Tinyproxy.probe_arg(), "-v");
+        for kind in [
+            BackendKind::Podman,
+            BackendKind::Docker,
+            BackendKind::AppleContainer,
+            BackendKind::GVisor,
+            BackendKind::DevcontainerCli,
+            BackendKind::GitBug,
+        ] {
+            assert_eq!(kind.probe_arg(), "--version", "{kind:?}");
+        }
     }
 }

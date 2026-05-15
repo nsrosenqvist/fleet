@@ -257,6 +257,10 @@ pub fn render_doctor(report: &ProbeReport) -> String {
     out.push_str("\nDevcontainer CLI:\n");
     out.push_str(&render_backend("devcontainer", &report.devcontainer_cli));
 
+    out.push_str("\nTrackers + egress tools:\n");
+    out.push_str(&render_backend("git-bug", &report.git_bug));
+    out.push_str(&render_backend("tinyproxy", &report.tinyproxy));
+
     out.push_str("\nRecommended engine: ");
     match report.recommended {
         Some(BackendKind::Podman) => out.push_str("podman\n"),
@@ -326,6 +330,8 @@ mod tests {
             apple_container: present(BackendKind::AppleContainer, "container 0.1.0"),
             gvisor: present(BackendKind::GVisor, "runsc 20260301"),
             devcontainer_cli: present(BackendKind::DevcontainerCli, "devcontainer 0.1.12"),
+            git_bug: present(BackendKind::GitBug, "git-bug version: 0.10.0"),
+            tinyproxy: present(BackendKind::Tinyproxy, "tinyproxy 1.11.1"),
             recommended: Some(BackendKind::AppleContainer),
         }
     }
@@ -337,6 +343,8 @@ mod tests {
             apple_container: absent(BackendKind::AppleContainer),
             gvisor: absent(BackendKind::GVisor),
             devcontainer_cli: absent(BackendKind::DevcontainerCli),
+            git_bug: absent(BackendKind::GitBug),
+            tinyproxy: absent(BackendKind::Tinyproxy),
             recommended: None,
         }
     }
@@ -380,6 +388,16 @@ mod tests {
         assert!(rendered.contains("Next steps:"));
         assert!(rendered.contains("no container engine detected"));
         assert!(rendered.contains("devcontainer CLI missing"));
+        assert!(rendered.contains("git-bug missing"));
+        assert!(rendered.contains("tinyproxy missing"));
+    }
+
+    #[test]
+    fn renders_tracker_and_egress_tools_section() {
+        let rendered = render_doctor(&report_all_present());
+        assert!(rendered.contains("Trackers + egress tools:"));
+        assert!(rendered.contains("✓ git-bug — git-bug version: 0.10.0"));
+        assert!(rendered.contains("✓ tinyproxy — tinyproxy 1.11.1"));
     }
 
     #[test]

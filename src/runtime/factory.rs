@@ -219,6 +219,8 @@ mod tests {
             apple_container: absent(BackendKind::AppleContainer),
             gvisor: absent(BackendKind::GVisor),
             devcontainer_cli: absent(BackendKind::DevcontainerCli),
+            git_bug: absent(BackendKind::GitBug),
+            tinyproxy: absent(BackendKind::Tinyproxy),
             recommended: None,
         }
     }
