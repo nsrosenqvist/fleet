@@ -261,6 +261,7 @@ mod tests {
             artifacts: PathBuf::from("/repo/.fleet/sessions/s1/artifacts"),
             env: vec![],
             command: None,
+            network: None,
         }
     }
 

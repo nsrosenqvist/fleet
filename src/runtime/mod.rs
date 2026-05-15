@@ -102,6 +102,12 @@ pub struct ContainerSpec {
     pub env: Vec<(String, String)>,
     /// Override the image's default command. `None` = use the image entrypoint.
     pub command: Option<Vec<String>>,
+    /// Engine-level network to attach the container to. `None` lets the
+    /// engine use its default bridge; `Some(name)` pins the container
+    /// to that network — used by the egress enforcer to route the
+    /// workflow container through a sidecar proxy. Adapters without
+    /// network-pinning support (Local, today's Docker) ignore this.
+    pub network: Option<String>,
 }
 
 /// Per-exec overrides. Empty defaults mean "inherit from the container."

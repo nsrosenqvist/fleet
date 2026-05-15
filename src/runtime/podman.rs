@@ -101,7 +101,15 @@ impl RuntimeAdapter for PodmanAdapter {
     }
 
     fn start_container(&self, spec: &ContainerSpec) -> Result<ContainerId> {
-        let extra = self.extra_run_args();
+        // Egress enforcement: when the executor passes a network name,
+        // pin the workflow container to that network via podman's
+        // `--network=<name>`. Combined with the proxy sidecar attached
+        // to the same `--internal` network, this is what closes the
+        // outbound path — the container can only reach the proxy.
+        let mut extra = self.extra_run_args();
+        if let Some(network) = &spec.network {
+            extra.push(format!("--network={network}"));
+        }
         let req = UpRequest {
             workspace: &spec.workspace,
             config: None,
@@ -287,6 +295,7 @@ mod tests {
             artifacts: PathBuf::from("/repo/.fleet/sessions/s1/artifacts"),
             env: vec![],
             command: None,
+            network: None,
         }
     }
 
@@ -372,6 +381,63 @@ mod tests {
         let spec = sample_spec(ImageId::new(DevcontainerCli::mint_image_name(&dc)));
         let id = a.start_container(&spec).unwrap();
         assert_eq!(id.as_str(), "c-podman-1");
+    }
+
+    #[test]
+    fn start_container_appends_network_flag_when_spec_has_network() {
+        // Egress enforcement: when the executor passes spec.network,
+        // the Podman adapter must add `--network=<name>` to the
+        // devcontainer CLI's `--run-args` chain so the container
+        // joins that network (and only that network).
+        let dc = sample_dc();
+        let up_args_with_net = vec![
+            "up".to_string(),
+            "--workspace-folder".to_string(),
+            "/repo".to_string(),
+            "--remove-existing-container".to_string(),
+            "--docker-path".to_string(),
+            "podman".to_string(),
+            "--mount".to_string(),
+            "type=bind,source=/repo/.fleet/sessions/s1/artifacts,target=/artifacts".to_string(),
+            "--run-args".to_string(),
+            "--network=fleet-s-egress".to_string(),
+        ];
+        let stdout = r#"{"outcome":"success","containerId":"c-net-1"}"#.to_string();
+        let invoker = invoker_with(vec![("devcontainer", up_args_with_net, stdout)]);
+        let a = PodmanAdapter::new(invoker, false);
+        let mut spec = sample_spec(ImageId::new(DevcontainerCli::mint_image_name(&dc)));
+        spec.network = Some("fleet-s-egress".to_string());
+        let id = a.start_container(&spec).unwrap();
+        assert_eq!(id.as_str(), "c-net-1");
+    }
+
+    #[test]
+    fn start_container_combines_runsc_and_network_flags() {
+        // Both hardening and egress active: the run-args list grows
+        // to include both. Order matters for the matcher; runsc comes
+        // first because it's set up by the adapter's constructor.
+        let dc = sample_dc();
+        let up_args = vec![
+            "up".to_string(),
+            "--workspace-folder".to_string(),
+            "/repo".to_string(),
+            "--remove-existing-container".to_string(),
+            "--docker-path".to_string(),
+            "podman".to_string(),
+            "--mount".to_string(),
+            "type=bind,source=/repo/.fleet/sessions/s1/artifacts,target=/artifacts".to_string(),
+            "--run-args".to_string(),
+            "--runtime=runsc".to_string(),
+            "--run-args".to_string(),
+            "--network=fleet-s-x".to_string(),
+        ];
+        let stdout = r#"{"outcome":"success","containerId":"c-combo"}"#.to_string();
+        let invoker = invoker_with(vec![("devcontainer", up_args, stdout)]);
+        let a = PodmanAdapter::new(invoker, true);
+        let mut spec = sample_spec(ImageId::new(DevcontainerCli::mint_image_name(&dc)));
+        spec.network = Some("fleet-s-x".to_string());
+        let id = a.start_container(&spec).unwrap();
+        assert_eq!(id.as_str(), "c-combo");
     }
 
     #[test]

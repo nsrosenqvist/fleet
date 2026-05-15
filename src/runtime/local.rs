@@ -43,6 +43,11 @@ struct State {
 struct LocalContainer {
     workspace: PathBuf,
     state: ContainerState,
+    /// Env from the `ContainerSpec`; prepended to every `exec` call so
+    /// downstream code that respects `HTTP_PROXY` / `HTTPS_PROXY` sees
+    /// the same env it would inside a real container. Local doesn't
+    /// have a notion of "container env"; this is the closest analogue.
+    env: Vec<(String, String)>,
 }
 
 impl LocalAdapter {
@@ -116,6 +121,7 @@ impl RuntimeAdapter for LocalAdapter {
             LocalContainer {
                 workspace: spec.workspace.clone(),
                 state: ContainerState::Running,
+                env: spec.env.clone(),
             },
         );
         drop(guard);
@@ -131,11 +137,11 @@ impl RuntimeAdapter for LocalAdapter {
         if argv.is_empty() {
             bail!("exec argv must contain at least the program name");
         }
-        // Snapshot the workspace path under the lock, then release before
-        // running the (potentially long) subprocess.
-        let workspace = self.with_container(container, |c| {
+        // Snapshot the workspace path + env under the lock, then
+        // release before running the (potentially long) subprocess.
+        let (workspace, env) = self.with_container(container, |c| {
             if c.state == ContainerState::Running {
-                Ok(c.workspace.clone())
+                Ok((c.workspace.clone(), c.env.clone()))
             } else {
                 Err(anyhow!("container {container} is not running"))
             }
@@ -144,11 +150,27 @@ impl RuntimeAdapter for LocalAdapter {
         // `Local` has no notion of "inside the container" — the workspace
         // path is just the cwd we'd cd to before running. The current
         // `ProcessInvoker` trait doesn't expose a cwd parameter; for now
-        // we shell through `sh -c "cd <ws> && <argv...>"`. When the trait
-        // grows a structured runner, this collapses naturally.
+        // we shell through `sh -c "cd <ws> && KEY=VAL ... <argv...>"`,
+        // exporting any container-level env via the standard shell
+        // env-prefix syntax so callers that depend on HTTP_PROXY etc.
+        // see them. When the trait grows a structured runner, this
+        // collapses naturally.
         let program = &argv[0];
         let rest = argv[1..].join(" ");
-        let script = format!("cd {} && {} {}", shell_escape(&workspace), program, rest);
+        let env_prefix = if env.is_empty() {
+            String::new()
+        } else {
+            let mut parts: Vec<String> = env
+                .iter()
+                .map(|(k, v)| format!("{k}={}", shell_escape(std::path::Path::new(v))))
+                .collect();
+            parts.push(String::new());
+            parts.join(" ")
+        };
+        let script = format!(
+            "cd {} && {env_prefix}{program} {rest}",
+            shell_escape(&workspace)
+        );
 
         match self.invoker.run("sh", vec!["-c".to_string(), script]) {
             Ok(stdout) => Ok(ExecHandle {
@@ -251,6 +273,7 @@ mod tests {
             artifacts: PathBuf::from("/tmp/art"),
             env: vec![],
             command: None,
+            network: None,
         }
     }
 

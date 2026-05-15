@@ -70,6 +70,7 @@ pub fn run_up() -> Result<i32> {
         artifacts,
         env: Vec::new(),
         command: None,
+        network: None,
     };
     let id = ctx.adapter.start_container(&spec)?;
     eprintln!("fleet runtime up: started container in {}", ctx.repo_root.display());

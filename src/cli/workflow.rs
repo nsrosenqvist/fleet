@@ -13,6 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::egress::{self, EgressEnforcer};
 use crate::process::{ProcessInvoker, RealProcessInvoker};
 use crate::repo;
 use crate::repo_config::RepoConfig;
@@ -96,6 +97,7 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
         None => None,
     };
 
+    let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let executor = WorkflowExecutor::new(invoker);
     let req = ExecuteRequest {
         workflow: &wf,
@@ -106,6 +108,7 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
         workspace: &root,
         session_id: session_id.clone(),
         issue,
+        egress: enforcer.as_ref(),
     };
 
     println!("{session_id}");
@@ -161,6 +164,7 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
     let report = probe(invoker.as_ref());
     let adapter = build_adapter(&config.runtime, &report, Arc::clone(&invoker))?;
 
+    let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let executor = WorkflowExecutor::new(invoker);
     let req = ExecuteRequest {
         workflow: &wf,
@@ -174,6 +178,7 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         // `--issue` is lost across processes today. Workflows that
         // depend on `FLEET_ISSUE_*` post-resume should re-spawn instead.
         issue: None,
+        egress: enforcer.as_ref(),
     };
     println!("{session_id}");
     let resumed = executor.resume(&req)?;
@@ -234,6 +239,7 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
     let adapter = build_adapter(&config.runtime, &report, Arc::clone(&invoker))?;
 
     let new_id = ClockIdSource.mint();
+    let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let executor = WorkflowExecutor::new(invoker);
     let req = ExecuteRequest {
         workflow: &wf,
@@ -247,6 +253,7 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
         // run via `workflow run --issue` is the supported path when
         // `FLEET_ISSUE_*` matters.
         issue: None,
+        egress: enforcer.as_ref(),
     };
 
     println!("{new_id}");
@@ -268,6 +275,60 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
 /// Resolve the on-disk path for a workflow name.
 fn workflow_path(root: &Path, name: &str) -> PathBuf {
     root.join(".fleet/workflows").join(format!("{name}.yaml"))
+}
+
+/// Build the egress enforcer for a workflow run. Single helper used
+/// by execute / resume / replay so the wiring stays in lockstep.
+fn build_workflow_enforcer(
+    config: &RepoConfig,
+    adapter: &dyn crate::runtime::RuntimeAdapter,
+    invoker: Arc<dyn ProcessInvoker>,
+) -> Box<dyn EgressEnforcer> {
+    let defaults: Vec<String> = fleet_default_allowlist_hosts(config);
+    let defaults_refs: Vec<&str> = defaults.iter().map(String::as_str).collect();
+    egress::build_enforcer(&config.runtime.network, adapter.name(), invoker, &defaults_refs)
+}
+
+/// Derive the set of hosts fleet adds to the allowlist regardless of
+/// `extra_hosts`. Today's list:
+/// - the configured tracker's host (e.g. `api.github.com` for the
+///   GitHub tracker; nothing for git-bug which is local).
+/// - LLM-provider hosts implied by the agents' `env_passthrough`
+///   (`ANTHROPIC_API_KEY` → `api.anthropic.com`, `OPENAI_API_KEY`
+///   → `api.openai.com`).
+/// - registry hosts the proxy sidecar's own image needs to be
+///   pullable (`registry-1.docker.io`).
+///
+/// Best-effort: unknown env vars don't add anything, and the user
+/// remains free to drop a custom host into `extra_hosts`. Returned
+/// sorted+deduped so the resulting tinyproxy.conf is byte-stable.
+fn fleet_default_allowlist_hosts(config: &RepoConfig) -> Vec<String> {
+    let mut hosts: Vec<String> = vec![
+        // Registry the proxy sidecar's image lives on.
+        "registry-1.docker.io".to_string(),
+    ];
+    // Tracker host: GitHub → api.github.com. Other trackers
+    // (git-bug, future Linear/Jira) only get added when the host is
+    // known and stable.
+    if matches!(config.tracker, crate::repo_config::Tracker::Github) {
+        hosts.push("api.github.com".to_string());
+        hosts.push("github.com".to_string());
+    }
+    // LLM provider inference via env_passthrough. Cheap heuristic:
+    // most providers' SDKs read a single `<PROVIDER>_API_KEY` env.
+    for (_name, spec) in config.agents.registry.iter() {
+        for env in &spec.env_passthrough {
+            if env.contains("ANTHROPIC") {
+                hosts.push("api.anthropic.com".to_string());
+            }
+            if env.contains("OPENAI") {
+                hosts.push("api.openai.com".to_string());
+            }
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 /// Resolve an `--issue <id>` argument through the repo's configured

@@ -95,6 +95,13 @@ pub struct ExecuteRequest<'a> {
     /// `FLEET_ISSUE_ID` / `FLEET_ISSUE_HUMAN_ID` / `FLEET_ISSUE_TITLE`
     /// in both agent and bash node environments.
     pub issue: Option<IssueContext>,
+    /// Egress policy enforcer. The executor calls `setup` once per
+    /// `execute` / `resume` / `replay` invocation, threads the
+    /// returned `proxy_env` and `network_name` into every agent
+    /// node's container spec, and calls `teardown` on terminal
+    /// transitions. Callers that don't need enforcement pass a
+    /// [`crate::egress::NoopEnforcer`] reference.
+    pub egress: &'a dyn crate::egress::EgressEnforcer,
 }
 
 impl WorkflowExecutor {
@@ -147,8 +154,15 @@ impl WorkflowExecutor {
         session.set_driver_pid(std::process::id(), (self.clock)());
         req.store.save(&session)?;
 
-        self.run_loop(req, &mut session, &order, 0)?;
-        self.finalize(req, &mut session)?;
+        let egress_setup = req.egress.setup(req.session_id.as_str())?;
+        let run_outcome = (|| -> Result<()> {
+            self.run_loop(req, &mut session, &order, 0, &egress_setup)?;
+            self.finalize(req, &mut session)
+        })();
+        if let Err(err) = req.egress.teardown(&egress_setup) {
+            tracing::warn!(error = %err, "egress teardown after execute failed");
+        }
+        run_outcome?;
         Ok(session)
     }
 
@@ -192,8 +206,15 @@ impl WorkflowExecutor {
         session.transition_to(SessionState::Running, (self.clock)())?;
         session.set_driver_pid(std::process::id(), (self.clock)());
         req.store.save(&session)?;
-        self.run_loop(req, &mut session, &order, start)?;
-        self.finalize(req, &mut session)?;
+        let egress_setup = req.egress.setup(req.session_id.as_str())?;
+        let run_outcome = (|| -> Result<()> {
+            self.run_loop(req, &mut session, &order, start, &egress_setup)?;
+            self.finalize(req, &mut session)
+        })();
+        if let Err(err) = req.egress.teardown(&egress_setup) {
+            tracing::warn!(error = %err, "egress teardown after resume failed");
+        }
+        run_outcome?;
         Ok(session)
     }
 
@@ -280,8 +301,15 @@ impl WorkflowExecutor {
         session.set_driver_pid(std::process::id(), (self.clock)());
         req.store.save(&session)?;
 
-        self.run_loop(req, &mut session, &order, start)?;
-        self.finalize(req, &mut session)?;
+        let egress_setup = req.egress.setup(req.session_id.as_str())?;
+        let run_outcome = (|| -> Result<()> {
+            self.run_loop(req, &mut session, &order, start, &egress_setup)?;
+            self.finalize(req, &mut session)
+        })();
+        if let Err(err) = req.egress.teardown(&egress_setup) {
+            tracing::warn!(error = %err, "egress teardown after replay failed");
+        }
+        run_outcome?;
         Ok(session)
     }
 
@@ -297,6 +325,7 @@ impl WorkflowExecutor {
         session: &mut Session,
         order: &[String],
         start_idx: usize,
+        egress: &crate::egress::EgressSetup,
     ) -> Result<()> {
         // `loop_counts` and `outputs` both live on the session so a
         // resume after a gate (or a replay carrying upstream context)
@@ -355,9 +384,9 @@ impl WorkflowExecutor {
             // parallel; everything else falls through to the regular
             // single-node path.
             let run_result = if let NodeKind::Fanout { siblings } = &node.kind {
-                self.run_fanout_node(req, node, siblings, session, &outputs)
+                self.run_fanout_node(req, node, siblings, session, &outputs, egress)
             } else {
-                self.run_node(req, node, session, &outputs)
+                self.run_node(req, node, session, &outputs, egress)
             };
             let outcome = match run_result {
                 Ok(o) => o,
@@ -495,6 +524,7 @@ impl WorkflowExecutor {
         node: &Node,
         session: &Session,
         outputs: &OutputMap,
+        egress: &crate::egress::EgressSetup,
     ) -> Result<NodeOutcome> {
         // Input artifact contract: declared `artifacts.in:` must exist
         // before the node runs. Detected here so a downstream node that
@@ -505,7 +535,9 @@ impl WorkflowExecutor {
         verify_inputs(&artifacts_dir, node)?;
 
         let outcome = match &node.kind {
-            NodeKind::Agent { agent, .. } => self.run_agent_node(req, node, agent, session)?,
+            NodeKind::Agent { agent, .. } => {
+                self.run_agent_node(req, node, agent, session, egress)?
+            }
             NodeKind::Bash { script } => {
                 self.run_bash_node(req, node, script, session)?;
                 NodeOutcome::empty()
@@ -536,6 +568,7 @@ impl WorkflowExecutor {
         node: &Node,
         agent_name: &str,
         session: &Session,
+        egress: &crate::egress::EgressSetup,
     ) -> Result<NodeOutcome> {
         let agent = req.agents.get(agent_name).ok_or_else(|| {
             anyhow!(
@@ -566,7 +599,16 @@ impl WorkflowExecutor {
             // at session creation.
             issue: session.issue.as_ref(),
         };
-        let env = build_agent_env(agent, &agent_ctx);
+        let mut env = build_agent_env(agent, &agent_ctx);
+        // Egress enforcement: append the proxy env so every HTTP/HTTPS
+        // client the agent uses respects HTTP_PROXY / HTTPS_PROXY.
+        // Order matters — putting these after the agent's own env
+        // means a workflow-specific override (e.g. `env_passthrough:
+        // [HTTP_PROXY]` from the user's shell) is honoured first, and
+        // fleet's proxy fills in any remaining slot.
+        for (k, v) in &egress.proxy_env {
+            env.push((k.clone(), v.clone()));
+        }
 
         let image = req
             .adapter
@@ -579,6 +621,7 @@ impl WorkflowExecutor {
             artifacts: artifacts_dir,
             env,
             command: None,
+            network: egress.network_name.clone(),
         };
         let container_id = req
             .adapter
@@ -768,6 +811,7 @@ impl WorkflowExecutor {
         siblings: &[String],
         session: &Session,
         outputs: &OutputMap,
+        egress: &crate::egress::EgressSetup,
     ) -> Result<NodeOutcome> {
         let sibling_nodes: Vec<&Node> = siblings
             .iter()
@@ -803,7 +847,7 @@ impl WorkflowExecutor {
             #[allow(clippy::needless_collect)]
             let handles: Vec<_> = sibling_nodes
                 .iter()
-                .map(|sib| scope.spawn(|| self.run_node(req, sib, session, outputs)))
+                .map(|sib| scope.spawn(|| self.run_node(req, sib, session, outputs, egress)))
                 .collect();
             handles
                 .into_iter()
@@ -1535,6 +1579,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -1565,6 +1610,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-missin"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -1601,6 +1647,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-liar"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -1836,6 +1883,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-iss"),
             issue: Some(sample_issue()),
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -1864,6 +1912,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-trivial"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -1871,6 +1920,155 @@ nodes:
         // Log was captured.
         let log = store.session_dir(&session.id).join("logs").join("only.log");
         assert!(log.is_file(), "expected log at {}", log.display());
+    }
+
+    /// Stub enforcer that hands back a fixed setup so we can verify
+    /// the executor wires `proxy_env` + `network_name` through to the
+    /// container start.
+    struct StubEnforcer {
+        env: Vec<(String, String)>,
+        network: Option<String>,
+        setup_calls: std::sync::Mutex<u32>,
+        teardown_calls: std::sync::Mutex<u32>,
+    }
+
+    impl StubEnforcer {
+        fn new(env: Vec<(String, String)>, network: Option<String>) -> Self {
+            Self {
+                env,
+                network,
+                setup_calls: std::sync::Mutex::new(0),
+                teardown_calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    impl crate::egress::EgressEnforcer for StubEnforcer {
+        fn setup(&self, _session_id: &str) -> Result<crate::egress::EgressSetup> {
+            *self.setup_calls.lock().unwrap() += 1;
+            Ok(crate::egress::EgressSetup {
+                proxy_env: self.env.clone(),
+                network_name: self.network.clone(),
+                proxy_container: None,
+            })
+        }
+        fn teardown(&self, _setup: &crate::egress::EgressSetup) -> Result<()> {
+            *self.teardown_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn agent_container_receives_egress_env_from_enforcer() {
+        // The enforcer hands the executor an HTTP_PROXY pair; the
+        // local adapter's exec invocation must see those env vars in
+        // the agent process's environment. The LocalAdapter writes
+        // env into its captured ExecHandle via the invoker's argv
+        // sequencing — easier: assert against the captured calls
+        // surface on the invoker.
+        let yaml = "\
+name: with-proxy
+nodes:
+  - id: only
+    agent: claude-code
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        // Snoop on the env args the local adapter hands to the
+        // invoker. The local adapter's `start_container` + `exec`
+        // both fall through to ProcessInvoker.run; capturing them
+        // lets us see what env was actually set on the child.
+        let envs_seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let envs_for_mock = Arc::clone(&envs_seen);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            envs_for_mock.lock().unwrap().push(args);
+            Ok(String::new())
+        });
+        let adapter = crate::runtime::local::LocalAdapter::new(Arc::new(mock));
+
+        let executor = executor_returning("");
+        let enforcer = StubEnforcer::new(
+            vec![
+                ("HTTP_PROXY".to_string(), "http://fleet-proxy:8888".to_string()),
+                ("HTTPS_PROXY".to_string(), "http://fleet-proxy:8888".to_string()),
+            ],
+            Some("fleet-net".to_string()),
+        );
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-egress-env"),
+            issue: None,
+            egress: &enforcer,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+        assert_eq!(*enforcer.setup_calls.lock().unwrap(), 1);
+        assert_eq!(*enforcer.teardown_calls.lock().unwrap(), 1);
+        // At least one invoker call sees the proxy env (via env= on
+        // the LocalAdapter's child invocation; the local adapter
+        // funnels env in argv as KEY=VALUE prefix calls).
+        let calls = envs_seen.lock().unwrap().clone();
+        let flat: String = calls
+            .iter()
+            .flat_map(|argv| argv.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Local adapter shell-quotes env values; match on a fuzzy
+        // pattern so test isn't coupled to the exact escape style.
+        assert!(
+            flat.contains("HTTP_PROXY=") && flat.contains("fleet-proxy:8888"),
+            "HTTP_PROXY not propagated; calls:\n{flat}"
+        );
+        assert!(
+            flat.contains("HTTPS_PROXY="),
+            "HTTPS_PROXY not propagated; calls:\n{flat}"
+        );
+    }
+
+    #[test]
+    fn executor_calls_enforcer_setup_and_teardown_around_run() {
+        // Even when the enforcer is a no-op variant, the executor
+        // must call setup before run and teardown after. Without
+        // this guarantee, a real enforcer would never see the
+        // session boundary it needs to allocate/reclaim resources.
+        let yaml = "\
+name: trivial
+nodes:
+  - id: only
+    type: bash
+    script: 'echo only'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let enforcer = StubEnforcer::new(vec![], None);
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-lifecycle"),
+            issue: None,
+            egress: &enforcer,
+        };
+        executor.execute(&req).unwrap();
+        assert_eq!(*enforcer.setup_calls.lock().unwrap(), 1);
+        assert_eq!(*enforcer.teardown_calls.lock().unwrap(), 1);
     }
 
     #[test]
@@ -1899,6 +2097,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-cost"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -1935,6 +2134,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-clean-marker"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         let active = crate::session::containers::list_active(
@@ -1973,6 +2173,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-noparse"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -2007,6 +2208,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fail"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -2039,6 +2241,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-ghost"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("unknown agent `ghost`"));
@@ -2082,6 +2285,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bash"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -2117,6 +2321,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bashfail"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("bash node `bad` failed"));
@@ -2158,6 +2363,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::AwaitingGate);
@@ -2216,6 +2422,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let final_session = executor.execute(&req).unwrap();
 
@@ -2262,6 +2469,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate-pid"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::AwaitingGate);
@@ -2295,6 +2503,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fail-pid"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let _ = executor.execute(&req).unwrap_err();
         let loaded = store.load(&SessionId::new("s-fail-pid")).unwrap();
@@ -2334,6 +2543,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-resume"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         // First execute pauses at the gate.
         let paused = executor.execute(&req).unwrap();
@@ -2373,6 +2583,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-done"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         // First run completes (no gate).
         let done = executor.execute(&req).unwrap();
@@ -2409,6 +2620,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-ghost"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.resume(&req).unwrap_err();
         assert!(
@@ -2489,6 +2701,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
 
         let replayed = executor.replay(&req, &src_id, "review").unwrap();
@@ -2543,6 +2756,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-bad"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
 
         let err = executor.replay(&req, &src_id, "nope").unwrap_err();
@@ -2580,6 +2794,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-no-src"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor
             .replay(&req, &SessionId::new("s-does-not-exist"), "only")
@@ -2644,6 +2859,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-top"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
 
         let replayed = executor.replay(&req, &src_id, "a").unwrap();
@@ -2691,6 +2907,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-empty"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let replayed = executor.replay(&req, &src_id, "only").unwrap();
         assert_eq!(replayed.state, SessionState::Completed);
@@ -2757,6 +2974,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate-outputs"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
 
         // The `decide` bash node "produces" its declared outputs as a
@@ -2851,6 +3069,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-with-outputs"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let replayed = executor.replay(&req, &src_id, "act").unwrap();
         assert_eq!(replayed.state, SessionState::Completed);
@@ -2968,6 +3187,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fanout-fail"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -3045,6 +3265,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3089,6 +3310,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fan-gate"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(
@@ -3130,6 +3352,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new(session_id),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         (session, script_log)
@@ -3433,6 +3656,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-dia"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3620,6 +3844,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3696,6 +3921,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3744,6 +3970,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bad-fork"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -3811,6 +4038,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3881,6 +4109,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3939,6 +4168,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3992,6 +4222,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -4041,6 +4272,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-assert-unknown"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -4147,6 +4379,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-loop-resume"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let paused = executor.execute(&req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -4217,6 +4450,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-issue-resume"),
             issue: Some(sample_issue()),
+            egress: &crate::egress::NoopEnforcer,
         };
         let paused = executor.execute(&exec_req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -4238,6 +4472,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-issue-resume"),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let resumed = executor.resume(&resume_req).unwrap();
         assert_eq!(resumed.state, SessionState::Completed);
@@ -4293,6 +4528,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-override"),
             issue: Some(original.clone()),
+            egress: &crate::egress::NoopEnforcer,
         };
         executor.execute(&exec_req).unwrap();
 
@@ -4311,6 +4547,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-override"),
             issue: Some(replacement.clone()),
+            egress: &crate::egress::NoopEnforcer,
         };
         let resumed = executor.resume(&resume_req).unwrap();
         assert_eq!(resumed.issue, Some(replacement));
@@ -4365,6 +4602,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
         // when:-false skipped the assert; workflow Completes despite
