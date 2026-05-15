@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 
 use crate::repo;
+use crate::runtime::factory::build_stopper;
 use crate::session::reaper::{self, RealPidProbe, ReapReport};
 use crate::session::store::SessionStore;
 use crate::session::{Session, SessionId, SessionState, now_ms};
@@ -106,7 +107,9 @@ pub fn run_logs(id: &str, node: Option<&str>) -> Result<i32> {
 pub fn run_reap() -> Result<i32> {
     let store = open_store()?;
     let probe = RealPidProbe;
-    let report = reaper::reap(&store, &probe, now_ms())
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let stopper = build_stopper(&repo::fleet_root(&cwd));
+    let report = reaper::reap(&store, &probe, stopper.as_ref(), now_ms())
         .with_context(|| format!("reaping sessions under {}", store.root().display()))?;
     print!("{}", render_reap_report(&report));
     Ok(0)
@@ -126,6 +129,22 @@ pub fn render_reap_report(report: &ReapReport) -> String {
     );
     for r in &report.reaped {
         let _ = writeln!(out, "  - {} -> crashed ({})", r.id, r.reason.summary());
+        if !r.stopped_containers.is_empty() {
+            let _ = writeln!(
+                out,
+                "      stopped {} leaked container(s): {}",
+                r.stopped_containers.len(),
+                r.stopped_containers.join(", "),
+            );
+        }
+        if !r.failed_container_stops.is_empty() {
+            let _ = writeln!(
+                out,
+                "      failed to stop {} leaked container(s); reclaim manually: {}",
+                r.failed_container_stops.len(),
+                r.failed_container_stops.join(", "),
+            );
+        }
     }
     out
 }
@@ -578,15 +597,37 @@ mod tests {
                 ReapedSession {
                     id: SessionId::new("s-a"),
                     reason: ReapReason::NoDriverPid,
+                    stopped_containers: vec![],
+                    failed_container_stops: vec![],
                 },
                 ReapedSession {
                     id: SessionId::new("s-b"),
                     reason: ReapReason::DeadDriver { pid: 1234 },
+                    stopped_containers: vec![],
+                    failed_container_stops: vec![],
                 },
             ],
         });
         assert!(r.contains("scanned 4 session(s); reaped 2"));
         assert!(r.contains("- s-a -> crashed (no driver_pid recorded)"));
         assert!(r.contains("- s-b -> crashed (driver pid 1234 is dead)"));
+    }
+
+    #[test]
+    fn render_reap_report_surfaces_stopped_and_failed_containers() {
+        use crate::session::reaper::{ReapReason, ReapedSession};
+        let r = render_reap_report(&ReapReport {
+            scanned: 1,
+            reaped: vec![ReapedSession {
+                id: SessionId::new("s-c"),
+                reason: ReapReason::DeadDriver { pid: 99_999 },
+                stopped_containers: vec!["c-aaa".to_string(), "c-bbb".to_string()],
+                failed_container_stops: vec!["c-ccc".to_string()],
+            }],
+        });
+        assert!(r.contains("stopped 2 leaked container(s): c-aaa, c-bbb"));
+        assert!(r.contains(
+            "failed to stop 1 leaked container(s); reclaim manually: c-ccc"
+        ));
     }
 }

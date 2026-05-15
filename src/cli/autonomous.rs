@@ -56,7 +56,7 @@ pub fn run(once: bool, watch: bool) -> Result<i32> {
 /// `Result` would be misleading. The `run` wrapper converts to the
 /// dispatch's `Result<i32>` shape.
 fn run_once(setup: &Setup) -> i32 {
-    sweep_crashed(&setup.store);
+    sweep_crashed(setup);
     let mut engine = AutonomousEngine::new();
     engine.toggle();
     let sessions = load_sessions(&setup.store);
@@ -79,7 +79,7 @@ fn run_once(setup: &Setup) -> i32 {
 /// transient outage. The only way out is `Ctrl-C` / `SIGTERM` to the
 /// fleet process itself.
 fn run_watch(setup: &Setup) -> Result<i32> {
-    sweep_crashed(&setup.store);
+    sweep_crashed(setup);
     let mut engine = AutonomousEngine::new();
     engine.toggle();
     let spawner = RealSpawner { binary: std::env::current_exe().ok() };
@@ -199,9 +199,13 @@ fn tick(
 /// Side-effecting helper: walk the session store and reap any stuck
 /// session whose driver process is gone. Failures are logged but
 /// non-fatal — a missing `.fleet/sessions/` directory shouldn't keep
-/// the supervisor from starting.
-fn sweep_crashed(store: &SessionStore) {
-    if let Err(err) = reaper::reap(store, &RealPidProbe, now_ms()) {
+/// the supervisor from starting. Leaked containers from prior crashes
+/// are stopped here too via the repo's configured runtime adapter; if
+/// the adapter can't be built (misconfigured engine), the stopper
+/// falls back to a noop and the markers are merely cleared.
+fn sweep_crashed(setup: &Setup) {
+    let stopper = crate::runtime::factory::build_stopper(&setup.repo_root);
+    if let Err(err) = reaper::reap(&setup.store, &RealPidProbe, stopper.as_ref(), now_ms()) {
         tracing::warn!(error = %err, "autonomous: reap sweep at startup failed");
     }
 }

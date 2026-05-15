@@ -60,7 +60,7 @@ use crate::repo;
 use crate::repo_config::RepoConfig;
 use crate::runtime::Capabilities;
 use crate::runtime::detect::probe;
-use crate::runtime::factory::build_adapter;
+use crate::runtime::factory::{build_adapter, build_stopper};
 use crate::session::reaper::{self, RealPidProbe, ReapReport};
 use crate::session::store::SessionStore;
 use crate::session::{Session, SessionState, now_ms};
@@ -81,7 +81,8 @@ pub fn run() -> Result<i32> {
     // session whose driver died left meta.json stuck in `running`, and
     // the TUI must show its correct (crashed) state from the first
     // frame. Errors here are logged but non-fatal — the TUI still opens.
-    let reap_report = match reaper::reap(&store, &RealPidProbe, now_ms()) {
+    let stopper = build_stopper(&root);
+    let reap_report = match reaper::reap(&store, &RealPidProbe, stopper.as_ref(), now_ms()) {
         Ok(r) => Some(r),
         Err(err) => {
             tracing::warn!(error = %err, "reaper sweep failed at TUI startup");
