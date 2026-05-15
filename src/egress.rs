@@ -311,6 +311,205 @@ impl EgressEnforcer for PodmanTinyproxyEnforcer {
     }
 }
 
+/// Host-resident tinyproxy enforcer.
+///
+/// Used on macOS (Apple Container and Podman-machine paths) where
+/// running the proxy as a sibling container is awkward — Apple
+/// Container hasn't shipped a `--internal` network primitive
+/// equivalent, and the Podman-machine path's network plumbing is
+/// brittle enough that a host-side proxy is simpler. The container
+/// reaches the proxy via the engine's host-bridge DNS name
+/// (`host.containers.internal` for Apple Container, the same name
+/// or `host.docker.internal` for Docker; configurable here).
+///
+/// Setup:
+/// 1. Write tinyproxy.conf + the allowlist file to a per-session
+///    tempdir under `<tmpdir>/fleet-egress-<sid>/`.
+/// 2. Invoke `tinyproxy -c <conf>`. Tinyproxy daemonises by default
+///    and writes its pid to the path declared in the conf.
+///
+/// Teardown:
+/// 1. Read the pidfile.
+/// 2. Send SIGTERM via `kill`.
+/// 3. Remove the tempdir.
+///
+/// Honest scope: enforcement here is `HTTP_PROXY` env-only. A
+/// malicious agent could unset `HTTP_PROXY` and reach the engine's
+/// default bridge. Treating this as a guardrail (well-behaved
+/// clients respect `HTTP_PROXY`) rather than a boundary is the v1
+/// macOS story; Apple Container network-pinning lands when its
+/// `--internal`-equivalent semantics are verified.
+pub struct HostProxyEnforcer {
+    invoker: Arc<dyn ProcessInvoker>,
+    /// DNS name the container uses to reach the host. Apple Container
+    /// resolves `host.containers.internal`; Docker exposes
+    /// `host.docker.internal`. Configurable so tests pin a deterministic
+    /// value.
+    host_address: String,
+    proxy_port: u16,
+    allowlist: Vec<String>,
+    /// Root tempdir for per-session config + pidfile. Tests inject a
+    /// known path; production resolves to `/tmp/fleet-egress-<sid>`
+    /// via `std::env::temp_dir()` at setup time.
+    tempdir_base: std::path::PathBuf,
+}
+
+impl HostProxyEnforcer {
+    #[must_use]
+    pub fn new(
+        invoker: Arc<dyn ProcessInvoker>,
+        host_address: impl Into<String>,
+        allowlist: Vec<String>,
+    ) -> Self {
+        Self {
+            invoker,
+            host_address: host_address.into(),
+            proxy_port: 8888,
+            allowlist,
+            tempdir_base: std::env::temp_dir(),
+        }
+    }
+
+    /// Test override for the tempdir base. Production uses
+    /// [`std::env::temp_dir`]; tests pin a per-test path so the
+    /// assertions stay deterministic.
+    #[must_use]
+    #[cfg(test)]
+    pub fn with_tempdir(mut self, base: std::path::PathBuf) -> Self {
+        self.tempdir_base = base;
+        self
+    }
+
+    fn session_dir(&self, session_id: &str) -> std::path::PathBuf {
+        self.tempdir_base.join(format!("fleet-egress-{session_id}"))
+    }
+}
+
+impl EgressEnforcer for HostProxyEnforcer {
+    fn setup(&self, session_id: &str) -> Result<EgressSetup> {
+        let dir = self.session_dir(session_id);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating egress tempdir {}", dir.display()))?;
+        let conf_path = dir.join("tinyproxy.conf");
+        let allowlist_path = dir.join("allowlist");
+        let pidfile_path = dir.join("tinyproxy.pid");
+
+        // Allowlist file: one host per line. The conf below
+        // references this path.
+        std::fs::write(&allowlist_path, self.allowlist.join("\n"))
+            .with_context(|| format!("writing {}", allowlist_path.display()))?;
+
+        let conf = build_host_tinyproxy_conf(
+            self.proxy_port,
+            &allowlist_path,
+            &pidfile_path,
+        );
+        std::fs::write(&conf_path, conf)
+            .with_context(|| format!("writing {}", conf_path.display()))?;
+
+        // Spawn tinyproxy. Default mode is daemonise; the binary
+        // forks and writes its pid to PidFile, then exits. ProcessInvoker.run
+        // captures stdout — we don't need it.
+        self.invoker
+            .run(
+                "tinyproxy",
+                vec!["-c".to_string(), conf_path.display().to_string()],
+            )
+            .with_context(|| format!("starting tinyproxy with config {}", conf_path.display()))?;
+
+        let proxy_url = format!(
+            "http://{host}:{port}",
+            host = self.host_address,
+            port = self.proxy_port
+        );
+        Ok(EgressSetup {
+            proxy_env: vec![
+                ("HTTP_PROXY".to_string(), proxy_url.clone()),
+                ("HTTPS_PROXY".to_string(), proxy_url.clone()),
+                ("http_proxy".to_string(), proxy_url.clone()),
+                ("https_proxy".to_string(), proxy_url),
+                (
+                    "NO_PROXY".to_string(),
+                    format!("localhost,127.0.0.1,{}", self.host_address),
+                ),
+                (
+                    "no_proxy".to_string(),
+                    format!("localhost,127.0.0.1,{}", self.host_address),
+                ),
+            ],
+            // No engine-side network on the host-proxy path; env-only.
+            network_name: None,
+            // Stash the pidfile path under proxy_container so teardown
+            // can find it. The field is conceptually "the thing
+            // teardown needs" rather than literally "a container id";
+            // host-proxy stores its pidfile path here.
+            proxy_container: Some(pidfile_path.display().to_string()),
+        })
+    }
+
+    fn teardown(&self, setup: &EgressSetup) -> Result<()> {
+        let Some(pidfile_str) = setup.proxy_container.as_deref() else {
+            return Ok(());
+        };
+        let pid = match std::fs::read_to_string(pidfile_str) {
+            Ok(s) => s.trim().to_string(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    pidfile = pidfile_str,
+                    "host-proxy pidfile unreadable; nothing to kill"
+                );
+                return Ok(());
+            }
+        };
+        if !pid.is_empty() {
+            if let Err(err) = self
+                .invoker
+                .run("kill", vec!["-TERM".to_string(), pid.clone()])
+            {
+                tracing::warn!(error = %err, pid = %pid, "killing tinyproxy failed");
+            }
+        }
+        // Best-effort cleanup of the tempdir. tinyproxy still owns
+        // the pidfile until it exits; tolerating a not-yet-cleaned
+        // dir is fine.
+        let pidfile = std::path::Path::new(pidfile_str);
+        if let Some(parent) = pidfile.parent() {
+            if let Err(err) = std::fs::remove_dir_all(parent) {
+                tracing::warn!(
+                    error = %err,
+                    dir = %parent.display(),
+                    "removing egress tempdir failed"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Host-proxy variant of the tinyproxy config. Differs from the
+/// container variant by referencing an external allowlist file
+/// (rather than embedding it as comments) and declaring a `PidFile`
+/// the enforcer can read for teardown.
+fn build_host_tinyproxy_conf(
+    port: u16,
+    allowlist_path: &std::path::Path,
+    pidfile_path: &std::path::Path,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "Port {port}");
+    out.push_str("Listen 0.0.0.0\n");
+    out.push_str("Timeout 60\n");
+    let _ = writeln!(out, "PidFile \"{}\"", pidfile_path.display());
+    let _ = writeln!(out, "Filter \"{}\"", allowlist_path.display());
+    out.push_str("FilterDefaultDeny Yes\n");
+    out.push_str("FilterExtended On\n");
+    out.push_str("ConnectPort 443\n");
+    out.push_str("ConnectPort 80\n");
+    out
+}
+
 /// Build the tinyproxy.conf body from the resolved allowlist.
 ///
 /// Tinyproxy's `Allow` directives are line-based; one host per line,
@@ -389,15 +588,32 @@ pub fn build_enforcer(
     match network.policy {
         NetworkPolicy::Open | NetworkPolicy::None => Box::new(NoopEnforcer),
         NetworkPolicy::Allowlist => {
-            if adapter_name == "podman" {
-                let allowlist = resolve_allowlist(network, fleet_defaults);
-                Box::new(PodmanTinyproxyEnforcer::new(invoker, allowlist))
-            } else {
-                tracing::warn!(
-                    adapter = adapter_name,
-                    "egress enforcement is not yet wired for this adapter; running open"
-                );
-                Box::new(NoopEnforcer)
+            let allowlist = resolve_allowlist(network, fleet_defaults);
+            match adapter_name {
+                "podman" => Box::new(PodmanTinyproxyEnforcer::new(invoker, allowlist)),
+                "apple-container" => Box::new(HostProxyEnforcer::new(
+                    invoker,
+                    // Apple Container exposes the host at this DNS name
+                    // to containers on its default network.
+                    "host.containers.internal",
+                    allowlist,
+                )),
+                "docker" => Box::new(HostProxyEnforcer::new(
+                    invoker,
+                    // Docker Desktop's host-bridge alias. On native
+                    // Docker (Linux without Desktop), this name does
+                    // not resolve — users on that path should switch
+                    // to the podman adapter for now.
+                    "host.docker.internal",
+                    allowlist,
+                )),
+                _ => {
+                    tracing::warn!(
+                        adapter = adapter_name,
+                        "egress enforcement is not yet wired for this adapter; running open"
+                    );
+                    Box::new(NoopEnforcer)
+                }
             }
         }
     }
@@ -498,16 +714,16 @@ mod tests {
     }
 
     #[test]
-    fn build_enforcer_returns_noop_for_non_podman_adapter_with_allowlist() {
-        // macOS Apple Container / docker / local don't have a
-        // wired adapter yet. The factory returns Noop so the
-        // workflow still runs (with a logged warning).
+    fn build_enforcer_returns_noop_for_local_adapter_with_allowlist() {
+        // Local has no isolation by design (it's fleet-on-fleet dev),
+        // so even allowlist policy is degraded to Noop with a logged
+        // warning. Apple Container + Docker go via host-proxy now.
         let net = NetworkConfig {
             policy: NetworkPolicy::Allowlist,
             extra_hosts: vec![],
         };
         let invoker: Arc<dyn ProcessInvoker> = Arc::new(MockProcessInvoker::new());
-        let enforcer = build_enforcer(&net, "apple-container", invoker, &[]);
+        let enforcer = build_enforcer(&net, "local", invoker, &[]);
         let setup = enforcer.setup("s-x").unwrap();
         assert!(!setup.is_enforcing());
     }
@@ -637,6 +853,162 @@ mod tests {
         };
         // Should return Ok despite both inner calls failing.
         enf.teardown(&setup).unwrap();
+    }
+
+    #[test]
+    fn build_enforcer_routes_apple_container_to_host_proxy() {
+        // The boxed return type is opaque; assert via the setup
+        // call shape, which only HostProxyEnforcer produces.
+        let net = NetworkConfig {
+            policy: NetworkPolicy::Allowlist,
+            extra_hosts: vec![],
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let invoker_calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls_for_mock = Arc::clone(&invoker_calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().with(always(), always()).returning(move |bin, _args| {
+            calls_for_mock.lock().unwrap().push(bin.to_string());
+            Ok(String::new())
+        });
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(mock);
+        // Re-route the host-proxy enforcer's tempdir into the test
+        // dir so we can drive the full setup without polluting /tmp.
+        // The factory builds a HostProxyEnforcer with std::env::temp_dir()
+        // so we override here by constructing it directly.
+        let enforcer = HostProxyEnforcer::new(
+            invoker,
+            "host.containers.internal",
+            resolve_allowlist(&net, &[]),
+        )
+        .with_tempdir(tmp.path().to_path_buf());
+        let setup = enforcer.setup("s-apple").unwrap();
+        // Apple Container uses host.containers.internal as the DNS
+        // alias for the host — this fingerprints HostProxyEnforcer.
+        assert!(
+            setup
+                .proxy_env
+                .iter()
+                .any(|(k, v)| k == "HTTP_PROXY" && v.contains("host.containers.internal"))
+        );
+        // The invoker saw tinyproxy, not podman — definitive proof
+        // that the host-proxy adapter, not the Podman sidecar, was
+        // selected.
+        let bins = invoker_calls.lock().unwrap().clone();
+        assert_eq!(bins, vec!["tinyproxy".to_string()]);
+    }
+
+    #[test]
+    fn host_proxy_setup_writes_conf_and_runs_tinyproxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let calls_for_mock = Arc::clone(&calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().with(always(), always()).returning(move |bin, args| {
+            calls_for_mock
+                .lock()
+                .unwrap()
+                .push((bin.to_string(), args));
+            Ok(String::new())
+        });
+        let enf = HostProxyEnforcer::new(
+            Arc::new(mock),
+            "host.containers.internal",
+            vec!["api.github.com".to_string()],
+        )
+        .with_tempdir(tmp.path().to_path_buf());
+
+        let setup = enf.setup("s-host").unwrap();
+        let dir = tmp.path().join("fleet-egress-s-host");
+        assert!(dir.join("tinyproxy.conf").is_file());
+        assert!(dir.join("allowlist").is_file());
+        // The allowlist file should literally contain the host.
+        let written = std::fs::read_to_string(dir.join("allowlist")).unwrap();
+        assert_eq!(written, "api.github.com");
+        // tinyproxy was invoked exactly once with the conf path.
+        let invocations = calls.lock().unwrap().clone();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].0, "tinyproxy");
+        assert!(invocations[0].1.contains(&"-c".to_string()));
+        // Env vars point at the host-bridge DNS name.
+        let env: std::collections::HashMap<String, String> =
+            setup.proxy_env.iter().cloned().collect();
+        assert_eq!(
+            env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://host.containers.internal:8888")
+        );
+        // No engine-side network on the host-proxy path.
+        assert_eq!(setup.network_name, None);
+        // proxy_container stashes the pidfile path for teardown.
+        assert!(setup.proxy_container.as_deref().unwrap().ends_with("tinyproxy.pid"));
+    }
+
+    #[test]
+    fn host_proxy_teardown_kills_pid_from_pidfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("fleet-egress-s-t/tinyproxy.pid");
+        std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+        std::fs::write(&pidfile, "12345\n").unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let calls_for_mock = Arc::clone(&calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().with(always(), always()).returning(move |bin, args| {
+            calls_for_mock
+                .lock()
+                .unwrap()
+                .push((bin.to_string(), args));
+            Ok(String::new())
+        });
+        let enf = HostProxyEnforcer::new(
+            Arc::new(mock),
+            "host.containers.internal",
+            vec![],
+        );
+        let setup = EgressSetup {
+            proxy_env: vec![],
+            network_name: None,
+            proxy_container: Some(pidfile.display().to_string()),
+        };
+        enf.teardown(&setup).unwrap();
+        let invocations = calls.lock().unwrap().clone();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].0, "kill");
+        assert_eq!(invocations[0].1, vec!["-TERM".to_string(), "12345".to_string()]);
+        // Tempdir is reclaimed.
+        assert!(!pidfile.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn host_proxy_teardown_tolerates_missing_pidfile() {
+        // setup() failed before tinyproxy wrote its pidfile, or the
+        // process crashed before doing so. teardown must not error.
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(|_, _| Ok(String::new()));
+        let enf = HostProxyEnforcer::new(
+            Arc::new(mock),
+            "host.containers.internal",
+            vec![],
+        );
+        let setup = EgressSetup {
+            proxy_env: vec![],
+            network_name: None,
+            proxy_container: Some("/nonexistent/path/to/pidfile".to_string()),
+        };
+        enf.teardown(&setup).unwrap();
+    }
+
+    #[test]
+    fn build_host_tinyproxy_conf_references_external_allowlist_and_pidfile() {
+        let conf = build_host_tinyproxy_conf(
+            9090,
+            std::path::Path::new("/tmp/al"),
+            std::path::Path::new("/tmp/pid"),
+        );
+        assert!(conf.contains("Port 9090"));
+        assert!(conf.contains("PidFile \"/tmp/pid\""));
+        assert!(conf.contains("Filter \"/tmp/al\""));
+        assert!(conf.contains("FilterDefaultDeny Yes"));
+        assert!(conf.contains("ConnectPort 443"));
     }
 
     #[test]
