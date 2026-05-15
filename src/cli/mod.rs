@@ -168,6 +168,26 @@ pub enum SessionsSub {
     /// forensic snapshot. Run automatically at TUI startup; this
     /// subcommand exists for scripted/manual use.
     Reap,
+
+    /// Remove a session's per-session git worktree, freeing the
+    /// checked-out source code from disk. The branch and the
+    /// session's logs/artifacts/meta.json are kept — `git checkout
+    /// fleet/session-<id>` still works afterwards. Exactly one of
+    /// `<id>`, `--completed`, or `--all` must be set.
+    Prune {
+        /// Session id to prune. Refuses to prune a still-Running
+        /// session (use `fleet sessions reap` first or wait for it
+        /// to finish).
+        id: Option<String>,
+        /// Prune every session in `Completed` state. Use to reclaim
+        /// disk after a batch of successful workflow runs.
+        #[arg(long, conflicts_with = "all")]
+        completed: bool,
+        /// Prune every session in any terminal state (Completed,
+        /// Failed, Crashed).
+        #[arg(long, conflicts_with = "completed")]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -221,6 +241,9 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             SessionsSub::Show { id } => sessions::run_show(&id),
             SessionsSub::Logs { id, node } => sessions::run_logs(&id, node.as_deref()),
             SessionsSub::Reap => sessions::run_reap(),
+            SessionsSub::Prune { id, completed, all } => {
+                sessions::run_prune(id.as_deref(), completed, all)
+            }
         },
         Command::Issues { sub } => match sub {
             IssuesSub::List => issues::run_list(),

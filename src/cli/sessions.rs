@@ -14,12 +14,15 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::process::{ProcessInvoker, RealProcessInvoker};
 use crate::repo;
 use crate::runtime::factory::build_stopper;
 use crate::session::reaper::{self, RealPidProbe, ReapReport};
 use crate::session::store::SessionStore;
 use crate::session::{Session, SessionId, SessionState, now_ms};
+use crate::worktree;
 
 /// CLI entry point for `fleet sessions list`. Sorted by id.
 pub fn run_list() -> Result<i32> {
@@ -116,6 +119,163 @@ pub fn run_reap() -> Result<i32> {
         .with_context(|| format!("reaping sessions under {}", store.root().display()))?;
     print!("{}", render_reap_report(&report));
     Ok(0)
+}
+
+/// CLI entry point for `fleet sessions prune [id|--completed|--all]`.
+/// Removes the per-session git worktree, clears
+/// `worktree_path` on the session's meta.json, and leaves everything
+/// else (logs, artifacts, the branch) intact. Returns 0 unless at
+/// least one prune attempt failed; per-session errors are surfaced
+/// in the report.
+pub fn run_prune(id: Option<&str>, completed: bool, all: bool) -> Result<i32> {
+    if id.is_none() && !completed && !all {
+        bail!(
+            "fleet sessions prune: specify a session id, --completed, or --all \
+             (one of them is required)"
+        );
+    }
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let store = SessionStore::for_repo(&root);
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+
+    let targets = if let Some(s) = id {
+        vec![SessionId::new(s)]
+    } else if all {
+        select_sessions_by_state(
+            &store,
+            &[
+                SessionState::Completed,
+                SessionState::Failed,
+                SessionState::Crashed,
+            ],
+        )?
+    } else {
+        // completed = true (validated above).
+        select_sessions_by_state(&store, &[SessionState::Completed])?
+    };
+
+    let mut report = PruneReport::default();
+    let now = now_ms();
+    for id in targets {
+        match prune_one(invoker.as_ref(), &root, &store, &id, now) {
+            Ok(PruneOutcome::Pruned) => report.pruned.push(id),
+            Ok(PruneOutcome::AlreadyClean) => report.skipped.push(id),
+            Err(err) => report.failed.push((id, format!("{err:#}"))),
+        }
+    }
+    print!("{}", render_prune_report(&report));
+    Ok(i32::from(!report.failed.is_empty()))
+}
+
+/// Outcome of a single prune attempt. `AlreadyClean` is a no-op —
+/// the session never had a worktree, or one has already been pruned;
+/// either way nothing changes on disk.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PruneOutcome {
+    Pruned,
+    AlreadyClean,
+}
+
+/// Bookkeeping for the renderer. Pure data so tests can assert on
+/// the surface without spinning up real sessions.
+#[derive(Debug, Default)]
+pub struct PruneReport {
+    pub pruned: Vec<SessionId>,
+    pub skipped: Vec<SessionId>,
+    pub failed: Vec<(SessionId, String)>,
+}
+
+/// Prune one session: remove its worktree (if any), clear the meta
+/// pointer, leave logs/artifacts/branch alone.
+///
+/// Refuses to prune a still-`Running` session — kill or reap first.
+/// All other states (including `AwaitingGate`) are fair game: the
+/// user passed the id explicitly, so they meant it.
+pub fn prune_one(
+    invoker: &dyn ProcessInvoker,
+    root: &Path,
+    store: &SessionStore,
+    id: &SessionId,
+    now: u64,
+) -> Result<PruneOutcome> {
+    let mut session = store
+        .load(id)
+        .with_context(|| format!("loading session `{id}`"))?;
+    if matches!(session.state, SessionState::Running) {
+        bail!(
+            "session `{id}` is still running — `fleet sessions reap` or wait for it \
+             to finish before pruning"
+        );
+    }
+    let Some(wt_path) = session.worktree_path.clone() else {
+        return Ok(PruneOutcome::AlreadyClean);
+    };
+    if wt_path.is_dir() {
+        worktree::remove_worktree(invoker, root, &wt_path, true)?;
+    } else {
+        // Worktree dir already gone from disk; drop any stale
+        // administrative entries so a future `git worktree list`
+        // doesn't surface the ghost. Best-effort: a failure here
+        // is not fatal — the meta.json clear below is the
+        // user-visible win.
+        if let Err(err) = worktree::prune_worktrees(invoker, root) {
+            tracing::warn!(error = %err, "pruning stale worktree metadata failed");
+        }
+    }
+    session.clear_worktree_path(now);
+    store.save(&session)?;
+    Ok(PruneOutcome::Pruned)
+}
+
+/// Walk the session store and collect ids whose state is in `states`.
+/// Sessions whose meta.json fails to parse are silently skipped —
+/// `fleet sessions list` surfaces those separately; prune shouldn't
+/// fail on read errors elsewhere in the store.
+fn select_sessions_by_state(
+    store: &SessionStore,
+    states: &[SessionState],
+) -> Result<Vec<SessionId>> {
+    let mut out = Vec::new();
+    for id in store
+        .list()
+        .with_context(|| format!("listing sessions under {}", store.root().display()))?
+    {
+        if let Ok(s) = store.load(&id) {
+            if states.contains(&s.state) {
+                out.push(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Pure renderer for `fleet sessions prune`. Stable wording so
+/// scripts can grep `pruned: N`.
+#[must_use]
+pub fn render_prune_report(report: &PruneReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "fleet sessions prune:");
+    let _ = writeln!(out, "  pruned: {}", report.pruned.len());
+    let _ = writeln!(
+        out,
+        "  skipped (no worktree to remove): {}",
+        report.skipped.len()
+    );
+    for id in &report.pruned {
+        let _ = writeln!(out, "    + {id}");
+    }
+    for id in &report.skipped {
+        let _ = writeln!(out, "    . {id}");
+    }
+    if !report.failed.is_empty() {
+        let _ = writeln!(out, "  failed: {}", report.failed.len());
+        for (id, err) in &report.failed {
+            let _ = writeln!(out, "    ! {id}: {err}");
+        }
+    }
+    out
 }
 
 /// Pure renderer for the reap CLI output. Surfacing wording in a free
@@ -345,9 +505,12 @@ const fn state_word(s: SessionState) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::process::MockProcessInvoker;
     use crate::session::SessionId;
+    use std::path::PathBuf;
 
     fn row(id: &str, state: &str, workflow: &str, node: Option<&str>) -> SessionRow {
         SessionRow {
@@ -579,6 +742,201 @@ mod tests {
         let s = Session::new(SessionId::new("s-1"), "standard", 1);
         let row = SessionRow::from_session(&s);
         assert_eq!(row.cost, None);
+    }
+
+    #[test]
+    fn render_prune_report_says_pruned_and_skipped() {
+        let report = PruneReport {
+            pruned: vec![SessionId::new("s-a"), SessionId::new("s-b")],
+            skipped: vec![SessionId::new("s-c")],
+            failed: vec![],
+        };
+        let r = render_prune_report(&report);
+        assert!(r.contains("pruned: 2"));
+        assert!(r.contains("skipped (no worktree to remove): 1"));
+        assert!(r.contains("+ s-a"));
+        assert!(r.contains("+ s-b"));
+        assert!(r.contains(". s-c"));
+        assert!(!r.contains("failed:"));
+    }
+
+    #[test]
+    fn render_prune_report_surfaces_failures() {
+        let report = PruneReport {
+            pruned: vec![],
+            skipped: vec![],
+            failed: vec![(SessionId::new("s-x"), "boom".to_string())],
+        };
+        let r = render_prune_report(&report);
+        assert!(r.contains("failed: 1"));
+        assert!(r.contains("! s-x: boom"));
+    }
+
+    /// Test helper: stage a completed session at the given id with a
+    /// pre-existing on-disk worktree directory.
+    fn stage_completed_with_worktree(
+        store: &SessionStore,
+        id: &str,
+        branch: &str,
+    ) -> (SessionId, PathBuf) {
+        let sid = SessionId::new(id);
+        let mut s = Session::new(sid.clone(), "standard", 1);
+        s.transition_to(SessionState::Running, 2).unwrap();
+        s.transition_to(SessionState::Completed, 3).unwrap();
+        let wt_path = store.session_dir(&sid).join("worktree");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        s.set_worktree(wt_path.clone(), branch, 3);
+        store.create(&s).unwrap();
+        (sid, wt_path)
+    }
+
+    #[test]
+    fn prune_one_removes_worktree_and_clears_meta_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let (id, wt_path) = stage_completed_with_worktree(&store, "s-1", "fleet/session-s-1");
+
+        let mut mock = MockProcessInvoker::new();
+        let expected_wt = wt_path.to_string_lossy().into_owned();
+        let root_str = dir.path().to_string_lossy().into_owned();
+        mock.expect_run()
+            .withf(move |prog, args| {
+                prog == "git"
+                    && args
+                        == &[
+                            "-C".to_string(),
+                            root_str.clone(),
+                            "worktree".to_string(),
+                            "remove".to_string(),
+                            "--force".to_string(),
+                            expected_wt.clone(),
+                        ]
+            })
+            .returning(|_, _| Ok(String::new()));
+
+        let outcome = prune_one(&mock, dir.path(), &store, &id, 99).unwrap();
+        assert_eq!(outcome, PruneOutcome::Pruned);
+
+        let reloaded = store.load(&id).unwrap();
+        assert!(
+            reloaded.worktree_path.is_none(),
+            "worktree_path must be cleared on meta.json"
+        );
+        // Branch is intentionally preserved — user can `git checkout`.
+        assert_eq!(reloaded.branch.as_deref(), Some("fleet/session-s-1"));
+        assert_eq!(reloaded.updated_at_ms, 99);
+    }
+
+    #[test]
+    fn prune_one_is_noop_when_session_has_no_worktree() {
+        // Non-git workspaces leave worktree_path = None on the
+        // session. Prune should report AlreadyClean and not invoke
+        // git at all.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let sid = SessionId::new("s-nowt");
+        let mut s = Session::new(sid.clone(), "standard", 1);
+        s.transition_to(SessionState::Running, 2).unwrap();
+        s.transition_to(SessionState::Completed, 3).unwrap();
+        store.create(&s).unwrap();
+
+        let mock = MockProcessInvoker::new(); // no expect_run() — must not be called.
+        let outcome = prune_one(&mock, dir.path(), &store, &sid, 99).unwrap();
+        assert_eq!(outcome, PruneOutcome::AlreadyClean);
+    }
+
+    #[test]
+    fn prune_one_refuses_running_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let sid = SessionId::new("s-run");
+        let mut s = Session::new(sid.clone(), "standard", 1);
+        s.transition_to(SessionState::Running, 2).unwrap();
+        let wt_path = store.session_dir(&sid).join("worktree");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        s.set_worktree(wt_path, "fleet/session-s-run", 2);
+        store.create(&s).unwrap();
+
+        let mock = MockProcessInvoker::new(); // must not be called.
+        let err = prune_one(&mock, dir.path(), &store, &sid, 99).unwrap_err();
+        assert!(format!("{err:#}").contains("still running"));
+    }
+
+    #[test]
+    fn prune_one_handles_missing_worktree_dir_with_prune_metadata() {
+        // The worktree dir was rm -rf'd out of band. We invoke
+        // `git worktree prune` to drop stale administrative entries
+        // and still clear the meta pointer.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let sid = SessionId::new("s-gone");
+        let mut s = Session::new(sid.clone(), "standard", 1);
+        s.transition_to(SessionState::Running, 2).unwrap();
+        s.transition_to(SessionState::Completed, 3).unwrap();
+        // Set worktree_path to a directory that does not exist.
+        s.set_worktree(
+            PathBuf::from("/no/such/worktree"),
+            "fleet/session-s-gone",
+            3,
+        );
+        store.create(&s).unwrap();
+
+        let mut mock = MockProcessInvoker::new();
+        let root_str = dir.path().to_string_lossy().into_owned();
+        mock.expect_run()
+            .withf(move |prog, args| {
+                prog == "git"
+                    && args
+                        == &[
+                            "-C".to_string(),
+                            root_str.clone(),
+                            "worktree".to_string(),
+                            "prune".to_string(),
+                        ]
+            })
+            .returning(|_, _| Ok(String::new()));
+
+        let outcome = prune_one(&mock, dir.path(), &store, &sid, 99).unwrap();
+        assert_eq!(outcome, PruneOutcome::Pruned);
+        let reloaded = store.load(&sid).unwrap();
+        assert!(reloaded.worktree_path.is_none());
+    }
+
+    #[test]
+    fn select_sessions_by_state_filters_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+
+        let mut completed = Session::new(SessionId::new("s-c"), "x", 1);
+        completed.transition_to(SessionState::Running, 2).unwrap();
+        completed.transition_to(SessionState::Completed, 3).unwrap();
+        store.create(&completed).unwrap();
+
+        let mut failed = Session::new(SessionId::new("s-f"), "x", 1);
+        failed.transition_to(SessionState::Running, 2).unwrap();
+        failed.transition_to(SessionState::Failed, 3).unwrap();
+        store.create(&failed).unwrap();
+
+        let mut running = Session::new(SessionId::new("s-r"), "x", 1);
+        running.transition_to(SessionState::Running, 2).unwrap();
+        store.create(&running).unwrap();
+
+        let only_completed = select_sessions_by_state(&store, &[SessionState::Completed]).unwrap();
+        assert_eq!(only_completed, vec![SessionId::new("s-c")]);
+
+        let terminals = select_sessions_by_state(
+            &store,
+            &[
+                SessionState::Completed,
+                SessionState::Failed,
+                SessionState::Crashed,
+            ],
+        )
+        .unwrap();
+        let ids: Vec<_> = terminals.iter().map(SessionId::to_string).collect();
+        assert!(ids.contains(&"s-c".to_string()));
+        assert!(ids.contains(&"s-f".to_string()));
+        assert!(!ids.contains(&"s-r".to_string()));
     }
 
     #[test]
