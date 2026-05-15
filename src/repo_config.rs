@@ -32,6 +32,7 @@ pub struct RepoConfig {
     pub agents: AgentsConfig,
     pub workflows: WorkflowsConfig,
     pub autonomous: AutonomousConfig,
+    pub cleanup: CleanupConfig,
 }
 
 /// `runtime:` block — which adapter to instantiate, how to harden it, where
@@ -321,6 +322,20 @@ impl Default for AutonomousConfig {
     }
 }
 
+/// `cleanup:` block — opt-in disk-hygiene knobs. Conservative
+/// defaults: nothing auto-prunes unless the user asks. Add a field
+/// here when introducing a new cleanup behaviour we want gated
+/// behind a config switch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanupConfig {
+    /// When `true`, a workflow that reaches `Completed` triggers the
+    /// equivalent of `fleet sessions prune <id>` automatically. The
+    /// branch + logs + artifacts are still preserved; only the
+    /// worktree dir is reclaimed. Default `false` (keep until
+    /// explicit prune).
+    pub auto_prune_completed: bool,
+}
+
 impl RepoConfig {
     /// Parse a config from a string. `path_hint` is used purely for error
     /// context (so the user sees which file failed); it does not have to
@@ -363,6 +378,14 @@ struct Raw {
     workflows: Option<RawWorkflows>,
     #[serde(default)]
     autonomous: Option<RawAutonomous>,
+    #[serde(default)]
+    cleanup: Option<RawCleanup>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawCleanup {
+    #[serde(default)]
+    auto_prune_completed: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -434,6 +457,7 @@ impl From<Raw> for RepoConfig {
             agents: default_agents,
             workflows: default_workflows,
             autonomous: default_autonomous,
+            cleanup: default_cleanup,
         } = Self::default();
 
         let runtime = match raw.runtime {
@@ -496,12 +520,21 @@ impl From<Raw> for RepoConfig {
             },
             None => default_autonomous,
         };
+        let cleanup = match raw.cleanup {
+            Some(c) => CleanupConfig {
+                auto_prune_completed: c
+                    .auto_prune_completed
+                    .unwrap_or(default_cleanup.auto_prune_completed),
+            },
+            None => default_cleanup,
+        };
         Self {
             runtime,
             tracker,
             agents,
             workflows,
             autonomous,
+            cleanup,
         }
     }
 }
@@ -526,6 +559,27 @@ mod tests {
         assert_eq!(cfg.autonomous.workflow, "standard");
         assert_eq!(cfg.autonomous.scan_interval_secs, 10);
         assert_eq!(cfg.autonomous.spawn_cooldown_secs, 2);
+        assert!(
+            !cfg.cleanup.auto_prune_completed,
+            "default must be keep-until-explicit-prune"
+        );
+    }
+
+    #[test]
+    fn parses_cleanup_auto_prune_completed_true() {
+        let yaml = "cleanup:\n  auto_prune_completed: true\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert!(cfg.cleanup.auto_prune_completed);
+    }
+
+    #[test]
+    fn missing_cleanup_block_falls_back_to_defaults() {
+        // Pre-cleanup-feature configs (and the `fleet init` scaffold)
+        // omit `cleanup:` entirely. Default behaviour: nothing
+        // auto-prunes.
+        let yaml = "tracker: github\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert!(!cfg.cleanup.auto_prune_completed);
     }
 
     #[test]

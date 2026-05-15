@@ -23,7 +23,7 @@ use crate::runtime::factory::build_adapter;
 use crate::session::IssueContext;
 use crate::session::SessionId;
 use crate::session::store::SessionStore;
-use crate::session::{ClockIdSource, IdSource, SessionState};
+use crate::session::{ClockIdSource, IdSource, Session, SessionState, now_ms};
 use crate::tracker::{Issue, build as build_tracker};
 use crate::workflow::executor::{ExecuteRequest, WorkflowExecutor, WorktreeMeta};
 use crate::workflow::spec::Workflow;
@@ -112,7 +112,7 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
     });
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
-    let executor = WorkflowExecutor::new(invoker);
+    let executor = WorkflowExecutor::new(Arc::clone(&invoker));
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -135,6 +135,7 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
                 state_word(session.state),
                 session.current_node.as_deref().unwrap_or("none")
             );
+            auto_prune_completed_session(&config, invoker.as_ref(), &root, &store, &session);
             Ok(i32::from(session.state != SessionState::Completed))
         }
         Err(err) => Err(err),
@@ -198,11 +199,11 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         // Pre-worktree-feature meta.json or a session created on a
         // non-git workspace: fall back to the shared repo root,
         // matching how it ran originally.
-        None => root,
+        None => root.clone(),
     };
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
-    let executor = WorkflowExecutor::new(invoker);
+    let executor = WorkflowExecutor::new(Arc::clone(&invoker));
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -228,6 +229,7 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         state_word(resumed.state),
         resumed.current_node.as_deref().unwrap_or("none"),
     );
+    auto_prune_completed_session(&config, invoker.as_ref(), &root, &store, &resumed);
     Ok(i32::from(resumed.state != SessionState::Completed))
 }
 
@@ -305,7 +307,7 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
     });
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
-    let executor = WorkflowExecutor::new(invoker);
+    let executor = WorkflowExecutor::new(Arc::clone(&invoker));
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -332,6 +334,7 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
                 session.current_node.as_deref().unwrap_or("none"),
                 state_word(session.state),
             );
+            auto_prune_completed_session(&config, invoker.as_ref(), &root, &store, &session);
             Ok(i32::from(session.state != SessionState::Completed))
         }
         Err(err) => Err(err),
@@ -395,6 +398,43 @@ fn provision_worktree(
         path: wt_path,
         branch,
     }))
+}
+
+/// Apply the `cleanup.auto_prune_completed` policy: if the config
+/// asks for it AND the session reached `Completed`, prune the
+/// session's worktree in-line. Errors are logged but never
+/// propagated — the workflow itself succeeded; a cleanup hiccup
+/// shouldn't poison its exit code.
+///
+/// Other terminal states (`Failed`, `Crashed`) are not auto-pruned
+/// regardless of the setting — they're forensic data, and the user
+/// asks for `--all` explicitly when they're ready to reclaim.
+fn auto_prune_completed_session(
+    config: &RepoConfig,
+    invoker: &dyn ProcessInvoker,
+    root: &Path,
+    store: &SessionStore,
+    session: &Session,
+) {
+    if !config.cleanup.auto_prune_completed {
+        return;
+    }
+    if session.state != SessionState::Completed {
+        return;
+    }
+    match crate::cli::sessions::prune_one(invoker, root, store, &session.id, now_ms()) {
+        Ok(crate::cli::sessions::PruneOutcome::Pruned) => {
+            tracing::info!(session = %session.id, "auto-pruned worktree after completion");
+        }
+        Ok(crate::cli::sessions::PruneOutcome::AlreadyClean) => {}
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                session = %session.id,
+                "auto-prune-on-completed failed; worktree remains on disk"
+            );
+        }
+    }
 }
 
 /// Build the egress enforcer for a workflow run. Single helper used
