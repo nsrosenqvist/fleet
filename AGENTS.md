@@ -125,6 +125,36 @@ Spawn picker:
 | `Enter` | Spawn the selected workflow |
 | `Esc` / `q` | Cancel |
 
+## Tools available inside the workflow container
+
+If you're an agent fleet spawned and you have a bound ticket (the
+session was started with `--issue <id>`), the `fleet-tracker` binary
+is on your PATH and lets you write back to the tracker. It speaks to
+a localhost HTTP bridge using a per-session bearer token that fleet
+piped in via `FLEET_BRIDGE_URL` / `FLEET_BRIDGE_TOKEN`.
+
+```
+fleet-tracker comment "Progress note"      # comments on your bound ticket
+fleet-tracker status in-progress           # open / in-progress / closed
+fleet-tracker add-label needs-review
+fleet-tracker remove-label needs-review
+fleet-tracker read                         # the bound ticket
+fleet-tracker read 87                      # any ticket (context only)
+fleet-tracker list                         # all open + closed
+```
+
+Writes are bridge-scoped: there's no `--id` flag on write
+subcommands because the session is bound to exactly one ticket and
+the bridge rejects writes targeting any other. Reads are unscoped on
+purpose so you can pull context from related tickets.
+
+If `fleet-tracker` is missing from the container, the host either
+isn't Linux (Mach-O binaries can't exec under the container's ELF
+loader) or didn't install the binary alongside `fleet`. The bridge
+HTTP endpoint at `$FLEET_BRIDGE_URL` is still reachable via curl in
+that case — see [`docs/orchestration.md`](./docs/orchestration.md)
+for the route surface and the bridge's security model.
+
 ## Things not to touch without coordination
 
 - **`src/session/state.rs` transition table.** The nested match is deliberate; see its doc-comment. Add states by extending the table, not by reshaping it.
