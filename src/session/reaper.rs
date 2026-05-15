@@ -43,6 +43,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use super::containers;
 use super::store::SessionStore;
 use super::{Session, SessionId, SessionState};
 
@@ -213,6 +214,12 @@ struct CrashSnapshot<'a> {
     node_at_crash: Option<&'a str>,
     /// Wallclock at the moment the reaper transitioned the session.
     crashed_at_ms: u64,
+    /// Container ids fleet was tracking as active when the driver
+    /// died. The engine doesn't auto-reclaim them — the user can
+    /// stop each via `fleet runtime stop <id>` after reading this
+    /// list. Empty when no containers had been started (e.g. crash
+    /// before the first agent node).
+    leaked_containers: Vec<String>,
     /// Map of node-log filename (e.g. `"plan.log"`) → last N lines of
     /// its contents. Bounded so a runaway agent's log doesn't bloat
     /// the snapshot.
@@ -226,7 +233,12 @@ fn write_crash_snapshot(
     session: &Session,
     reason: &ReapReason,
 ) -> Result<()> {
-    let log_tails = collect_log_tails(&store.session_dir(&session.id).join("logs"))?;
+    let session_dir = store.session_dir(&session.id);
+    let log_tails = collect_log_tails(&session_dir.join("logs"))?;
+    let leaked_containers = containers::list_active(&session_dir).unwrap_or_else(|err| {
+        tracing::warn!(session = %session.id, error = %err, "listing active container markers failed");
+        Vec::new()
+    });
     let snapshot = CrashSnapshot {
         session_id: session.id.as_str(),
         workflow: &session.workflow,
@@ -234,13 +246,21 @@ fn write_crash_snapshot(
         reason,
         node_at_crash: session.current_node.as_deref(),
         crashed_at_ms: session.updated_at_ms,
+        leaked_containers,
         log_tails,
     };
-    let path = store.session_dir(&session.id).join("crash.json");
+    let path = session_dir.join("crash.json");
     let body = serde_json::to_string_pretty(&snapshot)
         .context("serialising crash snapshot")?;
     std::fs::write(&path, body)
         .with_context(|| format!("writing {}", path.display()))?;
+    // Clear the markers so a second reap doesn't re-report the same
+    // orphans forever. The user has the ids in crash.json now;
+    // fleet's bookkeeping for "this session has live containers" is
+    // also done.
+    if let Err(err) = containers::clear_all(&session_dir) {
+        tracing::warn!(session = %session.id, error = %err, "clearing container markers failed");
+    }
     Ok(())
 }
 
@@ -472,6 +492,42 @@ mod tests {
         assert!(body.contains("\"pid\": 99999"));
         assert!(body.contains("plan.log"));
         assert!(body.contains("line 3"));
+        // Sessions without container markers report an empty array,
+        // not a missing field — the field is non-optional in the
+        // schema so downstream readers don't need to handle absence.
+        assert!(body.contains("\"leaked_containers\": []"), "got: {body}");
+    }
+
+    #[test]
+    fn reap_records_leaked_containers_in_snapshot() {
+        let (_d, store) = fresh_store();
+        let s = create_session(&store, "s-leaky", SessionState::Running, Some(99_999));
+        // Stage two container markers as if the executor had started
+        // containers and the driver died before stop.
+        containers::mark_active(&store.session_dir(&s.id), "c-aaa").unwrap();
+        containers::mark_active(&store.session_dir(&s.id), "c-bbb").unwrap();
+        let probe = ScriptedProbe::with_alive([]);
+        let _ = reap(&store, &probe, 9_000).unwrap();
+        let body = std::fs::read_to_string(store.session_dir(&s.id).join("crash.json")).unwrap();
+        assert!(body.contains("\"c-aaa\""), "got: {body}");
+        assert!(body.contains("\"c-bbb\""), "got: {body}");
+    }
+
+    #[test]
+    fn reap_clears_container_markers_after_recording() {
+        // Without this, a second reap would re-list the same orphans
+        // forever. The marker dir must be empty post-reap.
+        let (_d, store) = fresh_store();
+        let s = create_session(&store, "s-leaky", SessionState::Running, Some(99_999));
+        containers::mark_active(&store.session_dir(&s.id), "c-aaa").unwrap();
+        let probe = ScriptedProbe::with_alive([]);
+        let _ = reap(&store, &probe, 9_000).unwrap();
+        assert!(
+            containers::list_active(&store.session_dir(&s.id))
+                .unwrap()
+                .is_empty(),
+            "markers must be cleared after they land in crash.json"
+        );
     }
 
     #[test]

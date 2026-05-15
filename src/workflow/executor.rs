@@ -482,6 +482,20 @@ impl WorkflowExecutor {
             .start_container(&spec)
             .with_context(|| format!("starting container for node `{}`", node.id))?;
 
+        // Record the container as active *immediately* after start, so a
+        // fleet crash between here and the matching stop leaves a
+        // marker on disk that the reaper can pick up. A failure to
+        // write the marker downgrades to a warning — the agent run
+        // should still proceed; we just lose the leak-detection signal
+        // for this one container if it crashes.
+        let session_dir = req.store.session_dir(&session.id);
+        if let Err(err) = crate::session::containers::mark_active(
+            &session_dir,
+            container_id.as_str(),
+        ) {
+            tracing::warn!(?err, container = %container_id, "writing container marker failed");
+        }
+
         let exec_result = req.adapter.exec(&container_id, &agent.command, ExecOpts::default());
         // Log capture first — happens even on adapter-level error so the
         // user can read what happened after a failure.
@@ -504,6 +518,17 @@ impl WorkflowExecutor {
         // surrounding workflow run continues even if stop hits a flake.
         if let Err(err) = req.adapter.stop(&container_id) {
             tracing::warn!(?err, container = %container_id, "stopping container failed");
+        }
+        // Whether stop succeeded or not, drop the active marker. A
+        // dangling marker after a successful stop would re-report a
+        // dead container as leaked on the next reap. The marker file
+        // is metadata for *fleet's* bookkeeping; the engine's actual
+        // container state is the source of truth.
+        if let Err(err) = crate::session::containers::mark_stopped(
+            &session_dir,
+            container_id.as_str(),
+        ) {
+            tracing::warn!(?err, container = %container_id, "clearing container marker failed");
         }
 
         let handle = exec_result?;
@@ -1686,6 +1711,44 @@ nodes:
         // Cost survives the round-trip to disk.
         let loaded = store.load(&SessionId::new("s-cost")).unwrap();
         assert_eq!(loaded.node_costs.get("only"), Some(&0.42));
+    }
+
+    #[test]
+    fn agent_node_clears_container_marker_after_clean_stop() {
+        // After a successful agent run the marker MUST be gone — a
+        // dangling marker would make the reaper report a healthy
+        // container as leaked.
+        let yaml = "\
+name: trivial
+nodes:
+  - id: only
+    agent: claude-code
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("ok\n");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-clean-marker"),
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        let active = crate::session::containers::list_active(
+            &store.session_dir(&session.id),
+        )
+        .unwrap();
+        assert!(
+            active.is_empty(),
+            "marker must be cleared after a successful agent run: {active:?}"
+        );
     }
 
     #[test]
