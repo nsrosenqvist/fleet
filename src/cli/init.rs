@@ -186,8 +186,7 @@ fn ensure_file(path: &Path, root: &Path, contents: &str, plan: &mut InitPlan) ->
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating parent of {}", path.display()))?;
         }
-        fs::write(path, contents)
-            .with_context(|| format!("writing {}", path.display()))?;
+        fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
         plan.record_created(rel);
     }
     Ok(())
@@ -465,7 +464,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         perform_init(dir.path()).unwrap();
         let plan = perform_init(dir.path()).unwrap();
-        assert!(plan.created.is_empty(), "second run created = {:?}", plan.created);
+        assert!(
+            plan.created.is_empty(),
+            "second run created = {:?}",
+            plan.created
+        );
         // Every scaffolded path should show up as "already present".
         for expected in [
             ".fleet",
@@ -644,7 +647,10 @@ mod tests {
     fn default_devcontainer_json_is_loadable_json() {
         let parsed: serde_json::Value = serde_json::from_str(DEFAULT_DEVCONTAINER_JSON)
             .expect("default devcontainer.json must parse");
-        assert_eq!(parsed.get("name").and_then(|v| v.as_str()), Some("fleet workspace"));
+        assert_eq!(
+            parsed.get("name").and_then(|v| v.as_str()),
+            Some("fleet workspace")
+        );
     }
 
     #[test]

@@ -75,12 +75,10 @@ fn resolve_kind(choice: AdapterChoice, probe: &ProbeReport) -> Result<ResolvedKi
             // GVisor/DevcontainerCli aren't engines; `recommended` never
             // points at them. The exhaustive arm keeps the compiler happy
             // if the enum grows.
-            Some(other) => bail!(
-                "internal: probe recommended non-engine backend {other:?}"
-            ),
-            None => bail!(
-                "no container engine detected — run `fleet runtime doctor` for install hints"
-            ),
+            Some(other) => bail!("internal: probe recommended non-engine backend {other:?}"),
+            None => {
+                bail!("no container engine detected — run `fleet runtime doctor` for install hints")
+            }
         },
         AdapterChoice::Podman => {
             if !probe.podman.present {
@@ -433,7 +431,10 @@ mod tests {
         let probe = probe_docker_only();
         let err = expect_err(build_adapter(&cfg, &probe, docker_rootful_invoker()));
         let msg = format!("{err}");
-        assert!(msg.contains("only supported with the podman adapter"), "msg = {msg}");
+        assert!(
+            msg.contains("only supported with the podman adapter"),
+            "msg = {msg}"
+        );
         assert!(msg.contains("docker"));
     }
 

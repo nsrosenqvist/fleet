@@ -24,8 +24,8 @@ use crate::tracker::{Issue, build};
 pub fn run_list() -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
-    let config = RepoConfig::load(root.join(".fleet/config.yaml"))
-        .context("loading .fleet/config.yaml")?;
+    let config =
+        RepoConfig::load(root.join(".fleet/config.yaml")).context("loading .fleet/config.yaml")?;
     let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
     let Some(tracker) = build(config.tracker, invoker) else {
         // Unimplemented plugin. Surface the actionable message instead of

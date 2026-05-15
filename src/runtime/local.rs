@@ -63,7 +63,11 @@ impl LocalAdapter {
         ContainerId::new(format!("local-{}", state.next_id))
     }
 
-    fn with_container<R>(&self, id: &ContainerId, f: impl FnOnce(&LocalContainer) -> R) -> Result<R> {
+    fn with_container<R>(
+        &self,
+        id: &ContainerId,
+        f: impl FnOnce(&LocalContainer) -> R,
+    ) -> Result<R> {
         let guard = self
             .state
             .lock()
@@ -243,7 +247,11 @@ mod tests {
         Arc::new(mock)
     }
 
-    fn invoker_strict_eq(prog: &'static str, args: Vec<String>, stdout: &'static str) -> Arc<dyn ProcessInvoker> {
+    fn invoker_strict_eq(
+        prog: &'static str,
+        args: Vec<String>,
+        stdout: &'static str,
+    ) -> Arc<dyn ProcessInvoker> {
         let mut mock = MockProcessInvoker::new();
         mock.expect_run()
             .with(eq(prog), eq(args))
@@ -253,8 +261,7 @@ mod tests {
 
     fn invoker_always_errors() -> Arc<dyn ProcessInvoker> {
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run()
-            .returning(|_, _| Err(anyhow!("nope")));
+        mock.expect_run().returning(|_, _| Err(anyhow!("nope")));
         Arc::new(mock)
     }
 
@@ -391,10 +398,7 @@ mod tests {
     fn exec_runs_program_with_workspace_as_cwd() {
         let invoker = invoker_strict_eq(
             "sh",
-            vec![
-                "-c".to_string(),
-                "cd '/tmp/ws' && pwd ".to_string(),
-            ],
+            vec!["-c".to_string(), "cd '/tmp/ws' && pwd ".to_string()],
             "/tmp/ws",
         );
         let a = LocalAdapter::new(invoker);

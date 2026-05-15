@@ -288,11 +288,19 @@ impl AppState {
         sort_sessions(&mut sessions);
         // Preserve the previously selected session by id; on no match,
         // select the first if any.
-        let prev = self.list_state.selected().and_then(|i| self.sessions.get(i)).map(|s| s.id.to_string());
+        let prev = self
+            .list_state
+            .selected()
+            .and_then(|i| self.sessions.get(i))
+            .map(|s| s.id.to_string());
         self.sessions = sessions;
         let new_index = prev
             .and_then(|id| self.sessions.iter().position(|s| s.id.to_string() == id))
-            .or(if self.sessions.is_empty() { None } else { Some(0) });
+            .or(if self.sessions.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
         self.list_state.select(new_index);
         self.refresh_log_tail();
         self.status_line = render_status_line(&self.sessions);
@@ -310,8 +318,7 @@ impl AppState {
             return;
         }
         let len = isize::try_from(self.sessions.len()).unwrap_or(isize::MAX);
-        let current = isize::try_from(self.list_state.selected().unwrap_or(0))
-            .unwrap_or(0);
+        let current = isize::try_from(self.list_state.selected().unwrap_or(0)).unwrap_or(0);
         let next = (current + delta).rem_euclid(len);
         let next_usize = usize::try_from(next).unwrap_or(0);
         self.list_state.select(Some(next_usize));
@@ -361,9 +368,7 @@ impl AppState {
         // tracker is lazy: deferred to the first toggle so a `gh
         // auth` failure doesn't trip up users who never use this
         // mode.
-        if key.modifiers.contains(KeyModifiers::SHIFT)
-            && matches!(key.code, KeyCode::Char('A'))
-        {
+        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('A')) {
             self.toggle_autonomous();
             return Action::None;
         }
@@ -479,8 +484,7 @@ impl AppState {
             return;
         }
         let len = isize::try_from(self.spawn_workflows.len()).unwrap_or(isize::MAX);
-        let current = isize::try_from(self.spawn_list_state.selected().unwrap_or(0))
-            .unwrap_or(0);
+        let current = isize::try_from(self.spawn_list_state.selected().unwrap_or(0)).unwrap_or(0);
         let next = (current + delta).rem_euclid(len);
         let next_usize = usize::try_from(next).unwrap_or(0);
         self.spawn_list_state.select(Some(next_usize));
@@ -505,8 +509,7 @@ impl AppState {
         };
         let Ok(binary) = std::env::current_exe() else {
             self.status_line =
-                " spawn failed: cannot resolve fleet binary path (current_exe) "
-                    .to_string();
+                " spawn failed: cannot resolve fleet binary path (current_exe) ".to_string();
             self.view = View::Sessions;
             return;
         };
@@ -569,9 +572,7 @@ impl AppState {
         let tracker = Arc::clone(tracker);
         let root = self.root.clone();
         let list_open = move || -> Result<Vec<crate::session::IssueContext>, String> {
-            let issues = tracker
-                .list_issues(&root)
-                .map_err(|e| format!("{e:#}"))?;
+            let issues = tracker.list_issues(&root).map_err(|e| format!("{e:#}"))?;
             Ok(issues
                 .into_iter()
                 .filter(|i| i.status == "open")
@@ -583,30 +584,23 @@ impl AppState {
                 })
                 .collect())
         };
-        let outcome =
-            self.autonomous
-                .step(now, &self.config.autonomous, &self.sessions, list_open);
+        let outcome = self
+            .autonomous
+            .step(now, &self.config.autonomous, &self.sessions, list_open);
         if let autonomous::AutonomousOutcome::Spawn(cmd) = outcome {
             self.dispatch_autonomous_spawn(&cmd, store);
         }
     }
 
-    fn dispatch_autonomous_spawn(
-        &mut self,
-        cmd: &autonomous::SpawnCommand,
-        store: &SessionStore,
-    ) {
+    fn dispatch_autonomous_spawn(&mut self, cmd: &autonomous::SpawnCommand, store: &SessionStore) {
         let Ok(binary) = std::env::current_exe() else {
             self.autonomous.set_status(
                 "autonomous: ON · spawn failed: cannot resolve fleet binary (current_exe)",
             );
             return;
         };
-        let mut child = build_workflow_run_command(
-            &binary,
-            &cmd.workflow,
-            Some(&cmd.issue.human_id),
-        );
+        let mut child =
+            build_workflow_run_command(&binary, &cmd.workflow, Some(&cmd.issue.human_id));
         child
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -960,7 +954,9 @@ fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     lines.push(kv_line("tracker", &snapshot.tracker));
 
-    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let body = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
 
@@ -1054,10 +1050,7 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         kv_line("workflow", &session.workflow),
         kv_line("state", state_word(session.state)),
         kv_line("node", session.current_node.as_deref().unwrap_or("-")),
-        kv_line(
-            "updated",
-            &format!("{} ms (epoch)", session.updated_at_ms),
-        ),
+        kv_line("updated", &format!("{} ms (epoch)", session.updated_at_ms)),
         kv_line("cost", &format_cost(session.total_cost_usd())),
     ];
     if !session.node_costs.is_empty() {
@@ -1103,19 +1096,13 @@ fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     // Autonomous status takes precedence when the engine is doing
     // something interesting (enabled, or has an override message set).
     // Otherwise show the existing free-form `status_line`.
-    let tail = if state.autonomous.enabled()
-        || state.autonomous.status() != "autonomous: OFF"
-    {
+    let tail = if state.autonomous.enabled() || state.autonomous.status() != "autonomous: OFF" {
         state.autonomous.status().to_string()
     } else {
         state.status_line.clone()
     };
     let bar = format!("{help} — {tail}");
-    let p = Paragraph::new(bar).style(
-        Style::default()
-            .bg(Color::Black)
-            .fg(Color::Gray),
-    );
+    let p = Paragraph::new(bar).style(Style::default().bg(Color::Black).fg(Color::Gray));
     f.render_widget(p, area);
 }
 
@@ -1215,7 +1202,11 @@ mod tests {
         .map(state_marker)
         .collect();
         let unique: std::collections::HashSet<_> = glyphs.iter().collect();
-        assert_eq!(unique.len(), glyphs.len(), "glyphs must be distinct: {glyphs:?}");
+        assert_eq!(
+            unique.len(),
+            glyphs.len(),
+            "glyphs must be distinct: {glyphs:?}"
+        );
     }
 
     #[test]
@@ -1421,8 +1412,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = SessionStore::at(tmp.path().to_path_buf());
         let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
-        let action = state
-            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()), &store);
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+            &store,
+        );
         assert!(matches!(action, Action::Quit));
     }
 
@@ -1431,8 +1424,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = SessionStore::at(tmp.path().to_path_buf());
         let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
-        let action = state
-            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &store);
+        let action = state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &store);
         assert!(matches!(action, Action::Quit));
     }
 
@@ -1483,7 +1475,10 @@ mod tests {
         store
             .create(&session("s-new", "wf", SessionState::Running, 1))
             .unwrap();
-        state.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()), &store);
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()),
+            &store,
+        );
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.selected().unwrap().id.as_str(), "s-new");
     }
@@ -1509,9 +1504,17 @@ mod tests {
     #[test]
     fn list_workflows_dir_returns_yaml_basenames_sorted() {
         let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), ".fleet/workflows/standard.yaml", "name: standard\n");
+        write(
+            tmp.path(),
+            ".fleet/workflows/standard.yaml",
+            "name: standard\n",
+        );
         write(tmp.path(), ".fleet/workflows/hotfix.yaml", "name: hotfix\n");
-        write(tmp.path(), ".fleet/workflows/review-only.yaml", "name: review-only\n");
+        write(
+            tmp.path(),
+            ".fleet/workflows/review-only.yaml",
+            "name: review-only\n",
+        );
         let names = list_workflows_dir(tmp.path());
         assert_eq!(names, vec!["hotfix", "review-only", "standard"]);
     }
@@ -1521,7 +1524,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), ".fleet/workflows/keeper.yaml", "name: keeper\n");
         write(tmp.path(), ".fleet/workflows/notes.md", "stuff\n");
-        write(tmp.path(), ".fleet/workflows/.dotfile.yaml", "name: hidden\n");
+        write(
+            tmp.path(),
+            ".fleet/workflows/.dotfile.yaml",
+            "name: hidden\n",
+        );
         std::fs::create_dir_all(tmp.path().join(".fleet/workflows/nested-dir")).unwrap();
         let names = list_workflows_dir(tmp.path());
         assert_eq!(names, vec!["keeper"]);
@@ -1529,8 +1536,7 @@ mod tests {
 
     #[test]
     fn build_workflow_run_command_without_issue() {
-        let cmd =
-            build_workflow_run_command(Path::new("/usr/local/bin/fleet"), "standard", None);
+        let cmd = build_workflow_run_command(Path::new("/usr/local/bin/fleet"), "standard", None);
         let dbg = format!("{cmd:?}");
         assert!(dbg.contains("/usr/local/bin/fleet"), "got: {dbg}");
         assert!(dbg.contains("workflow"), "got: {dbg}");
@@ -1541,11 +1547,8 @@ mod tests {
 
     #[test]
     fn build_workflow_run_command_with_issue_appends_flag() {
-        let cmd = build_workflow_run_command(
-            Path::new("/usr/local/bin/fleet"),
-            "standard",
-            Some("42"),
-        );
+        let cmd =
+            build_workflow_run_command(Path::new("/usr/local/bin/fleet"), "standard", Some("42"));
         let dbg = format!("{cmd:?}");
         assert!(dbg.contains("--issue"), "got: {dbg}");
         assert!(dbg.contains("42"), "got: {dbg}");
@@ -1554,7 +1557,11 @@ mod tests {
     #[test]
     fn n_key_in_sessions_view_opens_spawn_picker() {
         let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), ".fleet/workflows/standard.yaml", "name: standard\n");
+        write(
+            tmp.path(),
+            ".fleet/workflows/standard.yaml",
+            "name: standard\n",
+        );
         write(tmp.path(), ".fleet/workflows/hotfix.yaml", "name: hotfix\n");
         let store = SessionStore::at(tmp.path().join("sessions"));
         let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
@@ -1614,7 +1621,11 @@ mod tests {
         // inside the parent and leave clear margins, which is what
         // the clamp is for. Assert the bounds, not the exact value.
         assert_eq!(huge.width, 95);
-        assert!(huge.height >= 45 && huge.height <= 48, "got {}", huge.height);
+        assert!(
+            huge.height >= 45 && huge.height <= 48,
+            "got {}",
+            huge.height
+        );
         assert!(huge.y >= 1, "top margin missing; got y={}", huge.y);
         assert!(huge.y + huge.height < parent.y + parent.height);
     }
@@ -1629,7 +1640,11 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), ".fleet/workflows/standard.yaml", "name: standard\n");
+        write(
+            tmp.path(),
+            ".fleet/workflows/standard.yaml",
+            "name: standard\n",
+        );
         write(tmp.path(), ".fleet/workflows/hotfix.yaml", "name: hotfix\n");
         let store = SessionStore::at(tmp.path().join("sessions"));
         store
@@ -1673,7 +1688,11 @@ mod tests {
     #[test]
     fn esc_in_spawn_view_returns_to_sessions_without_spawning() {
         let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), ".fleet/workflows/standard.yaml", "name: standard\n");
+        write(
+            tmp.path(),
+            ".fleet/workflows/standard.yaml",
+            "name: standard\n",
+        );
         let store = SessionStore::at(tmp.path().join("sessions"));
         let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
         state.handle_key(
@@ -1835,12 +1854,20 @@ mod tests {
     #[test]
     fn r_reload_picks_up_config_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), ".fleet/config.yaml", "autonomous:\n  max_parallel: 1\n");
+        write(
+            tmp.path(),
+            ".fleet/config.yaml",
+            "autonomous:\n  max_parallel: 1\n",
+        );
         let store = SessionStore::at(tmp.path().join("sessions"));
         let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
         assert_eq!(state.config.autonomous.max_parallel, 1);
         // Edit the config and reload via `r`.
-        write(tmp.path(), ".fleet/config.yaml", "autonomous:\n  max_parallel: 7\n");
+        write(
+            tmp.path(),
+            ".fleet/config.yaml",
+            "autonomous:\n  max_parallel: 7\n",
+        );
         state.handle_key(
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()),
             &store,

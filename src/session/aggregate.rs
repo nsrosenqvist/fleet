@@ -197,12 +197,13 @@ mod tests {
     fn illegal_transition_leaves_session_untouched() {
         let mut s = fresh();
         // Created -> Completed is illegal.
-        let err = s
-            .transition_to(SessionState::Completed, 2_000)
-            .unwrap_err();
+        let err = s.transition_to(SessionState::Completed, 2_000).unwrap_err();
         assert!(format!("{err}").contains("cannot transition"));
         assert_eq!(s.state, SessionState::Created);
-        assert_eq!(s.updated_at_ms, 1_000, "timestamp must not advance on reject");
+        assert_eq!(
+            s.updated_at_ms, 1_000,
+            "timestamp must not advance on reject"
+        );
     }
 
     #[test]

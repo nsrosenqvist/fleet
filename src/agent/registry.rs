@@ -113,7 +113,11 @@ mod tests {
         let r = AgentRegistry::default();
         let spec = r.get("claude-code").expect("claude-code must be present");
         assert_eq!(spec.command, vec!["claude".to_string(), "code".to_string()]);
-        assert!(spec.env_passthrough.iter().any(|e| e == "ANTHROPIC_API_KEY"));
+        assert!(
+            spec.env_passthrough
+                .iter()
+                .any(|e| e == "ANTHROPIC_API_KEY")
+        );
     }
 
     #[test]
@@ -128,14 +132,20 @@ mod tests {
         // two entries that would re-order under HashMap to make the test
         // actually probe the property.
         let mut r = AgentRegistry::default();
-        r.entries.insert("zzz".to_string(), AgentSpec {
-            command: vec!["zzz".to_string()],
-            env_passthrough: vec![],
-        });
-        r.entries.insert("aaa".to_string(), AgentSpec {
-            command: vec!["aaa".to_string()],
-            env_passthrough: vec![],
-        });
+        r.entries.insert(
+            "zzz".to_string(),
+            AgentSpec {
+                command: vec!["zzz".to_string()],
+                env_passthrough: vec![],
+            },
+        );
+        r.entries.insert(
+            "aaa".to_string(),
+            AgentSpec {
+                command: vec!["aaa".to_string()],
+                env_passthrough: vec![],
+            },
+        );
         let names: Vec<_> = r.iter().map(|(n, _)| n.to_string()).collect();
         assert_eq!(names, vec!["aaa", "claude-code", "zzz"]);
     }
@@ -173,20 +183,31 @@ minimal:
     fn with_overrides_replaces_matching_names_and_keeps_others() {
         let defaults = AgentRegistry::default();
         let mut overrides_entries = BTreeMap::new();
-        overrides_entries.insert("claude-code".to_string(), AgentSpec {
-            command: vec!["my-claude".to_string()],
-            env_passthrough: vec!["MY_TOKEN".to_string()],
-        });
-        overrides_entries.insert("aider".to_string(), AgentSpec {
-            command: vec!["aider".to_string()],
-            env_passthrough: vec!["OPENAI_API_KEY".to_string()],
-        });
-        let overrides = AgentRegistry { entries: overrides_entries };
+        overrides_entries.insert(
+            "claude-code".to_string(),
+            AgentSpec {
+                command: vec!["my-claude".to_string()],
+                env_passthrough: vec!["MY_TOKEN".to_string()],
+            },
+        );
+        overrides_entries.insert(
+            "aider".to_string(),
+            AgentSpec {
+                command: vec!["aider".to_string()],
+                env_passthrough: vec!["OPENAI_API_KEY".to_string()],
+            },
+        );
+        let overrides = AgentRegistry {
+            entries: overrides_entries,
+        };
 
         let merged = defaults.with_overrides(overrides);
 
         // claude-code got replaced.
-        assert_eq!(merged.get("claude-code").unwrap().command, vec!["my-claude"]);
+        assert_eq!(
+            merged.get("claude-code").unwrap().command,
+            vec!["my-claude"]
+        );
         // aider got added.
         assert!(merged.get("aider").is_some());
         // No other defaults exist today, so len is exactly 2.

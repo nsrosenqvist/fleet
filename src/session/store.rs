@@ -101,8 +101,8 @@ impl SessionStore {
         let path = self.meta_path(id);
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let session: Session = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let session: Session =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         if session.id != *id {
             bail!(
                 "session id mismatch: directory {} contains meta.json with id {}",
@@ -154,8 +154,7 @@ impl SessionStore {
         let path = self.meta_path(&session.id);
         let json = serde_json::to_string_pretty(session)
             .with_context(|| format!("serialising session {}", session.id))?;
-        std::fs::write(&path, json)
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 }

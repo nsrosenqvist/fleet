@@ -334,5 +334,4 @@ nodes:
         let wf = parse("name: empty\nnodes: []");
         validate(&wf).unwrap();
     }
-
 }

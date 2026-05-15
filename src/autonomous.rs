@@ -133,9 +133,7 @@ impl AutonomousEngine {
         // one event-loop tick); terminal states free their slot.
         let in_flight_count = in_flight
             .iter()
-            .filter(|s| {
-                matches!(s.state, SessionState::Running | SessionState::AwaitingGate)
-            })
+            .filter(|s| matches!(s.state, SessionState::Running | SessionState::AwaitingGate))
             .count();
         let cap_usize = config.max_parallel as usize;
         if in_flight_count >= cap_usize {
@@ -161,8 +159,7 @@ impl AutonomousEngine {
             .iter()
             .filter_map(|s| s.issue.as_ref().map(|i| i.id.clone()))
             .collect();
-        let Some(candidate) = open_issues.into_iter().find(|i| !claimed.contains(&i.id))
-        else {
+        let Some(candidate) = open_issues.into_iter().find(|i| !claimed.contains(&i.id)) else {
             self.status = format!(
                 "autonomous: ON · {in_flight_count}/{cap} in-flight · no unclaimed open issues",
                 cap = config.max_parallel,
@@ -176,9 +173,7 @@ impl AutonomousEngine {
         // labels, `config.workflow` is the fallback. This is the
         // only place the engine reads label data; rule order is the
         // config author's contract.
-        let workflow = config
-            .resolve_workflow_for(&candidate.labels)
-            .to_string();
+        let workflow = config.resolve_workflow_for(&candidate.labels).to_string();
 
         // Found a candidate. Set the spawn timestamp BEFORE returning
         // so a panic in the caller's spawn path doesn't leak into a
@@ -338,8 +333,15 @@ mod tests {
         let out = e.step(t0(), &cfg(), &in_flight, || {
             Ok(vec![issue("42"), issue("43")])
         });
-        assert_eq!(out, AutonomousOutcome::WaitedFor(PauseReason::NoUnclaimedIssues));
-        assert!(e.status().contains("no unclaimed open issues"), "got: {}", e.status());
+        assert_eq!(
+            out,
+            AutonomousOutcome::WaitedFor(PauseReason::NoUnclaimedIssues)
+        );
+        assert!(
+            e.status().contains("no unclaimed open issues"),
+            "got: {}",
+            e.status()
+        );
     }
 
     #[test]
@@ -432,7 +434,10 @@ mod tests {
             Ok(vec![])
         });
         assert_eq!(out, AutonomousOutcome::Idle);
-        assert!(!called, "tracker closure must NOT be called inside scan interval");
+        assert!(
+            !called,
+            "tracker closure must NOT be called inside scan interval"
+        );
     }
 
     #[test]
@@ -443,15 +448,10 @@ mod tests {
         let now = Instant::now();
         let _ = e.step(now, &cfg, &[], || Ok(vec![]));
         let mut called = false;
-        let out = e.step(
-            now + Duration::from_secs(11),
-            &cfg,
-            &[],
-            || {
-                called = true;
-                Ok(vec![issue("1")])
-            },
-        );
+        let out = e.step(now + Duration::from_secs(11), &cfg, &[], || {
+            called = true;
+            Ok(vec![issue("1")])
+        });
         assert!(called, "tracker must be called after the interval elapsed");
         assert!(matches!(out, AutonomousOutcome::Spawn(_)));
     }
@@ -561,7 +561,9 @@ mod tests {
             labels: vec!["bug".to_string()],
             workflow: "hotfix".to_string(),
         }];
-        let out = e.step(t0(), &cfg, &[], || Ok(vec![issue_with_labels("42", &["bug"])]));
+        let out = e.step(t0(), &cfg, &[], || {
+            Ok(vec![issue_with_labels("42", &["bug"])])
+        });
         match out {
             AutonomousOutcome::Spawn(cmd) => {
                 assert_eq!(cmd.workflow, "hotfix", "routing rule must override default");
@@ -570,7 +572,11 @@ mod tests {
             other => panic!("expected Spawn, got {other:?}"),
         }
         // Status line mirrors the chosen workflow, not the default.
-        assert!(e.status().contains("spawned `hotfix`"), "got: {}", e.status());
+        assert!(
+            e.status().contains("spawned `hotfix`"),
+            "got: {}",
+            e.status()
+        );
     }
 
     #[test]

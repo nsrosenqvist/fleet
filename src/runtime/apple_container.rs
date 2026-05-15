@@ -100,12 +100,7 @@ impl RuntimeAdapter for AppleContainerAdapter {
         Ok(id)
     }
 
-    fn exec(
-        &self,
-        container: &ContainerId,
-        argv: &[String],
-        opts: ExecOpts,
-    ) -> Result<ExecHandle> {
+    fn exec(&self, container: &ContainerId, argv: &[String], opts: ExecOpts) -> Result<ExecHandle> {
         let workspace = self.workspace_for(container)?;
         self.cli.exec(&workspace, argv, opts)
     }
@@ -154,10 +149,7 @@ impl RuntimeAdapter for AppleContainerAdapter {
         // a `status` field.
         let stdout = match self.invoker.run(
             "container",
-            vec![
-                "inspect".to_string(),
-                container.as_str().to_string(),
-            ],
+            vec!["inspect".to_string(), container.as_str().to_string()],
         ) {
             Ok(s) => s,
             Err(err) => {
@@ -401,7 +393,11 @@ mod tests {
         let spec = sample_spec(ImageId::new(DevcontainerCli::mint_image_name(&dc)));
         let id = a.start_container(&spec).unwrap();
         let h = a
-            .exec(&id, &["uname".to_string(), "-s".to_string()], ExecOpts::default())
+            .exec(
+                &id,
+                &["uname".to_string(), "-s".to_string()],
+                ExecOpts::default(),
+            )
             .unwrap();
         assert_eq!(h.exit_code, 0);
         assert!(h.stdout.contains("Linux"));
@@ -445,7 +441,8 @@ mod tests {
     fn inspect_running_container_from_json_array() {
         // Apple's CLI wraps the result in a single-element array — verify
         // both common shapes are accepted.
-        let stdout = r#"[{"id":"c-run","status":"running","state":{"status":"running","exitCode":0}}]"#;
+        let stdout =
+            r#"[{"id":"c-run","status":"running","state":{"status":"running","exitCode":0}}]"#;
         let invoker = invoker_with(vec![(
             "container",
             vec!["inspect".to_string(), "c-run".to_string()],

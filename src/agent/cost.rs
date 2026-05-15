@@ -206,7 +206,10 @@ mod tests {
 
     #[test]
     fn returns_none_for_unknown_agent() {
-        assert_eq!(parse_agent_cost_usd("nonesuch", "Total cost: $0.42", ""), None);
+        assert_eq!(
+            parse_agent_cost_usd("nonesuch", "Total cost: $0.42", ""),
+            None
+        );
     }
 
     #[test]
@@ -242,10 +245,7 @@ Total duration (API): 2m
     #[test]
     fn claude_code_falls_back_to_total_cost_when_usd_variant_absent() {
         let stdout = "Total cost: $1.50\n";
-        assert_eq!(
-            parse_agent_cost_usd("claude-code", stdout, ""),
-            Some(1.50)
-        );
+        assert_eq!(parse_agent_cost_usd("claude-code", stdout, ""), Some(1.50));
     }
 
     #[test]
@@ -275,10 +275,7 @@ Total cost: $0.05
 ... continuing ...
 Total cost: $0.12
 ";
-        assert_eq!(
-            parse_agent_cost_usd("claude-code", stdout, ""),
-            Some(0.12)
-        );
+        assert_eq!(parse_agent_cost_usd("claude-code", stdout, ""), Some(0.12));
     }
 
     #[test]
@@ -347,5 +344,4 @@ Total cost: $0.12
         // single decimal — stop at the second dot.
         assert_eq!(read_decimal("1.2.3"), Some(1.2));
     }
-
 }

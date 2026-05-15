@@ -78,4 +78,3 @@ pub fn run_interactive(
         .with_context(|| format!("failed to spawn `{program}`"))?;
     Ok(status.code().unwrap_or(-1))
 }
-

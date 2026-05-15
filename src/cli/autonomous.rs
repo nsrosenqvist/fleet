@@ -65,7 +65,9 @@ fn run_once(setup: &Setup) -> i32 {
         Instant::now(),
         setup,
         &sessions,
-        &RealSpawner { binary: std::env::current_exe().ok() },
+        &RealSpawner {
+            binary: std::env::current_exe().ok(),
+        },
     );
     print!("{}", render_outcome(&outcome));
     match &outcome {
@@ -82,9 +84,10 @@ fn run_watch(setup: &Setup) -> Result<i32> {
     sweep_crashed(setup);
     let mut engine = AutonomousEngine::new();
     engine.toggle();
-    let spawner = RealSpawner { binary: std::env::current_exe().ok() };
-    let scan_interval =
-        Duration::from_secs(u64::from(setup.config.autonomous.scan_interval_secs));
+    let spawner = RealSpawner {
+        binary: std::env::current_exe().ok(),
+    };
+    let scan_interval = Duration::from_secs(u64::from(setup.config.autonomous.scan_interval_secs));
     loop {
         let sessions = load_sessions(&setup.store);
         let outcome = tick(&mut engine, Instant::now(), setup, &sessions, &spawner);
@@ -306,8 +309,9 @@ mod tests {
 
     #[test]
     fn render_outcome_wait_no_issues() {
-        let r =
-            render_outcome(&AutonomousOutcome::WaitedFor(PauseReason::NoUnclaimedIssues));
+        let r = render_outcome(&AutonomousOutcome::WaitedFor(
+            PauseReason::NoUnclaimedIssues,
+        ));
         assert_eq!(r, "wait no-unclaimed-issues\n");
     }
 
@@ -401,13 +405,7 @@ mod tests {
         let mut engine = AutonomousEngine::new();
         engine.toggle();
         let spawner = RecordingSpawner::new();
-        let outcome = tick(
-            &mut engine,
-            Instant::now(),
-            &setup,
-            &[],
-            &spawner,
-        );
+        let outcome = tick(&mut engine, Instant::now(), &setup, &[], &spawner);
         match outcome {
             AutonomousOutcome::Spawn(cmd) => {
                 assert_eq!(cmd.issue.human_id, "1");
@@ -416,7 +414,11 @@ mod tests {
             other => panic!("expected Spawn, got {other:?}"),
         }
         let calls = spawner.take();
-        assert_eq!(calls.len(), 1, "spawner must have been invoked exactly once");
+        assert_eq!(
+            calls.len(),
+            1,
+            "spawner must have been invoked exactly once"
+        );
     }
 
     #[test]
@@ -474,13 +476,7 @@ mod tests {
         let (_d, setup) = setup_with_tracker(tracker);
         let mut engine = AutonomousEngine::new();
         engine.toggle();
-        let outcome = tick(
-            &mut engine,
-            Instant::now(),
-            &setup,
-            &[],
-            &FailingSpawner,
-        );
+        let outcome = tick(&mut engine, Instant::now(), &setup, &[], &FailingSpawner);
         match outcome {
             AutonomousOutcome::WaitedFor(PauseReason::TrackerError(msg)) => {
                 assert!(msg.contains("disk full"), "got: {msg}");
@@ -554,7 +550,10 @@ mod tests {
         // Exhaustive coverage so a new variant breaks this test until
         // the match is updated.
         assert_eq!(
-            render_reason(&PauseReason::SlotsExhausted { in_flight: 1, cap: 2 }),
+            render_reason(&PauseReason::SlotsExhausted {
+                in_flight: 1,
+                cap: 2
+            }),
             "slots-exhausted in_flight=1 cap=2"
         );
         assert_eq!(

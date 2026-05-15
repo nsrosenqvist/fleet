@@ -103,12 +103,7 @@ impl RuntimeAdapter for DockerAdapter {
         Ok(id)
     }
 
-    fn exec(
-        &self,
-        container: &ContainerId,
-        argv: &[String],
-        opts: ExecOpts,
-    ) -> Result<ExecHandle> {
+    fn exec(&self, container: &ContainerId, argv: &[String], opts: ExecOpts) -> Result<ExecHandle> {
         let workspace = self.workspace_for(container)?;
         self.cli.exec(&workspace, argv, opts)
     }
@@ -441,7 +436,11 @@ mod tests {
                 ],
                 r#"{"outcome":"success","containerId":"c-stop"}"#.to_string(),
             ),
-            ("docker", vec!["stop".to_string(), "c-stop".to_string()], "c-stop".to_string()),
+            (
+                "docker",
+                vec!["stop".to_string(), "c-stop".to_string()],
+                "c-stop".to_string(),
+            ),
         ]);
         let a = DockerAdapter::new(invoker, false);
         let id = a
@@ -473,7 +472,8 @@ mod tests {
     #[test]
     fn stop_propagates_unexpected_errors() {
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run().returning(|_, _| Err(anyhow!("daemon not running")));
+        mock.expect_run()
+            .returning(|_, _| Err(anyhow!("daemon not running")));
         let a = DockerAdapter::new(Arc::new(mock), false);
         let err = a.stop(&ContainerId::new("c")).unwrap_err();
         assert!(format!("{err}").contains("daemon not running"));
@@ -534,11 +534,9 @@ mod tests {
 
     #[test]
     fn workspace_from_devcontainer_handles_canonical_layout() {
-        let dc = Devcontainer::from_str_at(
-            r#"{"image":"x"}"#,
-            "/repo/.devcontainer/devcontainer.json",
-        )
-        .unwrap();
+        let dc =
+            Devcontainer::from_str_at(r#"{"image":"x"}"#, "/repo/.devcontainer/devcontainer.json")
+                .unwrap();
         assert_eq!(workspace_from_devcontainer(&dc), PathBuf::from("/repo"));
     }
 

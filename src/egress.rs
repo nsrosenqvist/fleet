@@ -288,21 +288,17 @@ impl EgressEnforcer for PodmanTinyproxyEnforcer {
         // setup may leave only some resources, and we want to
         // reclaim what we can.
         if let Some(container) = &setup.proxy_container {
-            if let Err(err) = self.invoker.run(
-                "podman",
-                vec!["stop".to_string(), container.clone()],
-            ) {
+            if let Err(err) = self
+                .invoker
+                .run("podman", vec!["stop".to_string(), container.clone()])
+            {
                 tracing::warn!(error = %err, container = %container, "stopping tinyproxy sidecar failed");
             }
         }
         if let Some(network) = &setup.network_name {
             if let Err(err) = self.invoker.run(
                 "podman",
-                vec![
-                    "network".to_string(),
-                    "rm".to_string(),
-                    network.clone(),
-                ],
+                vec!["network".to_string(), "rm".to_string(), network.clone()],
             ) {
                 tracing::warn!(error = %err, network = %network, "removing podman network failed");
             }
@@ -399,11 +395,7 @@ impl EgressEnforcer for HostProxyEnforcer {
         std::fs::write(&allowlist_path, self.allowlist.join("\n"))
             .with_context(|| format!("writing {}", allowlist_path.display()))?;
 
-        let conf = build_host_tinyproxy_conf(
-            self.proxy_port,
-            &allowlist_path,
-            &pidfile_path,
-        );
+        let conf = build_host_tinyproxy_conf(self.proxy_port, &allowlist_path, &pidfile_path);
         std::fs::write(&conf_path, conf)
             .with_context(|| format!("writing {}", conf_path.display()))?;
 
@@ -624,14 +616,12 @@ pub fn build_enforcer(
 /// just for this would be silly; the input here is short (< 1 KiB
 /// in practice) so a hand-rolled encoder is fine.
 fn simple_base64_encode(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
-        let n = (u32::from(bytes[i]) << 16)
-            | (u32::from(bytes[i + 1]) << 8)
-            | u32::from(bytes[i + 2]);
+        let n =
+            (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8) | u32::from(bytes[i + 2]);
         out.push(ALPHA[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHA[((n >> 12) & 0x3F) as usize] as char);
         out.push(ALPHA[((n >> 6) & 0x3F) as usize] as char);
@@ -741,13 +731,15 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls_for_mock = Arc::clone(&calls);
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run().with(always(), always()).returning(move |bin, args| {
-            calls_for_mock
-                .lock()
-                .unwrap()
-                .push(format!("{bin} {}", args.join(" ")));
-            Ok(String::new())
-        });
+        mock.expect_run()
+            .with(always(), always())
+            .returning(move |bin, args| {
+                calls_for_mock
+                    .lock()
+                    .unwrap()
+                    .push(format!("{bin} {}", args.join(" ")));
+                Ok(String::new())
+            });
         let invoker: Arc<dyn ProcessInvoker> = Arc::new(mock);
         let enforcer = build_enforcer(&net, "podman", invoker, &[]);
         let setup = enforcer.setup("s-real").unwrap();
@@ -795,13 +787,15 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls_for_mock = Arc::clone(&calls);
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run().with(always(), always()).returning(move |bin, args| {
-            calls_for_mock
-                .lock()
-                .unwrap()
-                .push(format!("{bin} {}", args.join(" ")));
-            Ok(String::new())
-        });
+        mock.expect_run()
+            .with(always(), always())
+            .returning(move |bin, args| {
+                calls_for_mock
+                    .lock()
+                    .unwrap()
+                    .push(format!("{bin} {}", args.join(" ")));
+                Ok(String::new())
+            });
         let enf = PodmanTinyproxyEnforcer::new(Arc::new(mock), vec![]);
         let setup = EgressSetup {
             proxy_env: vec![],
@@ -824,13 +818,15 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls_for_mock = Arc::clone(&calls);
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run().with(always(), always()).returning(move |bin, args| {
-            calls_for_mock
-                .lock()
-                .unwrap()
-                .push(format!("{bin} {}", args.join(" ")));
-            Ok(String::new())
-        });
+        mock.expect_run()
+            .with(always(), always())
+            .returning(move |bin, args| {
+                calls_for_mock
+                    .lock()
+                    .unwrap()
+                    .push(format!("{bin} {}", args.join(" ")));
+                Ok(String::new())
+            });
         let enf = PodmanTinyproxyEnforcer::new(Arc::new(mock), vec![]);
         enf.teardown(&EgressSetup::empty()).unwrap();
         assert!(calls.lock().unwrap().is_empty());
@@ -842,9 +838,9 @@ mod tests {
         // already removed) must NOT propagate — partial cleanup is
         // worth more than a failed sweep.
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run().with(always(), always()).returning(|_, _| {
-            Err(anyhow::anyhow!("podman exploded"))
-        });
+        mock.expect_run()
+            .with(always(), always())
+            .returning(|_, _| Err(anyhow::anyhow!("podman exploded")));
         let enf = PodmanTinyproxyEnforcer::new(Arc::new(mock), vec![]);
         let setup = EgressSetup {
             proxy_env: vec![],
@@ -867,10 +863,12 @@ mod tests {
         let invoker_calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls_for_mock = Arc::clone(&invoker_calls);
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run().with(always(), always()).returning(move |bin, _args| {
-            calls_for_mock.lock().unwrap().push(bin.to_string());
-            Ok(String::new())
-        });
+        mock.expect_run()
+            .with(always(), always())
+            .returning(move |bin, _args| {
+                calls_for_mock.lock().unwrap().push(bin.to_string());
+                Ok(String::new())
+            });
         let invoker: Arc<dyn ProcessInvoker> = Arc::new(mock);
         // Re-route the host-proxy enforcer's tempdir into the test
         // dir so we can drive the full setup without polluting /tmp.
@@ -904,13 +902,12 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
         let calls_for_mock = Arc::clone(&calls);
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run().with(always(), always()).returning(move |bin, args| {
-            calls_for_mock
-                .lock()
-                .unwrap()
-                .push((bin.to_string(), args));
-            Ok(String::new())
-        });
+        mock.expect_run()
+            .with(always(), always())
+            .returning(move |bin, args| {
+                calls_for_mock.lock().unwrap().push((bin.to_string(), args));
+                Ok(String::new())
+            });
         let enf = HostProxyEnforcer::new(
             Arc::new(mock),
             "host.containers.internal",
@@ -940,7 +937,13 @@ mod tests {
         // No engine-side network on the host-proxy path.
         assert_eq!(setup.network_name, None);
         // proxy_container stashes the pidfile path for teardown.
-        assert!(setup.proxy_container.as_deref().unwrap().ends_with("tinyproxy.pid"));
+        assert!(
+            setup
+                .proxy_container
+                .as_deref()
+                .unwrap()
+                .ends_with("tinyproxy.pid")
+        );
     }
 
     #[test]
@@ -952,18 +955,13 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
         let calls_for_mock = Arc::clone(&calls);
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run().with(always(), always()).returning(move |bin, args| {
-            calls_for_mock
-                .lock()
-                .unwrap()
-                .push((bin.to_string(), args));
-            Ok(String::new())
-        });
-        let enf = HostProxyEnforcer::new(
-            Arc::new(mock),
-            "host.containers.internal",
-            vec![],
-        );
+        mock.expect_run()
+            .with(always(), always())
+            .returning(move |bin, args| {
+                calls_for_mock.lock().unwrap().push((bin.to_string(), args));
+                Ok(String::new())
+            });
+        let enf = HostProxyEnforcer::new(Arc::new(mock), "host.containers.internal", vec![]);
         let setup = EgressSetup {
             proxy_env: vec![],
             network_name: None,
@@ -973,7 +971,10 @@ mod tests {
         let invocations = calls.lock().unwrap().clone();
         assert_eq!(invocations.len(), 1);
         assert_eq!(invocations[0].0, "kill");
-        assert_eq!(invocations[0].1, vec!["-TERM".to_string(), "12345".to_string()]);
+        assert_eq!(
+            invocations[0].1,
+            vec!["-TERM".to_string(), "12345".to_string()]
+        );
         // Tempdir is reclaimed.
         assert!(!pidfile.parent().unwrap().exists());
     }
@@ -984,11 +985,7 @@ mod tests {
         // process crashed before doing so. teardown must not error.
         let mut mock = MockProcessInvoker::new();
         mock.expect_run().returning(|_, _| Ok(String::new()));
-        let enf = HostProxyEnforcer::new(
-            Arc::new(mock),
-            "host.containers.internal",
-            vec![],
-        );
+        let enf = HostProxyEnforcer::new(Arc::new(mock), "host.containers.internal", vec![]);
         let setup = EgressSetup {
             proxy_env: vec![],
             network_name: None,
@@ -1036,7 +1033,12 @@ mod tests {
         let encoded = simple_base64_encode(conf.as_bytes());
         // Decoded length should be the original length.
         assert_eq!(encoded.len() % 4, 0);
-        assert!(encoded.contains('+') || encoded.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '='));
+        assert!(
+            encoded.contains('+')
+                || encoded
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '=')
+        );
     }
 
     #[test]

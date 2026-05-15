@@ -177,12 +177,7 @@ pub trait RuntimeAdapter: Send + Sync {
 
     /// One-shot exec inside a running container. Stdout/stderr are captured
     /// in full; interactive use cases go through [`Self::attach_pty`].
-    fn exec(
-        &self,
-        container: &ContainerId,
-        argv: &[String],
-        opts: ExecOpts,
-    ) -> Result<ExecHandle>;
+    fn exec(&self, container: &ContainerId, argv: &[String], opts: ExecOpts) -> Result<ExecHandle>;
 
     /// Attach a PTY for an interactive session. The returned handle is
     /// owned by the caller; the adapter does not retain it.
@@ -379,11 +374,9 @@ mod tests {
     fn is_running_false_for_unknown() {
         let cid = ContainerId::new("c");
         assert!(
-            !FakeInspectAdapter::new(ContainerState::Unknown(
-                "not tracked by engine".to_string()
-            ))
-            .is_running(&cid)
-            .unwrap()
+            !FakeInspectAdapter::new(ContainerState::Unknown("not tracked by engine".to_string()))
+                .is_running(&cid)
+                .unwrap()
         );
     }
 

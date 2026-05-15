@@ -20,11 +20,11 @@ use crate::repo_config::RepoConfig;
 use crate::runtime::detect::probe;
 use crate::runtime::devcontainer::Devcontainer;
 use crate::runtime::factory::build_adapter;
-use crate::session::{ClockIdSource, IdSource, SessionState};
-use crate::session::store::SessionStore;
-use crate::session::SessionId;
-use crate::tracker::{Issue, build as build_tracker};
 use crate::session::IssueContext;
+use crate::session::SessionId;
+use crate::session::store::SessionStore;
+use crate::session::{ClockIdSource, IdSource, SessionState};
+use crate::tracker::{Issue, build as build_tracker};
 use crate::workflow::executor::{ExecuteRequest, WorkflowExecutor};
 use crate::workflow::spec::Workflow;
 use crate::workflow::validate::validate;
@@ -46,8 +46,7 @@ pub fn run_validate(name: &str) -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
     let path = workflow_path(&root, name);
-    let wf = Workflow::from_path(&path)
-        .with_context(|| format!("loading workflow `{name}`"))?;
+    let wf = Workflow::from_path(&path).with_context(|| format!("loading workflow `{name}`"))?;
     validate(&wf).with_context(|| format!("validating workflow `{name}`"))?;
     println!(
         "fleet workflow validate: `{name}` ok ({} node{})",
@@ -66,12 +65,11 @@ pub fn run_validate(name: &str) -> Result<i32> {
 pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
-    let config = RepoConfig::load(root.join(".fleet/config.yaml"))
-        .context("loading .fleet/config.yaml")?;
+    let config =
+        RepoConfig::load(root.join(".fleet/config.yaml")).context("loading .fleet/config.yaml")?;
 
     let wf_path = workflow_path(&root, name);
-    let wf = Workflow::from_path(&wf_path)
-        .with_context(|| format!("loading workflow `{name}`"))?;
+    let wf = Workflow::from_path(&wf_path).with_context(|| format!("loading workflow `{name}`"))?;
 
     let dc_path = if config.runtime.devcontainer.is_absolute() {
         config.runtime.devcontainer.clone()
@@ -134,8 +132,8 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
 pub fn run_resume(session_id: &str) -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
-    let config = RepoConfig::load(root.join(".fleet/config.yaml"))
-        .context("loading .fleet/config.yaml")?;
+    let config =
+        RepoConfig::load(root.join(".fleet/config.yaml")).context("loading .fleet/config.yaml")?;
 
     let store = SessionStore::for_repo(&root);
     let id = SessionId::new(session_id);
@@ -209,8 +207,8 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
 pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
-    let config = RepoConfig::load(root.join(".fleet/config.yaml"))
-        .context("loading .fleet/config.yaml")?;
+    let config =
+        RepoConfig::load(root.join(".fleet/config.yaml")).context("loading .fleet/config.yaml")?;
 
     let store = SessionStore::for_repo(&root);
     let src_id = SessionId::new(session_id);
@@ -286,7 +284,12 @@ fn build_workflow_enforcer(
 ) -> Box<dyn EgressEnforcer> {
     let defaults: Vec<String> = fleet_default_allowlist_hosts(config);
     let defaults_refs: Vec<&str> = defaults.iter().map(String::as_str).collect();
-    egress::build_enforcer(&config.runtime.network, adapter.name(), invoker, &defaults_refs)
+    egress::build_enforcer(
+        &config.runtime.network,
+        adapter.name(),
+        invoker,
+        &defaults_refs,
+    )
 }
 
 /// Derive the set of hosts fleet adds to the allowlist regardless of
@@ -441,7 +444,8 @@ mod tests {
 
     #[test]
     fn render_workflow_list_with_entries() {
-        let rendered = render_workflow_list(Path::new("/repo"), &["a".to_string(), "b".to_string()]);
+        let rendered =
+            render_workflow_list(Path::new("/repo"), &["a".to_string(), "b".to_string()]);
         assert!(rendered.contains("fleet workflows in /repo"));
         assert!(rendered.contains("  - a"));
         assert!(rendered.contains("  - b"));
@@ -491,7 +495,11 @@ mod tests {
 
     #[test]
     fn pick_issue_returns_exact_human_id_match() {
-        let issues = vec![make_issue("1", "a"), make_issue("42", "b"), make_issue("100", "c")];
+        let issues = vec![
+            make_issue("1", "a"),
+            make_issue("42", "b"),
+            make_issue("100", "c"),
+        ];
         let hit = pick_issue(&issues, "42").unwrap();
         assert_eq!(hit.title, "b");
     }

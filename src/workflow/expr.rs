@@ -133,9 +133,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
             }
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 // Slice is valid UTF-8: we only advanced over ASCII bytes.
@@ -214,9 +212,7 @@ impl Parser {
         };
         let op = match self.bump() {
             Some(t @ (Tok::EqEq | Tok::BangEq)) => t,
-            other => bail!(
-                "expected `==` or `!=` after `{node}.{name}`, got {other:?}"
-            ),
+            other => bail!("expected `==` or `!=` after `{node}.{name}`, got {other:?}"),
         };
         let rhs = match self.bump() {
             Some(Tok::Str(s)) => s,
@@ -275,73 +271,51 @@ mod tests {
             ("review", "decision", "approve"),
             ("plan", "kind", "feature"),
         ]);
-        assert!(evaluate(
-            r#"review.decision == "approve" && plan.kind == "feature""#,
-            &m
-        )
-        .unwrap());
-        assert!(!evaluate(
-            r#"review.decision == "approve" && plan.kind == "bug""#,
-            &m
-        )
-        .unwrap());
+        assert!(
+            evaluate(
+                r#"review.decision == "approve" && plan.kind == "feature""#,
+                &m
+            )
+            .unwrap()
+        );
+        assert!(!evaluate(r#"review.decision == "approve" && plan.kind == "bug""#, &m).unwrap());
     }
 
     #[test]
     fn or_short_circuits_correctly() {
         let m = ctx(&[("review", "decision", "approve")]);
-        assert!(evaluate(
-            r#"review.decision == "approve" || review.decision == "changes_requested""#,
-            &m
-        )
-        .unwrap());
-        assert!(!evaluate(
-            r#"review.decision == "rejected" || review.decision == "deferred""#,
-            &m
-        )
-        .unwrap());
+        assert!(
+            evaluate(
+                r#"review.decision == "approve" || review.decision == "changes_requested""#,
+                &m
+            )
+            .unwrap()
+        );
+        assert!(
+            !evaluate(
+                r#"review.decision == "rejected" || review.decision == "deferred""#,
+                &m
+            )
+            .unwrap()
+        );
     }
 
     #[test]
     fn parentheses_change_precedence() {
         // a && (b || c): with a=true, b=false, c=true → true
-        let m = ctx(&[
-            ("a", "v", "1"),
-            ("b", "v", "0"),
-            ("c", "v", "1"),
-        ]);
-        assert!(evaluate(
-            r#"a.v == "1" && (b.v == "1" || c.v == "1")"#,
-            &m
-        )
-        .unwrap());
+        let m = ctx(&[("a", "v", "1"), ("b", "v", "0"), ("c", "v", "1")]);
+        assert!(evaluate(r#"a.v == "1" && (b.v == "1" || c.v == "1")"#, &m).unwrap());
         // Without parens: a && b || c → (a && b) || c → false || true → true
         // With different shape — a=true, b=false, c=false → false
-        let m = ctx(&[
-            ("a", "v", "1"),
-            ("b", "v", "0"),
-            ("c", "v", "0"),
-        ]);
-        assert!(!evaluate(
-            r#"a.v == "1" && (b.v == "1" || c.v == "1")"#,
-            &m
-        )
-        .unwrap());
+        let m = ctx(&[("a", "v", "1"), ("b", "v", "0"), ("c", "v", "0")]);
+        assert!(!evaluate(r#"a.v == "1" && (b.v == "1" || c.v == "1")"#, &m).unwrap());
     }
 
     #[test]
     fn and_binds_tighter_than_or() {
         // a || b && c: with a=false, b=true, c=false → false || (true && false) → false
-        let m = ctx(&[
-            ("a", "v", "0"),
-            ("b", "v", "1"),
-            ("c", "v", "0"),
-        ]);
-        assert!(!evaluate(
-            r#"a.v == "1" || b.v == "1" && c.v == "1""#,
-            &m
-        )
-        .unwrap());
+        let m = ctx(&[("a", "v", "0"), ("b", "v", "1"), ("c", "v", "0")]);
+        assert!(!evaluate(r#"a.v == "1" || b.v == "1" && c.v == "1""#, &m).unwrap());
     }
 
     #[test]

@@ -42,7 +42,10 @@ pub struct Devcontainer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageSource {
     Image(String),
-    Build { dockerfile: PathBuf, context: PathBuf },
+    Build {
+        dockerfile: PathBuf,
+        context: PathBuf,
+    },
 }
 
 // Unknown fields are silently ignored (serde's default). Real-world
@@ -84,9 +87,8 @@ impl Devcontainer {
     pub fn from_str_at(input: &str, at: impl AsRef<Path>) -> Result<Self> {
         let at = at.as_ref();
         let stripped = strip_jsonc(input);
-        let raw: Raw = serde_json::from_str(&stripped).with_context(|| {
-            format!("parsing devcontainer JSON at {}", at.display())
-        })?;
+        let raw: Raw = serde_json::from_str(&stripped)
+            .with_context(|| format!("parsing devcontainer JSON at {}", at.display()))?;
 
         let image_source = match (raw.image, raw.build) {
             (Some(_), Some(_)) => bail!(
@@ -105,7 +107,10 @@ impl Devcontainer {
                     .context
                     .as_deref()
                     .map_or_else(|| parent.to_path_buf(), |c| parent.join(c));
-                ImageSource::Build { dockerfile, context }
+                ImageSource::Build {
+                    dockerfile,
+                    context,
+                }
             }
         };
 
@@ -277,7 +282,10 @@ mod tests {
         )
         .unwrap();
         match dc.image_source {
-            ImageSource::Build { dockerfile, context } => {
+            ImageSource::Build {
+                dockerfile,
+                context,
+            } => {
                 assert_eq!(dockerfile, PathBuf::from("/repo/.devcontainer/Dockerfile"));
                 assert_eq!(context, PathBuf::from("/repo/.devcontainer/.."));
             }
@@ -319,11 +327,9 @@ mod tests {
 
     #[test]
     fn parses_workspace_folder() {
-        let dc = Devcontainer::from_str_at(
-            r#"{ "image": "x", "workspaceFolder": "/work" }"#,
-            "/x.json",
-        )
-        .unwrap();
+        let dc =
+            Devcontainer::from_str_at(r#"{ "image": "x", "workspaceFolder": "/work" }"#, "/x.json")
+                .unwrap();
         assert_eq!(dc.workspace_folder.as_deref(), Some("/work"));
     }
 
@@ -403,21 +409,16 @@ mod tests {
 
     #[test]
     fn does_not_strip_commas_inside_strings() {
-        let dc = Devcontainer::from_str_at(
-            r#"{ "image": "x", "workspaceFolder": "/a,/b" }"#,
-            "/x.json",
-        )
-        .unwrap();
+        let dc =
+            Devcontainer::from_str_at(r#"{ "image": "x", "workspaceFolder": "/a,/b" }"#, "/x.json")
+                .unwrap();
         assert_eq!(dc.workspace_folder.as_deref(), Some("/a,/b"));
     }
 
     #[test]
     fn handles_escaped_quotes_inside_strings() {
-        let dc = Devcontainer::from_str_at(
-            r#"{ "image": "with \"quotes\" inside" }"#,
-            "/x.json",
-        )
-        .unwrap();
+        let dc = Devcontainer::from_str_at(r#"{ "image": "with \"quotes\" inside" }"#, "/x.json")
+            .unwrap();
         assert_eq!(
             dc.image_source,
             ImageSource::Image(r#"with "quotes" inside"#.to_string())

@@ -68,7 +68,10 @@ pub fn run_logs(id: &str, node: Option<&str>) -> Result<i32> {
     if let Some(name) = node {
         let path = logs_dir.join(format!("{name}.log"));
         if !path.is_file() {
-            bail!("no log for node `{name}` in session `{id}` (expected at {})", path.display());
+            bail!(
+                "no log for node `{name}` in session `{id}` (expected at {})",
+                path.display()
+            );
         }
         let body = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -90,8 +93,8 @@ pub fn run_logs(id: &str, node: Option<&str>) -> Result<i32> {
             .and_then(|s| s.to_str())
             .unwrap_or("<unnamed>");
         println!("=== {header} ===");
-        let body = std::fs::read_to_string(&log)
-            .with_context(|| format!("reading {}", log.display()))?;
+        let body =
+            std::fs::read_to_string(&log).with_context(|| format!("reading {}", log.display()))?;
         print!("{body}");
         if !body.ends_with('\n') {
             println!();
@@ -302,7 +305,11 @@ pub fn render_session_show(session: &Session, store: &SessionStore, logs: &[Path
         "  directory:    {}",
         store.session_dir(&session.id).display()
     );
-    let _ = writeln!(out, "  total cost:   {}", format_cost(session.total_cost_usd()));
+    let _ = writeln!(
+        out,
+        "  total cost:   {}",
+        format_cost(session.total_cost_usd())
+    );
     out.push_str("  node costs:\n");
     if session.node_costs.is_empty() {
         out.push_str("    (no agent cost lines parsed yet)\n");
@@ -469,10 +476,7 @@ mod tests {
 
     #[test]
     fn render_session_list_shows_dash_for_missing_current_node() {
-        let r = render_session_list(
-            Path::new("/r"),
-            &[row("s-1", "created", "standard", None)],
-        );
+        let r = render_session_list(Path::new("/r"), &[row("s-1", "created", "standard", None)]);
         assert!(r.contains("node=-"));
     }
 
@@ -626,8 +630,6 @@ mod tests {
             }],
         });
         assert!(r.contains("stopped 2 leaked container(s): c-aaa, c-bbb"));
-        assert!(r.contains(
-            "failed to stop 1 leaked container(s); reclaim manually: c-ccc"
-        ));
+        assert!(r.contains("failed to stop 1 leaked container(s); reclaim manually: c-ccc"));
     }
 }

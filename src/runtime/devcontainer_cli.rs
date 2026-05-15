@@ -103,7 +103,10 @@ impl DevcontainerCli {
                 "image".hash(&mut hasher);
                 name.hash(&mut hasher);
             }
-            ImageSource::Build { dockerfile, context } => {
+            ImageSource::Build {
+                dockerfile,
+                context,
+            } => {
                 "build".hash(&mut hasher);
                 dockerfile.hash(&mut hasher);
                 context.hash(&mut hasher);
@@ -134,7 +137,10 @@ impl DevcontainerCli {
         let parsed: BuildResult = parse_json_output(&stdout)
             .with_context(|| format!("parsing `devcontainer build` output: {stdout}"))?;
         if parsed.outcome != "success" {
-            bail!("`devcontainer build` reported non-success outcome: {}", parsed.outcome);
+            bail!(
+                "`devcontainer build` reported non-success outcome: {}",
+                parsed.outcome
+            );
         }
         // The CLI echoes the `--image-name` we passed; sanity-check it. The
         // field may be a single string or an array of tags depending on CLI
@@ -185,7 +191,10 @@ impl DevcontainerCli {
         let parsed: UpResult = parse_json_output(&stdout)
             .with_context(|| format!("parsing `devcontainer up` output: {stdout}"))?;
         if parsed.outcome != "success" {
-            bail!("`devcontainer up` reported non-success outcome: {}", parsed.outcome);
+            bail!(
+                "`devcontainer up` reported non-success outcome: {}",
+                parsed.outcome
+            );
         }
         Ok(ContainerId::new(parsed.container_id))
     }
@@ -196,12 +205,7 @@ impl DevcontainerCli {
     /// [`ProcessInvoker`] contract — the handle reports `exit_code: 1` plus
     /// the formatted error in `stderr` on failure, matching [`super::local`]'s
     /// behaviour.
-    pub fn exec(
-        &self,
-        workspace: &Path,
-        argv: &[String],
-        opts: ExecOpts,
-    ) -> Result<ExecHandle> {
+    pub fn exec(&self, workspace: &Path, argv: &[String], opts: ExecOpts) -> Result<ExecHandle> {
         if argv.is_empty() {
             bail!("exec argv must contain at least the program name");
         }
@@ -413,8 +417,7 @@ mod tests {
         let dc = sample_dc();
         let minted = DevcontainerCli::mint_image_name(&dc);
         // The CLI sometimes wraps a single image name in an array.
-        let stdout =
-            format!(r#"{{"outcome":"success","imageName":["{minted}","extra:tag"]}}"#);
+        let stdout = format!(r#"{{"outcome":"success","imageName":["{minted}","extra:tag"]}}"#);
         let stdout_static: &'static str = Box::leak(stdout.into_boxed_str());
         let mut mock = MockProcessInvoker::new();
         mock.expect_run()
@@ -552,7 +555,11 @@ mod tests {
             env: vec![("FOO".to_string(), "bar".to_string())],
         };
         let h = cli
-            .exec(Path::new("/repo"), &["ls".to_string(), "-la".to_string()], opts)
+            .exec(
+                Path::new("/repo"),
+                &["ls".to_string(), "-la".to_string()],
+                opts,
+            )
             .unwrap();
         assert_eq!(h.exit_code, 0);
         assert!(h.stdout.contains("drwxr-xr-x"));
@@ -564,7 +571,11 @@ mod tests {
         mock.expect_run().returning(|_, _| Err(anyhow!("boom")));
         let cli = DevcontainerCli::new(Arc::new(mock), Engine::Docker);
         let h = cli
-            .exec(Path::new("/repo"), &["false".to_string()], ExecOpts::default())
+            .exec(
+                Path::new("/repo"),
+                &["false".to_string()],
+                ExecOpts::default(),
+            )
             .unwrap();
         assert_eq!(h.exit_code, 1);
         assert!(h.stderr.contains("boom"));
@@ -591,7 +602,8 @@ mod tests {
 
     #[test]
     fn parse_json_output_finds_json_after_leading_banner() {
-        let stdout = "[info] starting up\nrandom log\n{\"outcome\":\"success\",\"containerId\":\"c1\"}";
+        let stdout =
+            "[info] starting up\nrandom log\n{\"outcome\":\"success\",\"containerId\":\"c1\"}";
         let parsed: UpResult = parse_json_output(stdout).unwrap();
         assert_eq!(parsed.outcome, "success");
         assert_eq!(parsed.container_id, "c1");

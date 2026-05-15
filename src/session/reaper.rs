@@ -334,10 +334,8 @@ fn write_crash_snapshot(
         log_tails,
     };
     let path = session_dir.join("crash.json");
-    let body = serde_json::to_string_pretty(&snapshot)
-        .context("serialising crash snapshot")?;
-    std::fs::write(&path, body)
-        .with_context(|| format!("writing {}", path.display()))?;
+    let body = serde_json::to_string_pretty(&snapshot).context("serialising crash snapshot")?;
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -349,7 +347,9 @@ fn collect_log_tails(logs_dir: &Path) -> Result<BTreeMap<String, String>> {
     let entries = match std::fs::read_dir(logs_dir) {
         Ok(e) => e,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(err) => return Err(anyhow::Error::from(err).context(format!("reading {}", logs_dir.display()))),
+        Err(err) => {
+            return Err(anyhow::Error::from(err).context(format!("reading {}", logs_dir.display())));
+        }
     };
     for entry in entries {
         let entry = entry.with_context(|| format!("scanning {}", logs_dir.display()))?;
@@ -430,7 +430,12 @@ mod tests {
         (dir, s)
     }
 
-    fn create_session(store: &SessionStore, id: &str, state: SessionState, driver_pid: Option<u32>) -> Session {
+    fn create_session(
+        store: &SessionStore,
+        id: &str,
+        state: SessionState,
+        driver_pid: Option<u32>,
+    ) -> Session {
         let mut s = Session::new(SessionId::new(id), "standard", 1_000);
         store.create(&s).unwrap();
         if state != SessionState::Created {
@@ -472,10 +477,17 @@ mod tests {
     fn classify_skips_terminal_states() {
         let mut s = Session::new(SessionId::new("s-x"), "wf", 1);
         let probe = ScriptedProbe::with_alive([]);
-        for state in [SessionState::Completed, SessionState::Failed, SessionState::Crashed] {
+        for state in [
+            SessionState::Completed,
+            SessionState::Failed,
+            SessionState::Crashed,
+        ] {
             s.state = state;
             s.driver_pid = Some(42);
-            assert!(classify(&s, &probe).is_none(), "{state:?} must not be reaped");
+            assert!(
+                classify(&s, &probe).is_none(),
+                "{state:?} must not be reaped"
+            );
         }
     }
 
@@ -537,10 +549,7 @@ mod tests {
         assert_eq!(r.scanned, 1);
         assert_eq!(r.reaped.len(), 1);
         assert_eq!(r.reaped[0].id, SessionId::new("s-orphan"));
-        assert_eq!(
-            r.reaped[0].reason,
-            ReapReason::DeadDriver { pid: 99_999 }
-        );
+        assert_eq!(r.reaped[0].reason, ReapReason::DeadDriver { pid: 99_999 });
         let loaded = store.load(&SessionId::new("s-orphan")).unwrap();
         assert_eq!(loaded.state, SessionState::Crashed);
         assert_eq!(loaded.driver_pid, None);
@@ -560,12 +569,18 @@ mod tests {
         let probe = ScriptedProbe::with_alive([]);
         let _ = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         let snap_path = store.session_dir(&s.id).join("crash.json");
-        assert!(snap_path.exists(), "crash.json must be written next to meta.json");
+        assert!(
+            snap_path.exists(),
+            "crash.json must be written next to meta.json"
+        );
         let body = std::fs::read_to_string(&snap_path).unwrap();
         // Spot-check the high-level shape.
         assert!(body.contains("\"session_id\": \"s-snap\""), "got: {body}");
         assert!(body.contains("\"workflow\": \"standard\""));
-        assert!(body.contains("\"dead_driver\""), "reason discriminant missing");
+        assert!(
+            body.contains("\"dead_driver\""),
+            "reason discriminant missing"
+        );
         assert!(body.contains("\"pid\": 99999"));
         assert!(body.contains("plan.log"));
         assert!(body.contains("line 3"));
@@ -634,9 +649,7 @@ mod tests {
         fn stop(&self, container_id: &str) -> Result<()> {
             self.stopped.lock().unwrap().push(container_id.to_string());
             if self.fail_ids.contains(container_id) {
-                Err(anyhow::anyhow!(
-                    "synthetic stop failure for {container_id}"
-                ))
+                Err(anyhow::anyhow!("synthetic stop failure for {container_id}"))
             } else {
                 Ok(())
             }
@@ -728,7 +741,10 @@ mod tests {
         let probe = ScriptedProbe::with_alive([]);
         let r = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         assert_eq!(r.scanned, 3);
-        assert!(r.reaped.is_empty(), "terminal + gated sessions must not be reaped");
+        assert!(
+            r.reaped.is_empty(),
+            "terminal + gated sessions must not be reaped"
+        );
         // States unchanged.
         assert_eq!(
             store.load(&SessionId::new("s-done")).unwrap().state,
@@ -862,5 +878,4 @@ mod tests {
         assert_eq!(out.get("a.log").unwrap(), "a-1\na-2");
         assert_eq!(out.get("b.log").unwrap(), "b-1");
     }
-
 }

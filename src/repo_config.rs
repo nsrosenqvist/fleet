@@ -304,7 +304,9 @@ fn rule_matches(rule: &RoutingRule, issue_labels: &[String]) -> bool {
     if rule.labels.is_empty() {
         return true;
     }
-    rule.labels.iter().any(|l| issue_labels.iter().any(|il| il == l))
+    rule.labels
+        .iter()
+        .any(|l| issue_labels.iter().any(|il| il == l))
 }
 
 impl Default for AutonomousConfig {
@@ -439,9 +441,7 @@ impl From<Raw> for RepoConfig {
                 let network = match r.network {
                     Some(n) => NetworkConfig {
                         policy: n.policy.unwrap_or(default_runtime.network.policy),
-                        extra_hosts: n
-                            .extra_hosts
-                            .unwrap_or(default_runtime.network.extra_hosts),
+                        extra_hosts: n.extra_hosts.unwrap_or(default_runtime.network.extra_hosts),
                     },
                     None => default_runtime.network,
                 };
@@ -458,14 +458,12 @@ impl From<Raw> for RepoConfig {
         let agents = match raw.agents {
             Some(a) => {
                 let default = a.default.unwrap_or(default_agents.default);
-                let registry = a
-                    .registry
-                    .map_or(default_agents.registry, |user| {
-                        // Overlay user entries on the defaults so the
-                        // built-in `claude-code` survives unless the user
-                        // explicitly replaces it.
-                        AgentRegistry::default().with_overrides(user)
-                    });
+                let registry = a.registry.map_or(default_agents.registry, |user| {
+                    // Overlay user entries on the defaults so the
+                    // built-in `claude-code` survives unless the user
+                    // explicitly replaces it.
+                    AgentRegistry::default().with_overrides(user)
+                });
                 AgentsConfig { default, registry }
             }
             None => default_agents,
@@ -680,10 +678,7 @@ autonomous:
         // top-level default.
         assert_eq!(cfg.resolve_workflow_for(&[]), "fallback");
         // Tagged issue still hits the earlier specific rule.
-        assert_eq!(
-            cfg.resolve_workflow_for(&["bug".to_string()]),
-            "hotfix"
-        );
+        assert_eq!(cfg.resolve_workflow_for(&["bug".to_string()]), "hotfix");
     }
 
     #[test]

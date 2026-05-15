@@ -140,11 +140,7 @@ impl WorkflowExecutor {
     pub fn execute(&self, req: &ExecuteRequest<'_>) -> Result<Session> {
         validate(req.workflow).context("workflow failed static validation")?;
         let order = topological_order(req.workflow)?;
-        let mut session = Session::new(
-            req.session_id.clone(),
-            &req.workflow.name,
-            (self.clock)(),
-        );
+        let mut session = Session::new(req.session_id.clone(), &req.workflow.name, (self.clock)());
         // Persist the caller's issue context on the session so a
         // subsequent `fleet workflow resume` after a gate doesn't
         // lose `FLEET_ISSUE_*` env on downstream nodes.
@@ -256,28 +252,28 @@ impl WorkflowExecutor {
     ) -> Result<Session> {
         validate(req.workflow).context("workflow failed static validation")?;
         let order = topological_order(req.workflow)?;
-        let start = order.iter().position(|id| id == rerun_from).ok_or_else(|| {
-            anyhow!(
-                "node `{rerun_from}` is not in workflow `{}`'s topological order \
+        let start = order
+            .iter()
+            .position(|id| id == rerun_from)
+            .ok_or_else(|| {
+                anyhow!(
+                    "node `{rerun_from}` is not in workflow `{}`'s topological order \
                  (fanout siblings are excluded — start from the owning fanout node)",
-                req.workflow.name
-            )
-        })?;
+                    req.workflow.name
+                )
+            })?;
 
         // Load the src session — fail fast on a bogus id before we
         // mint a new directory we'd then have to clean up. We also
         // hand the src's `outputs` map forward so the new run starts
         // with the same upstream context the original had at this
         // point in the schedule.
-        let src = req.store.load(src_session_id).with_context(|| {
-            format!("loading source session `{src_session_id}` for replay")
-        })?;
+        let src = req
+            .store
+            .load(src_session_id)
+            .with_context(|| format!("loading source session `{src_session_id}` for replay"))?;
 
-        let mut session = Session::new(
-            req.session_id.clone(),
-            &req.workflow.name,
-            (self.clock)(),
-        );
+        let mut session = Session::new(req.session_id.clone(), &req.workflow.name, (self.clock)());
         session.issue.clone_from(&req.issue);
         session.outputs.clone_from(&src.outputs);
         req.store.create(&session)?;
@@ -357,9 +353,8 @@ impl WorkflowExecutor {
                         continue;
                     }
                     Err(err) => {
-                        let wrapped = err.context(format!(
-                            "evaluating `when:` for node `{node_id}`"
-                        ));
+                        let wrapped =
+                            err.context(format!("evaluating `when:` for node `{node_id}`"));
                         self.mark_failed(req, session, &wrapped);
                         return Err(wrapped);
                     }
@@ -588,9 +583,8 @@ impl WorkflowExecutor {
             } => (persona.as_deref(), prompt_file.as_ref()),
             _ => unreachable!("run_agent_node only reached via NodeKind::Agent"),
         };
-        let prompt = resolve_prompt_artifact(req.workspace, prompt_file).with_context(|| {
-            format!("preparing prompt for agent node `{}`", node.id)
-        })?;
+        let prompt = resolve_prompt_artifact(req.workspace, prompt_file)
+            .with_context(|| format!("preparing prompt for agent node `{}`", node.id))?;
         let agent_ctx = AgentContext {
             persona,
             prompt: prompt.as_ref(),
@@ -635,14 +629,15 @@ impl WorkflowExecutor {
         // should still proceed; we just lose the leak-detection signal
         // for this one container if it crashes.
         let session_dir = req.store.session_dir(&session.id);
-        if let Err(err) = crate::session::containers::mark_active(
-            &session_dir,
-            container_id.as_str(),
-        ) {
+        if let Err(err) =
+            crate::session::containers::mark_active(&session_dir, container_id.as_str())
+        {
             tracing::warn!(?err, container = %container_id, "writing container marker failed");
         }
 
-        let exec_result = req.adapter.exec(&container_id, &agent.command, ExecOpts::default());
+        let exec_result = req
+            .adapter
+            .exec(&container_id, &agent.command, ExecOpts::default());
         // Log capture first — happens even on adapter-level error so the
         // user can read what happened after a failure.
         let log_path = self.node_log_path(req, session, &node.id);
@@ -670,10 +665,9 @@ impl WorkflowExecutor {
         // dead container as leaked on the next reap. The marker file
         // is metadata for *fleet's* bookkeeping; the engine's actual
         // container state is the source of truth.
-        if let Err(err) = crate::session::containers::mark_stopped(
-            &session_dir,
-            container_id.as_str(),
-        ) {
+        if let Err(err) =
+            crate::session::containers::mark_stopped(&session_dir, container_id.as_str())
+        {
             tracing::warn!(?err, container = %container_id, "clearing container marker failed");
         }
 
@@ -692,18 +686,17 @@ impl WorkflowExecutor {
         // not have printed a cost line at all, or its format may have
         // changed since the parser was last updated. We surface the
         // signal in the UI; nothing else acts on it.
-        let outcome = parse_agent_cost_usd(agent_name, &handle.stdout, &handle.stderr)
-            .map_or_else(
-                || {
-                    tracing::debug!(
-                        agent = agent_name,
-                        node = %node.id,
-                        "agent cost parser found no match in output"
-                    );
-                    NodeOutcome::empty()
-                },
-                |usd| NodeOutcome::with_cost(&node.id, usd),
-            );
+        let outcome = parse_agent_cost_usd(agent_name, &handle.stdout, &handle.stderr).map_or_else(
+            || {
+                tracing::debug!(
+                    agent = agent_name,
+                    node = %node.id,
+                    "agent cost parser found no match in output"
+                );
+                NodeOutcome::empty()
+            },
+            |usd| NodeOutcome::with_cost(&node.id, usd),
+        );
         Ok(outcome)
     }
 
@@ -782,10 +775,7 @@ impl WorkflowExecutor {
             Err(err) => {
                 let body = format!("--- assert errored ---\n{expr_str}\n{err:#}\n");
                 let _ = std::fs::write(&log_path, body);
-                Err(err.context(format!(
-                    "evaluating `expr:` for assert node `{}`",
-                    node.id
-                )))
+                Err(err.context(format!("evaluating `expr:` for assert node `{}`", node.id)))
             }
         }
     }
@@ -906,12 +896,7 @@ impl WorkflowExecutor {
         }
     }
 
-    fn node_log_path(
-        &self,
-        req: &ExecuteRequest<'_>,
-        session: &Session,
-        node_id: &str,
-    ) -> PathBuf {
+    fn node_log_path(&self, req: &ExecuteRequest<'_>, session: &Session, node_id: &str) -> PathBuf {
         let _ = self; // method form keeps the surface symmetric with run_*_node.
         req.store
             .session_dir(&session.id)
@@ -919,12 +904,7 @@ impl WorkflowExecutor {
             .join(format!("{node_id}.log"))
     }
 
-    fn mark_failed(
-        &self,
-        req: &ExecuteRequest<'_>,
-        session: &mut Session,
-        err: &anyhow::Error,
-    ) {
+    fn mark_failed(&self, req: &ExecuteRequest<'_>, session: &mut Session, err: &anyhow::Error) {
         // Best-effort: even when persistence fails, the original node
         // error is what the user cares about. Surface a save error through
         // tracing rather than overshadowing the real failure.
@@ -981,11 +961,7 @@ pub fn verify_inputs(artifacts_dir: &Path, node: &Node) -> Result<()> {
 /// Re-runs (via `loop_back_to`) overwrite the prior entry under the
 /// same `(node_id, local_name)`, which is exactly what downstream
 /// `when:` predicates want — they see the latest pass's decision.
-pub fn extract_outputs(
-    artifacts_dir: &Path,
-    node: &Node,
-    acc: &mut OutputMap,
-) -> Result<()> {
+pub fn extract_outputs(artifacts_dir: &Path, node: &Node, acc: &mut OutputMap) -> Result<()> {
     if node.outputs.is_empty() {
         return Ok(());
     }
@@ -1086,10 +1062,7 @@ pub struct PromptArtifact {
 /// plus any persona / prompt / issue context. Pure; the testable seam
 /// for `run_agent_node`.
 #[must_use]
-pub fn build_agent_env(
-    agent: &AgentSpec,
-    ctx: &AgentContext<'_>,
-) -> Vec<(String, String)> {
+pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = agent
         .env_passthrough
         .iter()
@@ -1269,9 +1242,7 @@ fn topological_order(wf: &Workflow) -> Result<Vec<String>> {
 /// Flatten the session's persisted nested outputs map into the
 /// in-memory [`OutputMap`] the executor's expression engine consumes.
 /// Pure; tests assert the round-trip with [`outputs_to_persisted`].
-fn outputs_from_persisted(
-    persisted: &BTreeMap<String, BTreeMap<String, String>>,
-) -> OutputMap {
+fn outputs_from_persisted(persisted: &BTreeMap<String, BTreeMap<String, String>>) -> OutputMap {
     let mut out = HashMap::new();
     for (node_id, names) in persisted {
         for (name, value) in names {
@@ -1284,9 +1255,7 @@ fn outputs_from_persisted(
 /// Nest the in-memory [`OutputMap`] back into the `BTreeMap` shape
 /// that rides on `Session`. Stable ordering thanks to `BTreeMap` so
 /// the persisted JSON is byte-stable across runs with the same data.
-fn outputs_to_persisted(
-    outputs: &OutputMap,
-) -> BTreeMap<String, BTreeMap<String, String>> {
+fn outputs_to_persisted(outputs: &OutputMap) -> BTreeMap<String, BTreeMap<String, String>> {
     let mut nested: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for ((node_id, name), value) in outputs {
         nested
@@ -1303,8 +1272,8 @@ fn outputs_to_persisted(
 /// skipped silently. Used by `replay` to stage a prior session's
 /// `artifacts/` into a new session.
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
-    let entries = std::fs::read_dir(src)
-        .with_context(|| format!("reading directory {}", src.display()))?;
+    let entries =
+        std::fs::read_dir(src).with_context(|| format!("reading directory {}", src.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("scanning {}", src.display()))?;
         let from = entry.path();
@@ -1313,13 +1282,11 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
             .file_type()
             .with_context(|| format!("statting {}", from.display()))?;
         if file_type.is_dir() {
-            std::fs::create_dir_all(&to)
-                .with_context(|| format!("creating {}", to.display()))?;
+            std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
             copy_dir_contents(&from, &to)?;
         } else if file_type.is_file() {
-            std::fs::copy(&from, &to).with_context(|| {
-                format!("copying {} → {}", from.display(), to.display())
-            })?;
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
         }
         // Symlinks/specials: skip silently. Artifacts/ holds generated
         // text files in practice; nothing else should be there.
@@ -1443,7 +1410,10 @@ mod tests {
 
         copy_dir_contents(src.path(), dst.path()).unwrap();
 
-        assert_eq!(std::fs::read_to_string(dst.path().join("top.txt")).unwrap(), "t");
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("top.txt")).unwrap(),
+            "t"
+        );
         assert_eq!(
             std::fs::read_to_string(dst.path().join("nested/inner.md")).unwrap(),
             "i"
@@ -1461,7 +1431,10 @@ mod tests {
         std::fs::write(src.path().join("a.txt"), "new").unwrap();
         std::fs::write(dst.path().join("a.txt"), "old").unwrap();
         copy_dir_contents(src.path(), dst.path()).unwrap();
-        assert_eq!(std::fs::read_to_string(dst.path().join("a.txt")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("a.txt")).unwrap(),
+            "new"
+        );
     }
 
     #[test]
@@ -1482,10 +1455,16 @@ mod tests {
     fn verify_inputs_fails_with_specific_path_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("plan.md"), "p").unwrap();
-        let err = verify_inputs(tmp.path(), &agent_node("code", &["plan.md", "review.md"], &[]))
-            .unwrap_err();
+        let err = verify_inputs(
+            tmp.path(),
+            &agent_node("code", &["plan.md", "review.md"], &[]),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("node `code` requires input artifact `review.md`"), "got: {msg}");
+        assert!(
+            msg.contains("node `code` requires input artifact `review.md`"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1494,8 +1473,11 @@ mod tests {
         // declared order in the YAML) so error messages stay
         // deterministic regardless of filesystem walk order.
         let tmp = tempfile::tempdir().unwrap();
-        let err = verify_inputs(tmp.path(), &agent_node("n", &["first.md", "second.md"], &[]))
-            .unwrap_err();
+        let err = verify_inputs(
+            tmp.path(),
+            &agent_node("n", &["first.md", "second.md"], &[]),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("first.md"), "got: {msg}");
         assert!(!msg.contains("second.md"), "got: {msg}");
@@ -1517,8 +1499,7 @@ mod tests {
     #[test]
     fn verify_outputs_fails_with_specific_path_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = verify_outputs(tmp.path(), &agent_node("plan", &[], &["plan.md"]))
-            .unwrap_err();
+        let err = verify_outputs(tmp.path(), &agent_node("plan", &[], &["plan.md"])).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("node `plan` was expected to produce output artifact `plan.md`"),
@@ -1614,7 +1595,10 @@ nodes:
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("requires input artifact `missing.md`"), "got: {msg}");
+        assert!(
+            msg.contains("requires input artifact `missing.md`"),
+            "got: {msg}"
+        );
         // Session ends Failed.
         assert_eq!(
             store.load(&SessionId::new("s-missin")).unwrap().state,
@@ -1678,7 +1662,10 @@ nodes:
             env_passthrough: vec!["FLEET_TEST_KEY".to_string()],
         };
         let env = build_agent_env(&spec, &AgentContext::default());
-        assert!(env.iter().any(|(k, v)| k == "FLEET_TEST_KEY" && v == "secret"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "FLEET_TEST_KEY" && v == "secret")
+        );
         unsafe { std::env::remove_var("FLEET_TEST_KEY") };
     }
 
@@ -1694,15 +1681,18 @@ nodes:
             ..AgentContext::default()
         };
         let env = build_agent_env(&spec, &ctx);
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "FLEET_ISSUE_ID" && v == "gh:42"));
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "FLEET_ISSUE_HUMAN_ID" && v == "42"));
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "FLEET_ISSUE_TITLE" && v == "Fix the parser"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "FLEET_ISSUE_ID" && v == "gh:42")
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "FLEET_ISSUE_HUMAN_ID" && v == "42")
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "FLEET_ISSUE_TITLE" && v == "Fix the parser")
+        );
     }
 
     #[test]
@@ -1716,7 +1706,10 @@ nodes:
             ..AgentContext::default()
         };
         let env = build_agent_env(&spec, &ctx);
-        assert!(env.iter().any(|(k, v)| k == "FLEET_PERSONA" && v == "planner"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "FLEET_PERSONA" && v == "planner")
+        );
     }
 
     #[test]
@@ -1734,12 +1727,14 @@ nodes:
             ..AgentContext::default()
         };
         let env = build_agent_env(&spec, &ctx);
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "FLEET_PROMPT_FILE" && v == "prompts/planner.md"));
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "FLEET_PROMPT" && v.contains("You are the planner.")));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "FLEET_PROMPT_FILE" && v == "prompts/planner.md")
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "FLEET_PROMPT" && v.contains("You are the planner."))
+        );
     }
 
     #[test]
@@ -1759,8 +1754,7 @@ nodes:
             issue: Some(&issue),
         };
         let env = build_agent_env(&spec, &ctx);
-        let keys: std::collections::HashSet<&str> =
-            env.iter().map(|(k, _)| k.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains("FLEET_PERSONA"));
         assert!(keys.contains("FLEET_PROMPT_FILE"));
         assert!(keys.contains("FLEET_PROMPT"));
@@ -1870,7 +1864,10 @@ nodes:
 
         let mut mock = MockProcessInvoker::new();
         mock.expect_run()
-            .with(eq("sh"), eq(vec!["-c".to_string(), expected_cmd.to_string()]))
+            .with(
+                eq("sh"),
+                eq(vec!["-c".to_string(), expected_cmd.to_string()]),
+            )
             .returning(|_, _| Ok("42\n".to_string()));
         let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
 
@@ -1993,8 +1990,14 @@ nodes:
         let executor = executor_returning("");
         let enforcer = StubEnforcer::new(
             vec![
-                ("HTTP_PROXY".to_string(), "http://fleet-proxy:8888".to_string()),
-                ("HTTPS_PROXY".to_string(), "http://fleet-proxy:8888".to_string()),
+                (
+                    "HTTP_PROXY".to_string(),
+                    "http://fleet-proxy:8888".to_string(),
+                ),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://fleet-proxy:8888".to_string(),
+                ),
             ],
             Some("fleet-net".to_string()),
         );
@@ -2137,10 +2140,8 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
         };
         let session = executor.execute(&req).unwrap();
-        let active = crate::session::containers::list_active(
-            &store.session_dir(&session.id),
-        )
-        .unwrap();
+        let active =
+            crate::session::containers::list_active(&store.session_dir(&session.id)).unwrap();
         assert!(
             active.is_empty(),
             "marker must be cleared after a successful agent run: {active:?}"
@@ -2270,11 +2271,13 @@ nodes:
         mock.expect_run()
             .with(
                 eq("sh"),
-                eq(vec!["-c".to_string(), "cd '/repo' && echo hello".to_string()]),
+                eq(vec![
+                    "-c".to_string(),
+                    "cd '/repo' && echo hello".to_string(),
+                ]),
             )
             .returning(|_, _| Ok("hello\n".to_string()));
-        let executor =
-            WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
 
         let req = ExecuteRequest {
             workflow: &wf,
@@ -2426,7 +2429,11 @@ nodes:
         };
         let final_session = executor.execute(&req).unwrap();
 
-        let mid = snapshot.lock().unwrap().clone().expect("mid-run snapshot missing");
+        let mid = snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("mid-run snapshot missing");
         assert_eq!(mid.state, SessionState::Running);
         assert_eq!(
             mid.driver_pid,
@@ -2435,7 +2442,10 @@ nodes:
         );
 
         assert_eq!(final_session.state, SessionState::Completed);
-        assert!(final_session.driver_pid.is_none(), "driver_pid must clear on Completed");
+        assert!(
+            final_session.driver_pid.is_none(),
+            "driver_pid must clear on Completed"
+        );
         // …and the on-disk session agrees with the in-memory one.
         let loaded = store.load(&session_id).unwrap();
         assert!(loaded.driver_pid.is_none());
@@ -2715,9 +2725,7 @@ nodes:
         assert_eq!(review_count, 1, "review ran once; got: {bashed:?}");
         assert_eq!(plan_count, 0, "plan was skipped; got: {bashed:?}");
         // Src artifact carried over to the new session.
-        let copied = store
-            .session_dir(&replayed.id)
-            .join("artifacts/plan.md");
+        let copied = store.session_dir(&replayed.id).join("artifacts/plan.md");
         assert!(copied.is_file(), "src artifact should be staged");
         let body = std::fs::read_to_string(&copied).unwrap();
         assert_eq!(body, "from the src run");
@@ -2869,9 +2877,7 @@ nodes:
         let b_count = bashed.iter().filter(|s| s.contains("echo b")).count();
         assert_eq!(a_count, 1, "a ran once; got: {bashed:?}");
         assert_eq!(b_count, 1, "b ran once; got: {bashed:?}");
-        let staged = store
-            .session_dir(&replayed.id)
-            .join("artifacts/staged.txt");
+        let staged = store.session_dir(&replayed.id).join("artifacts/staged.txt");
         assert!(staged.is_file(), "staged artifact carried over");
     }
 
@@ -2918,12 +2924,22 @@ nodes:
     #[test]
     fn outputs_to_and_from_persisted_round_trip() {
         let mut flat: OutputMap = HashMap::new();
-        flat.insert(("plan".to_string(), "decision".to_string()), "yes".to_string());
+        flat.insert(
+            ("plan".to_string(), "decision".to_string()),
+            "yes".to_string(),
+        );
         flat.insert(("plan".to_string(), "score".to_string()), "5".to_string());
-        flat.insert(("review".to_string(), "decision".to_string()), "no".to_string());
+        flat.insert(
+            ("review".to_string(), "decision".to_string()),
+            "no".to_string(),
+        );
         let nested = outputs_to_persisted(&flat);
         assert_eq!(
-            nested.get("plan").unwrap().get("decision").map(String::as_str),
+            nested
+                .get("plan")
+                .unwrap()
+                .get("decision")
+                .map(String::as_str),
             Some("yes")
         );
         let back = outputs_from_persisted(&nested);
@@ -3017,9 +3033,7 @@ nodes:
         let resumed = executor.resume(&req).unwrap();
         assert_eq!(resumed.state, SessionState::Completed);
         assert_eq!(resumed.current_node.as_deref(), Some("act"));
-        assert!(
-            store.session_dir(&resumed.id).join("logs/act.log").exists()
-        );
+        assert!(store.session_dir(&resumed.id).join("logs/act.log").exists());
     }
 
     #[test]
@@ -3075,7 +3089,12 @@ nodes:
         assert_eq!(replayed.state, SessionState::Completed);
         // act fired — its log exists. Pre-persistence the when:
         // predicate would have skipped this node.
-        assert!(store.session_dir(&replayed.id).join("logs/act.log").exists());
+        assert!(
+            store
+                .session_dir(&replayed.id)
+                .join("logs/act.log")
+                .exists()
+        );
         // The carried-forward outputs are present on the new session.
         assert_eq!(
             replayed
@@ -3199,10 +3218,8 @@ nodes:
         // Session is Failed; the fanout node's log captures the failure.
         let loaded = store.load(&SessionId::new("s-fanout-fail")).unwrap();
         assert_eq!(loaded.state, SessionState::Failed);
-        let fanout_log = std::fs::read_to_string(
-            store.session_dir(&loaded.id).join("logs/checks.log"),
-        )
-        .unwrap();
+        let fanout_log =
+            std::fs::read_to_string(store.session_dir(&loaded.id).join("logs/checks.log")).unwrap();
         assert!(
             fanout_log.contains("--- fanout failed:"),
             "got: {fanout_log}"
@@ -3250,8 +3267,11 @@ nodes:
         mock.expect_run().returning(move |_, args| {
             let s = args.last().cloned().unwrap_or_default();
             if s.contains("write outputs") {
-                std::fs::write(af.join("discover.outputs.json"), r#"{"decision":"approve"}"#)
-                    .unwrap();
+                std::fs::write(
+                    af.join("discover.outputs.json"),
+                    r#"{"decision":"approve"}"#,
+                )
+                .unwrap();
             }
             Ok(String::new())
         });
@@ -3704,7 +3724,8 @@ nodes:
         )
         .unwrap();
         let mut acc: OutputMap = HashMap::new();
-        let node = agent_node_with_outputs("review", &[("decision", "decision"), ("note", "summary")]);
+        let node =
+            agent_node_with_outputs("review", &[("decision", "decision"), ("note", "summary")]);
         extract_outputs(tmp.path(), &node, &mut acc).unwrap();
         assert_eq!(
             acc.get(&("review".to_string(), "decision".to_string())),
@@ -3862,8 +3883,7 @@ nodes:
         let revise_log = store.session_dir(&session_id).join("logs/revise.log");
         let revise_body = std::fs::read_to_string(&revise_log).unwrap();
         assert!(
-            revise_body.contains("--- skipped:")
-                && revise_body.contains("review.decision"),
+            revise_body.contains("--- skipped:") && revise_body.contains("review.decision"),
             "expected skip marker, got: {revise_body}"
         );
     }
@@ -4023,8 +4043,7 @@ nodes:
             let s = args.last().cloned().unwrap_or_default();
             if s.contains("write outputs") {
                 setup_calls2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                std::fs::write(af.join("setup.outputs.json"), r#"{"decision":"approve"}"#)
-                    .unwrap();
+                std::fs::write(af.join("setup.outputs.json"), r#"{"decision":"approve"}"#).unwrap();
             }
             Ok(String::new())
         });
@@ -4090,7 +4109,11 @@ nodes:
             let s = args.last().cloned().unwrap_or_default();
             if s.contains("write outputs") {
                 let n = setup_calls2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let decision = if n < 2 { "changes_requested" } else { "approve" };
+                let decision = if n < 2 {
+                    "changes_requested"
+                } else {
+                    "approve"
+                };
                 std::fs::write(
                     af.join("setup.outputs.json"),
                     format!(r#"{{"decision":"{decision}"}}"#),
@@ -4153,8 +4176,7 @@ nodes:
         mock.expect_run().returning(move |_, args| {
             let s = args.last().cloned().unwrap_or_default();
             if s.contains("write outputs") {
-                std::fs::write(af.join("setup.outputs.json"), r#"{"decision":"approve"}"#)
-                    .unwrap();
+                std::fs::write(af.join("setup.outputs.json"), r#"{"decision":"approve"}"#).unwrap();
             }
             Ok(String::new())
         });
@@ -4173,8 +4195,8 @@ nodes:
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
         // The assert node leaves a "passed" log so the trail is auditable.
-        let log = std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log"))
-            .unwrap();
+        let log =
+            std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log")).unwrap();
         assert!(log.contains("--- assert passed ---"), "got: {log}");
     }
 
@@ -4227,17 +4249,13 @@ nodes:
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("assert node `check` failed")
-                && msg.contains("setup.decision"),
+            msg.contains("assert node `check` failed") && msg.contains("setup.decision"),
             "got: {msg}"
         );
         // Session ends Failed and the log captures the failing expression.
-        assert_eq!(
-            store.load(&session_id).unwrap().state,
-            SessionState::Failed
-        );
-        let log = std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log"))
-            .unwrap();
+        assert_eq!(store.load(&session_id).unwrap().state, SessionState::Failed);
+        let log =
+            std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log")).unwrap();
         assert!(log.contains("--- assert failed ---"), "got: {log}");
     }
 
@@ -4280,9 +4298,15 @@ nodes:
             msg.contains("evaluating `expr:` for assert node `check`"),
             "got: {msg}"
         );
-        assert!(msg.contains("unknown output `setup.decision`"), "got: {msg}");
+        assert!(
+            msg.contains("unknown output `setup.decision`"),
+            "got: {msg}"
+        );
         assert_eq!(
-            store.load(&SessionId::new("s-assert-unknown")).unwrap().state,
+            store
+                .load(&SessionId::new("s-assert-unknown"))
+                .unwrap()
+                .state,
             SessionState::Failed
         );
     }
@@ -4608,8 +4632,8 @@ nodes:
         // when:-false skipped the assert; workflow Completes despite
         // the assert expression being false.
         assert_eq!(session.state, SessionState::Completed);
-        let log = std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log"))
-            .unwrap();
+        let log =
+            std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log")).unwrap();
         assert!(log.contains("--- skipped:"), "got: {log}");
     }
 }

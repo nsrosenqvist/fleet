@@ -211,9 +211,10 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             WorkflowSub::Validate { name } => workflow::run_validate(&name),
             WorkflowSub::Run { name, issue } => workflow::run_run(&name, issue.as_deref()),
             WorkflowSub::Resume { session } => workflow::run_resume(&session),
-            WorkflowSub::Replay { session, rerun_from } => {
-                workflow::run_replay(&session, &rerun_from)
-            }
+            WorkflowSub::Replay {
+                session,
+                rerun_from,
+            } => workflow::run_replay(&session, &rerun_from),
         },
         Command::Sessions { sub } => match sub {
             SessionsSub::List => sessions::run_list(),

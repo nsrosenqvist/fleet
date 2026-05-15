@@ -46,12 +46,10 @@ pub fn marker_path(session_dir: &Path, container_id: &str) -> PathBuf {
 /// the reaper later misses a leaked container.
 pub fn mark_active(session_dir: &Path, container_id: &str) -> Result<()> {
     let dir = session_dir.join(CONTAINERS_DIR);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = marker_path(session_dir, container_id);
     // Empty file; the *name* is the payload.
-    std::fs::write(&path, [])
-        .with_context(|| format!("writing marker {}", path.display()))?;
+    std::fs::write(&path, []).with_context(|| format!("writing marker {}", path.display()))?;
     Ok(())
 }
 
@@ -63,10 +61,9 @@ pub fn mark_stopped(session_dir: &Path, container_id: &str) -> Result<()> {
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(anyhow::Error::from(err).context(format!(
-            "removing marker {}",
-            path.display()
-        ))),
+        Err(err) => {
+            Err(anyhow::Error::from(err).context(format!("removing marker {}", path.display())))
+        }
     }
 }
 
@@ -80,10 +77,7 @@ pub fn list_active(session_dir: &Path) -> Result<Vec<String>> {
         Ok(e) => e,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
-            return Err(anyhow::Error::from(err).context(format!(
-                "reading {}",
-                dir.display()
-            )));
+            return Err(anyhow::Error::from(err).context(format!("reading {}", dir.display())));
         }
     };
     let mut out = Vec::new();
@@ -110,10 +104,7 @@ pub fn clear_all(session_dir: &Path) -> Result<()> {
         Ok(e) => e,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
-            return Err(anyhow::Error::from(err).context(format!(
-                "reading {}",
-                dir.display()
-            )));
+            return Err(anyhow::Error::from(err).context(format!("reading {}", dir.display())));
         }
     };
     for entry in entries {

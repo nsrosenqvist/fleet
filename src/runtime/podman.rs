@@ -127,12 +127,7 @@ impl RuntimeAdapter for PodmanAdapter {
         Ok(id)
     }
 
-    fn exec(
-        &self,
-        container: &ContainerId,
-        argv: &[String],
-        opts: ExecOpts,
-    ) -> Result<ExecHandle> {
+    fn exec(&self, container: &ContainerId, argv: &[String], opts: ExecOpts) -> Result<ExecHandle> {
         let workspace = self.workspace_for(container)?;
         self.cli.exec(&workspace, argv, opts)
     }
@@ -497,7 +492,11 @@ mod tests {
         let spec = sample_spec(ImageId::new(DevcontainerCli::mint_image_name(&dc)));
         let id = a.start_container(&spec).unwrap();
         let h = a
-            .exec(&id, &["echo".to_string(), "hi".to_string()], ExecOpts::default())
+            .exec(
+                &id,
+                &["echo".to_string(), "hi".to_string()],
+                ExecOpts::default(),
+            )
             .unwrap();
         assert_eq!(h.exit_code, 0);
         assert_eq!(h.stdout, "hi\n");
@@ -529,10 +528,7 @@ mod tests {
 
     #[test]
     fn attach_argv_wraps_exec_dash_it_with_container_id() {
-        let argv = attach_argv(
-            &ContainerId::new("c-123"),
-            &["bash".to_string()],
-        );
+        let argv = attach_argv(&ContainerId::new("c-123"), &["bash".to_string()]);
         assert_eq!(argv, vec!["exec", "-it", "c-123", "bash"]);
     }
 
@@ -564,11 +560,17 @@ mod tests {
                 ],
                 r#"{"outcome":"success","containerId":"c-stop"}"#.to_string(),
             ),
-            ("podman", vec!["stop".to_string(), "c-stop".to_string()], "c-stop".to_string()),
+            (
+                "podman",
+                vec!["stop".to_string(), "c-stop".to_string()],
+                "c-stop".to_string(),
+            ),
         ]);
         let a = PodmanAdapter::new(invoker, false);
         let id = a
-            .start_container(&sample_spec(ImageId::new(DevcontainerCli::mint_image_name(&dc))))
+            .start_container(&sample_spec(ImageId::new(
+                DevcontainerCli::mint_image_name(&dc),
+            )))
             .unwrap();
         a.stop(&id).unwrap();
         // After stop, the workspace mapping must be gone — subsequent exec
@@ -595,7 +597,8 @@ mod tests {
     #[test]
     fn stop_propagates_unexpected_errors() {
         let mut mock = MockProcessInvoker::new();
-        mock.expect_run().returning(|_, _| Err(anyhow!("kernel panic")));
+        mock.expect_run()
+            .returning(|_, _| Err(anyhow!("kernel panic")));
         let a = PodmanAdapter::new(Arc::new(mock), false);
         let err = a.stop(&ContainerId::new("c")).unwrap_err();
         assert!(format!("{err}").contains("kernel panic"));
@@ -656,11 +659,9 @@ mod tests {
 
     #[test]
     fn workspace_from_devcontainer_handles_canonical_layout() {
-        let dc = Devcontainer::from_str_at(
-            r#"{"image":"x"}"#,
-            "/repo/.devcontainer/devcontainer.json",
-        )
-        .unwrap();
+        let dc =
+            Devcontainer::from_str_at(r#"{"image":"x"}"#, "/repo/.devcontainer/devcontainer.json")
+                .unwrap();
         assert_eq!(workspace_from_devcontainer(&dc), PathBuf::from("/repo"));
     }
 
@@ -677,8 +678,7 @@ mod tests {
     #[test]
     fn workspace_from_devcontainer_handles_root_level_file() {
         // `.devcontainer.json` (no directory) lives at the repo root.
-        let dc =
-            Devcontainer::from_str_at(r#"{"image":"x"}"#, "/repo/.devcontainer.json").unwrap();
+        let dc = Devcontainer::from_str_at(r#"{"image":"x"}"#, "/repo/.devcontainer.json").unwrap();
         assert_eq!(workspace_from_devcontainer(&dc), PathBuf::from("/repo"));
     }
 

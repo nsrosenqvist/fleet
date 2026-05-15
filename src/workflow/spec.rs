@@ -299,9 +299,7 @@ fn stringify_outputs(raw: BTreeMap<String, Value>) -> Result<BTreeMap<String, St
             Value::String(s) => s,
             Value::Bool(b) => b.to_string(),
             Value::Number(n) => n.to_string(),
-            other => bail!(
-                "outputs.{k} must be a scalar (string/bool/number); got: {other:?}"
-            ),
+            other => bail!("outputs.{k} must be a scalar (string/bool/number); got: {other:?}"),
         };
         out.insert(k, s);
     }
@@ -326,7 +324,11 @@ nodes:
         let n = &wf.nodes[0];
         assert_eq!(n.id, "only");
         match &n.kind {
-            NodeKind::Agent { agent, persona, prompt_file } => {
+            NodeKind::Agent {
+                agent,
+                persona,
+                prompt_file,
+            } => {
                 assert_eq!(agent, "claude-code");
                 assert!(persona.is_none());
                 assert!(prompt_file.is_none());
@@ -472,7 +474,10 @@ nodes:
         assert_eq!(revise.loop_back_to.as_deref(), Some("review"));
         assert_eq!(revise.max_loops, Some(2));
         let review = wf.node("review").unwrap();
-        assert_eq!(review.outputs.get("decision"), Some(&"review.decision".to_string()));
+        assert_eq!(
+            review.outputs.get("decision"),
+            Some(&"review.decision".to_string())
+        );
         assert_eq!(review.artifacts.r#in, vec!["diff"]);
         assert_eq!(review.artifacts.out, vec!["review.md"]);
     }
@@ -486,7 +491,10 @@ nodes:
 ";
         let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("agent node `plan` missing `agent:`"), "got: {msg}");
+        assert!(
+            msg.contains("agent node `plan` missing `agent:`"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -607,7 +615,11 @@ nodes:
     fn from_path_loads_from_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wf.yaml");
-        std::fs::write(&path, "name: ondisk\nnodes:\n  - id: n\n    agent: claude\n").unwrap();
+        std::fs::write(
+            &path,
+            "name: ondisk\nnodes:\n  - id: n\n    agent: claude\n",
+        )
+        .unwrap();
         let wf = Workflow::from_path(&path).unwrap();
         assert_eq!(wf.name, "ondisk");
     }

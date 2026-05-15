@@ -73,7 +73,10 @@ pub fn run_up() -> Result<i32> {
         network: None,
     };
     let id = ctx.adapter.start_container(&spec)?;
-    eprintln!("fleet runtime up: started container in {}", ctx.repo_root.display());
+    eprintln!(
+        "fleet runtime up: started container in {}",
+        ctx.repo_root.display()
+    );
     println!("{id}");
     Ok(0)
 }
@@ -207,8 +210,7 @@ impl Context_ {
     /// state.
     fn artifacts_dir(&self) -> Result<PathBuf> {
         let path = self.repo_root.join(".fleet/sessions/manual/artifacts");
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
         Ok(path)
     }
 }
@@ -244,7 +246,10 @@ pub fn render_doctor(report: &ProbeReport) -> String {
     out.push_str("Engines:\n");
     out.push_str(&render_backend("podman", &report.podman));
     out.push_str(&render_backend("docker", &report.docker));
-    out.push_str(&render_backend("container (Apple)", &report.apple_container));
+    out.push_str(&render_backend(
+        "container (Apple)",
+        &report.apple_container,
+    ));
 
     out.push_str("\nHardening:\n");
     out.push_str(&render_backend("runsc (gVisor)", &report.gvisor));
