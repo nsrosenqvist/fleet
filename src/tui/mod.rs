@@ -294,7 +294,7 @@ impl AppState {
             .or(if self.sessions.is_empty() { None } else { Some(0) });
         self.list_state.select(new_index);
         self.refresh_log_tail();
-        self.status_line = format!(" {} sessions ", self.sessions.len());
+        self.status_line = render_status_line(&self.sessions);
         Ok(())
     }
 
@@ -733,6 +733,48 @@ pub const fn state_word(s: SessionState) -> &'static str {
     }
 }
 
+/// Render a USD cost as `$0.42` (two decimals) or `-` when absent.
+/// Mirrors the wording in `cli::sessions` — duplicated rather than
+/// shared because the wording is a UI contract; consolidating once
+/// would invite one renderer's refactor to silently drift the other.
+#[must_use]
+pub fn format_cost(cost: Option<f64>) -> String {
+    cost.map_or_else(|| "-".to_string(), |v| format!("${v:.2}"))
+}
+
+/// Walk every session and sum the ones with cost data. Returns
+/// `(total, samples)` — `samples` is how many sessions contributed
+/// (so the renderer can choose between "no data" and "$X.YZ").
+#[must_use]
+pub fn lifetime_cost(sessions: &[Session]) -> (f64, usize) {
+    let mut total = 0.0;
+    let mut samples = 0usize;
+    for s in sessions {
+        if let Some(v) = s.total_cost_usd() {
+            total += v;
+            samples += 1;
+        }
+    }
+    (total, samples)
+}
+
+/// Render the status-bar tail used by the sidebar when autonomous
+/// mode isn't taking over the line. Includes the session count and,
+/// when at least one session has cost data, a lifetime total. Free
+/// function so the wording is asserted in tests.
+#[must_use]
+pub fn render_status_line(sessions: &[Session]) -> String {
+    let (total, samples) = lifetime_cost(sessions);
+    if samples == 0 {
+        format!(" {} sessions ", sessions.len())
+    } else {
+        format!(
+            " {} sessions · ${total:.2} total ({samples} with cost) ",
+            sessions.len(),
+        )
+    }
+}
+
 /// Single-glyph state marker for the sidebar list.
 pub const fn state_marker(s: SessionState) -> &'static str {
     match s {
@@ -934,8 +976,14 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .sessions
         .iter()
         .map(|s| {
+            // Cost suffix only when we have a figure — keeps fresh
+            // repos visually clean ("nothing to render" beats "a long
+            // row of dashes").
+            let cost_suffix = s
+                .total_cost_usd()
+                .map_or_else(String::new, |v| format!(" ${v:.2}"));
             let label = format!(
-                "{} {} {}",
+                "{} {} {}{cost_suffix}",
                 state_marker(s.state),
                 s.id,
                 s.workflow,
@@ -974,12 +1022,23 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
             "updated",
             &format!("{} ms (epoch)", session.updated_at_ms),
         ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "log tail:",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
+        kv_line("cost", &format_cost(session.total_cost_usd())),
     ];
+    if !session.node_costs.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "node costs:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for (node, usd) in &session.node_costs {
+            lines.push(Line::from(format!("  {node:<16} ${usd:.4}")));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "log tail:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
     if state.log_tail.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no logs yet)",
@@ -1053,6 +1112,57 @@ mod tests {
     fn state_word_matches_serde_renames() {
         assert_eq!(state_word(SessionState::AwaitingGate), "awaiting_gate");
         assert_eq!(state_word(SessionState::Completed), "completed");
+    }
+
+    #[test]
+    fn format_cost_some_is_two_decimal_dollars() {
+        assert_eq!(format_cost(Some(0.42)), "$0.42");
+        assert_eq!(format_cost(Some(1.5)), "$1.50");
+        assert_eq!(format_cost(Some(0.0)), "$0.00");
+    }
+
+    #[test]
+    fn format_cost_none_is_dash() {
+        assert_eq!(format_cost(None), "-");
+    }
+
+    #[test]
+    fn lifetime_cost_skips_sessions_without_cost_data() {
+        let mut s_with = session("s-1", "wf", SessionState::Running, 1);
+        s_with.record_node_cost("plan", 0.10, 2);
+        let s_without = session("s-2", "wf", SessionState::Running, 3);
+        let mut s_zero = session("s-3", "wf", SessionState::Running, 4);
+        s_zero.record_node_cost("plan", 0.0, 5);
+        let (total, samples) = lifetime_cost(&[s_with, s_without, s_zero]);
+        // Two contributed; one missing.
+        assert_eq!(samples, 2);
+        assert!((total - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lifetime_cost_returns_zero_zero_for_empty() {
+        let (total, samples) = lifetime_cost(&[]);
+        assert!(total.abs() < 1e-9);
+        assert_eq!(samples, 0);
+    }
+
+    #[test]
+    fn render_status_line_no_cost_data_shows_only_session_count() {
+        let sessions = vec![
+            session("s-1", "wf", SessionState::Running, 1),
+            session("s-2", "wf", SessionState::Completed, 2),
+        ];
+        assert_eq!(render_status_line(&sessions), " 2 sessions ");
+    }
+
+    #[test]
+    fn render_status_line_with_cost_data_shows_total() {
+        let mut s = session("s-1", "wf", SessionState::Completed, 1);
+        s.record_node_cost("plan", 0.42, 2);
+        assert_eq!(
+            render_status_line(&[s]),
+            " 1 sessions · $0.42 total (1 with cost) "
+        );
     }
 
     #[test]

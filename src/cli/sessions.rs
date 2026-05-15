@@ -163,12 +163,17 @@ fn list_log_files(store: &SessionStore, id: &SessionId) -> Result<Vec<PathBuf>> 
 
 /// One row in the list output. Owned representation so the pure renderer
 /// can be tested without instantiating real sessions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `cost` is intentionally `Option<f64>`: `None` means "no agent ran or
+/// no cost line could be parsed", `Some(0.0)` means "agent reported
+/// zero." UI preserves the distinction by rendering `-` vs `$0.00`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionRow {
     pub id: String,
     pub state: String,
     pub workflow: String,
     pub current_node: Option<String>,
+    pub cost: Option<f64>,
     pub error: Option<String>,
 }
 
@@ -179,6 +184,7 @@ impl SessionRow {
             state: state_word(s.state).to_string(),
             workflow: s.workflow.clone(),
             current_node: s.current_node.clone(),
+            cost: s.total_cost_usd(),
             error: None,
         }
     }
@@ -189,9 +195,34 @@ impl SessionRow {
             state: "?".to_string(),
             workflow: "?".to_string(),
             current_node: None,
+            cost: None,
             error: Some(format!("{err:#}")),
         }
     }
+}
+
+/// Render an `Option<f64>` USD value with the contract the rest of
+/// fleet's CLI uses: `Some(v)` → `$0.42`, `None` → `-`. Free helper
+/// so every render site picks the same wording.
+#[must_use]
+pub fn format_cost(cost: Option<f64>) -> String {
+    cost.map_or_else(|| "-".to_string(), |v| format!("${v:.2}"))
+}
+
+/// Sum a slice of optional costs into `(total, samples)`. `total` is
+/// the sum of every `Some(v)`; `samples` is how many rows contributed.
+/// Used by the list renderer to surface a "lifetime total" line.
+#[must_use]
+pub fn aggregate_cost(rows: &[SessionRow]) -> (f64, usize) {
+    let mut total = 0.0;
+    let mut samples = 0usize;
+    for row in rows {
+        if let Some(v) = row.cost {
+            total += v;
+            samples += 1;
+        }
+    }
+    (total, samples)
 }
 
 /// Pure renderer for `fleet sessions list`. Stable wording.
@@ -206,9 +237,10 @@ pub fn render_session_list(root: &Path, rows: &[SessionRow]) -> String {
     }
     for row in rows {
         let node = row.current_node.as_deref().unwrap_or("-");
+        let cost = format_cost(row.cost);
         let _ = writeln!(
             out,
-            "  {state:<10} {id}  workflow={workflow}  node={node}",
+            "  {state:<10} {id}  workflow={workflow}  node={node}  cost={cost}",
             state = row.state,
             id = row.id,
             workflow = row.workflow,
@@ -216,6 +248,16 @@ pub fn render_session_list(root: &Path, rows: &[SessionRow]) -> String {
         if let Some(err) = &row.error {
             let _ = writeln!(out, "    ! {err}");
         }
+    }
+    // Trailing total — only shown when at least one row contributed.
+    // Suppressed for "every session reported no cost data" so we
+    // don't add an unhelpful "$0.00 across 0 session(s)" line.
+    let (total, samples) = aggregate_cost(rows);
+    if samples > 0 {
+        let _ = writeln!(
+            out,
+            "  total: ${total:.2} across {samples} session(s) with cost data"
+        );
     }
     out
 }
@@ -241,6 +283,15 @@ pub fn render_session_show(session: &Session, store: &SessionStore, logs: &[Path
         "  directory:    {}",
         store.session_dir(&session.id).display()
     );
+    let _ = writeln!(out, "  total cost:   {}", format_cost(session.total_cost_usd()));
+    out.push_str("  node costs:\n");
+    if session.node_costs.is_empty() {
+        out.push_str("    (no agent cost lines parsed yet)\n");
+    } else {
+        for (node, usd) in &session.node_costs {
+            let _ = writeln!(out, "    - {node:<16} ${usd:.4}");
+        }
+    }
     out.push_str("  logs:\n");
     if logs.is_empty() {
         out.push_str("    (none yet)\n");
@@ -278,6 +329,18 @@ mod tests {
             state: state.to_string(),
             workflow: workflow.to_string(),
             current_node: node.map(str::to_string),
+            cost: None,
+            error: None,
+        }
+    }
+
+    fn row_with_cost(id: &str, cost: f64) -> SessionRow {
+        SessionRow {
+            id: id.to_string(),
+            state: "completed".to_string(),
+            workflow: "standard".to_string(),
+            current_node: None,
+            cost: Some(cost),
             error: None,
         }
     }
@@ -307,11 +370,82 @@ mod tests {
             state: "?".into(),
             workflow: "?".into(),
             current_node: None,
+            cost: None,
             error: Some("meta.json missing".into()),
         };
         let r = render_session_list(Path::new("/r"), &[row]);
         assert!(r.contains("?          s-broken"));
         assert!(r.contains("! meta.json missing"));
+    }
+
+    #[test]
+    fn render_session_list_shows_cost_column() {
+        let r = render_session_list(Path::new("/r"), &[row_with_cost("s-1", 0.42)]);
+        assert!(r.contains("cost=$0.42"), "got: {r}");
+    }
+
+    #[test]
+    fn render_session_list_shows_dash_for_missing_cost() {
+        let r = render_session_list(
+            Path::new("/r"),
+            &[row("s-1", "running", "standard", Some("plan"))],
+        );
+        assert!(r.contains("cost=-"), "got: {r}");
+    }
+
+    #[test]
+    fn render_session_list_appends_total_when_any_row_has_cost() {
+        let rows = vec![
+            row_with_cost("s-1", 0.10),
+            row_with_cost("s-2", 0.30),
+            row("s-3", "running", "standard", Some("plan")), // no cost
+        ];
+        let r = render_session_list(Path::new("/r"), &rows);
+        assert!(
+            r.contains("total: $0.40 across 2 session(s) with cost data"),
+            "got: {r}"
+        );
+    }
+
+    #[test]
+    fn render_session_list_omits_total_when_no_row_has_cost() {
+        // A repo where no agents have run yet should not see a noisy
+        // "$0.00 across 0 session(s)" line. Bigger usability than
+        // perfect coverage.
+        let rows = vec![row("s-1", "running", "standard", Some("plan"))];
+        let r = render_session_list(Path::new("/r"), &rows);
+        assert!(!r.contains("total:"), "got: {r}");
+    }
+
+    #[test]
+    fn aggregate_cost_sums_only_some_values() {
+        let rows = vec![
+            row_with_cost("a", 0.10),
+            row("b", "running", "standard", None),
+            row_with_cost("c", 0.30),
+        ];
+        let (total, samples) = aggregate_cost(&rows);
+        assert!((total - 0.40).abs() < 1e-9);
+        assert_eq!(samples, 2);
+    }
+
+    #[test]
+    fn aggregate_cost_returns_zero_zero_for_empty() {
+        let (total, samples) = aggregate_cost(&[]);
+        assert!(total.abs() < 1e-9);
+        assert_eq!(samples, 0);
+    }
+
+    #[test]
+    fn format_cost_some_renders_two_decimals_with_dollar() {
+        assert_eq!(format_cost(Some(0.42)), "$0.42");
+        assert_eq!(format_cost(Some(0.0)), "$0.00");
+        assert_eq!(format_cost(Some(1.5)), "$1.50");
+    }
+
+    #[test]
+    fn format_cost_none_renders_dash() {
+        assert_eq!(format_cost(None), "-");
     }
 
     #[test]
@@ -349,6 +483,31 @@ mod tests {
     }
 
     #[test]
+    fn render_session_show_says_no_cost_when_node_costs_empty() {
+        let store = SessionStore::at("/r/.fleet/sessions");
+        let session = Session::new(SessionId::new("s-x"), "standard", 1);
+        let r = render_session_show(&session, &store, &[]);
+        assert!(r.contains("total cost:   -"), "got: {r}");
+        assert!(
+            r.contains("node costs:\n    (no agent cost lines parsed yet)"),
+            "got: {r}"
+        );
+    }
+
+    #[test]
+    fn render_session_show_lists_per_node_costs_and_total() {
+        let store = SessionStore::at("/r/.fleet/sessions");
+        let mut session = Session::new(SessionId::new("s-x"), "standard", 1);
+        session.record_node_cost("plan", 0.10, 2);
+        session.record_node_cost("review", 0.32, 3);
+        let r = render_session_show(&session, &store, &[]);
+        assert!(r.contains("total cost:   $0.42"), "got: {r}");
+        // BTreeMap iteration is sorted by key.
+        assert!(r.contains("- plan             $0.1000"), "got: {r}");
+        assert!(r.contains("- review           $0.3200"), "got: {r}");
+    }
+
+    #[test]
     fn list_log_files_returns_empty_when_dir_missing() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::at(dir.path().to_path_buf());
@@ -382,6 +541,21 @@ mod tests {
         let row = SessionRow::from_session(&s);
         assert_eq!(row.state, "completed");
         assert_eq!(row.workflow, "standard");
+    }
+
+    #[test]
+    fn session_row_from_session_carries_cost_when_recorded() {
+        let mut s = Session::new(SessionId::new("s-1"), "standard", 1);
+        s.record_node_cost("plan", 0.20, 2);
+        let row = SessionRow::from_session(&s);
+        assert_eq!(row.cost, Some(0.20));
+    }
+
+    #[test]
+    fn session_row_from_session_has_no_cost_when_node_costs_empty() {
+        let s = Session::new(SessionId::new("s-1"), "standard", 1);
+        let row = SessionRow::from_session(&s);
+        assert_eq!(row.cost, None);
     }
 
     #[test]
