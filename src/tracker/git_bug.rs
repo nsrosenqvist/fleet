@@ -2,8 +2,10 @@
 //!
 //! Shells `git-bug bug --format json` directly on the host through a
 //! [`ProcessInvoker`]. `git-bug` is project-local — the binary reads
-//! the project's git history — so no auth handling is needed; the
-//! installation hint lives in `fleet runtime doctor` (next chunk).
+//! the project's git history — so no auth handling is needed. The
+//! user installs `git-bug` themselves (e.g. `brew install git-bug`);
+//! a missing binary surfaces as the invoker's error on first
+//! `fleet issues list`.
 //!
 //! Defensive parsing handles `git-bug`'s quirks: it emits `null`
 //! (not `[]`) for labels-less issues, and may print an empty body

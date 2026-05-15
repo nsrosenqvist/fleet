@@ -15,7 +15,9 @@ Notes for AI assistants (Claude Code, Codex, etc.) and human contributors workin
 
 The full v2 design (and what's intentionally out of scope) is in [`~/.claude/plans/declarative-wobbling-quasar.md`](file:///home/niklas/.claude/plans/declarative-wobbling-quasar.md) — read that first if you're picking up a feature from the follow-up list.
 
-User-facing docs live under [`docs/`](./docs/). Start with [`docs/README.md`](./docs/README.md). Note that `docs/sandbox.md` / `docs/auth.md` / `docs/network.md` predate the v2 rewrite and reference AO + Lima — treat them as historical until they're rewritten. The current-state docs are `docs/worktrees.md` and `docs/SMOKE_EGRESS.md`.
+For the contributor's system-level view, read [`ARCHITECTURE.md`](./ARCHITECTURE.md) at the repo root — pillars, system diagram, module map, and a walkthrough of how `fleet workflow run` flows end-to-end.
+
+For the operator's view (security boundaries, configuration, day-to-day commands), user-facing docs live under [`docs/`](./docs/). Start with [`docs/README.md`](./docs/README.md). All docs are now v2-current.
 
 ## Workspace model
 
