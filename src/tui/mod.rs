@@ -1046,13 +1046,10 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         return;
     };
 
-    let mut lines = vec![
-        kv_line("workflow", &session.workflow),
-        kv_line("state", state_word(session.state)),
-        kv_line("node", session.current_node.as_deref().unwrap_or("-")),
-        kv_line("updated", &format!("{} ms (epoch)", session.updated_at_ms)),
-        kv_line("cost", &format_cost(session.total_cost_usd())),
-    ];
+    let mut lines: Vec<Line<'static>> = detail_kv_pairs(session)
+        .into_iter()
+        .map(|(k, v)| kv_line(k, &v))
+        .collect();
     if !session.node_costs.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1114,6 +1111,37 @@ fn kv_line(key: &str, value: &str) -> Line<'static> {
     ])
 }
 
+/// Pure helper: build the (label, value) pairs the detail view shows
+/// at the top, in display order. Factored out for testability — the
+/// ratatui `Frame`-based renderer is awkward to assert on directly.
+///
+/// `worktree` and `branch` rows are only emitted when the session
+/// has them populated, so non-git sessions (and pre-worktree
+/// meta.json) keep the previous compact display.
+#[must_use]
+pub fn detail_kv_pairs(session: &Session) -> Vec<(&'static str, String)> {
+    let mut pairs: Vec<(&'static str, String)> = vec![
+        ("workflow", session.workflow.clone()),
+        ("state", state_word(session.state).to_string()),
+        (
+            "node",
+            session
+                .current_node
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+    ];
+    if let Some(path) = session.worktree_path.as_deref() {
+        pairs.push(("worktree", path.display().to_string()));
+    }
+    if let Some(branch) = session.branch.as_deref() {
+        pairs.push(("branch", branch.to_string()));
+    }
+    pairs.push(("updated", format!("{} ms (epoch)", session.updated_at_ms)));
+    pairs.push(("cost", format_cost(session.total_cost_usd())));
+    pairs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,6 +1163,44 @@ mod tests {
     fn state_word_matches_serde_renames() {
         assert_eq!(state_word(SessionState::AwaitingGate), "awaiting_gate");
         assert_eq!(state_word(SessionState::Completed), "completed");
+    }
+
+    #[test]
+    fn detail_kv_pairs_omits_worktree_rows_when_unset() {
+        // Non-git sessions never get worktree_path/branch populated;
+        // the detail view stays compact, matching pre-worktree
+        // behaviour exactly.
+        let s = session("s-1", "standard", SessionState::Running, 1);
+        let pairs = detail_kv_pairs(&s);
+        let labels: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert!(!labels.contains(&"worktree"));
+        assert!(!labels.contains(&"branch"));
+    }
+
+    #[test]
+    fn detail_kv_pairs_includes_worktree_rows_when_set() {
+        let mut s = session("s-1", "standard", SessionState::Running, 1);
+        s.set_worktree(
+            std::path::PathBuf::from("/repo/.fleet/sessions/s-1/worktree"),
+            "fleet/session-s-1",
+            2,
+        );
+        let pairs = detail_kv_pairs(&s);
+        let by_key: std::collections::BTreeMap<&str, &str> =
+            pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            by_key.get("worktree").copied(),
+            Some("/repo/.fleet/sessions/s-1/worktree"),
+        );
+        assert_eq!(by_key.get("branch").copied(), Some("fleet/session-s-1"));
+        // Order: worktree + branch slot between `node` and `updated`,
+        // so the user sees them right after the per-run context.
+        let labels: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        let wt_idx = labels.iter().position(|k| *k == "worktree").unwrap();
+        let br_idx = labels.iter().position(|k| *k == "branch").unwrap();
+        let up_idx = labels.iter().position(|k| *k == "updated").unwrap();
+        assert!(wt_idx < br_idx);
+        assert!(br_idx < up_idx);
     }
 
     #[test]
