@@ -569,6 +569,7 @@ mod tests {
             id: "gh:42".to_string(),
             human_id: "42".to_string(),
             title: "Fix the parser".to_string(),
+            labels: Vec::new(),
         });
         store.save(&s).unwrap();
         let probe = ScriptedProbe::with_alive([]);

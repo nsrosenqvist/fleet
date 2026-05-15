@@ -578,6 +578,7 @@ impl AppState {
                     id: i.id,
                     human_id: i.human_id,
                     title: i.title,
+                    labels: i.labels,
                 })
                 .collect())
         };

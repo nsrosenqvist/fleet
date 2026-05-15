@@ -249,6 +249,7 @@ mod tests {
             id: "gh:42".to_string(),
             human_id: "42".to_string(),
             title: "Fix the parser".to_string(),
+            labels: Vec::new(),
         });
         s.loop_counts.insert("revise".to_string(), 2);
         let json = serde_json::to_string(&s).unwrap();

@@ -49,6 +49,13 @@ pub struct IssueContext {
     /// User-facing id (`"42"`, short git-bug hash).
     pub human_id: String,
     pub title: String,
+    /// Tracker labels in their original casing. Used by autonomous
+    /// mode's per-issue routing to pick a workflow; persisted on the
+    /// session so the chosen route is reproducible after a resume.
+    /// `serde(default)` preserves backward compat with meta.json
+    /// written before routing existed.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 // `store::SessionStore` is intentionally not re-exported yet: nothing in
 // the binary references it from outside the `session` module, so a

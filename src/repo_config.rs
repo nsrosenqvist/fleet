@@ -174,8 +174,9 @@ pub struct AutonomousConfig {
     /// Maximum concurrent in-flight workflow runs autonomous mode is
     /// allowed to drive. In-flight = `Running` or `AwaitingGate`.
     pub max_parallel: u32,
-    /// Workflow to fire against each claimed open issue. Must exist
-    /// under `.fleet/workflows/` and have `trigger.autonomous: true`.
+    /// Default workflow fired when no [`Self::routing`] rule matches a
+    /// candidate issue. Must exist under `.fleet/workflows/` and have
+    /// `trigger.autonomous: true`.
     pub workflow: String,
     /// Minimum seconds between tracker scans. Real `gh` / `git-bug`
     /// shells cost hundreds of ms — debouncing keeps the TUI cheap.
@@ -184,6 +185,50 @@ pub struct AutonomousConfig {
     /// next slot. Lets `fleet workflow run` materialise its session
     /// row so claim-avoidance sees the new in-flight session.
     pub spawn_cooldown_secs: u32,
+    /// Label-driven workflow selection. Rules are tried in order;
+    /// the first whose `labels` intersect the issue's labels wins.
+    /// Empty = always use [`Self::workflow`]. A rule with empty
+    /// `labels` is a wildcard match — useful for staging a workflow
+    /// override last in the list as a catch-all.
+    pub routing: Vec<RoutingRule>,
+}
+
+/// One label-driven routing rule: if any of `labels` matches a label
+/// on the candidate issue, fire `workflow` instead of the autonomous
+/// default. Order in the config file is the precedence order — first
+/// match wins. Empty `labels` matches every issue (catch-all).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingRule {
+    pub labels: Vec<String>,
+    pub workflow: String,
+}
+
+impl AutonomousConfig {
+    /// Pick the workflow to fire for an issue whose labels are
+    /// `issue_labels`. Walks [`Self::routing`] in order; first rule
+    /// whose `labels` intersect wins. Falls back to
+    /// [`Self::workflow`]. Pure; the engine consults it per
+    /// candidate.
+    #[must_use]
+    pub fn resolve_workflow_for(&self, issue_labels: &[String]) -> &str {
+        for rule in &self.routing {
+            if rule_matches(rule, issue_labels) {
+                return &rule.workflow;
+            }
+        }
+        &self.workflow
+    }
+}
+
+/// A rule matches when its `labels` is empty (wildcard) or when at
+/// least one of its labels is present in the issue's labels. Free
+/// function so the policy is unit-tested without a full
+/// `AutonomousConfig`.
+fn rule_matches(rule: &RoutingRule, issue_labels: &[String]) -> bool {
+    if rule.labels.is_empty() {
+        return true;
+    }
+    rule.labels.iter().any(|l| issue_labels.iter().any(|il| il == l))
 }
 
 impl Default for AutonomousConfig {
@@ -193,6 +238,7 @@ impl Default for AutonomousConfig {
             workflow: "standard".to_string(),
             scan_interval_secs: 10,
             spawn_cooldown_secs: 2,
+            routing: Vec::new(),
         }
     }
 }
@@ -251,6 +297,18 @@ struct RawAutonomous {
     scan_interval_secs: Option<u32>,
     #[serde(default)]
     spawn_cooldown_secs: Option<u32>,
+    /// Routing rules parsed as `[{ labels: [...], workflow: "..." }]`.
+    /// Absent in the YAML → empty Vec → engine always uses the default
+    /// workflow, matching pre-routing behaviour exactly.
+    #[serde(default)]
+    routing: Option<Vec<RawRoutingRule>>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawRoutingRule {
+    #[serde(default)]
+    labels: Option<Vec<String>>,
+    workflow: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -330,6 +388,15 @@ impl From<Raw> for RepoConfig {
                 spawn_cooldown_secs: a
                     .spawn_cooldown_secs
                     .unwrap_or(default_autonomous.spawn_cooldown_secs),
+                routing: a.routing.map_or(default_autonomous.routing, |raw_rules| {
+                    raw_rules
+                        .into_iter()
+                        .map(|r| RoutingRule {
+                            labels: r.labels.unwrap_or_default(),
+                            workflow: r.workflow,
+                        })
+                        .collect()
+                }),
             },
             None => default_autonomous,
         };
@@ -390,6 +457,135 @@ autonomous:
         assert_eq!(cfg.autonomous.workflow, "standard");
         assert_eq!(cfg.autonomous.scan_interval_secs, 10);
         assert_eq!(cfg.autonomous.spawn_cooldown_secs, 2);
+        assert!(cfg.autonomous.routing.is_empty());
+    }
+
+    #[test]
+    fn routing_absent_yields_empty_vec() {
+        // Pre-routing configs must still parse and behave exactly as
+        // before — the engine falls back to autonomous.workflow.
+        let yaml = "autonomous:\n  workflow: standard\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert!(cfg.autonomous.routing.is_empty());
+    }
+
+    #[test]
+    fn routing_parses_full_block() {
+        let yaml = "\
+autonomous:
+  workflow: standard
+  routing:
+    - labels: [bug, hotfix]
+      workflow: hotfix
+    - labels: [docs]
+      workflow: docs-only
+    - workflow: catch-all
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.autonomous.routing.len(), 3);
+        assert_eq!(cfg.autonomous.routing[0].labels, vec!["bug", "hotfix"]);
+        assert_eq!(cfg.autonomous.routing[0].workflow, "hotfix");
+        assert_eq!(cfg.autonomous.routing[1].labels, vec!["docs"]);
+        assert_eq!(cfg.autonomous.routing[1].workflow, "docs-only");
+        // Catch-all: no `labels:` key → empty Vec → matches every issue.
+        assert!(cfg.autonomous.routing[2].labels.is_empty());
+        assert_eq!(cfg.autonomous.routing[2].workflow, "catch-all");
+    }
+
+    #[test]
+    fn resolve_workflow_no_rules_returns_default() {
+        let cfg = AutonomousConfig::default();
+        assert_eq!(cfg.resolve_workflow_for(&["bug".to_string()]), "standard");
+        assert_eq!(cfg.resolve_workflow_for(&[]), "standard");
+    }
+
+    #[test]
+    fn resolve_workflow_first_matching_rule_wins() {
+        let cfg = AutonomousConfig {
+            routing: vec![
+                RoutingRule {
+                    labels: vec!["bug".to_string()],
+                    workflow: "hotfix".to_string(),
+                },
+                RoutingRule {
+                    labels: vec!["bug".to_string()],
+                    workflow: "later".to_string(),
+                },
+            ],
+            ..AutonomousConfig::default()
+        };
+        assert_eq!(
+            cfg.resolve_workflow_for(&["bug".to_string()]),
+            "hotfix",
+            "first matching rule must win"
+        );
+    }
+
+    #[test]
+    fn resolve_workflow_returns_default_when_no_rule_matches() {
+        let cfg = AutonomousConfig {
+            routing: vec![RoutingRule {
+                labels: vec!["bug".to_string()],
+                workflow: "hotfix".to_string(),
+            }],
+            ..AutonomousConfig::default()
+        };
+        assert_eq!(
+            cfg.resolve_workflow_for(&["feature".to_string()]),
+            "standard"
+        );
+        assert_eq!(cfg.resolve_workflow_for(&[]), "standard");
+    }
+
+    #[test]
+    fn resolve_workflow_intersects_rather_than_subset() {
+        // Issue with multiple labels matches a rule that names any
+        // one of them. Designed for the common case "open issues are
+        // tagged with several labels; we route on the most specific
+        // one we know about."
+        let cfg = AutonomousConfig {
+            routing: vec![RoutingRule {
+                labels: vec!["hotfix".to_string()],
+                workflow: "fast-track".to_string(),
+            }],
+            ..AutonomousConfig::default()
+        };
+        assert_eq!(
+            cfg.resolve_workflow_for(&[
+                "p1".to_string(),
+                "hotfix".to_string(),
+                "backend".to_string(),
+            ]),
+            "fast-track"
+        );
+    }
+
+    #[test]
+    fn resolve_workflow_empty_labels_rule_is_wildcard() {
+        // A rule with `labels: []` matches every issue. The intended
+        // use is "default override" — staged last in the list as a
+        // catch-all.
+        let cfg = AutonomousConfig {
+            routing: vec![
+                RoutingRule {
+                    labels: vec!["bug".to_string()],
+                    workflow: "hotfix".to_string(),
+                },
+                RoutingRule {
+                    labels: Vec::new(),
+                    workflow: "fallback".to_string(),
+                },
+            ],
+            ..AutonomousConfig::default()
+        };
+        // Untagged issue falls through to the wildcard, not the
+        // top-level default.
+        assert_eq!(cfg.resolve_workflow_for(&[]), "fallback");
+        // Tagged issue still hits the earlier specific rule.
+        assert_eq!(
+            cfg.resolve_workflow_for(&["bug".to_string()]),
+            "hotfix"
+        );
     }
 
     #[test]

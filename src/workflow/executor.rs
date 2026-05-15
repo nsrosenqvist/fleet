@@ -1174,6 +1174,7 @@ mod tests {
             id: "gh:42".to_string(),
             human_id: "42".to_string(),
             title: "Fix the parser".to_string(),
+            labels: Vec::new(),
         }
     }
 
@@ -1563,6 +1564,7 @@ nodes:
             id: "gh:1".to_string(),
             human_id: "1".to_string(),
             title: "Doesn't render".to_string(),
+            labels: Vec::new(),
         };
         let prefix = bash_issue_env_prefix(Some(&ctx));
         // `'` inside single-quoted string becomes `'\''` (close-quote,
@@ -1576,6 +1578,7 @@ nodes:
             id: "gh:1".to_string(),
             human_id: "1".to_string(),
             title: String::new(),
+            labels: Vec::new(),
         };
         let prefix = bash_issue_env_prefix(Some(&ctx));
         assert!(prefix.contains("FLEET_ISSUE_TITLE='' "), "got: {prefix}");
@@ -3587,6 +3590,7 @@ nodes:
             id: "gh:99".to_string(),
             human_id: "99".to_string(),
             title: "Hotfix the parser".to_string(),
+            labels: Vec::new(),
         };
         let resume_req = ExecuteRequest {
             workflow: &wf,

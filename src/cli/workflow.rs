@@ -219,6 +219,7 @@ fn resolve_issue(
         id: found.id.clone(),
         human_id: found.human_id.clone(),
         title: found.title.clone(),
+        labels: found.labels.clone(),
     })
 }
 

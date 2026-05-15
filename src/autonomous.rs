@@ -170,17 +170,26 @@ impl AutonomousEngine {
             return AutonomousOutcome::WaitedFor(PauseReason::NoUnclaimedIssues);
         };
 
+        // Pick a workflow for this specific issue. The default and
+        // any user-defined `routing:` rules in config are consulted
+        // by `resolve_workflow_for` — if no rule matches the issue's
+        // labels, `config.workflow` is the fallback. This is the
+        // only place the engine reads label data; rule order is the
+        // config author's contract.
+        let workflow = config
+            .resolve_workflow_for(&candidate.labels)
+            .to_string();
+
         // Found a candidate. Set the spawn timestamp BEFORE returning
         // so a panic in the caller's spawn path doesn't leak into a
         // tight retry loop on the next tick.
         self.last_spawn_at = Some(now);
         self.status = format!(
-            "autonomous: ON · spawned `{wf}` for #{human}",
-            wf = config.workflow,
+            "autonomous: ON · spawned `{workflow}` for #{human}",
             human = candidate.human_id,
         );
         AutonomousOutcome::Spawn(SpawnCommand {
-            workflow: config.workflow.clone(),
+            workflow,
             issue: candidate,
         })
     }
@@ -220,6 +229,7 @@ pub enum PauseReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo_config::RoutingRule;
     use crate::session::SessionId;
 
     fn cfg() -> AutonomousConfig {
@@ -235,6 +245,16 @@ mod tests {
             id: format!("gh:{human}"),
             human_id: human.to_string(),
             title: format!("Issue {human}"),
+            labels: Vec::new(),
+        }
+    }
+
+    fn issue_with_labels(human: &str, labels: &[&str]) -> IssueContext {
+        IssueContext {
+            id: format!("gh:{human}"),
+            human_id: human.to_string(),
+            title: format!("Issue {human}"),
+            labels: labels.iter().map(|s| (*s).to_string()).collect(),
         }
     }
 
@@ -530,5 +550,96 @@ mod tests {
         let mut e = AutonomousEngine::new();
         e.set_status("autonomous: cannot enable — tracker unavailable");
         assert!(e.status().contains("cannot enable"));
+    }
+
+    #[test]
+    fn step_routes_to_matching_workflow_based_on_issue_labels() {
+        let mut e = AutonomousEngine::new();
+        e.toggle();
+        let mut cfg = cfg();
+        cfg.routing = vec![RoutingRule {
+            labels: vec!["bug".to_string()],
+            workflow: "hotfix".to_string(),
+        }];
+        let out = e.step(t0(), &cfg, &[], || Ok(vec![issue_with_labels("42", &["bug"])]));
+        match out {
+            AutonomousOutcome::Spawn(cmd) => {
+                assert_eq!(cmd.workflow, "hotfix", "routing rule must override default");
+                assert_eq!(cmd.issue.human_id, "42");
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+        // Status line mirrors the chosen workflow, not the default.
+        assert!(e.status().contains("spawned `hotfix`"), "got: {}", e.status());
+    }
+
+    #[test]
+    fn step_falls_back_to_default_workflow_when_no_rule_matches() {
+        let mut e = AutonomousEngine::new();
+        e.toggle();
+        let mut cfg = cfg();
+        cfg.routing = vec![RoutingRule {
+            labels: vec!["docs".to_string()],
+            workflow: "docs-only".to_string(),
+        }];
+        // Issue has no `docs` label — should land on autonomous.workflow.
+        let out = e.step(t0(), &cfg, &[], || {
+            Ok(vec![issue_with_labels("42", &["bug"])])
+        });
+        match out {
+            AutonomousOutcome::Spawn(cmd) => assert_eq!(cmd.workflow, "standard"),
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_uses_default_workflow_when_issue_has_no_labels() {
+        let mut e = AutonomousEngine::new();
+        e.toggle();
+        let mut cfg = cfg();
+        cfg.routing = vec![RoutingRule {
+            labels: vec!["bug".to_string()],
+            workflow: "hotfix".to_string(),
+        }];
+        let out = e.step(t0(), &cfg, &[], || Ok(vec![issue("42")]));
+        match out {
+            AutonomousOutcome::Spawn(cmd) => {
+                assert_eq!(cmd.workflow, "standard");
+                assert!(cmd.issue.labels.is_empty());
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_first_matching_rule_wins_for_multi_labeled_issue() {
+        // Issue carrying multiple labels matches whichever rule fires
+        // first in the config — locks the "config-author owns
+        // precedence" contract.
+        let mut e = AutonomousEngine::new();
+        e.toggle();
+        let mut cfg = cfg();
+        cfg.routing = vec![
+            RoutingRule {
+                labels: vec!["hotfix".to_string()],
+                workflow: "fast-track".to_string(),
+            },
+            RoutingRule {
+                labels: vec!["docs".to_string()],
+                workflow: "docs-only".to_string(),
+            },
+        ];
+        let out = e.step(t0(), &cfg, &[], || {
+            Ok(vec![issue_with_labels("42", &["docs", "hotfix"])])
+        });
+        match out {
+            AutonomousOutcome::Spawn(cmd) => {
+                assert_eq!(
+                    cmd.workflow, "fast-track",
+                    "rule order is config-author contract"
+                );
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
     }
 }
