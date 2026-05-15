@@ -16,8 +16,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 
 use crate::repo;
-use crate::session::{Session, SessionId, SessionState};
+use crate::session::reaper::{self, RealPidProbe, ReapReport};
 use crate::session::store::SessionStore;
+use crate::session::{Session, SessionId, SessionState, now_ms};
 
 /// CLI entry point for `fleet sessions list`. Sorted by id.
 pub fn run_list() -> Result<i32> {
@@ -96,6 +97,37 @@ pub fn run_logs(id: &str, node: Option<&str>) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// CLI entry point for `fleet sessions reap`. Returns 0 regardless of
+/// how many sessions were reaped — reaping is recovery, not a failure
+/// signal. Exit non-zero only when the sweep itself errors (e.g. the
+/// store root is unreadable).
+pub fn run_reap() -> Result<i32> {
+    let store = open_store()?;
+    let probe = RealPidProbe;
+    let report = reaper::reap(&store, &probe, now_ms())
+        .with_context(|| format!("reaping sessions under {}", store.root().display()))?;
+    print!("{}", render_reap_report(&report));
+    Ok(0)
+}
+
+/// Pure renderer for the reap CLI output. Surfacing wording in a free
+/// function keeps it test-asserted without I/O.
+#[must_use]
+pub fn render_reap_report(report: &ReapReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "scanned {} session(s); reaped {}",
+        report.scanned,
+        report.reaped.len()
+    );
+    for r in &report.reaped {
+        let _ = writeln!(out, "  - {} -> crashed ({})", r.id, r.reason.summary());
+    }
+    out
 }
 
 /// Open the `SessionStore` for the current repo's fleet root.
@@ -350,5 +382,37 @@ mod tests {
         let row = SessionRow::from_session(&s);
         assert_eq!(row.state, "completed");
         assert_eq!(row.workflow, "standard");
+    }
+
+    #[test]
+    fn render_reap_report_says_zero_when_nothing_reaped() {
+        let r = render_reap_report(&ReapReport {
+            scanned: 3,
+            reaped: vec![],
+        });
+        assert!(r.contains("scanned 3 session(s); reaped 0"));
+        // No per-session lines.
+        assert!(!r.contains(" -> crashed"));
+    }
+
+    #[test]
+    fn render_reap_report_lists_each_reaped_with_reason() {
+        use crate::session::reaper::{ReapReason, ReapedSession};
+        let r = render_reap_report(&ReapReport {
+            scanned: 4,
+            reaped: vec![
+                ReapedSession {
+                    id: SessionId::new("s-a"),
+                    reason: ReapReason::NoDriverPid,
+                },
+                ReapedSession {
+                    id: SessionId::new("s-b"),
+                    reason: ReapReason::DeadDriver { pid: 1234 },
+                },
+            ],
+        });
+        assert!(r.contains("scanned 4 session(s); reaped 2"));
+        assert!(r.contains("- s-a -> crashed (no driver_pid recorded)"));
+        assert!(r.contains("- s-b -> crashed (driver pid 1234 is dead)"));
     }
 }

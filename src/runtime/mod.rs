@@ -198,10 +198,13 @@ pub trait RuntimeAdapter: Send + Sync {
     ///
     /// Anything other than [`ContainerState::Running`] is treated as
     /// "not alive": `Exited`, `Dead`, and `Unknown` all indicate the
-    /// container cannot serve the workload. Used by the session reaper
-    /// to corroborate "driver process died" with "container is gone."
-    /// The reaper itself lands in the next commit — `dead_code` here
-    /// goes away as soon as that wiring is in place.
+    /// container cannot serve the workload. The session reaper's
+    /// primary crash signal is the driver pid, not container state —
+    /// fleet sessions tear down their containers per node, so by the
+    /// time a session is "stuck", its containers are usually already
+    /// gone. This predicate exists for a future enhancement that stops
+    /// orphaned containers after a reap; for now it's the contract that
+    /// future enhancement will consume.
     #[allow(dead_code)]
     fn is_running(&self, container: &ContainerId) -> Result<bool> {
         Ok(matches!(self.inspect(container)?, ContainerState::Running))

@@ -61,6 +61,7 @@ use crate::repo_config::RepoConfig;
 use crate::runtime::Capabilities;
 use crate::runtime::detect::probe;
 use crate::runtime::factory::build_adapter;
+use crate::session::reaper::{self, RealPidProbe, ReapReport};
 use crate::session::store::SessionStore;
 use crate::session::{Session, SessionState, now_ms};
 
@@ -76,6 +77,18 @@ pub fn run() -> Result<i32> {
     let root = repo::fleet_root(&cwd);
     let store = SessionStore::for_repo(&root);
 
+    // Sweep crashed sessions *before* taking over the terminal: a
+    // session whose driver died left meta.json stuck in `running`, and
+    // the TUI must show its correct (crashed) state from the first
+    // frame. Errors here are logged but non-fatal — the TUI still opens.
+    let reap_report = match reaper::reap(&store, &RealPidProbe, now_ms()) {
+        Ok(r) => Some(r),
+        Err(err) => {
+            tracing::warn!(error = %err, "reaper sweep failed at TUI startup");
+            None
+        }
+    };
+
     let mut stdout = io::stdout();
     enable_raw_mode().context("enabling terminal raw mode")?;
     execute!(stdout, EnterAlternateScreen).context("entering alternate screen")?;
@@ -85,7 +98,7 @@ pub fn run() -> Result<i32> {
     // Run the loop, but always tear down terminal state before
     // propagating its result — otherwise an early return leaves the
     // user staring at a useless raw-mode terminal.
-    let loop_result = event_loop(&mut terminal, &root, &store);
+    let loop_result = event_loop(&mut terminal, &root, &store, reap_report);
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
@@ -96,8 +109,20 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     root: &Path,
     store: &SessionStore,
+    reap_report: Option<ReapReport>,
 ) -> Result<i32> {
     let mut state = AppState::new(root.to_path_buf(), store)?;
+    // Surface the reap outcome in the status bar so the user sees what
+    // happened without scrolling through logs. Silent when nothing was
+    // reaped — the default "N sessions" line is more useful.
+    if let Some(report) = reap_report {
+        if !report.reaped.is_empty() {
+            state.status_line = format!(
+                " reaped {} crashed session(s) on startup ",
+                report.reaped.len()
+            );
+        }
+    }
     loop {
         terminal.draw(|f| render(f, &state))?;
         if event::poll(POLL_TIMEOUT)? {

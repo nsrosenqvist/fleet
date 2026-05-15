@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod aggregate;
+pub mod reaper;
 pub mod state;
 pub mod store;
 

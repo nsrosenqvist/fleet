@@ -141,6 +141,11 @@ pub enum SessionsSub {
         #[arg(long)]
         node: Option<String>,
     },
+    /// Sweep `.fleet/sessions/` for sessions stuck in `running` whose
+    /// driver process is gone; transition them to `crashed` and drop a
+    /// forensic snapshot. Run automatically at TUI startup; this
+    /// subcommand exists for scripted/manual use.
+    Reap,
 }
 
 #[derive(Debug, Subcommand)]
@@ -175,6 +180,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             SessionsSub::List => sessions::run_list(),
             SessionsSub::Show { id } => sessions::run_show(&id),
             SessionsSub::Logs { id, node } => sessions::run_logs(&id, node.as_deref()),
+            SessionsSub::Reap => sessions::run_reap(),
         },
         Command::Issues { sub } => match sub {
             IssuesSub::List => issues::run_list(),
