@@ -185,6 +185,86 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
     Ok(i32::from(resumed.state != SessionState::Completed))
 }
 
+/// CLI entry point for `fleet workflow replay <session> --rerun-from <node>`.
+/// Mints a new session whose workflow is read off the source session's
+/// `meta.json`, copies the source's artifacts/ into it, and runs the
+/// workflow from `rerun_from` onward.
+///
+/// Caveats inherited from the executor's `replay` contract:
+/// - The src session must have been run against a workflow whose YAML
+///   is still resolvable under `.fleet/workflows/<name>.yaml`. Replay
+///   re-parses the *current* YAML — if the workflow has been edited
+///   between runs, the new run uses the new shape.
+/// - `outputs:` accumulator is rebuilt empty for the rerun (same gap
+///   as resume). `when:`-gated nodes downstream of an upstream
+///   `outputs:` declaration see the default and may skip.
+/// - The issue context is not re-resolved; new agent nodes won't see
+///   `FLEET_ISSUE_*`. Re-spawn via `workflow run --issue <id>` if a
+///   replay needs them.
+pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let config = RepoConfig::load(root.join(".fleet/config.yaml"))
+        .context("loading .fleet/config.yaml")?;
+
+    let store = SessionStore::for_repo(&root);
+    let src_id = SessionId::new(session_id);
+    let src = store
+        .load(&src_id)
+        .with_context(|| format!("loading source session `{session_id}` for replay"))?;
+
+    let wf_path = workflow_path(&root, &src.workflow);
+    let wf = Workflow::from_path(&wf_path).with_context(|| {
+        format!(
+            "loading workflow `{}` for replay of session `{session_id}`",
+            src.workflow
+        )
+    })?;
+
+    let dc_path = if config.runtime.devcontainer.is_absolute() {
+        config.runtime.devcontainer.clone()
+    } else {
+        root.join(&config.runtime.devcontainer)
+    };
+    let devcontainer = Devcontainer::from_path(&dc_path)
+        .with_context(|| format!("loading devcontainer at {}", dc_path.display()))?;
+
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+    let report = probe(invoker.as_ref());
+    let adapter = build_adapter(&config.runtime, &report, Arc::clone(&invoker))?;
+
+    let new_id = ClockIdSource.mint();
+    let executor = WorkflowExecutor::new(invoker);
+    let req = ExecuteRequest {
+        workflow: &wf,
+        adapter: adapter.as_ref(),
+        agents: &config.agents.registry,
+        store: &store,
+        devcontainer: &devcontainer,
+        workspace: &root,
+        session_id: new_id.clone(),
+        // Issue context is not carried forward — re-spawning a fresh
+        // run via `workflow run --issue` is the supported path when
+        // `FLEET_ISSUE_*` matters.
+        issue: None,
+    };
+
+    println!("{new_id}");
+    let result = executor.replay(&req, &src_id, rerun_from);
+    match result {
+        Ok(session) => {
+            eprintln!(
+                "fleet workflow replay: from `{session_id}` re-running `{}` (last node: {}) — {}",
+                src.workflow,
+                session.current_node.as_deref().unwrap_or("none"),
+                state_word(session.state),
+            );
+            Ok(i32::from(session.state != SessionState::Completed))
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Resolve the on-disk path for a workflow name.
 fn workflow_path(root: &Path, name: &str) -> PathBuf {
     root.join(".fleet/workflows").join(format!("{name}.yaml"))

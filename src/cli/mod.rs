@@ -134,6 +134,20 @@ pub enum WorkflowSub {
     /// re-parses its workflow YAML, and continues from the node after
     /// the gate.
     Resume { session: String },
+
+    /// Replay a prior session from a chosen node. Mints a new session,
+    /// copies the source session's artifacts/ into it, and runs the
+    /// workflow starting at `--rerun-from`. Use case: iterate on a
+    /// reviewer prompt without re-paying for upstream agents.
+    Replay {
+        /// Source session id to replay.
+        session: String,
+        /// Node id to start the rerun at. Must appear in the workflow's
+        /// topological order (fanout siblings excluded — pass the
+        /// owning fanout node instead).
+        #[arg(long = "rerun-from")]
+        rerun_from: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -197,6 +211,9 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             WorkflowSub::Validate { name } => workflow::run_validate(&name),
             WorkflowSub::Run { name, issue } => workflow::run_run(&name, issue.as_deref()),
             WorkflowSub::Resume { session } => workflow::run_resume(&session),
+            WorkflowSub::Replay { session, rerun_from } => {
+                workflow::run_replay(&session, &rerun_from)
+            }
         },
         Command::Sessions { sub } => match sub {
             SessionsSub::List => sessions::run_list(),
