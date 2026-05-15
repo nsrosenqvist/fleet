@@ -29,9 +29,6 @@ pub use github::GitHubTracker;
 /// specifics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-// Production callers (concrete tracker impls + bridge HTTP routes) land
-// in the next commits.
-#[allow(dead_code)]
 pub enum Status {
     Open,
     InProgress,
@@ -43,7 +40,6 @@ pub enum Status {
 /// practice); fleet does not parse it because the only consumer today
 /// is the agent prompt context, which displays it verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct Comment {
     pub author: String,
     pub body: String,
@@ -54,7 +50,6 @@ pub struct Comment {
 /// Returned by [`Tracker::read`] and surfaced verbatim to bridge
 /// callers so agents see the same story a human would.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct IssueDetail {
     pub issue: Issue,
     pub body: String,
@@ -95,15 +90,15 @@ impl Issue {
 ///
 /// Write methods (`comment`, `set_status`, `add_label`, `remove_label`,
 /// `create`, `link_parent`) and the rich-read method (`read`) carry
-/// default impls that bail with a clear error. Concrete trackers
-/// override the methods they support in later commits; the default
-/// keeps the trait Liskov-substitutable through Phase 1 even when an
-/// impl hasn't been extended yet.
+/// default impls that bail with a clear error. Trackers without
+/// concrete support (e.g. a stub used in a test) get the bail-by-name
+/// behaviour for free; the two production impls (`GitBugTracker` and
+/// `GitHubTracker`) override every method.
 ///
-/// `#[allow(dead_code)]` on the new methods is short-lived — the
-/// follow-up commits in this phase wire production callers (concrete
-/// tracker impls, then the bridge HTTP server) and the allow falls off
-/// per-method as each gains a non-test caller.
+/// `#[allow(dead_code)]` stays on the trait until the bridge HTTP
+/// server (commit 7 of this phase) calls these methods in production —
+/// today the impl bodies are unreachable from `main()`, so the dead-code
+/// chain reaches every method and every helper type the methods name.
 #[allow(dead_code)]
 pub trait Tracker: Send + Sync {
     fn name(&self) -> &'static str;
