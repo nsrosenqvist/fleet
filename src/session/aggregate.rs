@@ -9,6 +9,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use super::{IssueContext, SessionId, SessionState};
 
@@ -71,6 +72,20 @@ pub struct Session {
     /// the default after a resume/replay boundary.
     #[serde(default)]
     pub outputs: BTreeMap<String, BTreeMap<String, String>>,
+    /// Absolute path to the per-session git worktree, when one was
+    /// created (i.e. when the workspace is a git repo and fleet
+    /// minted `fleet/session-<short-id>` for this run). `None` for
+    /// non-git workspaces — in which case the agent runs against
+    /// the shared repo root and replay loses its code-state
+    /// guarantees. `replay` reads this off the src session to base
+    /// the new session's worktree at the same code state.
+    #[serde(default)]
+    pub worktree_path: Option<PathBuf>,
+    /// Name of the git branch checked out in [`Self::worktree_path`].
+    /// `replay` uses this as the git ref to base the new session's
+    /// worktree on. `None` when [`Self::worktree_path`] is `None`.
+    #[serde(default)]
+    pub branch: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -92,6 +107,8 @@ impl Session {
             driver_pid: None,
             node_costs: BTreeMap::new(),
             outputs: BTreeMap::new(),
+            worktree_path: None,
+            branch: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }
@@ -147,6 +164,27 @@ impl Session {
     /// cares about for "what did this session cost me?" framing.
     pub fn record_node_cost(&mut self, node_id: impl Into<String>, usd: f64, now_ms: u64) {
         self.node_costs.insert(node_id.into(), usd);
+        self.updated_at_ms = now_ms;
+    }
+
+    /// Record the per-session worktree path + branch fleet minted for
+    /// this session. Atomic write so a reader (TUI / reaper) never
+    /// sees one half-populated. Bumps `updated_at_ms` so the sidebar
+    /// reflects the activity.
+    #[allow(dead_code)] // wired by the workflow CLI in a subsequent commit
+    pub fn set_worktree(&mut self, path: PathBuf, branch: impl Into<String>, now_ms: u64) {
+        self.worktree_path = Some(path);
+        self.branch = Some(branch.into());
+        self.updated_at_ms = now_ms;
+    }
+
+    /// Drop the worktree pointer once the worktree has been pruned
+    /// off-disk. Branch name is *kept* — the branch may persist after
+    /// the worktree is gone (the user can still `git checkout`/`merge`
+    /// it). Bumps `updated_at_ms`.
+    #[allow(dead_code)] // wired by `fleet sessions prune` in a subsequent commit
+    pub fn clear_worktree_path(&mut self, now_ms: u64) {
+        self.worktree_path = None;
         self.updated_at_ms = now_ms;
     }
 
@@ -402,6 +440,82 @@ mod tests {
         }"#;
         let s: Session = serde_json::from_str(json).unwrap();
         assert!(s.node_costs.is_empty());
+    }
+
+    #[test]
+    fn new_session_has_no_worktree_or_branch() {
+        let s = fresh();
+        assert!(s.worktree_path.is_none());
+        assert!(s.branch.is_none());
+    }
+
+    #[test]
+    fn set_worktree_stamps_both_fields_and_bumps_timestamp() {
+        let mut s = fresh();
+        s.set_worktree(
+            PathBuf::from("/repo/.fleet/sessions/s-test/worktree"),
+            "fleet/session-s-test",
+            2_000,
+        );
+        assert_eq!(
+            s.worktree_path.as_deref(),
+            Some(std::path::Path::new(
+                "/repo/.fleet/sessions/s-test/worktree"
+            ))
+        );
+        assert_eq!(s.branch.as_deref(), Some("fleet/session-s-test"));
+        assert_eq!(s.updated_at_ms, 2_000);
+    }
+
+    #[test]
+    fn clear_worktree_path_keeps_branch_and_bumps_timestamp() {
+        // Branch survives the worktree directory — the user can still
+        // `git checkout fleet/session-<id>` after `fleet sessions prune`
+        // removed the on-disk worktree.
+        let mut s = fresh();
+        s.set_worktree(
+            PathBuf::from("/repo/.fleet/sessions/s-test/worktree"),
+            "fleet/session-s-test",
+            2_000,
+        );
+        s.clear_worktree_path(3_000);
+        assert!(s.worktree_path.is_none());
+        assert_eq!(
+            s.branch.as_deref(),
+            Some("fleet/session-s-test"),
+            "branch must persist after worktree pruning"
+        );
+        assert_eq!(s.updated_at_ms, 3_000);
+    }
+
+    #[test]
+    fn worktree_round_trips_through_json() {
+        let mut s = fresh();
+        s.set_worktree(
+            PathBuf::from("/repo/.fleet/sessions/s-test/worktree"),
+            "fleet/session-s-test",
+            2_000,
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn missing_worktree_fields_default_to_none_on_load() {
+        // Backward compatibility with meta.json written before the
+        // worktree fields landed: serde(default) makes both keys
+        // optional on the wire.
+        let json = r#"{
+            "id": "s-1",
+            "workflow": "standard",
+            "state": "created",
+            "created_at_ms": 1,
+            "updated_at_ms": 1
+        }"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert!(s.worktree_path.is_none());
+        assert!(s.branch.is_none());
     }
 
     #[test]
