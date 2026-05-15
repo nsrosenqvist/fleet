@@ -43,26 +43,40 @@ impls.
 
 ### `PodmanTinyproxyEnforcer` (Linux + Podman + `policy: allowlist`)
 
-The strongest config. Three steps at session start:
+The strongest config. Five steps at session start:
 
 1. **Internal network.** `podman network create --internal
    fleet-<sid>`. The `--internal` flag means containers on this
    network have no route to the outside; only other containers on
    the same network are reachable.
-2. **Sidecar.** A tinyproxy container is run on that network with
-   the allowlist baked into its config. The workflow container's
-   `HTTP_PROXY` / `HTTPS_PROXY` point at the sidecar's hostname on
-   the internal network.
-3. **Bridge the sidecar outward.** After step 2, the sidecar is
+2. **Tinyproxy sidecar.** A tinyproxy container is run on that
+   network with the allowlist baked into its config. The workflow
+   container's `HTTP_PROXY` / `HTTPS_PROXY` point at the sidecar's
+   hostname on the internal network.
+3. **Bridge the proxy outward.** After step 2, the sidecar is
    `podman network connect`-ed to the default `podman` bridge
    network. The sidecar gets a route out; the workflow container
    does not. The two-step is more verbose than `--network=bridge`
    once, but it makes the audit trail clearer: only the sidecar
    ever bridges outward, never the workflow container.
+4. **DNS-stub sidecar.** A second sidecar (default image
+   `4km3/dnsmasq:latest`) is run on the same `--internal` network.
+   At session setup time fleet pre-resolves every allowlist host on
+   the host via `getent ahosts`, then starts dnsmasq with `-k
+   --no-resolv --no-hosts` plus one `--host-record=name,ip` per
+   resolved record. Authoritative behaviour: allowlist names
+   resolve to the pre-fetched IPs; everything else returns NXDOMAIN.
+5. **Pin the workflow container's resolver.** Fleet inspects the
+   DNS sidecar's IP on the internal network and passes
+   `--dns=<ip>` to the workflow container's start. The container's
+   `/etc/resolv.conf` is overridden to point only at the stub.
 
-Result: the workflow container has exactly one network path — through
-the sidecar — and the sidecar refuses CONNECTs to hosts not on the
-allowlist.
+Result: the workflow container has exactly one network path —
+through the sidecar — and the sidecar refuses CONNECTs to hosts not
+on the allowlist. Independently, the container's resolver can only
+resolve allowlisted names; queries for any other host fail at the
+stub, closing the DNS-exfiltration channel that an unfiltered
+upstream resolver would otherwise leak through.
 
 ### `HostProxyEnforcer` (macOS Apple Container or Docker + `policy: allowlist`)
 
@@ -130,17 +144,22 @@ not honour wildcards — don't rely on it.
 
 ## What it does NOT protect against
 
-The egress module's own docstring is the source of truth; the three
-honest gaps:
+The egress module's own docstring is the source of truth; the honest
+gaps:
 
-- **DNS exfiltration.** tinyproxy doesn't intercept DNS. The container
-  asks the host resolver for `api.anthropic.com` (allowed) but the
-  attacker can encode a payload into a TXT-record lookup of
-  `${base64 secret}.attacker.com` and the host resolver dutifully
-  forwards it. Allowlist'd nameservers don't help — the *query
-  itself* carries the data. The DNS-stub-resolver follow-up closes
-  this on Linux; macOS path can't until Apple Container ships
-  network-isolation primitives.
+- **DNS exfiltration on macOS** (mitigated on Linux + Podman). On
+  Linux, fleet ships a DNS-stub sidecar in the same `--internal`
+  network as the workflow container. The stub pre-resolves the
+  allowlist on the host at session setup, serves those records
+  authoritatively, and returns NXDOMAIN for everything else — so a
+  query for `${base64 secret}.attacker.com` fails at the stub
+  instead of being forwarded to the host resolver. The workflow
+  container's `--dns=<stub-ip>` flag wires it up. On macOS (Apple
+  Container or Docker), the host-proxy path doesn't have this
+  protection: Apple Container has not shipped a network-internal
+  primitive equivalent to Podman's `--internal`, and the cooperative
+  HOST_PROXY env-only model leaves DNS unfiltered. Mitigation when
+  this matters: run on Linux Podman.
 - **SNI-on-IP bypass.** A client that sets `curl --resolve
   example.com:1.2.3.4` makes the proxy believe it's talking to
   `example.com` (allowlist'd) while actually connecting to

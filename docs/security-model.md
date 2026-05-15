@@ -118,20 +118,26 @@ resource.
 unintended CDN, registry, or third-party host. A clear deny instead
 of a silent leak.
 
-**Does not protect against:** DNS exfiltration (queries hit the host
-resolver before tinyproxy sees them), SNI-on-IP bypass (a client
-that resolves an allowlisted name to an attacker IP), or kernel-level
-egress on the macOS path (the macOS enforcer is env-only — a hostile
-agent that unsets `HTTPS_PROXY` reaches the network directly).
+**Does not protect against:** DNS exfiltration on macOS (the
+Linux + Podman path now ships a DNS-stub sidecar that NXDOMAINs
+non-allowlist names; macOS lacks the network-internal primitive
+needed to make this work and remains env-only), SNI-on-IP bypass (a
+client that resolves an allowlisted name to an attacker IP), or
+kernel-level egress on the macOS path (the macOS enforcer is env-only
+— a hostile agent that unsets `HTTPS_PROXY` reaches the network
+directly).
 
 ## Explicit non-goals
 
 These are NOT what fleet's security model promises today. Calling them
 out so you can build your own layered controls if you need them:
 
-- **DNS-level egress filtering.** Out of scope for v1 on both Linux
-  and macOS paths. A determined attacker can encode data into queries
-  to an allowlisted nameserver.
+- **DNS-level egress filtering on macOS.** The Linux + Podman path
+  ships a DNS-stub sidecar (`--internal` network + pre-resolved
+  allowlist + NXDOMAIN for everything else). The macOS path can't
+  match this until Apple Container provides a network-internal
+  primitive — until then, `HostProxyEnforcer` is env-only and DNS
+  queries from the workflow container reach the host resolver.
 - **Kernel-level egress on macOS.** Apple Container has not shipped
   a `--internal`-network primitive equivalent to Podman's. The macOS
   enforcer relies on `HTTP_PROXY` env-var injection — strong against
@@ -153,15 +159,12 @@ out so you can build your own layered controls if you need them:
 
 Tracked as follow-ups in the v2 plan; the broad themes:
 
-- **DNS stub resolver** inside the egress network. Adds a tiny
-  authoritative resolver that only answers for allowlist hosts;
-  everything else NXDOMAIN. Closes the DNS-exfiltration gap on
-  Linux + Podman; harder on macOS until Apple Container gains
-  network-isolation primitives.
 - **Apple Container `--internal` network pinning.** Promotes the
   macOS HostProxyEnforcer from env-only to engine-enforced once
   Apple ships the network primitive (or fleet's workarounds settle
-  enough to ship a real boundary).
+  enough to ship a real boundary). The DNS-stub piece on Linux +
+  Podman has shipped; the macOS equivalent is blocked on the same
+  Apple-side primitive landing.
 - **First-run bootstrap UX.** `fleet runtime doctor` reports what's
   missing; an interactive install-prompt would close the loop for
   users who don't have Podman / runsc / devcontainer-CLI configured.

@@ -32,9 +32,15 @@
 //!
 //! ## What this *doesn't* defend against
 //!
-//! - **DNS exfiltration**: tinyproxy doesn't intercept DNS. A
-//!   determined attacker could encode data into queries to an
-//!   allowlisted nameserver. Out of scope for v1.
+//! - **DNS exfiltration via allowlisted names** (mitigated on Linux,
+//!   open on macOS): [`PodmanTinyproxyEnforcer`] now ships a DNS-stub
+//!   sidecar that pre-resolves the allowlist and serves NXDOMAIN for
+//!   everything else, so a query for `${secret}.attacker.com` from
+//!   inside the workflow container fails at the stub instead of being
+//!   forwarded to the host resolver. The macOS [`HostProxyEnforcer`]
+//!   path doesn't have this because Apple Container hasn't shipped a
+//!   network-internal primitive equivalent to Podman's `--internal`
+//!   yet; documented as honest non-goal in `docs/network.md`.
 //! - **A malicious agent who unsets `HTTP_PROXY`**: tinyproxy is the
 //!   *only* network path out, but only because the firewall rules in
 //!   the private podman network blackhole everything else. The
@@ -171,8 +177,12 @@ pub struct PodmanTinyproxyEnforcer {
     /// Host:port the proxy listens on inside its network. Tinyproxy's
     /// default is 8888; we hard-code so the env vars are deterministic.
     proxy_port: u16,
+    /// OCI image to run as the DNS stub sidecar. Defaults to
+    /// `4km3/dnsmasq:latest` (small alpine-based image, ~6MB).
+    dns_image: String,
     /// Configured allowlist hosts (already merged with fleet defaults).
-    /// `setup` bakes them into the tinyproxy config.
+    /// `setup` bakes them into the tinyproxy config AND pre-resolves
+    /// them on the host to feed the DNS stub sidecar.
     allowlist: Vec<String>,
 }
 
@@ -183,6 +193,7 @@ impl PodmanTinyproxyEnforcer {
             invoker,
             image: "kalaksi/tinyproxy:latest".to_string(),
             proxy_port: 8888,
+            dns_image: "4km3/dnsmasq:latest".to_string(),
             allowlist,
         }
     }
@@ -193,6 +204,52 @@ impl PodmanTinyproxyEnforcer {
 
     fn proxy_container_name(session_id: &str) -> String {
         format!("fleet-proxy-{session_id}")
+    }
+
+    fn dns_container_name(session_id: &str) -> String {
+        format!("fleet-dns-{session_id}")
+    }
+
+    /// Start the DNS-stub sidecar after the proxy is up. Pre-resolves
+    /// the allowlist on the host (each hostname becomes one or more
+    /// `--host-record=name,ip` flags), runs dnsmasq in the same
+    /// `--internal` network, then inspects the container for its IP
+    /// on that network so the workflow container can be pointed at it
+    /// via `--dns=<ip>`. Returns the sidecar name + IP.
+    fn start_dns_sidecar(&self, session_id: &str, network: &str) -> Result<(String, String)> {
+        let records = pre_resolve_allowlist(self.invoker.as_ref(), &self.allowlist);
+        let dns_name = Self::dns_container_name(session_id);
+
+        let mut dns_argv = vec![
+            "run".to_string(),
+            "-d".to_string(),
+            "--rm".to_string(),
+            "--name".to_string(),
+            dns_name.clone(),
+            "--network".to_string(),
+            network.to_string(),
+            self.dns_image.clone(),
+        ];
+        dns_argv.extend(build_dnsmasq_args(&records));
+        self.invoker
+            .run("podman", dns_argv)
+            .with_context(|| format!("starting DNS stub sidecar {dns_name}"))?;
+
+        let dns_ip = self
+            .invoker
+            .run(
+                "podman",
+                vec![
+                    "inspect".to_string(),
+                    dns_name.clone(),
+                    "--format".to_string(),
+                    format!("{{{{ (index .NetworkSettings.Networks \"{network}\").IPAddress }}}}"),
+                ],
+            )
+            .with_context(|| format!("inspecting DNS sidecar {dns_name} for IP"))?
+            .trim()
+            .to_string();
+        Ok((dns_name, dns_ip))
     }
 }
 
@@ -273,6 +330,11 @@ impl EgressEnforcer for PodmanTinyproxyEnforcer {
             )
             .with_context(|| format!("bridging tinyproxy sidecar {proxy_name} outward"))?;
 
+        // 5-7. DNS stub: pre-resolve allowlist, start sidecar, capture
+        //    its IP. Factored out to keep this function within
+        //    clippy's `too_many_lines` budget; behaviour is unchanged.
+        let (dns_name, dns_ip) = self.start_dns_sidecar(session_id, &network)?;
+
         let proxy_url = format!("http://{proxy_name}:{port}", port = self.proxy_port);
         Ok(EgressSetup {
             proxy_env: vec![
@@ -294,15 +356,25 @@ impl EgressEnforcer for PodmanTinyproxyEnforcer {
             ],
             network_name: Some(network),
             proxy_container: Some(proxy_name),
-            dns_ip: None,
-            dns_container: None,
+            dns_ip: Some(dns_ip),
+            dns_container: Some(dns_name),
         })
     }
 
     fn teardown(&self, setup: &EgressSetup) -> Result<()> {
         // Best-effort: don't abort if one step fails — a partial
         // setup may leave only some resources, and we want to
-        // reclaim what we can.
+        // reclaim what we can. Order: DNS stub first (innermost
+        // resource), then proxy, then network. Reverse of setup so
+        // dependents go before dependencies.
+        if let Some(dns) = &setup.dns_container {
+            if let Err(err) = self
+                .invoker
+                .run("podman", vec!["stop".to_string(), dns.clone()])
+            {
+                tracing::warn!(error = %err, container = %dns, "stopping DNS stub sidecar failed");
+            }
+        }
         if let Some(container) = &setup.proxy_container {
             if let Err(err) = self
                 .invoker
@@ -321,6 +393,68 @@ impl EgressEnforcer for PodmanTinyproxyEnforcer {
         }
         Ok(())
     }
+}
+
+/// Pre-resolve each allowlist hostname on the host via `getent ahosts`.
+/// Returns the records as `(host, [ip, ip, ...])` pairs in the
+/// allowlist's order, omitting any host that didn't resolve. Failures
+/// (host unknown, getent missing) log a warning and skip that entry —
+/// the proxy itself doesn't require every allowlist host to be DNS-pinnable,
+/// and we'd rather the stub serve a partial set than fail the whole run.
+fn pre_resolve_allowlist(
+    invoker: &dyn ProcessInvoker,
+    hosts: &[String],
+) -> Vec<(String, Vec<String>)> {
+    hosts
+        .iter()
+        .filter_map(|host| {
+            let ips = pre_resolve_host(invoker, host);
+            if ips.is_empty() {
+                tracing::warn!(host = %host, "DNS pre-resolution failed; host omitted from DNS stub allowlist");
+                None
+            } else {
+                Some((host.clone(), ips))
+            }
+        })
+        .collect()
+}
+
+/// Resolve a single hostname to its A/AAAA records via `getent ahosts`.
+/// Returns deduplicated IPs in the order getent reports them. Empty
+/// Vec on any error — caller decides whether the failure is fatal.
+fn pre_resolve_host(invoker: &dyn ProcessInvoker, host: &str) -> Vec<String> {
+    let Ok(text) = invoker.run("getent", vec!["ahosts".to_string(), host.to_string()]) else {
+        return Vec::new();
+    };
+    let mut ips = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in text.lines() {
+        if let Some(ip) = line.split_whitespace().next() {
+            if seen.insert(ip.to_string()) {
+                ips.push(ip.to_string());
+            }
+        }
+    }
+    ips
+}
+
+/// Build the dnsmasq argv that turns it into an authoritative
+/// allowlist resolver: `-k` (keep in foreground), `--no-resolv` (no
+/// upstream forwarding — anything not locally known returns NXDOMAIN),
+/// `--no-hosts` (don't read /etc/hosts from the container image), plus
+/// one `--host-record=name,ip` per pre-resolved (host, ip) pair.
+fn build_dnsmasq_args(records: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut args = vec![
+        "-k".to_string(),
+        "--no-resolv".to_string(),
+        "--no-hosts".to_string(),
+    ];
+    for (host, ips) in records {
+        for ip in ips {
+            args.push(format!("--host-record={host},{ip}"));
+        }
+    }
+    args
 }
 
 /// Host-resident tinyproxy enforcer.
@@ -671,7 +805,7 @@ fn simple_base64_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::process::MockProcessInvoker;
-    use mockall::predicate::always;
+    use mockall::predicate::{always, eq};
     use std::sync::Mutex;
 
     #[test]
@@ -769,13 +903,20 @@ mod tests {
         let setup = enforcer.setup("s-real").unwrap();
         assert!(setup.is_enforcing(), "podman+allowlist must enforce");
         let invocations = calls.lock().unwrap().clone();
-        // Exactly three podman calls: network create, run, network connect.
-        assert_eq!(invocations.len(), 3, "got: {invocations:?}");
+        // Six calls: network create, proxy run, network connect, then
+        // for the DNS sidecar: getent ahosts (one per allowlist host),
+        // dnsmasq run, dns inspect.
+        assert_eq!(invocations.len(), 6, "got: {invocations:?}");
         assert!(invocations[0].starts_with("podman network create --internal fleet-s-real"));
         assert!(invocations[1].contains("podman run"));
         assert!(invocations[1].contains("--name fleet-proxy-s-real"));
         assert!(invocations[1].contains("--network fleet-s-real"));
         assert!(invocations[2].starts_with("podman network connect podman fleet-proxy-s-real"));
+        assert!(invocations[3].starts_with("getent ahosts api.example.com"));
+        assert!(invocations[4].contains("podman run"));
+        assert!(invocations[4].contains("--name fleet-dns-s-real"));
+        assert!(invocations[4].contains("4km3/dnsmasq:latest"));
+        assert!(invocations[5].starts_with("podman inspect fleet-dns-s-real"));
     }
 
     #[test]
@@ -807,6 +948,136 @@ mod tests {
     }
 
     #[test]
+    fn pre_resolve_host_dedupes_ips_from_getent_output() {
+        // `getent ahosts` repeats each IP three times (STREAM/DGRAM/RAW).
+        // Pre-resolution dedupes so the dnsmasq config doesn't carry
+        // every record three times.
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run()
+            .with(
+                eq("getent"),
+                eq(vec!["ahosts".to_string(), "api.anthropic.com".to_string()]),
+            )
+            .returning(|_, _| {
+                Ok("1.2.3.4 STREAM api.anthropic.com\n\
+                    1.2.3.4 DGRAM \n\
+                    1.2.3.4 RAW \n\
+                    2001:db8::1 STREAM\n\
+                    2001:db8::1 DGRAM\n\
+                    2001:db8::1 RAW\n"
+                    .to_string())
+            });
+        let ips = pre_resolve_host(&mock, "api.anthropic.com");
+        assert_eq!(ips, vec!["1.2.3.4".to_string(), "2001:db8::1".to_string()]);
+    }
+
+    #[test]
+    fn pre_resolve_host_returns_empty_on_invoker_error() {
+        // getent failures (host unknown, getent missing) → empty Vec.
+        // Caller decides whether the failure is fatal.
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run()
+            .returning(|_, _| Err(anyhow::anyhow!("no such host")));
+        assert!(pre_resolve_host(&mock, "no.such.host").is_empty());
+    }
+
+    #[test]
+    fn build_dnsmasq_args_emits_host_records_for_each_ip() {
+        let records = vec![
+            (
+                "api.anthropic.com".to_string(),
+                vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()],
+            ),
+            (
+                "api.github.com".to_string(),
+                vec!["140.82.121.4".to_string()],
+            ),
+        ];
+        let args = build_dnsmasq_args(&records);
+        // Fixed prefix: keep-in-foreground + no-resolv + no-hosts.
+        assert_eq!(args[0], "-k");
+        assert_eq!(args[1], "--no-resolv");
+        assert_eq!(args[2], "--no-hosts");
+        // One --host-record per IP, in the input order.
+        assert_eq!(args[3], "--host-record=api.anthropic.com,1.2.3.4");
+        assert_eq!(args[4], "--host-record=api.anthropic.com,5.6.7.8");
+        assert_eq!(args[5], "--host-record=api.github.com,140.82.121.4");
+        assert_eq!(args.len(), 6);
+    }
+
+    #[test]
+    fn build_dnsmasq_args_with_no_records_still_emits_fixed_prefix() {
+        // No allowlist hosts resolved → dnsmasq still starts, refuses
+        // every query (no records + --no-resolv).
+        let args = build_dnsmasq_args(&[]);
+        assert_eq!(
+            args,
+            vec![
+                "-k".to_string(),
+                "--no-resolv".to_string(),
+                "--no-hosts".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn pre_resolve_allowlist_skips_hosts_that_fail_to_resolve() {
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(|_, args| {
+            // arg[1] is the hostname. Resolve only api.example.com;
+            // fail unresolvable.local.
+            if args.get(1).map(String::as_str) == Some("api.example.com") {
+                Ok("1.2.3.4 STREAM api.example.com\n".to_string())
+            } else {
+                Err(anyhow::anyhow!("no such host"))
+            }
+        });
+        let hosts = vec![
+            "api.example.com".to_string(),
+            "unresolvable.local".to_string(),
+        ];
+        let records = pre_resolve_allowlist(&mock, &hosts);
+        // Only api.example.com made it through; unresolvable.local
+        // was warned-and-skipped.
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "api.example.com");
+        assert_eq!(records[0].1, vec!["1.2.3.4".to_string()]);
+    }
+
+    #[test]
+    fn podman_tinyproxy_setup_populates_dns_fields_on_egress_setup() {
+        // The DNS sidecar inspect returns an IP; setup() must surface
+        // it as EgressSetup.dns_ip so the runtime adapter can plumb
+        // --dns=<ip> into the workflow container's start.
+        let mut mock = MockProcessInvoker::new();
+        let call_idx = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let idx_for_mock = std::sync::Arc::clone(&call_idx);
+        mock.expect_run().returning(move |bin, args| {
+            // Bind + bump the call index in a tight scope so the
+            // mutex is released before the match arms run.
+            let n = {
+                let mut i = idx_for_mock.lock().unwrap();
+                let n = *i;
+                *i += 1;
+                n
+            };
+            // Call sequence: 0=network create, 1=proxy run, 2=network connect,
+            // 3=getent ahosts, 4=dnsmasq run, 5=podman inspect.
+            if bin == "podman" && args.first().map(String::as_str) == Some("inspect") {
+                Ok("10.89.0.42\n".to_string())
+            } else if n == 3 {
+                Ok("1.2.3.4 STREAM api.example.com\n".to_string())
+            } else {
+                Ok(String::new())
+            }
+        });
+        let enf = PodmanTinyproxyEnforcer::new(Arc::new(mock), vec!["api.example.com".to_string()]);
+        let setup = enf.setup("s-dns").unwrap();
+        assert_eq!(setup.dns_ip.as_deref(), Some("10.89.0.42"));
+        assert_eq!(setup.dns_container.as_deref(), Some("fleet-dns-s-dns"));
+    }
+
+    #[test]
     fn podman_tinyproxy_teardown_stops_container_and_removes_network() {
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls_for_mock = Arc::clone(&calls);
@@ -825,16 +1096,18 @@ mod tests {
             proxy_env: vec![],
             network_name: Some("fleet-s-down".to_string()),
             proxy_container: Some("fleet-proxy-s-down".to_string()),
-            dns_ip: None,
-            dns_container: None,
+            dns_ip: Some("10.89.0.5".to_string()),
+            dns_container: Some("fleet-dns-s-down".to_string()),
         };
         enf.teardown(&setup).unwrap();
         let invocations = calls.lock().unwrap().clone();
-        // stop, then network rm — order matters: the network can't
-        // be removed until its containers detach.
-        assert_eq!(invocations.len(), 2, "got: {invocations:?}");
-        assert!(invocations[0].starts_with("podman stop fleet-proxy-s-down"));
-        assert!(invocations[1].starts_with("podman network rm fleet-s-down"));
+        // DNS stop, then proxy stop, then network rm — DNS goes first
+        // (innermost dependent); network can't be removed until both
+        // sidecars detach.
+        assert_eq!(invocations.len(), 3, "got: {invocations:?}");
+        assert!(invocations[0].starts_with("podman stop fleet-dns-s-down"));
+        assert!(invocations[1].starts_with("podman stop fleet-proxy-s-down"));
+        assert!(invocations[2].starts_with("podman network rm fleet-s-down"));
     }
 
     #[test]
