@@ -5,9 +5,9 @@
 //! the project's git history — so no auth handling is needed; the
 //! installation hint lives in `fleet runtime doctor` (next chunk).
 //!
-//! Defensive parsing matches the AO-era tracker's quirks: `git-bug`
-//! emits `null` (not `[]`) for labels-less issues, and may print an
-//! empty body or the literal `null` for an empty repo.
+//! Defensive parsing handles `git-bug`'s quirks: it emits `null`
+//! (not `[]`) for labels-less issues, and may print an empty body
+//! or the literal `null` for an empty repo.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -67,9 +67,9 @@ pub fn parse_git_bug_output(stdout: &str) -> Vec<Issue> {
     issues
 }
 
-/// `git-bug bug --format json` row (subset). Same defensive `null →
-/// default` treatment as the AO-era impl — git-bug emits `null` (not
-/// `[]`) for the labels field on issues with no labels.
+/// `git-bug bug --format json` row (subset). Every field uses
+/// `null_as_default` because git-bug emits `null` (not `[]`/`""`)
+/// for missing values — naive serde derive would refuse to parse.
 #[derive(Deserialize)]
 struct GitBugIssue {
     id: String,
@@ -153,8 +153,9 @@ mod tests {
 
     #[test]
     fn list_issues_tolerates_null_labels() {
-        // Reproduces the AO-era regression: git-bug emits `labels: null`,
-        // not `[]`, for issues with no labels. Must not fail parsing.
+        // git-bug emits `labels: null`, not `[]`, for issues with no
+        // labels — naive serde derive refuses to parse. Lock the
+        // tolerance so a future serde upgrade doesn't quietly break it.
         let json = r#"[{"id":"a","human_id":"a1","title":"X","status":"open","labels":null}]"#;
         let t = GitBugTracker::new(invoker_returning(json));
         let issues = t.list_issues(Path::new("/repo")).unwrap();

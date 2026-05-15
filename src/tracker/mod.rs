@@ -1,15 +1,11 @@
 //! Host-side issue trackers.
 //!
-//! v2 sibling to [`crate::ao::tracker`]: same [`Issue`] shape and trait
-//! method, but the [`GitBugTracker`] and [`GitHubTracker`] impls shell
-//! directly to `git-bug` / `gh` on the host through a
-//! [`ProcessInvoker`](crate::process::ProcessInvoker) instead of routing
-//! through `limactl shell`. The new impls are testable without a real
-//! `git-bug` binary; the old impls remain for the AO codepath until that
-//! is removed.
+//! [`GitBugTracker`] and [`GitHubTracker`] shell directly to `git-bug` /
+//! `gh` through a [`ProcessInvoker`](crate::process::ProcessInvoker) so
+//! both are testable without the real binaries installed.
 //!
-//! Tracker plugins **read** — they list issues. Closing/commenting is the
-//! workflow engine's job (per the plan), so the trait stays small.
+//! Trackers **read** — they list issues. Closing / commenting is the
+//! workflow engine's job, so the trait stays narrow.
 
 pub mod git_bug;
 pub mod github;
@@ -24,9 +20,7 @@ use crate::repo_config::Tracker as TrackerChoice;
 pub use git_bug::GitBugTracker;
 pub use github::GitHubTracker;
 
-/// Uniform issue shape across plugins. Mirrors
-/// [`crate::ao::tracker::Issue`] field-for-field so future code that
-/// migrates from the AO path doesn't churn its data model.
+/// Uniform issue shape across plugins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issue {
     /// Stable opaque id (full hash for git-bug, `"gh:<number>"` for

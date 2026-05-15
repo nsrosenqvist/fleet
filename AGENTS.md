@@ -141,5 +141,5 @@ Spawn picker:
 ## Honesty rules
 
 - **Don't claim end-to-end behaviour you only wired the plumbing for.** The egress module's docstring and `docs/SMOKE_EGRESS.md` are the template: plumbing landed, real verification needs a manual host smoke pass.
-- **Update or remove stale comments alongside the code change** that makes them stale (e.g. `src/tracker/mod.rs`'s doc-comment still mentions "the AO codepath until that is removed" — AO is gone; that's a low-priority cleanup).
+- **Update or remove stale comments alongside the code change** that makes them stale. When you rename a struct, fix the doc-comments that named it. When you remove a module, sweep for prose references to it. Comment rot is silent and compounds — the only way to keep it out is to treat it as part of the change that introduced it.
 - **Surface uncertainty rather than hiding it.** When a change has a real gap (uncommitted host changes don't ride into a worktree, DNS exfiltration still leaks, replay's `outputs:` accumulator rebuilds empty), document it in the docstring or the user-facing doc — not just in the commit message.

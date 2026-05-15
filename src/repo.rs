@@ -1,17 +1,14 @@
-//! Repo-root resolution for the v2 codepaths.
+//! Repo-root resolution.
 //!
-//! The legacy [`crate::repo_root`] in `main.rs` looks for the very specific
-//! `Cargo.toml + agent-orchestrator.yaml` combination, which only matches the
-//! fleet repo itself. That worked when fleet was a wrapper *around* AO living
-//! in this checkout; it cannot work for the distributable binary which has
-//! to run in arbitrary user repos.
+//! Fleet has to work from any directory inside a user's repo, so callers
+//! need a "where does my fleet state live" answer they can trust.
 //!
-//! [`fleet_root`] replaces it for v2 callers: walk ancestors of `cwd` for a
-//! `.fleet/` directory first (the user already initialised this repo for
-//! fleet), and fall back to the nearest `.git/` checkout root (any git repo
-//! is a fine default workspace boundary). Anything else returns `cwd` itself
-//! so the rest of the binary always gets *some* path — failures surface at
-//! the caller's "is this initialised?" check, not here.
+//! [`fleet_root`] walks ancestors of `cwd`: prefer the nearest
+//! `.fleet/` (the user already initialised this repo for fleet), then
+//! the nearest `.git/` (any git repo is a fine default workspace
+//! boundary). With neither, returns `cwd` so the rest of the binary
+//! always gets *some* path — failures surface at the caller's
+//! "is this initialised?" check, not here.
 
 use std::path::{Path, PathBuf};
 

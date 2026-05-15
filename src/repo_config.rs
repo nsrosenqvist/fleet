@@ -1,8 +1,7 @@
 //! Per-repo fleet configuration: `.fleet/config.yaml`.
 //!
-//! Distinct from the user-global XDG config in [`crate::config`] (TOML,
-//! AO-era settings). This module models the YAML schema scaffolded by
-//! [`crate::cli::init`] and consumed by v2 commands.
+//! Models the YAML schema scaffolded by [`crate::cli::init`] and consumed
+//! by every workflow / runtime / autonomous command.
 //!
 //! Design choices:
 //! - All fields are optional in YAML; missing keys fall back to compiled-in

@@ -1,9 +1,8 @@
 //! CLI surface for fleet. clap derive + thin dispatch.
 //!
-//! All commands are v2 (devcontainer + per-repo `.fleet/` state). The
-//! AO/Lima passthrough surface that lived here previously has been
-//! removed; the binary now talks to the host's container engine
-//! directly via the runtime adapter trait.
+//! Every subcommand operates against the current repo's `.fleet/`
+//! state, the chosen `RuntimeAdapter`, and the host's container
+//! engine — no orchestrator-in-a-VM hop in between.
 
 use clap::{Parser, Subcommand};
 

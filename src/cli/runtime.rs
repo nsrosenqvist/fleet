@@ -1,15 +1,14 @@
-//! `fleet runtime …` — v2-era runtime-adapter commands.
+//! `fleet runtime …` — runtime-adapter commands.
 //!
-//! `runtime doctor` probes the host for container engines and prints a
-//! human-readable summary. It does **not** touch AO or Lima; this is the
-//! diagnostic the user runs when their pipeline is the new devcontainer +
-//! Podman/Apple Container stack.
+//! `runtime doctor` probes the host for container engines (Podman, Apple
+//! Container, Docker) plus the devcontainer CLI and prints a
+//! human-readable summary of what's usable.
 //!
-//! `runtime build/up/exec/stop/inspect` drive the chosen adapter end-to-end
-//! against the current repo's `.fleet/config.yaml`. They're the manual
-//! escape hatch users reach for when something feels off — and the surface
-//! through which fleet developers can iterate on adapter behaviour before
-//! the workflow engine wraps everything.
+//! `runtime build / up / exec / stop / inspect / attach` drive the chosen
+//! adapter end-to-end against the current repo's `.fleet/config.yaml`.
+//! They're the manual escape hatch users reach for when something feels
+//! off — and the surface fleet developers iterate against when wiring
+//! new adapter behaviour before the workflow engine wraps everything.
 //!
 //! All formatting goes through pure functions (e.g. [`render_doctor`]) so the
 //! CLI is a thin wire-up over fully-tested formatters. Entry points hand in a
