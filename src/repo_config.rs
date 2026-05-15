@@ -31,6 +31,7 @@ pub struct RepoConfig {
     pub tracker: Tracker,
     pub agents: AgentsConfig,
     pub workflows: WorkflowsConfig,
+    pub autonomous: AutonomousConfig,
 }
 
 /// `runtime:` block — which adapter to instantiate, how to harden it, where
@@ -164,6 +165,38 @@ impl Default for WorkflowsConfig {
     }
 }
 
+/// `autonomous:` block — bounds + cadence for the TUI's `Shift+A`
+/// autonomous mode. All fields optional; defaults are conservative
+/// enough that a user who flips the toggle without configuring
+/// anything still gets a sane supervisor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutonomousConfig {
+    /// Maximum concurrent in-flight workflow runs autonomous mode is
+    /// allowed to drive. In-flight = `Running` or `AwaitingGate`.
+    pub max_parallel: u32,
+    /// Workflow to fire against each claimed open issue. Must exist
+    /// under `.fleet/workflows/` and have `trigger.autonomous: true`.
+    pub workflow: String,
+    /// Minimum seconds between tracker scans. Real `gh` / `git-bug`
+    /// shells cost hundreds of ms — debouncing keeps the TUI cheap.
+    pub scan_interval_secs: u32,
+    /// Seconds to wait after spawning before the engine considers the
+    /// next slot. Lets `fleet workflow run` materialise its session
+    /// row so claim-avoidance sees the new in-flight session.
+    pub spawn_cooldown_secs: u32,
+}
+
+impl Default for AutonomousConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel: 3,
+            workflow: "standard".to_string(),
+            scan_interval_secs: 10,
+            spawn_cooldown_secs: 2,
+        }
+    }
+}
+
 impl RepoConfig {
     /// Parse a config from a string. `path_hint` is used purely for error
     /// context (so the user sees which file failed); it does not have to
@@ -204,6 +237,20 @@ struct Raw {
     agents: Option<RawAgents>,
     #[serde(default)]
     workflows: Option<RawWorkflows>,
+    #[serde(default)]
+    autonomous: Option<RawAutonomous>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawAutonomous {
+    #[serde(default)]
+    max_parallel: Option<u32>,
+    #[serde(default)]
+    workflow: Option<String>,
+    #[serde(default)]
+    scan_interval_secs: Option<u32>,
+    #[serde(default)]
+    spawn_cooldown_secs: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -240,6 +287,7 @@ impl From<Raw> for RepoConfig {
             tracker: default_tracker,
             agents: default_agents,
             workflows: default_workflows,
+            autonomous: default_autonomous,
         } = Self::default();
 
         let runtime = match raw.runtime {
@@ -272,11 +320,25 @@ impl From<Raw> for RepoConfig {
             },
             None => default_workflows,
         };
+        let autonomous = match raw.autonomous {
+            Some(a) => AutonomousConfig {
+                max_parallel: a.max_parallel.unwrap_or(default_autonomous.max_parallel),
+                workflow: a.workflow.unwrap_or(default_autonomous.workflow),
+                scan_interval_secs: a
+                    .scan_interval_secs
+                    .unwrap_or(default_autonomous.scan_interval_secs),
+                spawn_cooldown_secs: a
+                    .spawn_cooldown_secs
+                    .unwrap_or(default_autonomous.spawn_cooldown_secs),
+            },
+            None => default_autonomous,
+        };
         Self {
             runtime,
             tracker,
             agents,
             workflows,
+            autonomous,
         }
     }
 }
@@ -297,6 +359,37 @@ mod tests {
         assert_eq!(cfg.tracker, Tracker::GitBug);
         assert_eq!(cfg.agents.default, "claude-code");
         assert_eq!(cfg.workflows.default, "standard");
+        assert_eq!(cfg.autonomous.max_parallel, 3);
+        assert_eq!(cfg.autonomous.workflow, "standard");
+        assert_eq!(cfg.autonomous.scan_interval_secs, 10);
+        assert_eq!(cfg.autonomous.spawn_cooldown_secs, 2);
+    }
+
+    #[test]
+    fn parses_full_autonomous_block() {
+        let yaml = "\
+autonomous:
+  max_parallel: 5
+  workflow: hotfix
+  scan_interval_secs: 30
+  spawn_cooldown_secs: 5
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.autonomous.max_parallel, 5);
+        assert_eq!(cfg.autonomous.workflow, "hotfix");
+        assert_eq!(cfg.autonomous.scan_interval_secs, 30);
+        assert_eq!(cfg.autonomous.spawn_cooldown_secs, 5);
+    }
+
+    #[test]
+    fn partial_autonomous_fills_remaining_with_defaults() {
+        let yaml = "autonomous:\n  max_parallel: 1\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.autonomous.max_parallel, 1);
+        // Unspecified fields fall back to defaults.
+        assert_eq!(cfg.autonomous.workflow, "standard");
+        assert_eq!(cfg.autonomous.scan_interval_secs, 10);
+        assert_eq!(cfg.autonomous.spawn_cooldown_secs, 2);
     }
 
     #[test]

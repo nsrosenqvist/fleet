@@ -13,8 +13,10 @@
 //! - `tui` — minimal ratatui session browser
 //! - `cli` — clap surface + dispatch
 //! - `process` — `ProcessInvoker` trait + `RealProcessInvoker` + helpers
+//! - `autonomous` — supervisor engine driving the TUI's `Shift+A` mode
 
 mod agent;
+mod autonomous;
 mod cli;
 mod process;
 mod repo;

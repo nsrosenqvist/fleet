@@ -16,6 +16,12 @@
 //!   subprocess (inherits env + cwd), Esc cancels. The TUI itself
 //!   doesn't drive the run — `r` reloads when you want to see the new
 //!   session row.
+//! - `Shift+A` — toggle autonomous mode. While ON, the supervisor in
+//!   [`crate::autonomous`] periodically scans the configured tracker
+//!   for open issues and detaches `fleet workflow run` subprocesses
+//!   against unclaimed ones — bounded by `autonomous.max_parallel`
+//!   from `.fleet/config.yaml`. The status bar surfaces the engine's
+//!   live status line.
 //! - `d` — toggle the doctor pane.
 //!
 //! The TUI is a *browser*, not a workflow driver — it does not run
@@ -48,6 +54,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
+use crate::autonomous;
 use crate::process::{ProcessInvoker, RealProcessInvoker};
 use crate::repo;
 use crate::repo_config::RepoConfig;
@@ -101,6 +108,11 @@ fn event_loop(
                 }
             }
         }
+        // After event handling (or after the poll timed out), let the
+        // autonomous supervisor decide whether to fire anything. The
+        // engine debounces internally so this is cheap to call every
+        // iteration.
+        state.autonomous_tick(store, std::time::Instant::now());
     }
 }
 
@@ -130,6 +142,30 @@ struct AppState {
     /// tracks the sessions sidebar) so reopening the picker doesn't
     /// nuke the session selection.
     spawn_list_state: ListState,
+    /// Repo config snapshot. Reloaded on `r`. Carries the
+    /// `autonomous:` bounds + the tracker choice the engine needs.
+    config: RepoConfig,
+    /// Autonomous supervisor. Off by default; toggled via `Shift+A`.
+    autonomous: autonomous::AutonomousEngine,
+    /// Tracker built lazily on first `Shift+A` — the `gh`/`git-bug`
+    /// construction happens then, not at TUI startup, so users who
+    /// never use autonomous mode aren't blocked by tracker setup.
+    tracker: TrackerState,
+}
+
+/// Lifecycle of the lazily-built tracker. Three states because the
+/// "tried and the plugin isn't implemented" outcome must be sticky:
+/// re-pressing `Shift+A` after a Linear/Jira refusal shouldn't
+/// silently retry the same build.
+enum TrackerState {
+    /// Not yet built. First `Shift+A` transitions out of this.
+    Pending,
+    /// Built and ready to scan.
+    Built(Arc<dyn crate::tracker::Tracker>),
+    /// Built failed — typically the configured plugin (Linear / Jira)
+    /// has no impl yet. The toggle handler surfaces this in the
+    /// engine status; subsequent presses don't retry.
+    Unsupported,
 }
 
 /// Top-level view enum. `Sessions` is the default; `Doctor` shows the
@@ -193,6 +229,7 @@ impl DoctorSnapshot {
 
 impl AppState {
     fn new(root: PathBuf, store: &SessionStore) -> Result<Self> {
+        let config = RepoConfig::load(root.join(".fleet/config.yaml")).unwrap_or_default();
         let mut state = Self {
             root,
             sessions: Vec::new(),
@@ -204,6 +241,9 @@ impl AppState {
             doctor: None,
             spawn_workflows: Vec::new(),
             spawn_list_state: ListState::default(),
+            config,
+            autonomous: autonomous::AutonomousEngine::new(),
+            tracker: TrackerState::Pending,
         };
         state.reload(store)?;
         Ok(state)
@@ -291,6 +331,16 @@ impl AppState {
             self.mark_selected_failed(store);
             return Action::None;
         }
+        // Shift+A toggles autonomous mode from any view. Building the
+        // tracker is lazy: deferred to the first toggle so a `gh
+        // auth` failure doesn't trip up users who never use this
+        // mode.
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('A'))
+        {
+            self.toggle_autonomous();
+            return Action::None;
+        }
         // Dispatch by view. Each view owns its own keybindings; common
         // ones (`q` quit, `Esc` close) are handled per-view so an `Esc`
         // out of a modal doesn't also quit the app.
@@ -312,6 +362,12 @@ impl AppState {
                 Action::None
             }
             KeyCode::Char('r') => {
+                // Reload sessions + config so edits to
+                // .fleet/config.yaml take effect (notably the
+                // autonomous block's bounds + scan interval) without
+                // restarting the TUI.
+                self.config =
+                    RepoConfig::load(self.root.join(".fleet/config.yaml")).unwrap_or_default();
                 if let Err(err) = self.reload(store) {
                     self.status_line = format!(" reload failed: {err:#} ");
                 }
@@ -428,7 +484,7 @@ impl AppState {
             self.view = View::Sessions;
             return;
         };
-        let mut cmd = build_spawn_command(&binary, &name);
+        let mut cmd = build_workflow_run_command(&binary, &name, None);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -444,6 +500,105 @@ impl AppState {
             }
         }
         self.view = View::Sessions;
+    }
+
+    /// Toggle autonomous mode. On the first ON, build the tracker
+    /// from `.fleet/config.yaml`. Tracker build failures leave the
+    /// engine OFF with a status line explaining why; re-pressing
+    /// `Shift+A` after an Unsupported result does not retry.
+    fn toggle_autonomous(&mut self) {
+        if !self.autonomous.enabled() {
+            if matches!(self.tracker, TrackerState::Pending) {
+                let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+                self.tracker = crate::tracker::build(self.config.tracker, invoker)
+                    .map_or(TrackerState::Unsupported, |boxed| {
+                        TrackerState::Built(Arc::from(boxed))
+                    });
+            }
+            if matches!(self.tracker, TrackerState::Unsupported) {
+                self.autonomous.set_status(format!(
+                    "autonomous: cannot enable — tracker `{}` is not implemented yet",
+                    self.config.tracker.as_str(),
+                ));
+                return;
+            }
+        }
+        self.autonomous.toggle();
+    }
+
+    /// One autonomous supervisor tick. The engine debounces, so this
+    /// can be called every TUI iteration without flooding the
+    /// tracker. On a spawn outcome, detach a `fleet workflow run`
+    /// subprocess and force a session reload so the new row shows up
+    /// in the sidebar.
+    fn autonomous_tick(&mut self, store: &SessionStore, now: std::time::Instant) {
+        if !self.autonomous.enabled() {
+            return;
+        }
+        // The tracker must exist if we're enabled (toggle gates on
+        // that). Defensive guard for safety.
+        let TrackerState::Built(tracker) = &self.tracker else {
+            return;
+        };
+        let tracker = Arc::clone(tracker);
+        let root = self.root.clone();
+        let list_open = move || -> Result<Vec<crate::session::IssueContext>, String> {
+            let issues = tracker
+                .list_issues(&root)
+                .map_err(|e| format!("{e:#}"))?;
+            Ok(issues
+                .into_iter()
+                .filter(|i| i.status == "open")
+                .map(|i| crate::session::IssueContext {
+                    id: i.id,
+                    human_id: i.human_id,
+                    title: i.title,
+                })
+                .collect())
+        };
+        let outcome =
+            self.autonomous
+                .step(now, &self.config.autonomous, &self.sessions, list_open);
+        if let autonomous::AutonomousOutcome::Spawn(cmd) = outcome {
+            self.dispatch_autonomous_spawn(&cmd, store);
+        }
+    }
+
+    fn dispatch_autonomous_spawn(
+        &mut self,
+        cmd: &autonomous::SpawnCommand,
+        store: &SessionStore,
+    ) {
+        let Ok(binary) = std::env::current_exe() else {
+            self.autonomous.set_status(
+                "autonomous: ON · spawn failed: cannot resolve fleet binary (current_exe)",
+            );
+            return;
+        };
+        let mut child = build_workflow_run_command(
+            &binary,
+            &cmd.workflow,
+            Some(&cmd.issue.human_id),
+        );
+        child
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match child.spawn() {
+            Ok(_child) => {
+                // Reload so the new session row appears in the
+                // sidebar without waiting for the user to hit `r`.
+                if let Err(err) = self.reload(store) {
+                    tracing::warn!(?err, "autonomous post-spawn reload failed");
+                }
+            }
+            Err(err) => {
+                self.autonomous.set_status(format!(
+                    "autonomous: ON · spawn `{}` for #{} failed: {err:#}",
+                    cmd.workflow, cmd.issue.human_id,
+                ));
+            }
+        }
     }
 
     fn mark_selected_failed(&mut self, store: &SessionStore) {
@@ -510,16 +665,23 @@ pub fn list_workflows_dir(root: &Path) -> Vec<String> {
     names
 }
 
-/// Build the `fleet workflow run <name>` command that the spawn picker
-/// kicks off when the user hits Enter. Pure: doesn't actually call
-/// `spawn()`; the caller does that and can choose how to detach
-/// stdio. `fleet_binary` is the path to the fleet executable
-/// (typically `std::env::current_exe()`) so the spawned child is the
-/// same binary the TUI is running from.
+/// Build the `fleet workflow run <name> [--issue <human_id>]` command
+/// the spawn picker (no issue) and autonomous mode (with issue) both
+/// kick off. Pure: doesn't actually call `spawn()`; the caller does
+/// that and can choose how to detach stdio. `fleet_binary` is the
+/// path to the fleet executable (typically `std::env::current_exe()`)
+/// so the spawned child is the same binary the TUI is running from.
 #[must_use]
-pub fn build_spawn_command(fleet_binary: &Path, workflow_name: &str) -> std::process::Command {
+pub fn build_workflow_run_command(
+    fleet_binary: &Path,
+    workflow_name: &str,
+    issue_human_id: Option<&str>,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new(fleet_binary);
     cmd.args(["workflow", "run", workflow_name]);
+    if let Some(id) = issue_human_id {
+        cmd.args(["--issue", id]);
+    }
     cmd
 }
 
@@ -812,11 +974,23 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let help = match state.view {
-        View::Sessions => "[q] quit  [j/k] nav  [r] reload  [d] doctor  [Shift+K] kill  [n] spawn",
+        View::Sessions => {
+            "[q] quit  [j/k] nav  [r] reload  [d] doctor  [Shift+K] kill  [n] spawn  [Shift+A] auto"
+        }
         View::Doctor => "[q] quit  [Esc/d] back  [r] re-probe",
         View::Spawn => "[Esc/q] cancel  [j/k] nav  [Enter] spawn",
     };
-    let bar = format!("{help} —{}", state.status_line);
+    // Autonomous status takes precedence when the engine is doing
+    // something interesting (enabled, or has an override message set).
+    // Otherwise show the existing free-form `status_line`.
+    let tail = if state.autonomous.enabled()
+        || state.autonomous.status() != "autonomous: OFF"
+    {
+        state.autonomous.status().to_string()
+    } else {
+        state.status_line.clone()
+    };
+    let bar = format!("{help} — {tail}");
     let p = Paragraph::new(bar).style(
         Style::default()
             .bg(Color::Black)
@@ -1183,15 +1357,27 @@ mod tests {
     }
 
     #[test]
-    fn build_spawn_command_targets_fleet_workflow_run() {
-        let cmd = build_spawn_command(Path::new("/usr/local/bin/fleet"), "standard");
-        // std::process::Command doesn't expose a nice equality API, but
-        // its Debug repr contains the program + args.
+    fn build_workflow_run_command_without_issue() {
+        let cmd =
+            build_workflow_run_command(Path::new("/usr/local/bin/fleet"), "standard", None);
         let dbg = format!("{cmd:?}");
         assert!(dbg.contains("/usr/local/bin/fleet"), "got: {dbg}");
         assert!(dbg.contains("workflow"), "got: {dbg}");
         assert!(dbg.contains("run"), "got: {dbg}");
         assert!(dbg.contains("standard"), "got: {dbg}");
+        assert!(!dbg.contains("--issue"), "got: {dbg}");
+    }
+
+    #[test]
+    fn build_workflow_run_command_with_issue_appends_flag() {
+        let cmd = build_workflow_run_command(
+            Path::new("/usr/local/bin/fleet"),
+            "standard",
+            Some("42"),
+        );
+        let dbg = format!("{cmd:?}");
+        assert!(dbg.contains("--issue"), "got: {dbg}");
+        assert!(dbg.contains("42"), "got: {dbg}");
     }
 
     #[test]
@@ -1299,5 +1485,108 @@ mod tests {
         // Session stays Running — the kill was filtered out.
         let loaded = store.load(&SessionId::new("s-r")).unwrap();
         assert_eq!(loaded.state, SessionState::Running);
+    }
+
+    // === autonomous mode toggle ===
+
+    #[test]
+    fn shift_a_toggles_autonomous_with_buildable_tracker() {
+        // Default tracker is `git-bug`; `tracker::build` returns
+        // Some(...) for it without actually invoking the binary,
+        // so the toggle path runs cleanly in a hermetic test.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        assert!(!state.autonomous.enabled());
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert!(state.autonomous.enabled(), "Shift+A should enable");
+        assert!(
+            state.autonomous.status().contains("ON"),
+            "got: {}",
+            state.autonomous.status()
+        );
+        // Second toggle flips back off.
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert!(!state.autonomous.enabled(), "Shift+A again should disable");
+    }
+
+    #[test]
+    fn shift_a_refuses_to_enable_with_unimplemented_tracker() {
+        // Linear's `tracker::build` returns None — toggle must
+        // explain why instead of pretending autonomous mode is live.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/config.yaml", "tracker: linear\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert!(
+            !state.autonomous.enabled(),
+            "engine must NOT enable when tracker is unimplemented"
+        );
+        let status = state.autonomous.status();
+        assert!(
+            status.contains("cannot enable") && status.contains("linear"),
+            "got: {status}"
+        );
+    }
+
+    #[test]
+    fn shift_a_works_from_doctor_view_too() {
+        // Toggle is global, not Sessions-only — modal dispatch
+        // shouldn't swallow it.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.view, View::Doctor);
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert!(state.autonomous.enabled());
+        // View is unchanged — the toggle doesn't navigate.
+        assert_eq!(state.view, View::Doctor);
+    }
+
+    #[test]
+    fn autonomous_tick_when_disabled_is_a_noop() {
+        // Engine off → tick does nothing. Importantly: no tracker
+        // shell-out, so the test runs hermetically even though we
+        // never set up a fake `git-bug`.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        assert!(!state.autonomous.enabled());
+        // Should return immediately.
+        state.autonomous_tick(&store, std::time::Instant::now());
+        assert!(!state.autonomous.enabled());
+    }
+
+    #[test]
+    fn r_reload_picks_up_config_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/config.yaml", "autonomous:\n  max_parallel: 1\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        assert_eq!(state.config.autonomous.max_parallel, 1);
+        // Edit the config and reload via `r`.
+        write(tmp.path(), ".fleet/config.yaml", "autonomous:\n  max_parallel: 7\n");
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.config.autonomous.max_parallel, 7);
     }
 }
