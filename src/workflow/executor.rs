@@ -2702,6 +2702,69 @@ nodes:
     }
 
     #[test]
+    fn resume_preserves_worktree_fields_on_loaded_session() {
+        // The CLI points workspace at session.worktree_path on resume;
+        // the executor must not clobber the persisted fields. Here we
+        // exercise the full execute → gate → resume cycle with a
+        // worktree stamped on the initial run and assert it survives.
+        let yaml = "\
+name: gate-with-wt
+nodes:
+  - id: setup
+    type: bash
+    script: 'echo setup'
+  - id: g
+    depends_on: [setup]
+    type: gate
+    summary: 'human gate'
+  - id: cleanup
+    depends_on: [g]
+    type: bash
+    script: 'echo cleanup'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let wt = std::path::PathBuf::from("/repo/.fleet/sessions/s-resume-wt/worktree");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: &wt,
+            session_id: SessionId::new("s-resume-wt"),
+            issue: None,
+            worktree: Some(WorktreeMeta {
+                path: &wt,
+                branch: "fleet/session-s-resume-wt",
+            }),
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let paused = executor.execute(&req).unwrap();
+        assert_eq!(paused.state, SessionState::AwaitingGate);
+        assert_eq!(paused.worktree_path.as_deref(), Some(wt.as_path()));
+
+        // Resume — CLI would pass `worktree: None` here (the fields
+        // are loaded from disk). The persisted worktree must survive.
+        let resume_req = ExecuteRequest {
+            worktree: None,
+            ..req
+        };
+        let resumed = executor.resume(&resume_req).unwrap();
+        assert_eq!(resumed.state, SessionState::Completed);
+        assert_eq!(
+            resumed.worktree_path.as_deref(),
+            Some(wt.as_path()),
+            "resume must preserve the persisted worktree path"
+        );
+        assert_eq!(resumed.branch.as_deref(), Some("fleet/session-s-resume-wt"),);
+    }
+
+    #[test]
     fn resume_rejects_non_paused_session() {
         let yaml = "\
 name: simple

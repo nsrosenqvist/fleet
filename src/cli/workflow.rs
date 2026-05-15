@@ -179,6 +179,28 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
     let report = probe(invoker.as_ref());
     let adapter = build_adapter(&config.runtime, &report, Arc::clone(&invoker))?;
 
+    // Resume runs against the *original* session's worktree — the
+    // agent must see the in-progress files it was working with
+    // before the gate fired, not a fresh checkout. If the worktree
+    // has been removed out of band (e.g. `fleet sessions prune`),
+    // bail with a clear error rather than silently bind-mounting
+    // the repo root and confusing the agent.
+    let workspace_path: PathBuf = match session.worktree_path.as_deref() {
+        Some(p) if p.is_dir() => p.to_path_buf(),
+        Some(p) => {
+            return Err(anyhow!(
+                "session `{session_id}` is bound to worktree `{}` but that directory no \
+                 longer exists — recreate the worktree (e.g. via `git worktree add`) or \
+                 spawn a fresh run with `fleet workflow run`",
+                p.display(),
+            ));
+        }
+        // Pre-worktree-feature meta.json or a session created on a
+        // non-git workspace: fall back to the shared repo root,
+        // matching how it ran originally.
+        None => root,
+    };
+
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let executor = WorkflowExecutor::new(invoker);
     let req = ExecuteRequest {
@@ -187,15 +209,15 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         agents: &config.agents.registry,
         store: &store,
         devcontainer: &devcontainer,
-        workspace: &root,
+        workspace: &workspace_path,
         session_id: id,
         // Resume doesn't re-resolve issue context — the user's original
         // `--issue` is lost across processes today. Workflows that
         // depend on `FLEET_ISSUE_*` post-resume should re-spawn instead.
         issue: None,
-        // Resume re-uses the original session's worktree; commit 5
-        // wires that through. For now the field is None and resume
-        // continues to run against the repo root.
+        // Worktree path + branch already live on the loaded session —
+        // resume must not re-stamp (would bump updated_at_ms with no
+        // change) and the executor's resume() doesn't read it.
         worktree: None,
         egress: enforcer.as_ref(),
     };
