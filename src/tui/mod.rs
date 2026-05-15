@@ -47,7 +47,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -840,8 +840,13 @@ fn render(f: &mut Frame<'_>, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(f.area());
+    // Spawn is an *overlay* on top of the sessions view: the user
+    // hasn't left their place, they've just popped a picker. Render
+    // sessions underneath, then `Clear` the modal area and draw the
+    // picker on top. Doctor remains a full-pane mode because the
+    // user explicitly switched contexts to inspect host state.
     match state.view {
-        View::Sessions => {
+        View::Sessions | View::Spawn => {
             let body = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
@@ -852,11 +857,40 @@ fn render(f: &mut Frame<'_>, state: &AppState) {
         View::Doctor => {
             render_doctor(f, outer[0], state);
         }
-        View::Spawn => {
-            render_spawn(f, outer[0], state);
-        }
+    }
+    if state.view == View::Spawn {
+        let modal = centered_rect(outer[0], 60, 60);
+        f.render_widget(Clear, modal);
+        render_spawn(f, modal, state);
     }
     render_status(f, outer[1], state);
+}
+
+/// Centred sub-rectangle of `parent`, sized to `pct_x`% wide and
+/// `pct_y`% tall (each clamped to `[10, 95]` so the modal is always
+/// readable on tiny terminals and never the entire pane). Used by the
+/// spawn-picker overlay; future modals (confirm dialogs, error
+/// surfaces) can share it.
+#[must_use]
+pub fn centered_rect(parent: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let pct_x = pct_x.clamp(10, 95);
+    let pct_y = pct_y.clamp(10, 95);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(parent);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -1547,6 +1581,93 @@ mod tests {
         assert_eq!(state.view, View::Spawn);
         assert!(state.spawn_workflows.is_empty());
         assert_eq!(state.spawn_list_state.selected(), None);
+    }
+
+    #[test]
+    fn centered_rect_returns_rect_inside_parent() {
+        let parent = Rect::new(0, 0, 100, 50);
+        let r = centered_rect(parent, 60, 60);
+        assert!(r.x >= parent.x);
+        assert!(r.y >= parent.y);
+        assert!(r.x + r.width <= parent.x + parent.width);
+        assert!(r.y + r.height <= parent.y + parent.height);
+        // Roughly the expected proportions — exact due to clean
+        // arithmetic on the example dims.
+        assert_eq!(r.width, 60);
+        assert_eq!(r.height, 30);
+        assert_eq!(r.x, 20);
+        assert_eq!(r.y, 10);
+    }
+
+    #[test]
+    fn centered_rect_clamps_percentages_to_safe_range() {
+        // 5% would produce a 5x2 modal at 100x50 — too tiny to render.
+        // The clamp pulls both percentages up to 10%.
+        let parent = Rect::new(0, 0, 100, 50);
+        let small = centered_rect(parent, 5, 5);
+        assert_eq!(small.width, 10);
+        assert_eq!(small.height, 5);
+        // 200% would underflow the layout math. Clamp at 95%.
+        let huge = centered_rect(parent, 200, 200);
+        // 95% of 100 = 95 exact; 95% of 50 splits ratatui's layout
+        // into 2/47/1 or 1/48/1 depending on rounding — both fall
+        // inside the parent and leave clear margins, which is what
+        // the clamp is for. Assert the bounds, not the exact value.
+        assert_eq!(huge.width, 95);
+        assert!(huge.height >= 45 && huge.height <= 48, "got {}", huge.height);
+        assert!(huge.y >= 1, "top margin missing; got y={}", huge.y);
+        assert!(huge.y + huge.height < parent.y + parent.height);
+    }
+
+    #[test]
+    fn spawn_view_renders_overlay_atop_sessions() {
+        // The overlay must coexist with the sessions content: the
+        // sidebar's session count appears underneath, while the
+        // picker's title appears on top of it. Use a test backend
+        // to capture the rendered buffer.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/standard.yaml", "name: standard\n");
+        write(tmp.path(), ".fleet/workflows/hotfix.yaml", "name: hotfix\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        store
+            .create(&session("s-bg", "wf", SessionState::Running, 1))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.view, View::Spawn);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        let dumped: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Sidebar background still rendered.
+        assert!(
+            dumped.contains("Sessions"),
+            "background sidebar missing; got:\n{dumped}"
+        );
+        // Overlay's title and entries on top.
+        assert!(
+            dumped.contains("Spawn workflow"),
+            "overlay title missing; got:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("standard"),
+            "overlay entry missing; got:\n{dumped}"
+        );
     }
 
     #[test]
