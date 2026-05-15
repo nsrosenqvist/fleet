@@ -42,7 +42,6 @@ struct State {
 #[derive(Debug, Clone)]
 struct LocalContainer {
     workspace: PathBuf,
-    env: Vec<(String, String)>,
     state: ContainerState,
 }
 
@@ -116,7 +115,6 @@ impl RuntimeAdapter for LocalAdapter {
             id.clone(),
             LocalContainer {
                 workspace: spec.workspace.clone(),
-                env: spec.env.clone(),
                 state: ContainerState::Running,
             },
         );

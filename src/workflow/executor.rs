@@ -84,9 +84,11 @@ impl WorkflowExecutor {
         }
     }
 
-    /// Test override for the clock. Production callers ignore this; tests
-    /// pass a counter or fixed timestamp so assertions stay deterministic.
+    /// Test override for the clock. Production callers ignore this;
+    /// tests pass a counter or fixed timestamp so assertions stay
+    /// deterministic.
     #[must_use]
+    #[allow(dead_code)]
     pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.clock = Box::new(clock);
         self

@@ -56,9 +56,10 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Maximum-safety preset: microVM, rootless, microvm-network, builds + PTY.
-    /// Used as a target by `fleet doctor` to highlight where adapters fall
-    /// short.
+    /// Maximum-safety preset: microVM, rootless, microvm-network,
+    /// builds + PTY. Used by tests as the strongest-combination
+    /// reference; future doctor "score" views compare against it.
+    #[allow(dead_code)]
     pub const fn ideal() -> Self {
         Self {
             hardening: Hardening::MicroVm,

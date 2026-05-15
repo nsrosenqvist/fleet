@@ -1,15 +1,6 @@
 //! fleet — standalone Rust binary for running devcontainer-based agent
 //! workflows in any repo. See `~/.claude/plans/declarative-wobbling-quasar.md`
 //! for the design.
-
-// The Phase-1 TUI is a session browser only. Adapter capability
-// descriptors (`Capabilities`, `Hardening`, `NetworkIsolation`,
-// `RuntimeAdapter::capabilities`), agent-registry iteration, and the
-// adapter-choice `as_str` helpers are public surface the Phase-2 TUI
-// doctor pane will consume — they're deliberately kept around even
-// though no current caller exercises them. Lift this allow when those
-// surfaces land.
-#![allow(dead_code)]
 //!
 //! Module layout:
 //! - `repo` / `repo_config` — per-repo state location + `.fleet/config.yaml`

@@ -87,10 +87,6 @@ impl DevcontainerCli {
         Self { invoker, engine }
     }
 
-    pub const fn engine(&self) -> Engine {
-        self.engine
-    }
-
     /// Mint a stable image name from a [`Devcontainer`]. The name is the same
     /// for a given devcontainer source path + image source, across runs and
     /// processes — that's the trait's idempotency contract for `ensure_image`.

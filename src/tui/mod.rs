@@ -41,7 +41,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use std::sync::Arc;
+
+use crate::process::{ProcessInvoker, RealProcessInvoker};
 use crate::repo;
+use crate::repo_config::RepoConfig;
+use crate::runtime::Capabilities;
+use crate::runtime::detect::probe;
+use crate::runtime::factory::build_adapter;
 use crate::session::store::SessionStore;
 use crate::session::{Session, SessionState, now_ms};
 
@@ -103,6 +110,69 @@ struct AppState {
     log_tail: Vec<String>,
     last_selected_id: Option<String>,
     status_line: String,
+    /// Which top-level view is active. Toggled by `d`.
+    view: View,
+    /// Lazily-computed doctor snapshot. `None` until the user enters
+    /// the doctor view at least once; refreshed on every entry so the
+    /// pane reflects current config + host probe state.
+    doctor: Option<DoctorSnapshot>,
+}
+
+/// Top-level view enum. `Sessions` is the default; `Doctor` shows the
+/// adapter + tracker + agents introspection pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Sessions,
+    Doctor,
+}
+
+/// Resolved snapshot for the doctor pane. Computed by
+/// [`DoctorSnapshot::probe`] against the current cwd.
+#[derive(Debug, Clone)]
+pub struct DoctorSnapshot {
+    pub root: PathBuf,
+    pub initialised: bool,
+    pub configured_adapter: String,
+    pub configured_hardening: String,
+    pub tracker: String,
+    /// Adapter name + capability descriptor when the factory built one.
+    /// `Err(msg)` carries the user-facing reason the factory refused.
+    pub adapter: Result<(String, Capabilities), String>,
+    /// `(agent name, env passthrough whitelist)` rows from the registry,
+    /// in stable iteration order.
+    pub agents: Vec<(String, Vec<String>)>,
+}
+
+impl DoctorSnapshot {
+    /// Build a snapshot for the repo rooted at `root`. Uses
+    /// `RealProcessInvoker` to do the host probe + (potentially) the
+    /// Docker rootless check. Pure with respect to its arguments;
+    /// failure modes resolve into the struct rather than propagating.
+    pub fn probe(root: PathBuf) -> Self {
+        let initialised = repo::is_initialised(&root);
+        let config = RepoConfig::load(root.join(".fleet/config.yaml")).unwrap_or_default();
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+        let probe_report = probe(invoker.as_ref());
+        let adapter = match build_adapter(&config.runtime, &probe_report, Arc::clone(&invoker)) {
+            Ok(adapter) => Ok((adapter.name().to_string(), adapter.capabilities())),
+            Err(err) => Err(format!("{err:#}")),
+        };
+        let agents: Vec<(String, Vec<String>)> = config
+            .agents
+            .registry
+            .iter()
+            .map(|(name, spec)| (name.to_string(), spec.env_passthrough.clone()))
+            .collect();
+        Self {
+            root,
+            initialised,
+            configured_adapter: config.runtime.adapter.as_str().to_string(),
+            configured_hardening: config.runtime.hardening.as_str().to_string(),
+            tracker: config.tracker.as_str().to_string(),
+            adapter,
+            agents,
+        }
+    }
 }
 
 impl AppState {
@@ -114,6 +184,8 @@ impl AppState {
             log_tail: Vec::new(),
             last_selected_id: None,
             status_line: " ready ".to_string(),
+            view: View::Sessions,
+            doctor: None,
         };
         state.reload(store)?;
         Ok(state)
@@ -191,17 +263,43 @@ impl AppState {
     }
 
     fn handle_key(&mut self, key: KeyEvent, store: &SessionStore) -> Action {
-        // Shift+K is the Phase-1 kill affordance — match before the
-        // plain-k arm so the modifier discriminates.
+        // Shift+K is the kill affordance — match before the plain-k arm
+        // so the modifier discriminates.
         if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('K')) {
             self.mark_selected_failed(store);
             return Action::None;
         }
+        // `Esc` while in doctor view returns to sessions; from sessions
+        // it quits. `q` always quits.
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Char('q') => Action::Quit,
+            KeyCode::Esc => {
+                if self.view == View::Doctor {
+                    self.view = View::Sessions;
+                    Action::None
+                } else {
+                    Action::Quit
+                }
+            }
+            KeyCode::Char('d') => {
+                // Toggle doctor view. On entry, re-probe so the pane is
+                // always current rather than showing stale state.
+                self.view = match self.view {
+                    View::Sessions => {
+                        self.doctor = Some(DoctorSnapshot::probe(self.root.clone()));
+                        View::Doctor
+                    }
+                    View::Doctor => View::Sessions,
+                };
+                Action::None
+            }
             KeyCode::Char('r') => {
                 if let Err(err) = self.reload(store) {
                     self.status_line = format!(" reload failed: {err:#} ");
+                }
+                // In doctor view, refresh re-probes so config edits land.
+                if self.view == View::Doctor {
+                    self.doctor = Some(DoctorSnapshot::probe(self.root.clone()));
                 }
                 Action::None
             }
@@ -338,13 +436,91 @@ fn render(f: &mut Frame<'_>, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(f.area());
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(outer[0]);
-    render_sidebar(f, body[0], state);
-    render_detail(f, body[1], state);
+    match state.view {
+        View::Sessions => {
+            let body = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .split(outer[0]);
+            render_sidebar(f, body[0], state);
+            render_detail(f, body[1], state);
+        }
+        View::Doctor => {
+            render_doctor(f, outer[0], state);
+        }
+    }
     render_status(f, outer[1], state);
+}
+
+fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let block = Block::default().title(" Doctor ").borders(Borders::ALL);
+    let Some(snapshot) = state.doctor.as_ref() else {
+        let body = Paragraph::new("(probing host...)").block(block);
+        f.render_widget(body, area);
+        return;
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let repo_value = format!(
+        "{}  ({})",
+        snapshot.root.display(),
+        if snapshot.initialised {
+            "initialised"
+        } else {
+            "not initialised — run `fleet init`"
+        },
+    );
+    lines.push(kv_line("repo", &repo_value));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "runtime adapter:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(kv_line(
+        "configured",
+        &format!(
+            "{}  (hardening: {})",
+            snapshot.configured_adapter, snapshot.configured_hardening,
+        ),
+    ));
+    match &snapshot.adapter {
+        Ok((name, caps)) => {
+            lines.push(kv_line("resolved", &format!("{name}  {}", caps.describe())));
+        }
+        Err(msg) => {
+            lines.push(Line::from(vec![
+                Span::styled("resolved  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(msg.clone(), Style::default().fg(Color::Red)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "agents:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    if snapshot.agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (none)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (name, env) in &snapshot.agents {
+            let env_str = if env.is_empty() {
+                String::new()
+            } else {
+                format!("  (env: {})", env.join(", "))
+            };
+            lines.push(Line::from(format!("  - {name}{env_str}")));
+        }
+    }
+    lines.push(Line::from(""));
+
+    lines.push(kv_line("tracker", &snapshot.tracker));
+
+    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(body, area);
 }
 
 fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -427,7 +603,10 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let help = "[q] quit  [j/k] nav  [r] reload  [Shift+K] kill  [n] spawn-hint";
+    let help = match state.view {
+        View::Sessions => "[q] quit  [j/k] nav  [r] reload  [d] doctor  [Shift+K] kill  [n] spawn-hint",
+        View::Doctor => "[q] quit  [Esc/d] back  [r] re-probe",
+    };
     let bar = format!("{help} —{}", state.status_line);
     let p = Paragraph::new(bar).style(
         Style::default()
@@ -613,6 +792,74 @@ mod tests {
         // start at index 0 (newest); going up should wrap to last.
         state.move_selection(-1);
         assert_eq!(state.selected().unwrap().id.as_str(), "s-1");
+    }
+
+    #[test]
+    fn doctor_snapshot_probe_handles_uninitialised_repo() {
+        // Probing a fresh dir with no `.fleet/` returns initialised=false
+        // and falls back to default RepoConfig values.
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = DoctorSnapshot::probe(tmp.path().to_path_buf());
+        assert!(!snap.initialised);
+        assert_eq!(snap.configured_adapter, "auto");
+        assert_eq!(snap.configured_hardening, "auto");
+        assert_eq!(snap.tracker, "git-bug");
+        // Default registry contains claude-code.
+        assert!(snap.agents.iter().any(|(n, _)| n == "claude-code"));
+    }
+
+    #[test]
+    fn doctor_snapshot_probe_reports_initialised_after_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".fleet")).unwrap();
+        let snap = DoctorSnapshot::probe(tmp.path().to_path_buf());
+        assert!(snap.initialised);
+    }
+
+    #[test]
+    fn d_toggles_into_doctor_view_and_probes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        assert_eq!(state.view, View::Sessions);
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.view, View::Doctor);
+        assert!(state.doctor.is_some());
+    }
+
+    #[test]
+    fn d_toggles_back_to_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+            &store,
+        );
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.view, View::Sessions);
+    }
+
+    #[test]
+    fn esc_in_doctor_view_returns_to_sessions_not_quit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.view, View::Doctor);
+        let action = state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &store);
+        // Should NOT quit — it returns to sessions.
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.view, View::Sessions);
     }
 
     #[test]

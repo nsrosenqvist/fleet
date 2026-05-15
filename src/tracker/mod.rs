@@ -42,8 +42,10 @@ pub struct Issue {
 
 impl Issue {
     /// Substring match for picker-style filtering. Case-insensitive on
-    /// both id and title. Empty filter matches everything.
+    /// both id and title. Empty filter matches everything. Reserved
+    /// for the future TUI spawn picker; no current binary caller.
     #[must_use]
+    #[allow(dead_code)]
     pub fn matches(&self, filter: &str) -> bool {
         if filter.is_empty() {
             return true;

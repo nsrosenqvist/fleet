@@ -63,16 +63,20 @@ impl AgentRegistry {
         self.entries.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    /// Number of registered agents. Cheap; backing map.
+    /// Number of registered agents. Cheap; backing map. Public surface
+    /// paired with [`Self::iter`]; tests exercise it, no v2 binary
+    /// caller does — kept for symmetry + future TUI agents view.
     #[must_use]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Whether the registry has any entries. The default registry is never
-    /// empty, so this returning `true` indicates the caller explicitly
-    /// emptied it — likely a misconfiguration.
+    /// Whether the registry has any entries. The default registry is
+    /// never empty, so this returning `true` indicates the caller
+    /// explicitly emptied it — likely a misconfiguration.
     #[must_use]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

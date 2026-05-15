@@ -45,6 +45,10 @@ impl ImageId {
         Self(id.into())
     }
 
+    /// Borrow the raw id. Paired with the [`Display`] impl; no v2
+    /// caller uses it directly today, but it's part of the opaque
+    /// newtype's public surface.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -78,8 +82,13 @@ impl std::fmt::Display for ContainerId {
 }
 
 /// What the caller wants from a freshly-started container. A value object;
-/// adapters consume but never mutate it.
+/// adapters consume but never mutate it. `image` + `command` are part of
+/// the protocol surface — engine adapters route around them today (the
+/// devcontainer CLI rebuilds the image itself; the engine's entrypoint
+/// covers `command`), but they're kept for use by future no-devcontainer
+/// adapters.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ContainerSpec {
     pub image: ImageId,
     /// Bind-mounted into the container at the devcontainer's
