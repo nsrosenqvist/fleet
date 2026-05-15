@@ -54,3 +54,33 @@ The per-boundary deep-dives:
   verify the `curl evil.example.com` → blocked / `curl
   api.anthropic.com` → allowed contract on the supported (OS,
   adapter) combinations.
+
+## First-run bootstrap
+
+`fleet init` scaffolds `.fleet/` and `.devcontainer/` as before. It
+now also runs `fleet runtime doctor` at the end and appends a
+**Bootstrap your environment** section listing any missing tools
+with OS-tailored install commands (`brew install ...` on macOS,
+`sudo apt/dnf install ...` on Linux). Silent when everything is
+present. Each missing tool carries a note explaining when it's
+actually required (e.g. `git-bug` only matters with `tracker:
+git-bug`; `tinyproxy` only matters on macOS with `policy:
+allowlist`).
+
+## Cost budgets
+
+Opt-in spend guardrails configured per-repo in `.fleet/config.yaml`:
+
+```yaml
+cost:
+  per_session_budget_usd: 5.00       # null = unlimited (default)
+  lifetime_budget_usd: 100.00        # null = unlimited (default)
+```
+
+Before each agent node starts, fleet checks the session's
+accumulated cost and the lifetime sum across `.fleet/sessions/`. If
+either limit is met, the next agent spawn is refused with a clear
+error naming the limit + actual figure; the session transitions to
+`Failed`. In-flight agents complete — only new spawns are blocked.
+Honest scope: no projection logic. Fleet counts reported cost after
+each agent finishes; the next spawn's check uses real totals.

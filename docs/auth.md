@@ -105,7 +105,9 @@ not in the workflow container.
 No auth. `git-bug` is a project-local issue tracker; it reads issue
 data out of the repo's git refs directly. Anyone who can clone the
 repo can list its issues. Fleet's involvement is just shelling
-`git-bug bug --format json` and parsing the JSON.
+`git-bug bug --format json` and parsing the JSON. `fleet runtime
+doctor` surfaces a `✓ git-bug` / `✗ git-bug` line so you can verify
+the binary is on PATH before the first `fleet issues list`.
 
 ### Linear / Jira (future)
 
@@ -159,8 +161,12 @@ What this means in practice:
   looking calls to the LLM provider's API.** Anthropic billing has
   no way to tell "agent was tricked into running a million tokens"
   from "user asked the agent to run a million tokens." Set spend
-  alerts on your provider account; consider the cost-budget guardrail
-  follow-up (autonomous mode P3+ work, not shipped).
+  alerts on your provider account. Fleet's opt-in cost budgets
+  (`cost.per_session_budget_usd` / `cost.lifetime_budget_usd` in
+  `.fleet/config.yaml`) refuse to spawn new agent nodes once the
+  limit is hit; in-flight agents complete. Honest scope: no
+  projection — fleet counts reported cost after each agent finishes
+  and the next spawn checks the totals.
 - **Host-side credential exfil before fleet starts.** If the
   attacker has read access to your shell's env at the point you run
   fleet, they already have your secrets. The identity model assumes

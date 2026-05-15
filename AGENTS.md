@@ -105,7 +105,7 @@ Sessions view (the default):
 | `r` | Force refresh |
 | `d` | Toggle doctor view |
 | `n` | Open spawn picker |
-| `Shift+K` | Kill / mark failed (confirm via status bar `y/N`) |
+| `Shift+K` | Kill / mark failed (opens a confirm overlay — `y` accepts, `n` / `Esc` cancels) |
 | `Shift+A` | Toggle autonomous mode |
 | `q` / `Esc` | Quit |
 

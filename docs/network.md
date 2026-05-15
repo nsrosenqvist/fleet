@@ -213,7 +213,11 @@ fleet runtime doctor
 ```
 
 Reports the chosen adapter, the configured policy, and the
-enforcer that would be selected for a workflow run.
+enforcer that would be selected for a workflow run. Also surfaces
+a `✓ tinyproxy` / `✗ tinyproxy` line under "Trackers + egress
+tools:" — needed on the macOS / Docker host-proxy path (Linux Podman
+runs tinyproxy inside a sidecar container instead, so the host
+binary isn't required there).
 
 **Tail the sidecar's logs (Podman only).**
 
