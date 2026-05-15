@@ -50,8 +50,11 @@ pub fn perform_init(root: &Path) -> Result<InitPlan> {
 
     let fleet_dir = root.join(".fleet");
     ensure_dir(&fleet_dir, root, &mut plan)?;
-    ensure_dir(&fleet_dir.join("workflows"), root, &mut plan)?;
+    let workflows_dir = fleet_dir.join("workflows");
+    ensure_dir(&workflows_dir, root, &mut plan)?;
     ensure_dir(&fleet_dir.join("sessions"), root, &mut plan)?;
+    let prompts_dir = fleet_dir.join("prompts");
+    ensure_dir(&prompts_dir, root, &mut plan)?;
     ensure_file(
         &fleet_dir.join(".gitignore"),
         root,
@@ -62,6 +65,46 @@ pub fn perform_init(root: &Path) -> Result<InitPlan> {
         &fleet_dir.join("config.yaml"),
         root,
         DEFAULT_FLEET_CONFIG_YAML,
+        &mut plan,
+    )?;
+
+    // Default workflows + their prompt files. Users can edit or remove
+    // any of these without breaking `fleet init` (idempotent: we only
+    // write files that don't already exist).
+    ensure_file(
+        &workflows_dir.join("standard.yaml"),
+        root,
+        DEFAULT_WORKFLOW_STANDARD,
+        &mut plan,
+    )?;
+    ensure_file(
+        &workflows_dir.join("hotfix.yaml"),
+        root,
+        DEFAULT_WORKFLOW_HOTFIX,
+        &mut plan,
+    )?;
+    ensure_file(
+        &workflows_dir.join("review-only.yaml"),
+        root,
+        DEFAULT_WORKFLOW_REVIEW_ONLY,
+        &mut plan,
+    )?;
+    ensure_file(
+        &prompts_dir.join("planner.md"),
+        root,
+        DEFAULT_PROMPT_PLANNER,
+        &mut plan,
+    )?;
+    ensure_file(
+        &prompts_dir.join("implementer.md"),
+        root,
+        DEFAULT_PROMPT_IMPLEMENTER,
+        &mut plan,
+    )?;
+    ensure_file(
+        &prompts_dir.join("reviewer.md"),
+        root,
+        DEFAULT_PROMPT_REVIEWER,
         &mut plan,
     )?;
 
@@ -105,7 +148,9 @@ pub fn render_init_summary(root: &Path, plan: &InitPlan) -> String {
     if !plan.created.is_empty() {
         out.push_str("\nNext steps:\n");
         out.push_str("  - Edit .devcontainer/devcontainer.json to match your project.\n");
+        out.push_str("  - Tweak the default prompts under .fleet/prompts/.\n");
         out.push_str("  - Run `fleet runtime doctor` to verify your container engine.\n");
+        out.push_str("  - Try `fleet workflow list` and `fleet workflow run review-only`.\n");
     }
     out
 }
@@ -221,6 +266,121 @@ const DEFAULT_DEVCONTAINER_JSON: &str = "\
 }
 ";
 
+/// `.fleet/workflows/standard.yaml` — the canonical planner → coder →
+/// reviewer flow. Three agent nodes with persona + `prompt_file` wired;
+/// the artifact contract chains `plan.md` from `plan` into `implement`'s
+/// inputs. Review opens unbounded for now — `loop_back_to` + gates land
+/// in the executor in subsequent commits.
+const DEFAULT_WORKFLOW_STANDARD: &str = "\
+# Default `standard` workflow shipped by `fleet init`.
+# Planner → Coder → Reviewer. Edit freely.
+name: standard
+description: Plan → Code → Review
+trigger:
+  manual: true
+  autonomous: true
+nodes:
+  - id: plan
+    agent: claude-code
+    persona: planner
+    prompt_file: .fleet/prompts/planner.md
+    artifacts:
+      out: [plan.md]
+  - id: implement
+    depends_on: [plan]
+    agent: claude-code
+    persona: implementer
+    prompt_file: .fleet/prompts/implementer.md
+    artifacts:
+      in: [plan.md]
+  - id: review
+    depends_on: [implement]
+    agent: claude-code
+    persona: reviewer
+    prompt_file: .fleet/prompts/reviewer.md
+";
+
+/// `.fleet/workflows/hotfix.yaml` — minimal two-step flow for small
+/// fixes. Skips the planner pass.
+const DEFAULT_WORKFLOW_HOTFIX: &str = "\
+# Default `hotfix` workflow shipped by `fleet init`.
+# Quick fix — implement then review, no planner pass.
+name: hotfix
+description: Implement → Review (no planner)
+trigger:
+  manual: true
+nodes:
+  - id: implement
+    agent: claude-code
+    persona: implementer
+    prompt_file: .fleet/prompts/implementer.md
+  - id: review
+    depends_on: [implement]
+    agent: claude-code
+    persona: reviewer
+    prompt_file: .fleet/prompts/reviewer.md
+";
+
+/// `.fleet/workflows/review-only.yaml` — runs only the reviewer pass
+/// over the current state of the workspace.
+const DEFAULT_WORKFLOW_REVIEW_ONLY: &str = "\
+# Default `review-only` workflow shipped by `fleet init`.
+# Review the workspace's current state without making changes.
+name: review-only
+description: Reviewer pass only
+trigger:
+  manual: true
+nodes:
+  - id: review
+    agent: claude-code
+    persona: reviewer
+    prompt_file: .fleet/prompts/reviewer.md
+";
+
+/// Default planner persona prompt. Surfaced to the agent as the
+/// `FLEET_PROMPT` env var; users adapt to their team's style.
+const DEFAULT_PROMPT_PLANNER: &str = "\
+You are the planner.
+
+Read the issue (it's in the environment as FLEET_ISSUE_TITLE and
+FLEET_ISSUE_HUMAN_ID) and produce a short implementation plan as
+`plan.md` under /artifacts. The plan should cover:
+
+  - what files to touch and why
+  - the testing strategy
+  - any constraints (perf, compatibility, security)
+
+Do NOT write code yet. Only the plan.
+";
+
+/// Default implementer persona prompt.
+const DEFAULT_PROMPT_IMPLEMENTER: &str = "\
+You are the implementer.
+
+Read /artifacts/plan.md if present and implement the changes in the
+workspace. Run the project's tests. Stage commits as you go; don't
+push or open a PR.
+
+If you deviate from the plan, note the deviation in your final
+response so the reviewer can audit it.
+";
+
+/// Default reviewer persona prompt.
+const DEFAULT_PROMPT_REVIEWER: &str = "\
+You are the reviewer.
+
+Inspect the diff against the workspace's main branch (or the working
+tree). Look for:
+
+  - correctness bugs
+  - missing test coverage
+  - security issues (injection, secret handling, etc.)
+  - mismatch with /artifacts/plan.md (if it exists)
+
+Produce `review.md` under /artifacts with a short verdict
+(approve / changes_requested) and the specifics. Be concise.
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +482,77 @@ mod tests {
             serde_yml::from_str(DEFAULT_FLEET_CONFIG_YAML).expect("default config.yaml must parse");
         // Spot-check a known key to catch dramatic regressions.
         assert!(parsed.get("runtime").is_some(), "runtime: section missing");
+    }
+
+    #[test]
+    fn default_workflows_parse_and_validate() {
+        use crate::workflow::spec::Workflow;
+        use crate::workflow::validate::validate;
+        for (name, body) in [
+            ("standard", DEFAULT_WORKFLOW_STANDARD),
+            ("hotfix", DEFAULT_WORKFLOW_HOTFIX),
+            ("review-only", DEFAULT_WORKFLOW_REVIEW_ONLY),
+        ] {
+            let wf = Workflow::from_str_at(body, format!("/{name}.yaml"))
+                .unwrap_or_else(|e| panic!("default workflow `{name}` must parse: {e:#}"));
+            validate(&wf)
+                .unwrap_or_else(|e| panic!("default workflow `{name}` must validate: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn default_workflows_reference_claude_code_agent() {
+        // The default agent registry includes `claude-code` out of the
+        // box; the workflows we ship must reference it (otherwise the
+        // first `fleet workflow run` errors with an unknown-agent
+        // message — terrible first-run UX).
+        for (name, body) in [
+            ("standard", DEFAULT_WORKFLOW_STANDARD),
+            ("hotfix", DEFAULT_WORKFLOW_HOTFIX),
+            ("review-only", DEFAULT_WORKFLOW_REVIEW_ONLY),
+        ] {
+            assert!(
+                body.contains("agent: claude-code"),
+                "{name} must reference claude-code"
+            );
+        }
+    }
+
+    #[test]
+    fn default_prompts_are_nonempty_markdown() {
+        for (name, body) in [
+            ("planner.md", DEFAULT_PROMPT_PLANNER),
+            ("implementer.md", DEFAULT_PROMPT_IMPLEMENTER),
+            ("reviewer.md", DEFAULT_PROMPT_REVIEWER),
+        ] {
+            assert!(!body.trim().is_empty(), "prompt `{name}` must be non-empty");
+            // Loose sanity: every default prompt should mention what
+            // persona it's for so a user editing it knows immediately.
+            let body_lower = body.to_lowercase();
+            let role = match name {
+                "planner.md" => "planner",
+                "implementer.md" => "implementer",
+                "reviewer.md" => "reviewer",
+                _ => unreachable!(),
+            };
+            assert!(
+                body_lower.contains(role),
+                "prompt `{name}` must mention its persona (`{role}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn first_run_creates_default_workflows_and_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        perform_init(dir.path()).unwrap();
+        let root = dir.path();
+        assert!(root.join(".fleet/workflows/standard.yaml").is_file());
+        assert!(root.join(".fleet/workflows/hotfix.yaml").is_file());
+        assert!(root.join(".fleet/workflows/review-only.yaml").is_file());
+        assert!(root.join(".fleet/prompts/planner.md").is_file());
+        assert!(root.join(".fleet/prompts/implementer.md").is_file());
+        assert!(root.join(".fleet/prompts/reviewer.md").is_file());
     }
 
     #[test]
