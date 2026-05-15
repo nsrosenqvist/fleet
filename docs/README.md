@@ -22,3 +22,11 @@ The per-boundary deep-dives:
 - [`network.md`](./network.md) — egress allowlist. How `[network]
   mode = "allowlist"` routes worker traffic through the in-VM
   tinyproxy, and what the cooperative model does and doesn't enforce.
+
+## Workspace model
+
+- [`worktrees.md`](./worktrees.md) — per-session git worktrees. Why
+  every `fleet workflow run` gets its own branch + checked-out
+  working directory, how replay re-uses the prior session's branch
+  tip, and how `fleet sessions prune` reclaims disk while keeping
+  agent commits inspectable.
