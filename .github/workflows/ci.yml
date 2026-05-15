@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref so a quick re-push doesn't
+# stack two full matrices.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned via rust-toolchain.toml if present; otherwise the stable
+  # channel at the time the runner image was baked. Setting CARGO_TERM_COLOR
+  # makes the logs readable.
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Fast-path job: format + clippy on one platform. Catches style /
+  # lint regressions before the full matrix burns minutes on every
+  # target. Runs in parallel with the matrix; the matrix is gated on
+  # tests, not on this.
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        # `-D warnings` is set via RUSTFLAGS; the explicit flag here
+        # is defence-in-depth so a future RUSTFLAGS change doesn't
+        # silently weaken the gate.
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Cross-arch build + test matrix. Linux x86_64 is the daily driver;
+  # the rest cover the targets the v2 plan calls out for distribution.
+  # macOS runners are arm64 by default on GitHub now (M-series), so
+  # `macos-latest` already covers aarch64-apple-darwin natively.
+  # `x86_64-apple-darwin` uses an Intel image while it remains
+  # available; if that's retired upstream, drop the entry.
+  test:
+    name: test ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            # Native: build + test directly. No cross.
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            # arm64 linux: GitHub doesn't ship an arm runner on the
+            # free tier yet, so we cross-compile and skip tests for
+            # this target. Build-only is honest — running tests would
+            # need QEMU which adds 10× the wall time.
+            cross: true
+            test: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-apple-darwin
+            # macos-13 is the last image with Intel hardware available
+            # on GitHub-hosted runners. Drop this entry if the image
+            # retires before we have a maintained x86_64-darwin path.
+            os: macos-13
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache per target so cross-compiles don't clobber
+          # the native cache.
+          key: ${{ matrix.target }}
+      # Linker for aarch64 linux cross-builds. Without this, `ring`
+      # and any C-dep crate fails to link.
+      - name: install cross-linker (aarch64-linux-gnu)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: cargo build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: cargo test
+        if: matrix.test != false
+        run: cargo test --target ${{ matrix.target }}
+      # Smoke check: the produced binary at least starts and prints
+      # its --version. Helps catch link-time errors that the build
+      # step somehow let through (rare but seen with feature flags
+      # and weird linker scripts).
+      - name: smoke (--version)
+        if: matrix.cross != true
+        run: ./target/${{ matrix.target }}/release/fleet --version
