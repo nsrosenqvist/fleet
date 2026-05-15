@@ -1,11 +1,12 @@
 //! Phase-1 workflow executor.
 //!
-//! Drives a parsed [`Workflow`] against a [`RuntimeAdapter`] + agent registry
-//! + [`SessionStore`]. Scope today: linear topological traversal of
-//!   [`NodeKind::Agent`] and [`NodeKind::Bash`] nodes. Gate, assert, fanout,
-//!   `loop_back_to`, and parallel siblings are parsed and validated upstream
-//!   but rejected here with a clear "Phase 1 executor does not support …"
-//!   message — they land with the workflow-engine commit in Phase 2.
+//! Drives a parsed [`Workflow`] against a [`RuntimeAdapter`], agent
+//! registry, and [`SessionStore`]. Supports `NodeKind::Agent`,
+//! `NodeKind::Bash`, `NodeKind::Gate`, `NodeKind::Assert`,
+//! `loop_back_to`, and `when:` predicates over upstream `outputs:`.
+//!
+//! `NodeKind::Fanout` is parsed and validated upstream but rejected here
+//! until parallel-sibling execution lands.
 //!
 //! Lifecycle: `Created → Running → (Failed on node failure | Completed on
 //! all nodes done)`. Each node bumps `current_node` so the TUI/sidebar can
@@ -230,7 +231,7 @@ impl WorkflowExecutor {
                 return Ok(());
             }
 
-            if let Err(err) = self.run_node(req, node, session) {
+            if let Err(err) = self.run_node(req, node, session, &outputs) {
                 self.mark_failed(req, session, &err);
                 return Err(err);
             }
@@ -303,7 +304,13 @@ impl WorkflowExecutor {
         Ok(())
     }
 
-    fn run_node(&self, req: &ExecuteRequest<'_>, node: &Node, session: &Session) -> Result<()> {
+    fn run_node(
+        &self,
+        req: &ExecuteRequest<'_>,
+        node: &Node,
+        session: &Session,
+        outputs: &OutputMap,
+    ) -> Result<()> {
         // Input artifact contract: declared `artifacts.in:` must exist
         // before the node runs. Detected here so a downstream node that
         // depends on an upstream-produced file fails loudly with a
@@ -315,6 +322,7 @@ impl WorkflowExecutor {
         let inner = match &node.kind {
             NodeKind::Agent { agent, .. } => self.run_agent_node(req, node, agent, session),
             NodeKind::Bash { script } => self.run_bash_node(req, node, script, session),
+            NodeKind::Assert { expr } => self.run_assert_node(req, node, expr, session, outputs),
             // Unsupported kinds were rejected earlier in `execute`; this
             // branch is just an exhaustiveness guard.
             other => bail!(
@@ -455,6 +463,48 @@ impl WorkflowExecutor {
                     node.id,
                     log_path.display()
                 );
+            }
+        }
+    }
+
+    /// Evaluate the assert node's `expr:` against the live outputs map.
+    /// True → no-op (workflow continues). False → node failure that
+    /// transitions the session to Failed; the log file records the
+    /// expression that failed so the user can see *which* invariant
+    /// the workflow protects.
+    fn run_assert_node(
+        &self,
+        req: &ExecuteRequest<'_>,
+        node: &Node,
+        expr_str: &str,
+        session: &Session,
+        outputs: &OutputMap,
+    ) -> Result<()> {
+        let log_path = self.node_log_path(req, session, &node.id);
+        match expr::evaluate(expr_str, outputs) {
+            Ok(true) => {
+                let body = format!("--- assert passed ---\n{expr_str}\n");
+                if let Err(err) = std::fs::write(&log_path, body) {
+                    tracing::warn!(?err, log = %log_path.display(), "writing assert log failed");
+                }
+                Ok(())
+            }
+            Ok(false) => {
+                let body = format!("--- assert failed ---\n{expr_str}\n");
+                let _ = std::fs::write(&log_path, body);
+                bail!(
+                    "assert node `{}` failed: `{expr_str}` evaluated false (log at {})",
+                    node.id,
+                    log_path.display()
+                );
+            }
+            Err(err) => {
+                let body = format!("--- assert errored ---\n{expr_str}\n{err:#}\n");
+                let _ = std::fs::write(&log_path, body);
+                Err(err.context(format!(
+                    "evaluating `expr:` for assert node `{}`",
+                    node.id
+                )))
             }
         }
     }
@@ -712,20 +762,17 @@ fn shell_quote_value(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Phase 2 supports agent + bash + `loop_back_to`. Gate, assert, fanout
-/// land in subsequent commits — until then they're rejected at the top
-/// of `execute` so the session row never gets created for unsupported
-/// workflows.
+/// Phase 2 supports agent + bash + gate + assert + `loop_back_to`.
+/// Fanout (parallel siblings) lands in a later commit — until then
+/// it's rejected at the top of `execute` so the session row never
+/// gets created for unsupported workflows.
 fn reject_unsupported_node_kinds(wf: &Workflow) -> Result<()> {
     for n in &wf.nodes {
         match &n.kind {
-            NodeKind::Agent { .. } | NodeKind::Bash { .. } | NodeKind::Gate { .. } => {}
-            NodeKind::Assert { .. } => bail!(
-                "executor does not yet support assert nodes (workflow `{}`, node `{}`); \
-                 expression evaluation lands in a later commit",
-                wf.name,
-                n.id
-            ),
+            NodeKind::Agent { .. }
+            | NodeKind::Bash { .. }
+            | NodeKind::Gate { .. }
+            | NodeKind::Assert { .. } => {}
             NodeKind::Fanout { .. } => bail!(
                 "executor does not yet support fanout nodes (workflow `{}`, node `{}`); \
                  parallel sibling execution lands in a later commit",
@@ -2496,5 +2543,224 @@ nodes:
             3,
             "expected three setup runs across two revision cycles"
         );
+    }
+
+    // === assert nodes ===
+
+    #[test]
+    fn assert_node_with_true_expression_passes_and_workflow_completes() {
+        // setup writes a decision=approve outputs file; the assert node
+        // then verifies it. True → no-op, workflow runs to Completed.
+        let yaml = "\
+name: with-assert
+nodes:
+  - id: setup
+    type: bash
+    script: 'write outputs'
+    outputs: { decision: decision }
+  - id: check
+    depends_on: [setup]
+    type: assert
+    expr: 'setup.decision == \"approve\"'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let session_id = SessionId::new("s-assert-ok");
+        let af = store.session_dir(&session_id).join("artifacts");
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            if s.contains("write outputs") {
+                std::fs::write(af.join("setup.outputs.json"), r#"{"decision":"approve"}"#)
+                    .unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: session_id.clone(),
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+        // The assert node leaves a "passed" log so the trail is auditable.
+        let log = std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log"))
+            .unwrap();
+        assert!(log.contains("--- assert passed ---"), "got: {log}");
+    }
+
+    #[test]
+    fn assert_node_with_false_expression_fails_session() {
+        let yaml = "\
+name: with-failing-assert
+nodes:
+  - id: setup
+    type: bash
+    script: 'write outputs'
+    outputs: { decision: decision }
+  - id: check
+    depends_on: [setup]
+    type: assert
+    expr: 'setup.decision == \"approve\"'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let session_id = SessionId::new("s-assert-fail");
+        let af = store.session_dir(&session_id).join("artifacts");
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            if s.contains("write outputs") {
+                std::fs::write(
+                    af.join("setup.outputs.json"),
+                    r#"{"decision":"changes_requested"}"#,
+                )
+                .unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: session_id.clone(),
+            issue: None,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("assert node `check` failed")
+                && msg.contains("setup.decision"),
+            "got: {msg}"
+        );
+        // Session ends Failed and the log captures the failing expression.
+        assert_eq!(
+            store.load(&session_id).unwrap().state,
+            SessionState::Failed
+        );
+        let log = std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log"))
+            .unwrap();
+        assert!(log.contains("--- assert failed ---"), "got: {log}");
+    }
+
+    #[test]
+    fn assert_node_with_unknown_output_errors_with_pointer() {
+        // No upstream node declares a `decision` output. The assert
+        // node's reference to `setup.decision` must fail loudly rather
+        // than silently passing or quietly returning false.
+        let yaml = "\
+name: bad-assert
+nodes:
+  - id: setup
+    type: bash
+    script: 'echo setup'
+  - id: check
+    depends_on: [setup]
+    type: assert
+    expr: 'setup.decision == \"approve\"'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-assert-unknown"),
+            issue: None,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("evaluating `expr:` for assert node `check`"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("unknown output `setup.decision`"), "got: {msg}");
+        assert_eq!(
+            store.load(&SessionId::new("s-assert-unknown")).unwrap().state,
+            SessionState::Failed
+        );
+    }
+
+    #[test]
+    fn assert_node_combined_with_when_can_be_skipped() {
+        // An assert node also honours `when:`. If gated off, it neither
+        // passes nor fails — it's simply skipped. Useful for guarding
+        // an invariant that only applies on one branch of a fork.
+        let yaml = "\
+name: gated-assert
+nodes:
+  - id: setup
+    type: bash
+    script: 'write outputs'
+    outputs: { decision: decision }
+  - id: check
+    depends_on: [setup]
+    when: 'setup.decision == \"approve\"'
+    type: assert
+    expr: 'setup.decision == \"approve\"'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let session_id = SessionId::new("s-assert-skip");
+        let af = store.session_dir(&session_id).join("artifacts");
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            if s.contains("write outputs") {
+                std::fs::write(
+                    af.join("setup.outputs.json"),
+                    r#"{"decision":"changes_requested"}"#,
+                )
+                .unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: session_id.clone(),
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        // when:-false skipped the assert; workflow Completes despite
+        // the assert expression being false.
+        assert_eq!(session.state, SessionState::Completed);
+        let log = std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log"))
+            .unwrap();
+        assert!(log.contains("--- skipped:"), "got: {log}");
     }
 }
