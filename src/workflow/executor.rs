@@ -97,6 +97,13 @@ impl WorkflowExecutor {
     /// snapshot. Node-level errors transition the session to `Failed` and
     /// propagate; the on-disk state always reflects the last successful
     /// transition.
+    ///
+    /// `loop_back_to` is honoured: after a node with `loop_back_to: X`
+    /// succeeds, the executor jumps back to `X` and replays the slice
+    /// `[X ..= current]` in topological order. The cycle repeats up to
+    /// `max_loops` times (default 1 when the field is omitted). The
+    /// per-loop counter is held in memory; persistence-across-resume
+    /// lands with the gate-resume work in a later commit.
     pub fn execute(&self, req: &ExecuteRequest<'_>) -> Result<Session> {
         validate(req.workflow).context("workflow failed static validation")?;
         let order = topological_order(req.workflow)?;
@@ -111,16 +118,26 @@ impl WorkflowExecutor {
         session.transition_to(SessionState::Running, (self.clock)())?;
         req.store.save(&session)?;
 
-        for node_id in order {
-            let node = req.workflow.node(&node_id).expect(
-                "topological_order only returns ids from the workflow's nodes",
-            );
+        let mut loop_counts: HashMap<String, u32> = HashMap::new();
+        let mut i: usize = 0;
+        while i < order.len() {
+            let node_id = order[i].clone();
+            let node = req
+                .workflow
+                .node(&node_id)
+                .expect("topological_order only returns ids from the workflow's nodes");
             session.set_current_node(Some(node_id.clone()), (self.clock)());
             req.store.save(&session)?;
             if let Err(err) = self.run_node(req, node, &session) {
                 self.mark_failed(req, &mut session, &err);
                 return Err(err);
             }
+            // loop_back_to dispatch — only on success. `max_loops`
+            // defaults to 1 (one revision pass) when omitted: setting
+            // `loop_back_to` without an explicit bound is almost
+            // certainly a user wanting "one cycle", and unbounded loops
+            // are a footgun we don't enable implicitly.
+            i = resolve_loop_back(node, &order, &mut loop_counts).map_or(i + 1, |t| t);
         }
 
         // Last-node id stays as `current_node` for diagnostic value — it
@@ -467,43 +484,56 @@ fn shell_quote_value(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Phase 1 supports agent + bash. Reject the rest with a single, specific
-/// error so the user doesn't watch a workflow start running and then fail
-/// midway through. Detect at the top of `execute` so the session row
-/// never gets created for unsupported workflows.
+/// Phase 2 supports agent + bash + `loop_back_to`. Gate, assert, fanout
+/// land in subsequent commits — until then they're rejected at the top
+/// of `execute` so the session row never gets created for unsupported
+/// workflows.
 fn reject_unsupported_node_kinds(wf: &Workflow) -> Result<()> {
     for n in &wf.nodes {
         match &n.kind {
             NodeKind::Agent { .. } | NodeKind::Bash { .. } => {}
             NodeKind::Gate { .. } => bail!(
-                "Phase 1 executor does not support gate nodes (workflow `{}`, node `{}`); \
-                 human-gate handling lands with the Phase 2 workflow engine",
+                "executor does not yet support gate nodes (workflow `{}`, node `{}`); \
+                 human-gate handling lands in a later commit",
                 wf.name,
                 n.id
             ),
             NodeKind::Assert { .. } => bail!(
-                "Phase 1 executor does not support assert nodes (workflow `{}`, node `{}`); \
-                 expression evaluation lands in Phase 2",
+                "executor does not yet support assert nodes (workflow `{}`, node `{}`); \
+                 expression evaluation lands in a later commit",
                 wf.name,
                 n.id
             ),
             NodeKind::Fanout { .. } => bail!(
-                "Phase 1 executor does not support fanout nodes (workflow `{}`, node `{}`); \
-                 parallel sibling execution lands in Phase 2",
+                "executor does not yet support fanout nodes (workflow `{}`, node `{}`); \
+                 parallel sibling execution lands in a later commit",
                 wf.name,
                 n.id
             ),
         }
-        if n.loop_back_to.is_some() {
-            bail!(
-                "Phase 1 executor does not support loop_back_to (workflow `{}`, node `{}`); \
-                 bounded revision cycles land in Phase 2",
-                wf.name,
-                n.id
-            );
-        }
     }
     Ok(())
+}
+
+/// Decide whether a node's `loop_back_to` fires, returning the index in
+/// `order` to jump to. `None` means "continue forward". The per-node
+/// loop counter is mutated in place; an unrecognised target (which
+/// validation already rejects) is treated as "continue forward" so a
+/// stray bug never traps the executor.
+fn resolve_loop_back(
+    node: &Node,
+    order: &[String],
+    loop_counts: &mut HashMap<String, u32>,
+) -> Option<usize> {
+    let target_id = node.loop_back_to.as_ref()?;
+    let max = node.max_loops.unwrap_or(1);
+    let count = loop_counts.entry(node.id.clone()).or_insert(0);
+    if *count >= max {
+        return None;
+    }
+    let target_idx = order.iter().position(|id| id == target_id)?;
+    *count += 1;
+    Some(target_idx)
 }
 
 /// Kahn's algorithm topo sort with stable tie-breaking (alphabetical by id)
@@ -1283,7 +1313,7 @@ nodes:
             issue: None,
         };
         let err = executor.execute(&req).unwrap_err();
-        assert!(format!("{err:#}").contains("does not support gate nodes"));
+        assert!(format!("{err:#}").contains("does not yet support gate nodes"));
         // Session row must NOT have been created — the failure happened
         // before persistence kicked in.
         assert!(store.load(&SessionId::new("s-gate")).is_err());
@@ -1317,28 +1347,33 @@ nodes:
             issue: None,
         };
         let err = executor.execute(&req).unwrap_err();
-        assert!(format!("{err:#}").contains("does not support fanout nodes"));
+        assert!(format!("{err:#}").contains("does not yet support fanout nodes"));
     }
 
-    #[test]
-    fn loop_back_to_is_rejected() {
-        let yaml = "\
-name: with-loop
-nodes:
-  - id: review
-    agent: claude-code
-  - id: revise
-    depends_on: [review]
-    agent: claude-code
-    loop_back_to: review
-    max_loops: 1
-";
+    /// Helper: run `yaml` against an invoker that counts how many times
+    /// each bash script fires. Returns (final session, per-script counts).
+    /// All scripts are no-ops (Ok("")) so loop semantics are exercised
+    /// without artifact-contract concerns.
+    fn run_with_call_counter(
+        yaml: &str,
+        session_id: &str,
+    ) -> (Session, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let wf = Workflow::from_str_at(yaml, "/x").unwrap();
         let adapter = local_adapter_with_stdout("");
         let agents = AgentRegistry::default();
         let (_d, store) = build_store();
         let dc = sample_devcontainer();
-        let executor = executor_returning("");
+        let script_log: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_clone = std::sync::Arc::clone(&script_log);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            // Extract the user-script (last positional arg after `cd ... &&`).
+            let script = args.last().cloned().unwrap_or_default();
+            log_clone.lock().unwrap().push(script);
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
         let req = ExecuteRequest {
             workflow: &wf,
             adapter: &adapter,
@@ -1346,11 +1381,239 @@ nodes:
             store: &store,
             devcontainer: &dc,
             workspace: Path::new("/repo"),
-            session_id: SessionId::new("s-loop"),
+            session_id: SessionId::new(session_id),
             issue: None,
         };
-        let err = executor.execute(&req).unwrap_err();
-        assert!(format!("{err:#}").contains("does not support loop_back_to"));
+        let session = executor.execute(&req).unwrap();
+        (session, script_log)
+    }
+
+    #[test]
+    fn loop_back_to_replays_target_slice_for_max_loops_iterations() {
+        // a → b with b.loop_back_to=a, max_loops=2 produces three full
+        // a-then-b passes (1 original + 2 revision cycles). Script log
+        // expected: a1 b1 a2 b2 a3 b3.
+        let yaml = "\
+name: rev
+nodes:
+  - id: a
+    type: bash
+    script: 'echo a'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'echo b'
+    loop_back_to: a
+    max_loops: 2
+";
+        let (session, log) = run_with_call_counter(yaml, "s-rev");
+        assert_eq!(session.state, SessionState::Completed);
+        let scripts: Vec<String> = log.lock().unwrap().clone();
+        // Each entry contains `cd '/repo' && <script>` — match on the
+        // tail.
+        let tags: Vec<&str> = scripts
+            .iter()
+            .map(|s| if s.contains("echo a") { "a" } else { "b" })
+            .collect();
+        assert_eq!(tags, vec!["a", "b", "a", "b", "a", "b"]);
+    }
+
+    #[test]
+    fn loop_back_to_with_max_loops_default_runs_one_revision_pass() {
+        // No `max_loops` field → defaults to 1, so loops once.
+        let yaml = "\
+name: rev
+nodes:
+  - id: a
+    type: bash
+    script: 'echo a'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'echo b'
+    loop_back_to: a
+";
+        let (session, log) = run_with_call_counter(yaml, "s-rev-default");
+        assert_eq!(session.state, SessionState::Completed);
+        let scripts: Vec<String> = log.lock().unwrap().clone();
+        let tags: Vec<&str> = scripts
+            .iter()
+            .map(|s| if s.contains("echo a") { "a" } else { "b" })
+            .collect();
+        // 2 passes: original + 1 revision.
+        assert_eq!(tags, vec!["a", "b", "a", "b"]);
+    }
+
+    #[test]
+    fn loop_back_to_with_max_loops_zero_does_not_loop() {
+        // Explicit max_loops: 0 skips the cycle entirely — useful for
+        // workflows that conditionally disable revisions via config
+        // edits without dropping the loop_back_to field.
+        let yaml = "\
+name: rev
+nodes:
+  - id: a
+    type: bash
+    script: 'echo a'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'echo b'
+    loop_back_to: a
+    max_loops: 0
+";
+        let (session, log) = run_with_call_counter(yaml, "s-rev-zero");
+        assert_eq!(session.state, SessionState::Completed);
+        let scripts: Vec<String> = log.lock().unwrap().clone();
+        assert_eq!(scripts.len(), 2, "expected 2 runs (a,b), got {scripts:?}");
+    }
+
+    #[test]
+    fn loop_back_to_replays_intermediates_too() {
+        // Three-node chain a → b → c with c.loop_back_to=a. Replays the
+        // full [a, b, c] slice each cycle.
+        let yaml = "\
+name: rev3
+nodes:
+  - id: a
+    type: bash
+    script: 'echo a'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'echo b'
+  - id: c
+    depends_on: [b]
+    type: bash
+    script: 'echo c'
+    loop_back_to: a
+    max_loops: 1
+";
+        let (_, log) = run_with_call_counter(yaml, "s-rev3");
+        let scripts: Vec<String> = log.lock().unwrap().clone();
+        let tags: Vec<&str> = scripts
+            .iter()
+            .map(|s| {
+                if s.contains("echo a") {
+                    "a"
+                } else if s.contains("echo b") {
+                    "b"
+                } else {
+                    "c"
+                }
+            })
+            .collect();
+        assert_eq!(tags, vec!["a", "b", "c", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn loop_back_to_does_not_stack_across_independent_loops() {
+        // Two independent loops in the same workflow: a→b cycles once,
+        // c→d cycles once. The b-counter must not bleed into the d-loop.
+        let yaml = "\
+name: two-loops
+nodes:
+  - id: a
+    type: bash
+    script: 'echo a'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'echo b'
+    loop_back_to: a
+    max_loops: 1
+  - id: c
+    depends_on: [b]
+    type: bash
+    script: 'echo c'
+  - id: d
+    depends_on: [c]
+    type: bash
+    script: 'echo d'
+    loop_back_to: c
+    max_loops: 1
+";
+        let (_, log) = run_with_call_counter(yaml, "s-two-loops");
+        let scripts: Vec<String> = log.lock().unwrap().clone();
+        let tags: Vec<&str> = scripts
+            .iter()
+            .map(|s| {
+                if s.contains("echo a") {
+                    "a"
+                } else if s.contains("echo b") {
+                    "b"
+                } else if s.contains("echo c") {
+                    "c"
+                } else {
+                    "d"
+                }
+            })
+            .collect();
+        // a,b,a,b (first loop done) → c,d,c,d (second loop done).
+        assert_eq!(tags, vec!["a", "b", "a", "b", "c", "d", "c", "d"]);
+    }
+
+    #[test]
+    fn resolve_loop_back_returns_target_index_when_under_max() {
+        let yaml = "\
+name: rev
+nodes:
+  - id: a
+    type: bash
+    script: 'x'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'y'
+    loop_back_to: a
+    max_loops: 2
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let order = topological_order(&wf).unwrap();
+        let b = wf.node("b").unwrap();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        let idx = resolve_loop_back(b, &order, &mut counts).unwrap();
+        assert_eq!(order[idx], "a");
+        assert_eq!(counts["b"], 1);
+    }
+
+    #[test]
+    fn resolve_loop_back_returns_none_at_max() {
+        let yaml = "\
+name: rev
+nodes:
+  - id: a
+    type: bash
+    script: 'x'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'y'
+    loop_back_to: a
+    max_loops: 1
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let order = topological_order(&wf).unwrap();
+        let b = wf.node("b").unwrap();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        counts.insert("b".to_string(), 1); // already looped once
+        assert!(resolve_loop_back(b, &order, &mut counts).is_none());
+    }
+
+    #[test]
+    fn resolve_loop_back_returns_none_when_no_loop_back_to() {
+        let yaml = "\
+name: lin
+nodes:
+  - id: a
+    type: bash
+    script: 'x'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let order = topological_order(&wf).unwrap();
+        let a = wf.node("a").unwrap();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        assert!(resolve_loop_back(a, &order, &mut counts).is_none());
     }
 
     #[test]
