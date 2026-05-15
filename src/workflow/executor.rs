@@ -1,12 +1,16 @@
 //! Phase-1 workflow executor.
 //!
 //! Drives a parsed [`Workflow`] against a [`RuntimeAdapter`], agent
-//! registry, and [`SessionStore`]. Supports `NodeKind::Agent`,
-//! `NodeKind::Bash`, `NodeKind::Gate`, `NodeKind::Assert`,
-//! `loop_back_to`, and `when:` predicates over upstream `outputs:`.
+//! registry, and [`SessionStore`]. Supports every `NodeKind`:
+//! `Agent`, `Bash`, `Gate`, `Assert`, `Fanout` — plus `loop_back_to`
+//! and `when:` predicates over upstream `outputs:`.
 //!
-//! `NodeKind::Fanout` is parsed and validated upstream but rejected here
-//! until parallel-sibling execution lands.
+//! Fanout siblings are excluded from the main topological order
+//! (they're owned by their fanout, not standalone-scheduled) and run
+//! in parallel via `std::thread::scope` when the fanout fires. Sibling
+//! `outputs:` flow into the same accumulator the rest of the workflow
+//! uses, so downstream `when:` predicates can gate on parallel
+//! discoveries.
 //!
 //! Lifecycle: `Created → Running → (Failed on node failure | Completed on
 //! all nodes done)`. Each node bumps `current_node` so the TUI/sidebar can
@@ -101,8 +105,6 @@ impl WorkflowExecutor {
     pub fn execute(&self, req: &ExecuteRequest<'_>) -> Result<Session> {
         validate(req.workflow).context("workflow failed static validation")?;
         let order = topological_order(req.workflow)?;
-        reject_unsupported_node_kinds(req.workflow)?;
-
         let mut session = Session::new(
             req.session_id.clone(),
             &req.workflow.name,
@@ -130,8 +132,6 @@ impl WorkflowExecutor {
     pub fn resume(&self, req: &ExecuteRequest<'_>) -> Result<Session> {
         validate(req.workflow).context("workflow failed static validation")?;
         let order = topological_order(req.workflow)?;
-        reject_unsupported_node_kinds(req.workflow)?;
-
         let mut session = req
             .store
             .load(&req.session_id)
@@ -232,19 +232,36 @@ impl WorkflowExecutor {
                 return Ok(());
             }
 
-            if let Err(err) = self.run_node(req, node, session, &outputs) {
+            // Run the node. Fanout dispatches its siblings in
+            // parallel; everything else falls through to the regular
+            // single-node path.
+            let run_result = if let NodeKind::Fanout { siblings } = &node.kind {
+                self.run_fanout_node(req, node, siblings, session, &outputs)
+            } else {
+                self.run_node(req, node, session, &outputs)
+            };
+            if let Err(err) = run_result {
                 self.mark_failed(req, session, &err);
                 return Err(err);
             }
 
-            // After a successful run, extract any declared `outputs:`
-            // from the node's `<node_id>.outputs.json` so downstream
-            // `when:` predicates can see them. Missing file or missing
-            // key when outputs are declared is a node failure.
+            // After a successful run, extract any declared `outputs:`.
+            // For a fanout, the outputs live on each sibling (the
+            // fanout itself is just a dispatcher), so we extract per
+            // sibling. For everything else it's the node itself.
             let artifacts_dir = req.store.session_dir(&session.id).join("artifacts");
-            if let Err(err) = extract_outputs(&artifacts_dir, node, &mut outputs) {
-                self.mark_failed(req, session, &err);
-                return Err(err);
+            let extract_targets: Vec<&Node> = match &node.kind {
+                NodeKind::Fanout { siblings } => siblings
+                    .iter()
+                    .filter_map(|sid| req.workflow.node(sid))
+                    .collect(),
+                _ => vec![node],
+            };
+            for target in extract_targets {
+                if let Err(err) = extract_outputs(&artifacts_dir, target, &mut outputs) {
+                    self.mark_failed(req, session, &err);
+                    return Err(err);
+                }
             }
 
             i = match resolve_loop_back(node, order, &mut session.loop_counts) {
@@ -524,6 +541,115 @@ impl WorkflowExecutor {
         }
     }
 
+    /// Execute a fanout node's siblings in parallel. Each sibling runs
+    /// through the same [`Self::run_node`] machinery agent / bash /
+    /// assert / gate use, but inside its own thread. After all join,
+    /// any failure aggregates into a single error naming every
+    /// sibling that failed.
+    ///
+    /// Sibling output extraction is left to the caller (`run_loop`),
+    /// which knows the artifacts dir and the outputs accumulator. We
+    /// just confirm the parallel slate completed.
+    ///
+    /// Gates inside a fanout sibling are rejected — pausing one of
+    /// N parallel branches leaves the slate in an unwell state we
+    /// haven't designed for in v1. Users wanting "fan out and pause"
+    /// should put the gate downstream of the fanout instead.
+    fn run_fanout_node(
+        &self,
+        req: &ExecuteRequest<'_>,
+        node: &Node,
+        siblings: &[String],
+        session: &Session,
+        outputs: &OutputMap,
+    ) -> Result<()> {
+        let sibling_nodes: Vec<&Node> = siblings
+            .iter()
+            .map(|sid| {
+                req.workflow.node(sid).ok_or_else(|| {
+                    anyhow!(
+                        "internal: fanout `{}` references sibling `{sid}` that doesn't exist \
+                         (validate should have caught this)",
+                        node.id
+                    )
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        for sib in &sibling_nodes {
+            if matches!(sib.kind, NodeKind::Gate { .. } | NodeKind::Fanout { .. }) {
+                bail!(
+                    "fanout `{}` sibling `{}` is kind {:?} — gate/fanout inside a fanout is not supported in v1",
+                    node.id,
+                    sib.id,
+                    sib.kind
+                );
+            }
+        }
+
+        let log_path = self.node_log_path(req, session, &node.id);
+
+        let results: Vec<Result<()>> = std::thread::scope(|scope| {
+            // The `collect()` between spawn and join is deliberate, not
+            // wasteful: fusing the iterators would join each thread
+            // before spawning the next, serialising the slate. Suppress
+            // the needless-collect lint locally.
+            #[allow(clippy::needless_collect)]
+            let handles: Vec<_> = sibling_nodes
+                .iter()
+                .map(|sib| scope.spawn(|| self.run_node(req, sib, session, outputs)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| match h.join() {
+                    Ok(r) => r,
+                    Err(panic) => Err(anyhow!("sibling thread panicked: {panic:?}")),
+                })
+                .collect()
+        });
+
+        let mut failed: Vec<(String, String)> = Vec::new();
+        for (sib, res) in sibling_nodes.iter().zip(results) {
+            if let Err(err) = res {
+                failed.push((sib.id.clone(), format!("{err:#}")));
+            }
+        }
+
+        if failed.is_empty() {
+            let body = format!(
+                "--- fanout ok ({} siblings) ---\n{}\n",
+                sibling_nodes.len(),
+                sibling_nodes
+                    .iter()
+                    .map(|s| s.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            if let Err(err) = std::fs::write(&log_path, body) {
+                tracing::warn!(?err, log = %log_path.display(), "writing fanout log failed");
+            }
+            Ok(())
+        } else {
+            let combined = failed
+                .iter()
+                .map(|(id, err)| format!("  - {id}: {err}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = format!(
+                "--- fanout failed: {}/{} siblings failed ---\n{combined}\n",
+                failed.len(),
+                sibling_nodes.len(),
+            );
+            let _ = std::fs::write(&log_path, body);
+            bail!(
+                "fanout node `{}` had {} sibling failure(s) (log at {}):\n{combined}",
+                node.id,
+                failed.len(),
+                log_path.display(),
+            );
+        }
+    }
+
     fn node_log_path(
         &self,
         req: &ExecuteRequest<'_>,
@@ -777,28 +903,6 @@ fn shell_quote_value(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Phase 2 supports agent + bash + gate + assert + `loop_back_to`.
-/// Fanout (parallel siblings) lands in a later commit — until then
-/// it's rejected at the top of `execute` so the session row never
-/// gets created for unsupported workflows.
-fn reject_unsupported_node_kinds(wf: &Workflow) -> Result<()> {
-    for n in &wf.nodes {
-        match &n.kind {
-            NodeKind::Agent { .. }
-            | NodeKind::Bash { .. }
-            | NodeKind::Gate { .. }
-            | NodeKind::Assert { .. } => {}
-            NodeKind::Fanout { .. } => bail!(
-                "executor does not yet support fanout nodes (workflow `{}`, node `{}`); \
-                 parallel sibling execution lands in a later commit",
-                wf.name,
-                n.id
-            ),
-        }
-    }
-    Ok(())
-}
-
 /// Decide whether a node's `loop_back_to` fires, returning the index in
 /// `order` to jump to. `None` means "continue forward". The per-node
 /// loop counter is mutated in place; an unrecognised target (which
@@ -820,19 +924,49 @@ fn resolve_loop_back(
     Some(target_idx)
 }
 
+/// Set of node ids that appear as siblings in some fanout node. These
+/// are "owned" by the fanout: they execute when the fanout fires, not
+/// through the main topological schedule. Returns an empty set when no
+/// fanout exists, which is the common case.
+fn owned_fanout_siblings(wf: &Workflow) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for n in &wf.nodes {
+        if let NodeKind::Fanout { siblings } = &n.kind {
+            for s in siblings {
+                out.insert(s.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Kahn's algorithm topo sort with stable tie-breaking (alphabetical by id)
 /// so logs and tests get deterministic ordering across runs. Returns ids
 /// in execution order. Cycles are rejected upstream via `validate`; if one
 /// slips through here we still surface a clear error.
+///
+/// Fanout siblings are excluded from the order — they execute as part of
+/// their owning fanout's run, not as standalone scheduled nodes. Their
+/// edges are also dropped from indegree/adjacency so a non-fanout node
+/// that (oddly) depends on a sibling doesn't get stranded with an
+/// indegree it can never satisfy.
 fn topological_order(wf: &Workflow) -> Result<Vec<String>> {
-    let mut indegree: HashMap<String, usize> = wf
-        .nodes
+    let owned = owned_fanout_siblings(wf);
+    let active: Vec<&Node> = wf.nodes.iter().filter(|n| !owned.contains(&n.id)).collect();
+
+    let mut indegree: HashMap<String, usize> = active
         .iter()
-        .map(|n| (n.id.clone(), n.depends_on.len()))
+        .map(|n| {
+            let deg = n.depends_on.iter().filter(|d| !owned.contains(*d)).count();
+            (n.id.clone(), deg)
+        })
         .collect();
     let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
-    for n in &wf.nodes {
+    for n in &active {
         for dep in &n.depends_on {
+            if owned.contains(dep) {
+                continue;
+            }
             adjacency.entry(dep.clone()).or_default().push(n.id.clone());
         }
     }
@@ -845,7 +979,7 @@ fn topological_order(wf: &Workflow) -> Result<Vec<String>> {
     ready.sort();
     let mut queue: VecDeque<String> = ready.into();
 
-    let mut order = Vec::with_capacity(wf.nodes.len());
+    let mut order = Vec::with_capacity(active.len());
     while let Some(id) = queue.pop_front() {
         order.push(id.clone());
         let mut next: Vec<String> = adjacency.remove(&id).unwrap_or_default();
@@ -859,12 +993,14 @@ fn topological_order(wf: &Workflow) -> Result<Vec<String>> {
             }
         }
     }
-    if order.len() != wf.nodes.len() {
+    if order.len() != active.len() {
         bail!(
-            "workflow `{}` is not a DAG (topological sort produced {} of {} nodes)",
+            "workflow `{}` is not a DAG (topological sort produced {} of {} active nodes; \
+             {} fanout sibling(s) excluded by ownership)",
             wf.name,
             order.len(),
-            wf.nodes.len()
+            active.len(),
+            owned.len(),
         );
     }
     Ok(order)
@@ -1732,16 +1868,211 @@ nodes:
         );
     }
 
+    // === fanout ===
+
     #[test]
-    fn fanout_node_is_rejected() {
+    fn topological_order_excludes_fanout_siblings() {
+        // The fanout itself stays in the schedule; its siblings are
+        // owned by the fanout and don't appear in the main order.
         let yaml = "\
 name: with-fanout
 nodes:
-  - id: f
+  - id: lint
+    type: bash
+    script: 'lint'
+  - id: typecheck
+    type: bash
+    script: 'tc'
+  - id: parallel-checks
     type: fanout
-    siblings: [a]
+    siblings: [lint, typecheck]
+  - id: merge
+    depends_on: [parallel-checks]
+    type: bash
+    script: 'merge'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let order = topological_order(&wf).unwrap();
+        assert_eq!(
+            order,
+            vec!["parallel-checks".to_string(), "merge".to_string()],
+            "siblings should be excluded; fanout + downstream remain"
+        );
+    }
+
+    #[test]
+    fn fanout_runs_all_siblings_and_workflow_completes() {
+        // Each sibling fires exactly once; the fanout node itself runs
+        // last (in topo order) and gets a `--- fanout ok ---` log.
+        let yaml = "\
+name: two-siblings
+nodes:
+  - id: lint
+    type: bash
+    script: 'lint'
+  - id: typecheck
+    type: bash
+    script: 'tc'
+  - id: checks
+    type: fanout
+    siblings: [lint, typecheck]
+";
+        let (session, log) = run_with_call_counter(yaml, "s-fanout-ok");
+        assert_eq!(session.state, SessionState::Completed);
+        let scripts = log.lock().unwrap().clone();
+        // Order between lint/tc isn't deterministic (parallel) but
+        // each should appear exactly once.
+        let lint_count = scripts.iter().filter(|s| s.contains("lint")).count();
+        let tc_count = scripts.iter().filter(|s| s.contains("tc")).count();
+        assert_eq!(lint_count, 1, "lint ran once; got scripts: {scripts:?}");
+        assert_eq!(tc_count, 1, "typecheck ran once; got scripts: {scripts:?}");
+    }
+
+    #[test]
+    fn fanout_with_one_failing_sibling_fails_the_workflow() {
+        // Mock invoker that errors when it sees "boom" in the script.
+        let yaml = "\
+name: one-bad
+nodes:
+  - id: ok
+    type: bash
+    script: 'echo ok'
+  - id: boom
+    type: bash
+    script: 'echo boom'
+  - id: checks
+    type: fanout
+    siblings: [ok, boom]
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(|_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            if s.contains("echo boom") {
+                Err(anyhow!("boom: synthetic failure"))
+            } else {
+                Ok(String::new())
+            }
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-fanout-fail"),
+            issue: None,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fanout node `checks` had 1 sibling failure"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("boom"), "got: {msg}");
+        // Session is Failed; the fanout node's log captures the failure.
+        let loaded = store.load(&SessionId::new("s-fanout-fail")).unwrap();
+        assert_eq!(loaded.state, SessionState::Failed);
+        let fanout_log = std::fs::read_to_string(
+            store.session_dir(&loaded.id).join("logs/checks.log"),
+        )
+        .unwrap();
+        assert!(
+            fanout_log.contains("--- fanout failed:"),
+            "got: {fanout_log}"
+        );
+        assert!(fanout_log.contains("boom:"), "got: {fanout_log}");
+    }
+
+    #[test]
+    fn fanout_sibling_outputs_flow_into_downstream_when() {
+        // A sibling writes an outputs.json; a downstream node gates on
+        // `<sibling>.<key>`. Exercises the post-fanout extract path.
+        let yaml = "\
+name: outputs-from-fanout
+nodes:
+  - id: discover
+    type: bash
+    script: 'write outputs'
+    outputs: { decision: decision }
+  - id: also
+    type: bash
+    script: 'no-op'
+  - id: checks
+    type: fanout
+    siblings: [discover, also]
+  - id: open_pr
+    depends_on: [checks]
+    when: 'discover.decision == \"approve\"'
+    type: bash
+    script: 'echo open'
+  - id: revise
+    depends_on: [checks]
+    when: 'discover.decision == \"changes_requested\"'
+    type: bash
+    script: 'echo revise'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let session_id = SessionId::new("s-fan-when");
+        let af = store.session_dir(&session_id).join("artifacts");
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            if s.contains("write outputs") {
+                std::fs::write(af.join("discover.outputs.json"), r#"{"decision":"approve"}"#)
+                    .unwrap();
+            }
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: session_id.clone(),
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+        // open_pr ran (no skip marker); revise was skipped.
+        let open_log =
+            std::fs::read_to_string(store.session_dir(&session_id).join("logs/open_pr.log"))
+                .unwrap();
+        assert!(!open_log.contains("--- skipped"), "got: {open_log}");
+        let revise_log =
+            std::fs::read_to_string(store.session_dir(&session_id).join("logs/revise.log"))
+                .unwrap();
+        assert!(revise_log.contains("--- skipped:"), "got: {revise_log}");
+    }
+
+    #[test]
+    fn fanout_rejects_gate_sibling() {
+        let yaml = "\
+name: bad-fanout
+nodes:
   - id: a
-    agent: claude-code
+    type: bash
+    script: 'echo a'
+  - id: g
+    type: gate
+    summary: 'why is this here'
+  - id: checks
+    type: fanout
+    siblings: [a, g]
 ";
         let wf = Workflow::from_str_at(yaml, "/x").unwrap();
         let adapter = local_adapter_with_stdout("");
@@ -1756,11 +2087,14 @@ nodes:
             store: &store,
             devcontainer: &dc,
             workspace: Path::new("/repo"),
-            session_id: SessionId::new("s-fan"),
+            session_id: SessionId::new("s-fan-gate"),
             issue: None,
         };
         let err = executor.execute(&req).unwrap_err();
-        assert!(format!("{err:#}").contains("does not yet support fanout nodes"));
+        assert!(
+            format!("{err:#}").contains("gate/fanout inside a fanout is not supported"),
+            "got: {err:#}"
+        );
     }
 
     /// Helper: run `yaml` against an invoker that counts how many times
