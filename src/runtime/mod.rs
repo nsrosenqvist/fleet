@@ -202,12 +202,51 @@ pub trait RuntimeAdapter: Send + Sync {
     /// primary crash signal is the driver pid, not container state —
     /// fleet sessions tear down their containers per node, so by the
     /// time a session is "stuck", its containers are usually already
-    /// gone. This predicate exists for a future enhancement that stops
-    /// orphaned containers after a reap; for now it's the contract that
-    /// future enhancement will consume.
-    #[allow(dead_code)]
+    /// gone. Used by [`AdapterStopper`] to skip the engine-level
+    /// `stop` call for containers that have already exited (saves an
+    /// engine round-trip when many leaks are stale).
     fn is_running(&self, container: &ContainerId) -> Result<bool> {
         Ok(matches!(self.inspect(container)?, ContainerState::Running))
+    }
+}
+
+/// Bridge between [`RuntimeAdapter`] and [`crate::session::reaper::ContainerStopper`].
+/// Lives here (rather than in `session::reaper`) so the session module
+/// doesn't have to depend on runtime details.
+///
+/// Owns the boxed adapter so callers can hand off a one-shot stopper
+/// without juggling separate lifetimes: the typical use is to build
+/// an adapter, wrap it in a stopper, pass it to `reaper::reap`, and
+/// drop everything at the end of the sweep.
+///
+/// The stopper short-circuits when the engine already considers the
+/// container gone — saves an engine round-trip across a list of stale
+/// leaks, and lets `Inspect` errors fall through to the actual stop
+/// call so transient probe failures don't masquerade as success. Stop
+/// errors from the adapter pass through verbatim so the caller can
+/// list them as failed-to-stop entries.
+pub struct AdapterStopper {
+    adapter: Box<dyn RuntimeAdapter>,
+}
+
+impl AdapterStopper {
+    #[must_use]
+    pub fn new(adapter: Box<dyn RuntimeAdapter>) -> Self {
+        Self { adapter }
+    }
+}
+
+impl crate::session::reaper::ContainerStopper for AdapterStopper {
+    fn stop(&self, container_id: &str) -> Result<()> {
+        let id = ContainerId::new(container_id);
+        match self.adapter.is_running(&id) {
+            // Already gone — nothing to stop.
+            Ok(false) => Ok(()),
+            // Running, or we can't tell. Either way attempt the stop;
+            // `stop` is contract-idempotent so it's safe to call on a
+            // probably-dead container.
+            _ => self.adapter.stop(&id),
+        }
     }
 }
 

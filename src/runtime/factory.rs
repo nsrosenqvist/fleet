@@ -11,16 +11,18 @@
 //! `fleet runtime …` commands and shouldn't leak implementation jargon.
 
 use anyhow::{Result, bail};
+use std::path::Path;
 use std::sync::Arc;
 
 use super::apple_container::AppleContainerAdapter;
-use super::detect::{BackendKind, ProbeReport};
+use super::detect::{BackendKind, ProbeReport, probe};
 use super::docker::DockerAdapter;
 use super::local::LocalAdapter;
 use super::podman::PodmanAdapter;
-use super::RuntimeAdapter;
-use crate::process::ProcessInvoker;
-use crate::repo_config::{AdapterChoice, HardeningChoice, RuntimeConfig};
+use super::{AdapterStopper, RuntimeAdapter};
+use crate::process::{ProcessInvoker, RealProcessInvoker};
+use crate::repo_config::{AdapterChoice, HardeningChoice, RepoConfig, RuntimeConfig};
+use crate::session::reaper::{ContainerStopper, NoopStopper};
 
 /// Build the runtime adapter for this host given the repo config and a fresh
 /// probe report. `invoker` is shared with the constructed adapter; callers
@@ -154,6 +156,36 @@ fn probe_docker_rootless(invoker: &dyn ProcessInvoker) -> bool {
             ],
         )
         .is_ok_and(|stdout| stdout.contains("name=rootless"))
+}
+
+/// Build a `ContainerStopper` for the fleet root at `fleet_root`,
+/// falling back to [`NoopStopper`] on any failure. The reaper calls
+/// this at startup; a misconfigured `.fleet/config.yaml` (or one that
+/// references an uninstalled engine) must not prevent the reaper from
+/// transitioning crashed sessions out of `Running`. Failures are
+/// logged at `warn` so users still see what went wrong if they're
+/// investigating.
+///
+/// The boxed stopper owns its adapter — it's a one-shot built for
+/// the sweep, not the long-lived adapter the workflow executor uses.
+pub fn build_stopper(fleet_root: &Path) -> Box<dyn ContainerStopper> {
+    let config_path = fleet_root.join(".fleet/config.yaml");
+    let config = match RepoConfig::load(&config_path) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %config_path.display(), "stopper: falling back to noop (config unreadable)");
+            return Box::new(NoopStopper);
+        }
+    };
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+    let report = probe(invoker.as_ref());
+    match build_adapter(&config.runtime, &report, invoker) {
+        Ok(adapter) => Box::new(AdapterStopper::new(adapter)),
+        Err(err) => {
+            tracing::warn!(error = %err, "stopper: falling back to noop (adapter build failed)");
+            Box::new(NoopStopper)
+        }
+    }
 }
 
 #[cfg(test)]

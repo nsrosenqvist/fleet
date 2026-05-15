@@ -85,6 +85,34 @@ impl PidProbe for RealPidProbe {
     }
 }
 
+/// Port for stopping containers the reaper rediscovers as leaked. The
+/// trait deliberately takes container ids as `&str` — not the runtime
+/// crate's `ContainerId` — so this module does not depend on
+/// `crate::runtime`. The runtime crate provides the production
+/// implementation via [`crate::runtime::AdapterStopper`].
+///
+/// Stop is required to be idempotent: a container the engine already
+/// reaped on its own should not produce an error. Per-id failures are
+/// surfaced through the [`ReapedSession::failed_container_stops`]
+/// list; they don't fail the whole sweep.
+pub trait ContainerStopper: Send + Sync {
+    fn stop(&self, container_id: &str) -> Result<()>;
+}
+
+/// Stopper for callers without a real container engine (tests; sweeps
+/// against a fleet root whose `.fleet/config.yaml` is missing or
+/// unparseable). Records nothing; succeeds for every id. With a noop
+/// stopper, leaked-container markers are still cleared and listed in
+/// `crash.json` — only the engine-level stop is skipped.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopStopper;
+
+impl ContainerStopper for NoopStopper {
+    fn stop(&self, _container_id: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Why a session was reaped. Surfaced in the [`ReapReport`] returned to
 /// the caller and persisted into `crash.json` for post-hoc inspection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -117,6 +145,17 @@ impl ReapReason {
 pub struct ReapedSession {
     pub id: SessionId,
     pub reason: ReapReason,
+    /// Container ids the stopper killed successfully. Always a subset
+    /// of the `leaked_containers` recorded in `crash.json`. With
+    /// [`NoopStopper`], every id ends up here (the noop reports
+    /// success).
+    pub stopped_containers: Vec<String>,
+    /// Container ids the stopper attempted and failed. The user should
+    /// reclaim these manually (`fleet runtime stop <id>` or
+    /// `podman stop <id>` etc.). `crash.json` retains the full leaked
+    /// list so this stays a per-tick view; long-term recovery is in
+    /// the snapshot.
+    pub failed_container_stops: Vec<String>,
 }
 
 /// Outcome of a [`reap`] sweep. `scanned` is the total number of
@@ -140,6 +179,7 @@ pub struct ReapReport {
 pub fn reap(
     store: &SessionStore,
     probe: &dyn PidProbe,
+    stopper: &dyn ContainerStopper,
     now_ms: u64,
 ) -> Result<ReapReport> {
     let mut report = ReapReport::default();
@@ -169,7 +209,16 @@ pub fn reap(
         }
         session.clear_driver_pid(now_ms);
 
-        if let Err(err) = write_crash_snapshot(store, &session, &reason) {
+        // Inspect the leaked-container markers up front so we can
+        // record them in crash.json *and* try to stop each one.
+        // Persisting the snapshot before attempting any stop means a
+        // crash mid-stop still leaves a forensic record on disk.
+        let session_dir = store.session_dir(&session.id);
+        let leaked = containers::list_active(&session_dir).unwrap_or_else(|err| {
+            tracing::warn!(session = %session.id, error = %err, "listing active container markers failed");
+            Vec::new()
+        });
+        if let Err(err) = write_crash_snapshot(store, &session, &reason, &leaked) {
             tracing::warn!(session = %id, error = %err, "reaper: writing crash.json failed");
         }
 
@@ -178,12 +227,50 @@ pub fn reap(
             continue;
         }
 
+        // Best-effort stop for each leaked container; the markers come
+        // off after, regardless of stop outcome, so a second reap
+        // doesn't loop on a stuck-shutdown container forever.
+        let (killed, unkilled) = stop_leaked(stopper, &session.id, &leaked);
+        if let Err(err) = containers::clear_all(&session_dir) {
+            tracing::warn!(session = %session.id, error = %err, "clearing container markers failed");
+        }
+
         report.reaped.push(ReapedSession {
             id: session.id.clone(),
             reason,
+            stopped_containers: killed,
+            failed_container_stops: unkilled,
         });
     }
     Ok(report)
+}
+
+/// Apply the stopper to each leaked container id. Returns `(stopped,
+/// failed)` so the caller can fold the outcome into [`ReapedSession`].
+/// Per-id errors are logged at `warn` and accumulated in the failure
+/// list; they never short-circuit the sweep.
+fn stop_leaked(
+    stopper: &dyn ContainerStopper,
+    session_id: &SessionId,
+    leaked: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut killed = Vec::new();
+    let mut unkilled = Vec::new();
+    for cid in leaked {
+        match stopper.stop(cid) {
+            Ok(()) => killed.push(cid.clone()),
+            Err(err) => {
+                tracing::warn!(
+                    session = %session_id,
+                    container = %cid,
+                    error = %err,
+                    "reaper: stopping leaked container failed; user must reclaim manually"
+                );
+                unkilled.push(cid.clone());
+            }
+        }
+    }
+    (killed, unkilled)
 }
 
 /// Pure classifier: what reason (if any) would justify reaping this
@@ -232,13 +319,10 @@ fn write_crash_snapshot(
     store: &SessionStore,
     session: &Session,
     reason: &ReapReason,
+    leaked_containers: &[String],
 ) -> Result<()> {
     let session_dir = store.session_dir(&session.id);
     let log_tails = collect_log_tails(&session_dir.join("logs"))?;
-    let leaked_containers = containers::list_active(&session_dir).unwrap_or_else(|err| {
-        tracing::warn!(session = %session.id, error = %err, "listing active container markers failed");
-        Vec::new()
-    });
     let snapshot = CrashSnapshot {
         session_id: session.id.as_str(),
         workflow: &session.workflow,
@@ -246,7 +330,7 @@ fn write_crash_snapshot(
         reason,
         node_at_crash: session.current_node.as_deref(),
         crashed_at_ms: session.updated_at_ms,
-        leaked_containers,
+        leaked_containers: leaked_containers.to_vec(),
         log_tails,
     };
     let path = session_dir.join("crash.json");
@@ -254,13 +338,6 @@ fn write_crash_snapshot(
         .context("serialising crash snapshot")?;
     std::fs::write(&path, body)
         .with_context(|| format!("writing {}", path.display()))?;
-    // Clear the markers so a second reap doesn't re-report the same
-    // orphans forever. The user has the ids in crash.json now;
-    // fleet's bookkeeping for "this session has live containers" is
-    // also done.
-    if let Err(err) = containers::clear_all(&session_dir) {
-        tracing::warn!(session = %session.id, error = %err, "clearing container markers failed");
-    }
     Ok(())
 }
 
@@ -386,7 +463,7 @@ mod tests {
     fn empty_store_returns_empty_report() {
         let (_d, store) = fresh_store();
         let probe = ScriptedProbe::with_alive([]);
-        let r = reap(&store, &probe, 9_000).unwrap();
+        let r = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         assert_eq!(r.scanned, 0);
         assert!(r.reaped.is_empty());
     }
@@ -456,7 +533,7 @@ mod tests {
         let (_d, store) = fresh_store();
         create_session(&store, "s-orphan", SessionState::Running, Some(99_999));
         let probe = ScriptedProbe::with_alive([]);
-        let r = reap(&store, &probe, 9_000).unwrap();
+        let r = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         assert_eq!(r.scanned, 1);
         assert_eq!(r.reaped.len(), 1);
         assert_eq!(r.reaped[0].id, SessionId::new("s-orphan"));
@@ -481,7 +558,7 @@ mod tests {
         )
         .unwrap();
         let probe = ScriptedProbe::with_alive([]);
-        let _ = reap(&store, &probe, 9_000).unwrap();
+        let _ = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         let snap_path = store.session_dir(&s.id).join("crash.json");
         assert!(snap_path.exists(), "crash.json must be written next to meta.json");
         let body = std::fs::read_to_string(&snap_path).unwrap();
@@ -507,7 +584,7 @@ mod tests {
         containers::mark_active(&store.session_dir(&s.id), "c-aaa").unwrap();
         containers::mark_active(&store.session_dir(&s.id), "c-bbb").unwrap();
         let probe = ScriptedProbe::with_alive([]);
-        let _ = reap(&store, &probe, 9_000).unwrap();
+        let _ = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         let body = std::fs::read_to_string(store.session_dir(&s.id).join("crash.json")).unwrap();
         assert!(body.contains("\"c-aaa\""), "got: {body}");
         assert!(body.contains("\"c-bbb\""), "got: {body}");
@@ -521,13 +598,125 @@ mod tests {
         let s = create_session(&store, "s-leaky", SessionState::Running, Some(99_999));
         containers::mark_active(&store.session_dir(&s.id), "c-aaa").unwrap();
         let probe = ScriptedProbe::with_alive([]);
-        let _ = reap(&store, &probe, 9_000).unwrap();
+        let _ = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         assert!(
             containers::list_active(&store.session_dir(&s.id))
                 .unwrap()
                 .is_empty(),
             "markers must be cleared after they land in crash.json"
         );
+    }
+
+    /// Stopper that records every id asked of it; configurable to
+    /// fail certain ids so the failure-list path can be exercised.
+    struct RecordingStopper {
+        stopped: Mutex<Vec<String>>,
+        fail_ids: HashSet<String>,
+    }
+
+    impl RecordingStopper {
+        fn new() -> Self {
+            Self {
+                stopped: Mutex::new(Vec::new()),
+                fail_ids: HashSet::new(),
+            }
+        }
+
+        fn failing(fail_ids: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                stopped: Mutex::new(Vec::new()),
+                fail_ids: fail_ids.into_iter().map(String::from).collect(),
+            }
+        }
+    }
+
+    impl ContainerStopper for RecordingStopper {
+        fn stop(&self, container_id: &str) -> Result<()> {
+            self.stopped.lock().unwrap().push(container_id.to_string());
+            if self.fail_ids.contains(container_id) {
+                Err(anyhow::anyhow!(
+                    "synthetic stop failure for {container_id}"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn reap_calls_stopper_for_each_leaked_container() {
+        // Two markers staged before the reap; the stopper should be
+        // asked about each one exactly once and both should land in
+        // `stopped_containers`.
+        let (_d, store) = fresh_store();
+        let s = create_session(&store, "s-leak", SessionState::Running, Some(99_999));
+        containers::mark_active(&store.session_dir(&s.id), "c-aaa").unwrap();
+        containers::mark_active(&store.session_dir(&s.id), "c-bbb").unwrap();
+        let probe = ScriptedProbe::with_alive([]);
+        let stopper = RecordingStopper::new();
+        let r = reap(&store, &probe, &stopper, 9_000).unwrap();
+        let mut asked = stopper.stopped.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, vec!["c-aaa".to_string(), "c-bbb".to_string()]);
+        assert_eq!(r.reaped.len(), 1);
+        let mut reported = r.reaped[0].stopped_containers.clone();
+        reported.sort();
+        assert_eq!(reported, vec!["c-aaa".to_string(), "c-bbb".to_string()]);
+        assert!(r.reaped[0].failed_container_stops.is_empty());
+    }
+
+    #[test]
+    fn reap_records_stopper_failures_without_failing_the_sweep() {
+        // The stopper errors on `c-bad` but succeeds on `c-good`.
+        // Both ids must be reflected in the report; the second
+        // session in the store must still get reaped.
+        let (_d, store) = fresh_store();
+        let s1 = create_session(&store, "s-1", SessionState::Running, Some(99_991));
+        containers::mark_active(&store.session_dir(&s1.id), "c-good").unwrap();
+        containers::mark_active(&store.session_dir(&s1.id), "c-bad").unwrap();
+        let _s2 = create_session(&store, "s-2", SessionState::Running, Some(99_992));
+        let probe = ScriptedProbe::with_alive([]);
+        let stopper = RecordingStopper::failing(["c-bad"]);
+        let r = reap(&store, &probe, &stopper, 9_000).unwrap();
+        assert_eq!(r.reaped.len(), 2, "both sessions must be reaped");
+        let s1_entry = r
+            .reaped
+            .iter()
+            .find(|e| e.id == SessionId::new("s-1"))
+            .unwrap();
+        assert_eq!(s1_entry.stopped_containers, vec!["c-good".to_string()]);
+        assert_eq!(s1_entry.failed_container_stops, vec!["c-bad".to_string()]);
+        // Markers still get cleared even though one stop failed —
+        // leaving them would cause forever-growing re-reports.
+        assert!(
+            containers::list_active(&store.session_dir(&s1.id))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reap_with_no_leaked_containers_skips_the_stopper() {
+        // A session that crashed before starting an agent node has
+        // no container markers. The stopper should not be called at
+        // all — fewer engine round-trips means a faster sweep.
+        let (_d, store) = fresh_store();
+        let _s = create_session(&store, "s-no-leak", SessionState::Running, Some(99_999));
+        let probe = ScriptedProbe::with_alive([]);
+        let stopper = RecordingStopper::new();
+        let _r = reap(&store, &probe, &stopper, 9_000).unwrap();
+        assert!(
+            stopper.stopped.lock().unwrap().is_empty(),
+            "no markers => stopper untouched; saw: {:?}",
+            stopper.stopped.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn noop_stopper_reports_success_for_every_id() {
+        let s = NoopStopper;
+        assert!(s.stop("anything").is_ok());
+        assert!(s.stop("").is_ok());
     }
 
     #[test]
@@ -537,7 +726,7 @@ mod tests {
         create_session(&store, "s-fail", SessionState::Failed, None);
         create_session(&store, "s-gate", SessionState::AwaitingGate, None);
         let probe = ScriptedProbe::with_alive([]);
-        let r = reap(&store, &probe, 9_000).unwrap();
+        let r = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         assert_eq!(r.scanned, 3);
         assert!(r.reaped.is_empty(), "terminal + gated sessions must not be reaped");
         // States unchanged.
@@ -556,7 +745,7 @@ mod tests {
         let (_d, store) = fresh_store();
         create_session(&store, "s-alive", SessionState::Running, Some(42));
         let probe = ScriptedProbe::with_alive([42]);
-        let r = reap(&store, &probe, 9_000).unwrap();
+        let r = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         assert_eq!(r.scanned, 1);
         assert!(r.reaped.is_empty());
         assert_eq!(
@@ -570,7 +759,7 @@ mod tests {
         let (_d, store) = fresh_store();
         create_session(&store, "s-nopid", SessionState::Running, None);
         let probe = ScriptedProbe::with_alive([]);
-        let r = reap(&store, &probe, 9_000).unwrap();
+        let r = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         assert_eq!(r.reaped.len(), 1);
         assert_eq!(r.reaped[0].reason, ReapReason::NoDriverPid);
     }
@@ -583,7 +772,7 @@ mod tests {
         create_session(&store, "s-done", SessionState::Completed, None);
         create_session(&store, "s-gate", SessionState::AwaitingGate, None);
         let probe = ScriptedProbe::with_alive([7]);
-        let r = reap(&store, &probe, 9_000).unwrap();
+        let r = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         assert_eq!(r.scanned, 4);
         assert_eq!(r.reaped.len(), 1);
         assert_eq!(r.reaped[0].id, SessionId::new("s-dead"));
@@ -602,7 +791,7 @@ mod tests {
         s.driver_pid = Some(42);
         store.save(&s).unwrap();
         let probe = RecordingProbe::new();
-        let _ = reap(&store, &probe, 9_000).unwrap();
+        let _ = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         assert!(
             probe.asked.lock().unwrap().is_empty(),
             "completed session should not be probed; asked = {:?}",
@@ -629,7 +818,7 @@ mod tests {
         });
         store.save(&s).unwrap();
         let probe = ScriptedProbe::with_alive([]);
-        let _ = reap(&store, &probe, 9_000).unwrap();
+        let _ = reap(&store, &probe, &NoopStopper, 9_000).unwrap();
         let loaded = store.load(&SessionId::new("s-iss")).unwrap();
         assert_eq!(loaded.state, SessionState::Crashed);
         assert!(loaded.issue.is_some(), "issue context must survive reap");
