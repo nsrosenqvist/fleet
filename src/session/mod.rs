@@ -33,6 +33,22 @@ pub mod store;
 
 pub use aggregate::Session;
 pub use state::SessionState;
+
+/// Issue the workflow is acting on, when one was supplied via the
+/// tracker. Persisted on the session so that a `fleet workflow resume`
+/// after a gate retains the original `--issue` context without the
+/// caller having to re-specify it.
+///
+/// Lives here (rather than under `workflow::executor`) because it's a
+/// session-level fact, not an execution-local concern.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueContext {
+    /// Opaque tracker id (`"gh:42"`, full git-bug hash).
+    pub id: String,
+    /// User-facing id (`"42"`, short git-bug hash).
+    pub human_id: String,
+    pub title: String,
+}
 // `store::SessionStore` is intentionally not re-exported yet: nothing in
 // the binary references it from outside the `session` module, so a
 // top-level `pub use` would trip the `unused_imports` lint that the

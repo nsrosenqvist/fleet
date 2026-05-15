@@ -17,7 +17,7 @@
 //! the same devcontainer don't rebuild.
 
 use anyhow::{Context, Result, anyhow, bail};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,8 +29,8 @@ use crate::agent::registry::AgentSpec;
 use crate::process::ProcessInvoker;
 use crate::runtime::devcontainer::Devcontainer;
 use crate::runtime::{ContainerSpec, ExecOpts, RuntimeAdapter};
-use crate::session::{Session, SessionId, SessionState, now_ms};
 use crate::session::store::SessionStore;
+use crate::session::{IssueContext, Session, SessionId, SessionState, now_ms};
 
 /// Trait-bound closure type for the clock. Boxed so a single executor can
 /// be reused across runs with different test clocks.
@@ -45,19 +45,6 @@ pub struct WorkflowExecutor {
     /// own invoker.
     invoker: Arc<dyn ProcessInvoker>,
     clock: ClockFn,
-}
-
-/// Issue the workflow is acting on, when one was supplied via the
-/// tracker. `None` means "no issue context" (the workflow ran without
-/// `--issue`). Both forms are first-class: not every workflow needs a
-/// tracker issue (e.g. `fleet workflow run lint`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IssueContext {
-    /// Opaque tracker id (`"gh:42"`, full git-bug hash).
-    pub id: String,
-    /// User-facing id (`"42"`, short git-bug hash).
-    pub human_id: String,
-    pub title: String,
 }
 
 /// What [`WorkflowExecutor::execute`] needs to run one workflow. Bundled
@@ -121,6 +108,10 @@ impl WorkflowExecutor {
             &req.workflow.name,
             (self.clock)(),
         );
+        // Persist the caller's issue context on the session so a
+        // subsequent `fleet workflow resume` after a gate doesn't
+        // lose `FLEET_ISSUE_*` env on downstream nodes.
+        session.issue.clone_from(&req.issue);
         req.store.create(&session)?;
         session.transition_to(SessionState::Running, (self.clock)())?;
         req.store.save(&session)?;
@@ -152,6 +143,15 @@ impl WorkflowExecutor {
                 session.state
             );
         }
+        // Issue context survives resume: if the caller supplied a new
+        // one, it overrides (explicit caller intent wins); otherwise
+        // we keep whatever the original execute() persisted.
+        // `loop_counts` is similarly preserved from the loaded
+        // session — resolve_loop_back mutates it in place so the
+        // counter survives the gate boundary intact.
+        if req.issue.is_some() {
+            session.issue.clone_from(&req.issue);
+        }
         // Resume picks up *after* the gate. Find the gate node's
         // position; an unknown current_node (shouldn't happen but
         // guard) means we restart from index 0.
@@ -180,10 +180,11 @@ impl WorkflowExecutor {
         order: &[String],
         start_idx: usize,
     ) -> Result<()> {
-        let mut loop_counts: HashMap<String, u32> = HashMap::new();
-        // Accumulated outputs from upstream nodes. Re-runs (via
-        // `loop_back_to`) overwrite their own entries, so downstream
-        // `when:` predicates see the freshest decision each pass.
+        // `loop_counts` lives on the session so a resume after a gate
+        // doesn't reset cycle progress. Outputs aren't persisted today:
+        // workflows that gate *between* an output-producing node and a
+        // `when:`-gated downstream consumer would lose context on
+        // resume. Land that fix when a workflow exercises it.
         let mut outputs: OutputMap = HashMap::new();
         let mut i = start_idx;
         while i < order.len() {
@@ -246,7 +247,16 @@ impl WorkflowExecutor {
                 return Err(err);
             }
 
-            i = resolve_loop_back(node, order, &mut loop_counts).map_or(i + 1, |t| t);
+            i = match resolve_loop_back(node, order, &mut session.loop_counts) {
+                Some(target) => {
+                    // Persist the bumped counter so a future resume
+                    // after a gate continues from the same slot
+                    // rather than restarting the cycle.
+                    req.store.save(session)?;
+                    target
+                }
+                None => i + 1,
+            };
         }
         Ok(())
     }
@@ -371,7 +381,10 @@ impl WorkflowExecutor {
         let agent_ctx = AgentContext {
             persona,
             prompt: prompt.as_ref(),
-            issue: req.issue.as_ref(),
+            // Read from the persisted session so resume runs see the
+            // original `--issue`; `execute()` copies `req.issue` here
+            // at session creation.
+            issue: session.issue.as_ref(),
         };
         let env = build_agent_env(agent, &agent_ctx);
 
@@ -440,8 +453,10 @@ impl WorkflowExecutor {
         // repo's git config; we shell into it with `sh -c "cd <ws> && …"`,
         // mirroring `local::LocalAdapter::exec`'s wrapping. Issue env vars
         // are spliced in *after* the cd so they live in the script's
-        // environment without polluting the outer shell.
-        let env_prefix = bash_issue_env_prefix(req.issue.as_ref());
+        // environment without polluting the outer shell. The issue comes
+        // from the persisted session so a `resume` after a gate keeps
+        // the original `--issue` context visible to bash scripts too.
+        let env_prefix = bash_issue_env_prefix(session.issue.as_ref());
         let cmd = format!(
             "cd {} && {env_prefix}{script}",
             shell_quote_path(req.workspace)
@@ -792,7 +807,7 @@ fn reject_unsupported_node_kinds(wf: &Workflow) -> Result<()> {
 fn resolve_loop_back(
     node: &Node,
     order: &[String],
-    loop_counts: &mut HashMap<String, u32>,
+    loop_counts: &mut BTreeMap<String, u32>,
 ) -> Option<usize> {
     let target_id = node.loop_back_to.as_ref()?;
     let max = node.max_loops.unwrap_or(1);
@@ -1969,7 +1984,7 @@ nodes:
         let wf = Workflow::from_str_at(yaml, "/x").unwrap();
         let order = topological_order(&wf).unwrap();
         let b = wf.node("b").unwrap();
-        let mut counts: HashMap<String, u32> = HashMap::new();
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
         let idx = resolve_loop_back(b, &order, &mut counts).unwrap();
         assert_eq!(order[idx], "a");
         assert_eq!(counts["b"], 1);
@@ -1993,7 +2008,7 @@ nodes:
         let wf = Workflow::from_str_at(yaml, "/x").unwrap();
         let order = topological_order(&wf).unwrap();
         let b = wf.node("b").unwrap();
-        let mut counts: HashMap<String, u32> = HashMap::new();
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
         counts.insert("b".to_string(), 1); // already looped once
         assert!(resolve_loop_back(b, &order, &mut counts).is_none());
     }
@@ -2010,7 +2025,7 @@ nodes:
         let wf = Workflow::from_str_at(yaml, "/x").unwrap();
         let order = topological_order(&wf).unwrap();
         let a = wf.node("a").unwrap();
-        let mut counts: HashMap<String, u32> = HashMap::new();
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
         assert!(resolve_loop_back(a, &order, &mut counts).is_none());
     }
 
@@ -2704,6 +2719,267 @@ nodes:
             store.load(&SessionId::new("s-assert-unknown")).unwrap().state,
             SessionState::Failed
         );
+    }
+
+    // === resume restoration: issue + loop_counts persist ===
+
+    #[test]
+    fn loop_counts_persist_into_session_meta_after_gate_pause() {
+        // a → b (loops back to a, max 1) → g (gate) → z. Pre-fix:
+        // the in-memory `loop_counts` HashMap was rebuilt empty in
+        // `run_loop` on resume, so a workflow that paused *after*
+        // a loop_back could re-enter the cycle. Post-fix: counts
+        // live on the persisted session, so this test verifies the
+        // counter ends up in `session.loop_counts`.
+        let yaml = "\
+name: loop-then-gate
+nodes:
+  - id: a
+    type: bash
+    script: 'echo a'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'echo b'
+    loop_back_to: a
+    max_loops: 1
+  - id: g
+    depends_on: [b]
+    type: gate
+    summary: 'pause after the loop'
+  - id: z
+    depends_on: [g]
+    type: bash
+    script: 'echo z'
+";
+        let (session, _log) = run_with_call_counter(yaml, "s-loop-gate");
+        assert_eq!(session.state, SessionState::AwaitingGate);
+        assert_eq!(
+            session.loop_counts.get("b"),
+            Some(&1),
+            "execute should have fired the loop once and persisted the counter"
+        );
+    }
+
+    #[test]
+    fn resume_does_not_re_enter_already_exhausted_loop() {
+        // Drives the persistence end-to-end: a workflow that hits the
+        // gate after its loop budget is spent must not re-enter the
+        // loop on resume. Counts the calls so an off-by-one resume
+        // bug would surface.
+        let yaml = "\
+name: loop-then-gate
+nodes:
+  - id: a
+    type: bash
+    script: 'echo a'
+  - id: b
+    depends_on: [a]
+    type: bash
+    script: 'echo b'
+    loop_back_to: a
+    max_loops: 1
+  - id: g
+    depends_on: [b]
+    type: gate
+    summary: 'pause after the loop'
+  - id: z
+    depends_on: [g]
+    type: bash
+    script: 'echo z'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls2 = Arc::clone(&calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            calls2.lock().unwrap().push(s);
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-loop-resume"),
+            issue: None,
+        };
+        let paused = executor.execute(&req).unwrap();
+        assert_eq!(paused.state, SessionState::AwaitingGate);
+        assert_eq!(paused.loop_counts.get("b"), Some(&1));
+        let pre_resume_calls = calls.lock().unwrap().len();
+        // a, b, a (post-loop), b, then gate → 4 bash invocations.
+        assert_eq!(pre_resume_calls, 4, "expected a,b,a,b before gate");
+
+        let resumed = executor.resume(&req).unwrap();
+        assert_eq!(resumed.state, SessionState::Completed);
+        // After resume only `z` should fire — neither a nor b again.
+        let post_resume_total = calls.lock().unwrap().len();
+        assert_eq!(
+            post_resume_total - pre_resume_calls,
+            1,
+            "resume must only run `z`, not re-enter the spent loop"
+        );
+        // Counter survives untouched; loop_back didn't re-fire.
+        assert_eq!(resumed.loop_counts.get("b"), Some(&1));
+    }
+
+    #[test]
+    fn issue_context_persists_across_resume_when_caller_omits_it() {
+        // execute() carries an explicit --issue; resume() supplies no
+        // issue (the CLI today doesn't re-resolve). Post-fix, the
+        // resumed bash node must still see FLEET_ISSUE_* in its env
+        // prefix because the executor reads from session.issue.
+        let yaml = "\
+name: issue-across-gate
+nodes:
+  - id: setup
+    type: bash
+    script: 'echo setup'
+  - id: g
+    depends_on: [setup]
+    type: gate
+    summary: 'pause'
+  - id: ship
+    depends_on: [g]
+    type: bash
+    script: 'echo ship'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls2 = Arc::clone(&calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            // Capture the full sh -c script so we can inspect for the
+            // FLEET_ISSUE_* env prefix.
+            let s = args.last().cloned().unwrap_or_default();
+            calls2.lock().unwrap().push(s);
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+
+        // First run with an issue.
+        let exec_req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-issue-resume"),
+            issue: Some(sample_issue()),
+        };
+        let paused = executor.execute(&exec_req).unwrap();
+        assert_eq!(paused.state, SessionState::AwaitingGate);
+        assert_eq!(paused.issue, Some(sample_issue()));
+        // Pre-gate `setup` script must have seen the issue env.
+        let pre_gate_script = calls.lock().unwrap()[0].clone();
+        assert!(
+            pre_gate_script.contains("FLEET_ISSUE_ID='gh:42'"),
+            "pre-gate setup script missing issue env: {pre_gate_script}"
+        );
+
+        // Resume *without* re-supplying the issue (mirrors the CLI today).
+        let resume_req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-issue-resume"),
+            issue: None,
+        };
+        let resumed = executor.resume(&resume_req).unwrap();
+        assert_eq!(resumed.state, SessionState::Completed);
+        // The persisted issue should still be there.
+        assert_eq!(resumed.issue, Some(sample_issue()));
+        // Post-gate `ship` script must see the issue env too —
+        // that's the user-visible effect of the persistence fix.
+        let ship_script = calls
+            .lock()
+            .unwrap()
+            .last()
+            .expect("ship must have run")
+            .clone();
+        assert!(
+            ship_script.contains("FLEET_ISSUE_ID='gh:42'"),
+            "post-resume ship script missing issue env: {ship_script}"
+        );
+    }
+
+    #[test]
+    fn issue_context_on_resume_overrides_persisted_when_supplied() {
+        // Symmetric: if the caller *does* supply a fresh issue on
+        // resume, it wins. Lets a future CLI add `--issue` to
+        // `workflow resume` for retargeting.
+        let yaml = "\
+name: override
+nodes:
+  - id: setup
+    type: bash
+    script: 'echo setup'
+  - id: g
+    depends_on: [setup]
+    type: gate
+    summary: 'pause'
+  - id: ship
+    depends_on: [g]
+    type: bash
+    script: 'echo ship'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let original = sample_issue();
+        let exec_req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-override"),
+            issue: Some(original.clone()),
+        };
+        executor.execute(&exec_req).unwrap();
+
+        let replacement = IssueContext {
+            id: "gh:99".to_string(),
+            human_id: "99".to_string(),
+            title: "Hotfix the parser".to_string(),
+        };
+        let resume_req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-override"),
+            issue: Some(replacement.clone()),
+        };
+        let resumed = executor.resume(&resume_req).unwrap();
+        assert_eq!(resumed.issue, Some(replacement));
+        assert_ne!(resumed.issue, Some(original));
     }
 
     #[test]

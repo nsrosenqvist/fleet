@@ -8,8 +8,9 @@
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-use super::{SessionId, SessionState};
+use super::{IssueContext, SessionId, SessionState};
 
 /// One session row. Owned by the store; mutated only via [`Session::transition_to`]
 /// so the state-machine rules are the single gate for state changes.
@@ -27,6 +28,20 @@ pub struct Session {
     /// that last ran).
     #[serde(default)]
     pub current_node: Option<String>,
+    /// Tracker issue the workflow is acting on, if any. Persisted so
+    /// `fleet workflow resume` after a gate retains the issue context
+    /// the caller specified on the original `--issue <id>` — without
+    /// this the resumed run loses `FLEET_ISSUE_*` env in agent / bash
+    /// nodes downstream of the gate.
+    #[serde(default)]
+    pub issue: Option<IssueContext>,
+    /// Per-node `loop_back_to` counters. The executor mutates this
+    /// in place as cycles fire; persistence keeps the counters honest
+    /// across a `resume` boundary. Without it a gate placed
+    /// downstream of a loop would reset `max_loops` on every resume
+    /// and a workflow could spin forever.
+    #[serde(default)]
+    pub loop_counts: BTreeMap<String, u32>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -43,6 +58,8 @@ impl Session {
             workflow: workflow.into(),
             state: SessionState::Created,
             current_node: None,
+            issue: None,
+            loop_counts: BTreeMap::new(),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }
@@ -159,6 +176,36 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn round_trips_with_issue_and_loop_counts() {
+        let mut s = fresh();
+        s.issue = Some(IssueContext {
+            id: "gh:42".to_string(),
+            human_id: "42".to_string(),
+            title: "Fix the parser".to_string(),
+        });
+        s.loop_counts.insert("revise".to_string(), 2);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn missing_issue_and_loop_counts_default_to_empty_on_load() {
+        // Backward compatibility with meta.json from before these
+        // fields landed: serde(default) makes the absent keys parse.
+        let json = r#"{
+            "id": "s-1",
+            "workflow": "standard",
+            "state": "created",
+            "created_at_ms": 1,
+            "updated_at_ms": 1
+        }"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert!(s.issue.is_none());
+        assert!(s.loop_counts.is_empty());
     }
 
     #[test]

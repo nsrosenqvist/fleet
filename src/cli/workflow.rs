@@ -23,7 +23,8 @@ use crate::session::{ClockIdSource, IdSource, SessionState};
 use crate::session::store::SessionStore;
 use crate::session::SessionId;
 use crate::tracker::{Issue, build as build_tracker};
-use crate::workflow::executor::{ExecuteRequest, IssueContext, WorkflowExecutor};
+use crate::session::IssueContext;
+use crate::workflow::executor::{ExecuteRequest, WorkflowExecutor};
 use crate::workflow::spec::Workflow;
 use crate::workflow::validate::validate;
 
