@@ -189,11 +189,29 @@ pub trait RuntimeAdapter: Send + Sync {
     /// Lifecycle snapshot. Returns [`ContainerState::Unknown`] (not an error)
     /// when the container has never existed under this adapter.
     fn inspect(&self, container: &ContainerId) -> Result<ContainerState>;
+
+    /// Convenience predicate for liveness probing. Default impl derives
+    /// from [`Self::inspect`] so adapters that already model state
+    /// accurately get the right answer for free; adapters that can
+    /// implement a cheaper probe (e.g. `podman ps -q --filter id=…`)
+    /// may override.
+    ///
+    /// Anything other than [`ContainerState::Running`] is treated as
+    /// "not alive": `Exited`, `Dead`, and `Unknown` all indicate the
+    /// container cannot serve the workload. Used by the session reaper
+    /// to corroborate "driver process died" with "container is gone."
+    /// The reaper itself lands in the next commit — `dead_code` here
+    /// goes away as soon as that wiring is in place.
+    #[allow(dead_code)]
+    fn is_running(&self, container: &ContainerId) -> Result<bool> {
+        Ok(matches!(self.inspect(container)?, ContainerState::Running))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn image_id_round_trips_through_string() {
@@ -224,5 +242,112 @@ mod tests {
         m.insert(ContainerId::new("x"), 1);
         assert_eq!(m.get(&ContainerId::new("x")), Some(&1));
         assert_eq!(m.get(&ContainerId::new("y")), None);
+    }
+
+    /// Adapter stub for testing the default [`RuntimeAdapter::is_running`]
+    /// mapping. Returns whatever [`ContainerState`] the test queues up;
+    /// every other trait method is `unimplemented!` because the default
+    /// impl only consults `inspect`.
+    struct FakeInspectAdapter {
+        state: Mutex<ContainerState>,
+    }
+
+    impl FakeInspectAdapter {
+        fn new(state: ContainerState) -> Self {
+            Self {
+                state: Mutex::new(state),
+            }
+        }
+    }
+
+    impl RuntimeAdapter for FakeInspectAdapter {
+        fn name(&self) -> &'static str {
+            "fake-inspect"
+        }
+        fn capabilities(&self) -> Capabilities {
+            unimplemented!("not exercised by is_running tests")
+        }
+        fn ensure_image(&self, _devcontainer: &Devcontainer) -> Result<ImageId> {
+            unimplemented!("not exercised by is_running tests")
+        }
+        fn start_container(&self, _spec: &ContainerSpec) -> Result<ContainerId> {
+            unimplemented!("not exercised by is_running tests")
+        }
+        fn exec(
+            &self,
+            _container: &ContainerId,
+            _argv: &[String],
+            _opts: ExecOpts,
+        ) -> Result<ExecHandle> {
+            unimplemented!("not exercised by is_running tests")
+        }
+        fn attach_pty(&self, _container: &ContainerId, _argv: &[String]) -> Result<PtyHandle> {
+            unimplemented!("not exercised by is_running tests")
+        }
+        fn stop(&self, _container: &ContainerId) -> Result<()> {
+            unimplemented!("not exercised by is_running tests")
+        }
+        fn inspect(&self, _container: &ContainerId) -> Result<ContainerState> {
+            Ok(self.state.lock().unwrap().clone())
+        }
+    }
+
+    #[test]
+    fn is_running_true_only_for_running_state() {
+        let cid = ContainerId::new("c");
+        assert!(
+            FakeInspectAdapter::new(ContainerState::Running)
+                .is_running(&cid)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn is_running_false_for_exited() {
+        let cid = ContainerId::new("c");
+        assert!(
+            !FakeInspectAdapter::new(ContainerState::Exited { code: 0 })
+                .is_running(&cid)
+                .unwrap()
+        );
+        assert!(
+            !FakeInspectAdapter::new(ContainerState::Exited { code: 137 })
+                .is_running(&cid)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn is_running_false_for_dead() {
+        let cid = ContainerId::new("c");
+        assert!(
+            !FakeInspectAdapter::new(ContainerState::Dead)
+                .is_running(&cid)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn is_running_false_for_unknown() {
+        let cid = ContainerId::new("c");
+        assert!(
+            !FakeInspectAdapter::new(ContainerState::Unknown(
+                "not tracked by engine".to_string()
+            ))
+            .is_running(&cid)
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn is_running_false_for_created() {
+        // Created means the container exists but has not yet started —
+        // not "alive" for the reaper's purposes.
+        let cid = ContainerId::new("c");
+        assert!(
+            !FakeInspectAdapter::new(ContainerState::Created)
+                .is_running(&cid)
+                .unwrap()
+        );
     }
 }

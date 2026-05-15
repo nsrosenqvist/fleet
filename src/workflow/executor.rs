@@ -116,6 +116,7 @@ impl WorkflowExecutor {
         session.issue.clone_from(&req.issue);
         req.store.create(&session)?;
         session.transition_to(SessionState::Running, (self.clock)())?;
+        session.set_driver_pid(std::process::id(), (self.clock)());
         req.store.save(&session)?;
 
         self.run_loop(req, &mut session, &order, 0)?;
@@ -161,6 +162,7 @@ impl WorkflowExecutor {
             .and_then(|node_id| order.iter().position(|id| id == node_id))
             .map_or(0, |i| i + 1);
         session.transition_to(SessionState::Running, (self.clock)())?;
+        session.set_driver_pid(std::process::id(), (self.clock)());
         req.store.save(&session)?;
         self.run_loop(req, &mut session, &order, start)?;
         self.finalize(req, &mut session)?;
@@ -311,6 +313,11 @@ impl WorkflowExecutor {
         summary: &str,
     ) -> Result<()> {
         session.transition_to(SessionState::AwaitingGate, (self.clock)())?;
+        // The driver is parking the session for a user to resume. No
+        // fleet process is "driving" it any more, so clear the pid
+        // before persisting — otherwise the reaper would see a Running-
+        // adjacent session with a dead pid after this process exits.
+        session.clear_driver_pid((self.clock)());
         req.store.save(session)?;
         let log_path = self.node_log_path(req, session, node_id);
         let body = format!("--- gate ---\n{summary}\n");
@@ -326,6 +333,11 @@ impl WorkflowExecutor {
     fn finalize(&self, req: &ExecuteRequest<'_>, session: &mut Session) -> Result<()> {
         if session.state == SessionState::Running {
             session.transition_to(SessionState::Completed, (self.clock)())?;
+            // Driver is exiting cleanly — release the pid stamp so a
+            // subsequent reaper sweep doesn't see a stale claim. (The
+            // gate path clears separately in `handle_gate`; this branch
+            // covers Completed.)
+            session.clear_driver_pid((self.clock)());
             req.store.save(session)?;
         }
         Ok(())
@@ -679,6 +691,10 @@ impl WorkflowExecutor {
                 "transitioning to Failed after node error failed"
             );
         }
+        // Driver is unwinding with an error — clear the pid alongside
+        // the Failed transition so a reaper sweep doesn't reconfuse a
+        // terminal session with a stale Running claim.
+        session.clear_driver_pid((self.clock)());
         if let Err(save_err) = req.store.save(session) {
             tracing::warn!(?save_err, session = %session.id, original = %err, "saving Failed session failed");
         }
@@ -1751,6 +1767,136 @@ nodes:
         // The cleanup node must NOT have run yet.
         let cleanup_log = store.session_dir(&session.id).join("logs/cleanup.log");
         assert!(!cleanup_log.exists());
+    }
+
+    #[test]
+    fn driver_pid_is_set_during_run_and_cleared_on_completion() {
+        // The reaper relies on driver_pid being non-None for a Running
+        // session and None for terminal states. Verify the lifecycle by
+        // sampling meta.json from disk during a bash node, then again
+        // after execute() returns.
+        let yaml = "\
+name: trivial-bash
+nodes:
+  - id: only
+    type: bash
+    script: 'true'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-pid");
+
+        let snapshot: Arc<std::sync::Mutex<Option<Session>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let snap_writer = Arc::clone(&snapshot);
+        let store_for_mock = store.clone();
+        let sid_for_mock = session_id.clone();
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            // Load the persisted session at the moment the bash node
+            // fires. By construction this is mid-run, so driver_pid
+            // must be Some(this process's pid).
+            let s = store_for_mock.load(&sid_for_mock).unwrap();
+            *snap_writer.lock().unwrap() = Some(s);
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: session_id.clone(),
+            issue: None,
+        };
+        let final_session = executor.execute(&req).unwrap();
+
+        let mid = snapshot.lock().unwrap().clone().expect("mid-run snapshot missing");
+        assert_eq!(mid.state, SessionState::Running);
+        assert_eq!(
+            mid.driver_pid,
+            Some(std::process::id()),
+            "driver_pid must be stamped on disk while the session is running"
+        );
+
+        assert_eq!(final_session.state, SessionState::Completed);
+        assert!(final_session.driver_pid.is_none(), "driver_pid must clear on Completed");
+        // …and the on-disk session agrees with the in-memory one.
+        let loaded = store.load(&session_id).unwrap();
+        assert!(loaded.driver_pid.is_none());
+    }
+
+    #[test]
+    fn driver_pid_cleared_when_workflow_pauses_at_gate() {
+        // AwaitingGate is *not* a state the reaper should touch. By
+        // clearing driver_pid when the executor parks the session, the
+        // reaper sees `driver_pid == None && state == AwaitingGate` and
+        // knows to leave it alone.
+        let yaml = "\
+name: with-gate
+nodes:
+  - id: g
+    type: gate
+    summary: 'pause'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-gate-pid"),
+            issue: None,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::AwaitingGate);
+        assert!(session.driver_pid.is_none());
+        let loaded = store.load(&session.id).unwrap();
+        assert!(loaded.driver_pid.is_none());
+    }
+
+    #[test]
+    fn driver_pid_cleared_when_workflow_fails() {
+        // Failed is terminal; the reaper must see no stale pid claim.
+        let yaml = "\
+name: bash-fails
+nodes:
+  - id: bad
+    type: bash
+    script: 'false'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let executor = executor_failing_once();
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-fail-pid"),
+            issue: None,
+        };
+        let _ = executor.execute(&req).unwrap_err();
+        let loaded = store.load(&SessionId::new("s-fail-pid")).unwrap();
+        assert_eq!(loaded.state, SessionState::Failed);
+        assert!(loaded.driver_pid.is_none());
     }
 
     #[test]

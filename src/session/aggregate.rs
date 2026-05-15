@@ -42,6 +42,14 @@ pub struct Session {
     /// and a workflow could spin forever.
     #[serde(default)]
     pub loop_counts: BTreeMap<String, u32>,
+    /// OS process id of the fleet process currently driving this
+    /// session. Set when the executor enters `Running`, cleared when
+    /// it leaves (clean exit or transition to `AwaitingGate`). The
+    /// session reaper consults this to distinguish a session that is
+    /// genuinely making progress from one whose driver crashed and
+    /// left the state stuck in `Running`.
+    #[serde(default)]
+    pub driver_pid: Option<u32>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -60,6 +68,7 @@ impl Session {
             current_node: None,
             issue: None,
             loop_counts: BTreeMap::new(),
+            driver_pid: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }
@@ -88,6 +97,24 @@ impl Session {
     /// reflects node progress, not just state changes.
     pub fn set_current_node(&mut self, node: Option<String>, now_ms: u64) {
         self.current_node = node;
+        self.updated_at_ms = now_ms;
+    }
+
+    /// Stamp the OS pid of the fleet process currently driving this
+    /// session. The reaper uses this to detect "Running but no driver
+    /// alive". Bumps `updated_at_ms` so a freshly-claimed session is
+    /// visibly recent.
+    pub fn set_driver_pid(&mut self, pid: u32, now_ms: u64) {
+        self.driver_pid = Some(pid);
+        self.updated_at_ms = now_ms;
+    }
+
+    /// Clear the driver pid. Called on clean exit (the driver is
+    /// relinquishing the session — either it transitioned to a terminal
+    /// state, or it parked the session in `AwaitingGate` for a user to
+    /// resume later).
+    pub fn clear_driver_pid(&mut self, now_ms: u64) {
+        self.driver_pid = None;
         self.updated_at_ms = now_ms;
     }
 }
@@ -206,6 +233,53 @@ mod tests {
         let s: Session = serde_json::from_str(json).unwrap();
         assert!(s.issue.is_none());
         assert!(s.loop_counts.is_empty());
+    }
+
+    #[test]
+    fn new_session_has_no_driver_pid() {
+        assert_eq!(fresh().driver_pid, None);
+    }
+
+    #[test]
+    fn set_driver_pid_stamps_and_bumps_timestamp() {
+        let mut s = fresh();
+        s.set_driver_pid(4242, 2_000);
+        assert_eq!(s.driver_pid, Some(4242));
+        assert_eq!(s.updated_at_ms, 2_000);
+    }
+
+    #[test]
+    fn clear_driver_pid_resets_to_none_and_bumps_timestamp() {
+        let mut s = fresh();
+        s.set_driver_pid(4242, 2_000);
+        s.clear_driver_pid(3_000);
+        assert_eq!(s.driver_pid, None);
+        assert_eq!(s.updated_at_ms, 3_000);
+    }
+
+    #[test]
+    fn driver_pid_round_trips_through_json() {
+        let mut s = fresh();
+        s.set_driver_pid(4242, 2_000);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+        assert_eq!(back.driver_pid, Some(4242));
+    }
+
+    #[test]
+    fn missing_driver_pid_defaults_to_none_on_load() {
+        // Backward compatibility with meta.json from before driver_pid
+        // landed.
+        let json = r#"{
+            "id": "s-1",
+            "workflow": "standard",
+            "state": "running",
+            "created_at_ms": 1,
+            "updated_at_ms": 1
+        }"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(s.driver_pid, None);
     }
 
     #[test]
