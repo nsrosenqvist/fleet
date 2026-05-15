@@ -137,16 +137,24 @@ pub enum WorkflowSub {
 
     /// Replay a prior session from a chosen node. Mints a new session,
     /// copies the source session's artifacts/ into it, and runs the
-    /// workflow starting at `--rerun-from`. Use case: iterate on a
-    /// reviewer prompt without re-paying for upstream agents.
+    /// workflow starting at `--rerun-from` (continues to the end) or
+    /// `--rerun-only` (fires exactly that node, then exits). Use case:
+    /// iterate on a reviewer prompt without re-paying for upstream
+    /// agents — `--rerun-only` keeps the iteration narrow to one node.
     Replay {
         /// Source session id to replay.
         session: String,
-        /// Node id to start the rerun at. Must appear in the workflow's
-        /// topological order (fanout siblings excluded — pass the
-        /// owning fanout node instead).
-        #[arg(long = "rerun-from")]
-        rerun_from: String,
+        /// Node id to start the rerun at. Continues through every
+        /// successor node honouring `loop_back_to`, gates, fanouts.
+        /// Mutually exclusive with `--rerun-only`.
+        #[arg(long = "rerun-from", conflicts_with = "rerun_only")]
+        rerun_from: Option<String>,
+        /// Node id to run exactly once, then exit. No downstream nodes
+        /// fire, no `loop_back_to` cycles trigger. `when:` still gates
+        /// (false predicate skips, run completes with no node fired).
+        /// Mutually exclusive with `--rerun-from`.
+        #[arg(long = "rerun-only", conflicts_with = "rerun_from")]
+        rerun_only: Option<String>,
     },
 }
 
@@ -234,7 +242,8 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             WorkflowSub::Replay {
                 session,
                 rerun_from,
-            } => workflow::run_replay(&session, &rerun_from),
+                rerun_only,
+            } => workflow::run_replay(&session, rerun_from.as_deref(), rerun_only.as_deref()),
         },
         Command::Sessions { sub } => match sub {
             SessionsSub::List => sessions::run_list(),

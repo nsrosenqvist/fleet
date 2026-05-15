@@ -126,6 +126,21 @@ pub struct WorktreeMeta<'a> {
     pub branch: &'a str,
 }
 
+/// How far the inner loop should advance through a workflow.
+///
+/// - [`LoopBound::Full`]: walk every node from the start index to
+///   the end, honouring `loop_back_to`. This is the historical
+///   behaviour used by `execute`, `resume`, and `replay`.
+/// - [`LoopBound::SingleNode`]: run exactly one node body and then
+///   exit (regardless of any `loop_back_to` on that node). Used by
+///   `replay_only` so the user can iterate on a single node's
+///   prompt without firing anything downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopBound {
+    Full,
+    SingleNode,
+}
+
 impl WorkflowExecutor {
     pub fn new(invoker: Arc<dyn ProcessInvoker>) -> Self {
         Self {
@@ -181,7 +196,7 @@ impl WorkflowExecutor {
 
         let egress_setup = req.egress.setup(req.session_id.as_str())?;
         let run_outcome = (|| -> Result<()> {
-            self.run_loop(req, &mut session, &order, 0, &egress_setup)?;
+            self.run_loop(req, &mut session, &order, 0, &egress_setup, LoopBound::Full)?;
             self.finalize(req, &mut session)
         })();
         if let Err(err) = req.egress.teardown(&egress_setup) {
@@ -233,7 +248,14 @@ impl WorkflowExecutor {
         req.store.save(&session)?;
         let egress_setup = req.egress.setup(req.session_id.as_str())?;
         let run_outcome = (|| -> Result<()> {
-            self.run_loop(req, &mut session, &order, start, &egress_setup)?;
+            self.run_loop(
+                req,
+                &mut session,
+                &order,
+                start,
+                &egress_setup,
+                LoopBound::Full,
+            )?;
             self.finalize(req, &mut session)
         })();
         if let Err(err) = req.egress.teardown(&egress_setup) {
@@ -278,6 +300,41 @@ impl WorkflowExecutor {
         req: &ExecuteRequest<'_>,
         src_session_id: &SessionId,
         rerun_from: &str,
+    ) -> Result<Session> {
+        self.replay_with_bound(req, src_session_id, rerun_from, LoopBound::Full)
+    }
+
+    /// Single-node variant of `replay`: stage the src session's
+    /// artifacts and worktree state exactly as [`Self::replay`]
+    /// does, then run *only* `node_id` and exit. Used for tight
+    /// iteration on one node's prompt (typically the reviewer)
+    /// without firing anything downstream — no `loop_back_to`
+    /// cycles fire, no successor nodes run, the run completes
+    /// after the chosen node's body.
+    ///
+    /// `when:` still gates: a false predicate skips the node,
+    /// writes a skipped-log, and the run completes with no node
+    /// fired — consistent with the rest of the engine. The user
+    /// adjusts the predicate (or its inputs) and re-runs.
+    ///
+    /// Gate nodes still pause the run via `AwaitingGate`. Fanout
+    /// nodes still dispatch their siblings normally — single-node
+    /// is a *workflow-level* bound, not a fanout-level one.
+    pub fn replay_only(
+        &self,
+        req: &ExecuteRequest<'_>,
+        src_session_id: &SessionId,
+        node_id: &str,
+    ) -> Result<Session> {
+        self.replay_with_bound(req, src_session_id, node_id, LoopBound::SingleNode)
+    }
+
+    fn replay_with_bound(
+        &self,
+        req: &ExecuteRequest<'_>,
+        src_session_id: &SessionId,
+        rerun_from: &str,
+        bound: LoopBound,
     ) -> Result<Session> {
         validate(req.workflow).context("workflow failed static validation")?;
         let order = topological_order(req.workflow)?;
@@ -334,7 +391,7 @@ impl WorkflowExecutor {
 
         let egress_setup = req.egress.setup(req.session_id.as_str())?;
         let run_outcome = (|| -> Result<()> {
-            self.run_loop(req, &mut session, &order, start, &egress_setup)?;
+            self.run_loop(req, &mut session, &order, start, &egress_setup, bound)?;
             self.finalize(req, &mut session)
         })();
         if let Err(err) = req.egress.teardown(&egress_setup) {
@@ -344,11 +401,14 @@ impl WorkflowExecutor {
         Ok(session)
     }
 
-    /// The shared inner loop driving both `execute` and `resume`. Walks
-    /// `order` from `start_idx`, runs each node, and honours
-    /// `loop_back_to` and gate-pause transitions. Returns Ok with the
-    /// session left in `Running` (caller transitions to `Completed`) or
-    /// in `AwaitingGate` (caller leaves it alone). Errors propagate
+    /// The shared inner loop driving `execute`, `resume`, and the two
+    /// replay variants. Walks `order` from `start_idx`, runs each
+    /// node, and honours `loop_back_to` and gate-pause transitions.
+    /// `bound` controls whether the loop continues to the end of
+    /// the workflow or stops after a single successful node body
+    /// (the `replay_only` mode). Returns Ok with the session left
+    /// in `Running` (caller transitions to `Completed`) or in
+    /// `AwaitingGate` (caller leaves it alone). Errors propagate
     /// after marking the session `Failed`.
     fn run_loop(
         &self,
@@ -357,6 +417,7 @@ impl WorkflowExecutor {
         order: &[String],
         start_idx: usize,
         egress: &crate::egress::EgressSetup,
+        bound: LoopBound,
     ) -> Result<()> {
         // `loop_counts` and `outputs` both live on the session so a
         // resume after a gate (or a replay carrying upstream context)
@@ -469,6 +530,15 @@ impl WorkflowExecutor {
             if produced_outputs {
                 session.outputs = outputs_to_persisted(&outputs);
                 req.store.save(session)?;
+            }
+
+            // SingleNode bound exits after the first node body, even
+            // when the node carries `loop_back_to:`. The whole point
+            // of replay-only is "fire one node and stop"; a cycle
+            // would defeat that. Cycle semantics remain available
+            // via `replay --rerun-from`.
+            if matches!(bound, LoopBound::SingleNode) {
+                return Ok(());
             }
 
             i = match resolve_loop_back(node, order, &mut session.loop_counts) {
@@ -2934,6 +3004,182 @@ nodes:
                 .join("logs/review.log")
                 .exists()
         );
+    }
+
+    #[test]
+    fn replay_only_fires_exactly_one_node_then_exits() {
+        // Three-node workflow: plan → mid → end. Replay-only on `mid`
+        // should fire ONLY the mid node — plan is upstream of the
+        // rerun-from index (skipped, no log), end is downstream (would
+        // run under --rerun-from, must NOT run under --rerun-only).
+        let yaml = "\
+name: replay-only-three
+nodes:
+  - id: plan
+    type: bash
+    script: 'echo plan'
+  - id: mid
+    depends_on: [plan]
+    type: bash
+    script: 'echo mid'
+  - id: end
+    depends_on: [mid]
+    type: bash
+    script: 'echo end'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let src_id = stage_src_session(&store, "s-src-only", "replay-only-three", &[]);
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls_for_mock = Arc::clone(&calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            calls_for_mock.lock().unwrap().push(s);
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-only"),
+            issue: None,
+            worktree: None,
+            egress: &crate::egress::NoopEnforcer,
+        };
+
+        let replayed = executor.replay_only(&req, &src_id, "mid").unwrap();
+        assert_eq!(replayed.state, SessionState::Completed);
+        assert_eq!(replayed.current_node.as_deref(), Some("mid"));
+
+        let scripts = calls.lock().unwrap().clone();
+        let plan_count = scripts.iter().filter(|s| s.contains("echo plan")).count();
+        let mid_count = scripts.iter().filter(|s| s.contains("echo mid")).count();
+        let end_count = scripts.iter().filter(|s| s.contains("echo end")).count();
+        assert_eq!(plan_count, 0, "upstream node must be skipped");
+        assert_eq!(mid_count, 1, "the chosen node must fire exactly once");
+        assert_eq!(
+            end_count, 0,
+            "downstream nodes must NOT fire under --rerun-only"
+        );
+
+        // Log file for `end` should not exist on the new session.
+        let end_log = store.session_dir(&replayed.id).join("logs/end.log");
+        assert!(!end_log.exists(), "end's log must not be created");
+    }
+
+    #[test]
+    fn replay_only_ignores_loop_back_on_chosen_node() {
+        // A node with loop_back_to under regular `replay` would cycle.
+        // Under --rerun-only the cycle must NOT trigger — the run
+        // completes after the single node body.
+        let yaml = "\
+name: replay-only-loop
+nodes:
+  - id: review
+    type: bash
+    script: 'echo review'
+  - id: revise
+    depends_on: [review]
+    type: bash
+    script: 'echo revise'
+    loop_back_to: review
+    max_loops: 5
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let src_id = stage_src_session(&store, "s-src-loop", "replay-only-loop", &[]);
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls_for_mock = Arc::clone(&calls);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, args| {
+            let s = args.last().cloned().unwrap_or_default();
+            calls_for_mock.lock().unwrap().push(s);
+            Ok(String::new())
+        });
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-loop"),
+            issue: None,
+            worktree: None,
+            egress: &crate::egress::NoopEnforcer,
+        };
+
+        let replayed = executor.replay_only(&req, &src_id, "revise").unwrap();
+        assert_eq!(replayed.state, SessionState::Completed);
+        let scripts = calls.lock().unwrap().clone();
+        let revise_count = scripts.iter().filter(|s| s.contains("echo revise")).count();
+        let review_count = scripts.iter().filter(|s| s.contains("echo review")).count();
+        assert_eq!(revise_count, 1, "revise fires once, then exit");
+        assert_eq!(
+            review_count, 0,
+            "loop_back_to::review must NOT trigger under --rerun-only"
+        );
+        assert!(
+            replayed
+                .loop_counts
+                .get("revise")
+                .copied()
+                .unwrap_or_default()
+                == 0,
+            "loop counters must not advance under --rerun-only",
+        );
+    }
+
+    #[test]
+    fn replay_only_rejects_unknown_node() {
+        // Same validation path as replay() — a bogus node id surfaces
+        // the same topological-order error.
+        let yaml = "\
+name: only-bad
+nodes:
+  - id: only
+    type: bash
+    script: 'echo only'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let src_id = stage_src_session(&store, "s-src-bad", "only-bad", &[]);
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(|_, _| Ok(String::new()));
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id: SessionId::new("s-bad"),
+            issue: None,
+            worktree: None,
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let err = executor
+            .replay_only(&req, &src_id, "nonexistent")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("nonexistent"));
     }
 
     #[test]

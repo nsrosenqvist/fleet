@@ -233,10 +233,13 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
     Ok(i32::from(resumed.state != SessionState::Completed))
 }
 
-/// CLI entry point for `fleet workflow replay <session> --rerun-from <node>`.
+/// CLI entry point for
+/// `fleet workflow replay <session> --rerun-from <node> | --rerun-only <node>`.
 /// Mints a new session whose workflow is read off the source session's
 /// `meta.json`, copies the source's artifacts/ into it, and runs the
-/// workflow from `rerun_from` onward.
+/// workflow from the chosen node. With `--rerun-from`, continues to
+/// the end of the workflow; with `--rerun-only`, fires the chosen
+/// node exactly once and exits.
 ///
 /// Caveats inherited from the executor's `replay` contract:
 /// - The src session must have been run against a workflow whose YAML
@@ -249,7 +252,25 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
 /// - The issue context is not re-resolved; new agent nodes won't see
 ///   `FLEET_ISSUE_*`. Re-spawn via `workflow run --issue <id>` if a
 ///   replay needs them.
-pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
+pub fn run_replay(
+    session_id: &str,
+    rerun_from: Option<&str>,
+    rerun_only: Option<&str>,
+) -> Result<i32> {
+    // Exactly-one validation. Clap's conflicts_with already rejects
+    // the both-set case at parse time; this catches neither-set.
+    let mode = match (rerun_from, rerun_only) {
+        (Some(node), None) => ReplayMode::From(node),
+        (None, Some(node)) => ReplayMode::Only(node),
+        (None, None) => {
+            return Err(anyhow!(
+                "fleet workflow replay: one of `--rerun-from <node>` or \
+                 `--rerun-only <node>` is required"
+            ));
+        }
+        // conflicts_with should have caught this; treat defensively.
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with rejects both flags"),
+    };
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
     let config =
@@ -325,7 +346,10 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
     };
 
     println!("{new_id}");
-    let result = executor.replay(&req, &src_id, rerun_from);
+    let result = match mode {
+        ReplayMode::From(node) => executor.replay(&req, &src_id, node),
+        ReplayMode::Only(node) => executor.replay_only(&req, &src_id, node),
+    };
     match result {
         Ok(session) => {
             eprintln!(
@@ -339,6 +363,13 @@ pub fn run_replay(session_id: &str, rerun_from: &str) -> Result<i32> {
         }
         Err(err) => Err(err),
     }
+}
+
+/// Dispatch mode for `fleet workflow replay`. Decided at the CLI
+/// layer, consumed where the executor method is selected.
+enum ReplayMode<'a> {
+    From(&'a str),
+    Only(&'a str),
 }
 
 /// Resolve the on-disk path for a workflow name.
