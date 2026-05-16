@@ -20,6 +20,7 @@ mod agent;
 mod autonomous;
 mod bridge;
 mod cli;
+mod deps;
 mod egress;
 mod process;
 mod repo;

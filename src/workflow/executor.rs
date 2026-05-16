@@ -1070,15 +1070,14 @@ impl WorkflowExecutor {
             })?;
         if link_parent {
             if let Some(parent) = req.issue.as_ref() {
-                tracker
-                    .link_parent(req.workspace, &parent.human_id, &created.human_id)
-                    .with_context(|| {
-                        format!(
-                            "tracker-create node `{}`: `Tracker::link_parent` failed \
-                             (parent={}, child={})",
-                            node.id, parent.human_id, created.human_id
-                        )
-                    })?;
+                self.link_tracker_create_to_parent(
+                    req,
+                    node,
+                    tracker.as_ref(),
+                    parent,
+                    &created,
+                    &request.title,
+                )?;
             }
             // No bound issue → quietly skip the link. This is the
             // honest behaviour for a workflow run that didn't bind a
@@ -1104,6 +1103,79 @@ impl WorkflowExecutor {
                 created.human_id,
             ),
         ])
+    }
+
+    /// Wire a freshly-created child ticket back to its parent:
+    /// structural `link_parent` call, cross-link comments on both
+    /// tickets so a human reader sees the relationship, and a
+    /// `blocked → blocked_on` edge in `.fleet/deps.json` for the
+    /// supervisor's scheduler. Factored out of
+    /// [`Self::run_tracker_create_node`] to keep that function
+    /// under clippy's line cap.
+    fn link_tracker_create_to_parent(
+        &self,
+        req: &ExecuteRequest<'_>,
+        node: &Node,
+        tracker: &dyn Tracker,
+        parent: &IssueContext,
+        created: &crate::tracker::Issue,
+        title: &str,
+    ) -> Result<()> {
+        tracker
+            .link_parent(req.workspace, &parent.human_id, &created.human_id)
+            .with_context(|| {
+                format!(
+                    "tracker-create node `{}`: `Tracker::link_parent` failed \
+                     (parent={}, child={})",
+                    node.id, parent.human_id, created.human_id
+                )
+            })?;
+        // Cross-link comments: visible breadcrumbs on both tickets so
+        // a human browsing in GitHub / git-bug sees the relationship
+        // without consulting fleet's task-list rendering. The
+        // structural `link_parent` above is what the scheduler reads;
+        // these comments are for human readers.
+        let parent_comment = format!(
+            "fleet filed follow-up #{} (\"{title}\") to unblock this ticket",
+            created.human_id
+        );
+        tracker
+            .comment(req.workspace, &parent.human_id, &parent_comment)
+            .with_context(|| {
+                format!(
+                    "tracker-create node `{}`: posting cross-link comment on parent #{} failed",
+                    node.id, parent.human_id
+                )
+            })?;
+        let child_comment = format!(
+            "filed via fleet from #{} as a prerequisite",
+            parent.human_id
+        );
+        tracker
+            .comment(req.workspace, &created.human_id, &child_comment)
+            .with_context(|| {
+                format!(
+                    "tracker-create node `{}`: posting cross-link comment on new ticket #{} failed",
+                    node.id, created.human_id
+                )
+            })?;
+        // Record the dependency edge so the supervisor's scheduler
+        // (Phase 4) can skip the parent until the child closes.
+        let deps_store = crate::deps::DepsStore::at(deps_path_for(req.store));
+        deps_store
+            .add_edge(crate::deps::DepEdge {
+                blocked: parent.human_id.clone(),
+                blocked_on: created.human_id.clone(),
+                reason: crate::deps::BlockedReason::Ticket,
+                created_at_ms: (self.clock)(),
+            })
+            .with_context(|| {
+                format!(
+                    "tracker-create node `{}`: recording deps edge {} -> {} failed",
+                    node.id, parent.human_id, created.human_id
+                )
+            })?;
+        Ok(())
     }
 
     fn run_assert_node(
@@ -1810,6 +1882,21 @@ struct TrackerCreateRequest {
     body: String,
     #[serde(default)]
     labels: Vec<String>,
+}
+
+/// Resolve `.fleet/deps.json` from the executor's session store.
+/// The session store's root is `<fleet_root>/.fleet/sessions/`, so
+/// the deps file is its sibling `<fleet_root>/.fleet/deps.json`.
+/// Falls back to the session-store root's join when the path has no
+/// parent (e.g. some test configurations); the parent always exists
+/// under the v1 layout but the defensive fallback keeps tests
+/// constructing `SessionStore::at("./sessions")` from a tempdir
+/// working without each having to pre-create the parent.
+fn deps_path_for(store: &SessionStore) -> PathBuf {
+    store
+        .root()
+        .parent()
+        .map_or_else(|| store.root().join("deps.json"), |p| p.join("deps.json"))
 }
 
 /// Count how many distinct `tracker-create` nodes in `workflow`
@@ -6120,6 +6207,14 @@ nodes:
                 Ok(())
             }
         }
+
+        fn comment(&self, _: &Path, id: &str, body: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("comment(id={id}, body={body:?})"));
+            Ok(())
+        }
     }
 
     fn sample_created_issue(human: &str) -> crate::tracker::Issue {
@@ -6315,12 +6410,172 @@ nodes:
         };
         executor.execute(&req).unwrap();
         let calls = tracker.calls();
-        assert_eq!(calls.len(), 2, "expected create + link_parent: {calls:?}");
+        // Expect: create + link_parent + comment(parent) + comment(child).
+        assert_eq!(
+            calls.len(),
+            4,
+            "expected create + link_parent + 2 cross-link comments: {calls:?}"
+        );
+        assert!(calls[0].starts_with("create("));
         assert!(calls[1].starts_with("link_parent("));
         // Parent is the bound issue's human_id (`42`), child is the
         // freshly minted `99`.
         assert!(calls[1].contains("parent=42"));
         assert!(calls[1].contains("child=99"));
+        // Cross-link comments — order is (i) parent gets "fleet
+        // filed follow-up #99" then (ii) child gets "filed via fleet
+        // from #42".
+        assert!(calls[2].starts_with("comment(id=42, "));
+        assert!(calls[2].contains("follow-up #99"));
+        assert!(calls[3].starts_with("comment(id=99, "));
+        assert!(calls[3].contains("from #42"));
+    }
+
+    #[test]
+    fn tracker_create_node_records_deps_edge_when_link_parent_fires() {
+        // Same setup as the link_parent test but assert on the
+        // on-disk deps.json. Edge shape:
+        //   blocked = parent.human_id
+        //   blocked_on = created.human_id
+        //   reason = Ticket
+        let yaml = "\
+name: tc-deps
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        // Use a tempdir-backed store so the deps file lands somewhere
+        // we can read back.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path().join("sessions"));
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-deps");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("99")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: Some(sample_issue()),
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        executor.execute(&req).unwrap();
+
+        // Deps file lives at <session-store-parent>/deps.json. Same
+        // resolution the executor uses.
+        let deps_path = deps_path_for(&store);
+        let body = std::fs::read_to_string(&deps_path).expect("deps.json should have been written");
+        let doc: crate::deps::DepsDoc = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc.edges.len(), 1);
+        assert_eq!(doc.edges[0].blocked, "42");
+        assert_eq!(doc.edges[0].blocked_on, "99");
+        assert_eq!(doc.edges[0].reason, crate::deps::BlockedReason::Ticket);
+    }
+
+    #[test]
+    fn tracker_create_node_writes_no_deps_file_when_no_issue_bound() {
+        // Without a bound parent, the deps edge isn't recorded — the
+        // edge has nothing to anchor `blocked` to. The deps.json
+        // file should remain absent.
+        let yaml = "\
+name: tc-nodeps
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path().join("sessions"));
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-nodeps");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("11")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        executor.execute(&req).unwrap();
+        let deps_path = deps_path_for(&store);
+        assert!(
+            !deps_path.exists(),
+            "deps.json should not be written without a bound parent"
+        );
     }
 
     #[test]
