@@ -49,6 +49,11 @@ The per-boundary deep-dives:
 
 ## Verification
 
+- [`SMOKE_E2E.md`](./SMOKE_E2E.md) — tiered end-to-end smoke test
+  that drives every surface (CLI, TUI, workflow execution,
+  autonomous, brainstorm) against a throwaway TODO MVC project
+  under `tmp/`. The contracts-first decomposition pattern is the
+  narrative thread. Pick the tier matching what's installed.
 - [`SMOKE_EGRESS.md`](./SMOKE_EGRESS.md) — manual smoke checklist
   for the egress proxy. Run after any egress-related change to
   verify the `curl evil.example.com` → blocked / `curl
