@@ -207,6 +207,24 @@ impl DepsStore {
         }
         Ok(removed)
     }
+
+    /// Surgical: remove the single edge `(blocked, blocked_on)` if
+    /// present. Returns `true` when an edge was removed, `false`
+    /// when there was nothing matching (idempotent — the brainstorm
+    /// agent doesn't need to dry-run first). Used by
+    /// `fleet deps remove` to surgically drop one edge without
+    /// touching others a ticket might still have.
+    pub fn remove_edge(&self, blocked: &str, blocked_on: &str) -> Result<bool> {
+        let mut doc = self.load()?;
+        let before = doc.edges.len();
+        doc.edges
+            .retain(|e| !(e.blocked == blocked && e.blocked_on == blocked_on));
+        let removed = before != doc.edges.len();
+        if removed {
+            self.save(&doc)?;
+        }
+        Ok(removed)
+    }
 }
 
 /// Hard ceiling on the number of distinct nodes the cycle BFS
@@ -507,6 +525,32 @@ mod tests {
         // File untouched because no save happens.
         let loaded = store.load().unwrap();
         assert_eq!(loaded.edges.len(), 1);
+    }
+
+    #[test]
+    fn remove_edge_returns_true_when_an_edge_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        store.add_edge(sample_edge("42", "43")).unwrap();
+        store.add_edge(sample_edge("42", "44")).unwrap();
+        let removed = store.remove_edge("42", "43").unwrap();
+        assert!(removed);
+        // Only the 42→43 edge is gone; 42→44 survives.
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.edges.len(), 1);
+        assert_eq!(loaded.edges[0].blocked_on, "44");
+    }
+
+    #[test]
+    fn remove_edge_returns_false_when_no_matching_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        store.add_edge(sample_edge("42", "43")).unwrap();
+        // Both arguments must match; 42→999 has the right blocked
+        // side but wrong blocked_on, so nothing changes.
+        let removed = store.remove_edge("42", "999").unwrap();
+        assert!(!removed);
+        assert_eq!(store.load().unwrap().edges.len(), 1);
     }
 
     #[test]

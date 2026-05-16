@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 
 pub mod autonomous;
 pub mod brainstorm;
+pub mod deps;
 pub mod init;
 pub mod issues;
 pub mod plan;
@@ -82,6 +83,15 @@ pub enum Command {
     Brainstorm {
         #[command(subcommand)]
         sub: Option<BrainstormSub>,
+    },
+
+    /// Cross-session dependency graph: list / add / remove edges
+    /// in `.fleet/deps.json`. The supervisor consults this graph
+    /// to skip blocked tickets; the brainstorm agent records edges
+    /// when filing contracts-first ticket trees.
+    Deps {
+        #[command(subcommand)]
+        sub: DepsSub,
     },
 
     /// Launch the ratatui session browser.
@@ -340,6 +350,51 @@ pub enum PlanSub {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum DepsSub {
+    /// Print every blocked-on edge in `.fleet/deps.json`. Empty
+    /// when no edges are recorded — the common state for repos
+    /// that don't use blocked-by orchestration yet.
+    List,
+
+    /// Record an edge: `<blocked>` cannot proceed until
+    /// `--blocked-on` (a ticket id) or `--blocked-on-tag` (a
+    /// freeform slug, stored as `free:<slug>`) resolves. Exactly
+    /// one of the two flags is required. Refuses to create a
+    /// cycle.
+    Add {
+        /// Ticket id that gets blocked.
+        blocked: String,
+        /// Ticket id this one is blocked on. Mutually exclusive
+        /// with `--blocked-on-tag`.
+        #[arg(long, conflicts_with = "blocked_on_tag")]
+        blocked_on: Option<String>,
+        /// Freeform tag (e.g. `apt-mirror`) this one is blocked
+        /// on. Stored as `free:<tag>` so the supervisor
+        /// distinguishes it from ticket edges. Mutually exclusive
+        /// with `--blocked-on`.
+        #[arg(long, conflicts_with = "blocked_on")]
+        blocked_on_tag: Option<String>,
+    },
+
+    /// Surgically remove the single edge `(blocked, blocked_on)`.
+    /// Idempotent — removing an edge that isn't there isn't an
+    /// error.
+    Remove {
+        /// Ticket id on the left-hand side of the edge.
+        blocked: String,
+        /// Ticket id on the right-hand side. Mutually exclusive
+        /// with `--blocked-on-tag`.
+        #[arg(long, conflicts_with = "blocked_on_tag")]
+        blocked_on: Option<String>,
+        /// Freeform tag on the right-hand side. Same `free:<tag>`
+        /// storage as `add`. Mutually exclusive with
+        /// `--blocked-on`.
+        #[arg(long, conflicts_with = "blocked_on")]
+        blocked_on_tag: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum AutonomousSub {
     /// Tick the supervisor. `--once` runs a single tick and exits
     /// (suitable for cron). `--watch` loops, sleeping
@@ -412,6 +467,19 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             Some(BrainstormSub::List) => brainstorm::run_list(),
             Some(BrainstormSub::Attach { id }) => brainstorm::run_attach(&id),
             Some(BrainstormSub::Kill { id }) => brainstorm::run_kill(&id),
+        },
+        Command::Deps { sub } => match sub {
+            DepsSub::List => deps::run_list(),
+            DepsSub::Add {
+                blocked,
+                blocked_on,
+                blocked_on_tag,
+            } => deps::run_add(&blocked, blocked_on.as_deref(), blocked_on_tag.as_deref()),
+            DepsSub::Remove {
+                blocked,
+                blocked_on,
+                blocked_on_tag,
+            } => deps::run_remove(&blocked, blocked_on.as_deref(), blocked_on_tag.as_deref()),
         },
         Command::Plan { sub } => match sub {
             PlanSub::List => plan::run_list(),
