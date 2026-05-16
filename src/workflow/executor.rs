@@ -1009,6 +1009,23 @@ impl WorkflowExecutor {
             )
         })?;
 
+        // Per-session cap check. Counts distinct tracker-create nodes
+        // in this workflow whose `created_id` output is already
+        // populated in session state. Same-node re-fires (via
+        // loop_back_to) don't inflate the count because they
+        // overwrite the existing entry. This is the v1 protection
+        // against a runaway agent recommending dozens of follow-up
+        // tickets in one session.
+        let cap = req.workflow.effective_max_recommended_tickets();
+        let already_fired = count_tracker_create_firings(req.workflow, session);
+        if already_fired >= cap {
+            bail!(
+                "tracker-create node `{}`: per-session cap reached \
+                 (max_recommended_tickets = {cap}; {already_fired} already filed)",
+                node.id
+            );
+        }
+
         let (src_node, src_name) = parse_output_ref(from).with_context(|| {
             format!("tracker-create node `{}`: parsing `from: {from}`", node.id)
         })?;
@@ -1793,6 +1810,28 @@ struct TrackerCreateRequest {
     body: String,
     #[serde(default)]
     labels: Vec<String>,
+}
+
+/// Count how many distinct `tracker-create` nodes in `workflow`
+/// have already filed a ticket in this session, per the persisted
+/// `created_id` output. Same-node re-fires (via `loop_back_to`)
+/// overwrite the existing entry rather than appending, so the
+/// returned count is "number of `tracker-create` nodes that have
+/// successfully run at least once" — exactly what the per-session
+/// cap wants to measure.
+fn count_tracker_create_firings(workflow: &Workflow, session: &Session) -> u32 {
+    let count = workflow
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::TrackerCreate { .. }))
+        .filter(|n| {
+            session
+                .outputs
+                .get(&n.id)
+                .is_some_and(|m| m.contains_key("created_id"))
+        })
+        .count();
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 /// Parse a `<node>.<output>` reference (the shape used by
@@ -6597,6 +6636,205 @@ nodes:
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("forced tracker create failure"));
+    }
+
+    #[test]
+    fn tracker_create_node_enforces_max_recommended_tickets_cap() {
+        // Two tracker-create nodes in a workflow with max=1: the
+        // first succeeds, the second fails with a cap message.
+        // Mock tracker has exactly one `next_create` configured to
+        // make sure it isn't called twice.
+        let yaml = "\
+name: tc-cap
+max_recommended_tickets: 1
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: first
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: false
+  - id: second
+    depends_on: [first]
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: false
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-cap");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("77")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("per-session cap"), "got: {msg}");
+        assert!(msg.contains("max_recommended_tickets = 1"), "got: {msg}");
+
+        // First node fired exactly once; second blocked at the cap.
+        let calls = tracker.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "second tracker-create must not have called create(): {calls:?}"
+        );
+    }
+
+    #[test]
+    fn tracker_create_node_allows_firings_up_to_default_cap() {
+        // No explicit cap: default is 3. Three tracker-create nodes
+        // all fire successfully.
+        let yaml = "\
+name: tc-cap-default
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: t1
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: false
+  - id: t2
+    depends_on: [t1]
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: false
+  - id: t3
+    depends_on: [t2]
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: false
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-cap-d");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        // Sequence each create's response so the assertions on
+        // returned ids stay distinct.
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("100")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+        // Three create() calls — one per tracker-create node.
+        assert_eq!(tracker.calls().len(), 3);
+    }
+
+    #[test]
+    fn count_tracker_create_firings_returns_zero_when_no_outputs_persisted() {
+        let yaml = "\
+name: zero
+nodes:
+  - id: t
+    type: tracker-create
+    from: a.b
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let session = Session::new(SessionId::new("s"), "zero", 0);
+        assert_eq!(count_tracker_create_firings(&wf, &session), 0);
+    }
+
+    #[test]
+    fn count_tracker_create_firings_skips_non_tracker_create_nodes() {
+        // Even if a non-tracker-create node happens to emit a
+        // `created_id` key in its outputs, the helper must not count
+        // it — only TrackerCreate variants matter.
+        let yaml = "\
+name: mixed
+nodes:
+  - id: bash
+    type: bash
+    script: 'echo'
+    outputs: { created_id: created_id }
+  - id: t
+    type: tracker-create
+    from: bash.created_id
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let mut session = Session::new(SessionId::new("s"), "mixed", 0);
+        let mut bash_outputs = BTreeMap::new();
+        bash_outputs.insert("created_id".to_string(), "1".to_string());
+        session.outputs.insert("bash".to_string(), bash_outputs);
+        // bash emitted `created_id` but isn't a tracker-create.
+        assert_eq!(count_tracker_create_firings(&wf, &session), 0);
     }
 
     #[test]

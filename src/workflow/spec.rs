@@ -30,7 +30,20 @@ pub struct Workflow {
     pub description: Option<String>,
     pub trigger: Trigger,
     pub nodes: Vec<Node>,
+    /// Hard cap on the number of `tracker-create` nodes that may
+    /// successfully file a ticket during a single session run.
+    /// Protects against runaway agents recommending hundreds of
+    /// follow-up tickets in a row. `None` falls back to
+    /// [`DEFAULT_MAX_RECOMMENDED_TICKETS`].
+    pub max_recommended_tickets: Option<u32>,
 }
+
+/// Per-session cap applied when a workflow doesn't declare one.
+/// Three is the value the plan settled on — enough headroom for a
+/// real blocked-handler chain (e.g. agent files a parent ticket
+/// that itself depends on two prerequisites) without surrendering
+/// the runaway-protection story.
+pub const DEFAULT_MAX_RECOMMENDED_TICKETS: u32 = 3;
 
 /// How the workflow can be started. Manual = a user invokes
 /// `fleet workflow run …`; autonomous = autonomous-mode picks it from
@@ -148,6 +161,15 @@ impl Workflow {
     pub fn node(&self, id: &str) -> Option<&Node> {
         self.nodes.iter().find(|n| n.id == id)
     }
+
+    /// Effective cap on `tracker-create` firings per session. Returns
+    /// the workflow's explicit value if any, falling back to
+    /// [`DEFAULT_MAX_RECOMMENDED_TICKETS`] otherwise.
+    #[must_use]
+    pub fn effective_max_recommended_tickets(&self) -> u32 {
+        self.max_recommended_tickets
+            .unwrap_or(DEFAULT_MAX_RECOMMENDED_TICKETS)
+    }
 }
 
 // === Raw deserialisation layer ===
@@ -164,6 +186,8 @@ struct RawWorkflow {
     trigger: Option<Trigger>,
     #[serde(default)]
     nodes: Vec<RawNode>,
+    #[serde(default)]
+    max_recommended_tickets: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -231,6 +255,7 @@ impl TryFrom<RawWorkflow> for Workflow {
             description: raw.description,
             trigger,
             nodes,
+            max_recommended_tickets: raw.max_recommended_tickets,
         })
     }
 }
@@ -623,6 +648,29 @@ nodes:
             }
             other => panic!("expected TrackerCreate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn effective_max_recommended_tickets_falls_back_to_default_when_unset() {
+        let yaml = "name: x\nnodes: []";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        assert!(wf.max_recommended_tickets.is_none());
+        assert_eq!(
+            wf.effective_max_recommended_tickets(),
+            DEFAULT_MAX_RECOMMENDED_TICKETS
+        );
+    }
+
+    #[test]
+    fn effective_max_recommended_tickets_honours_explicit_value() {
+        let yaml = "\
+name: x
+max_recommended_tickets: 1
+nodes: []
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(wf.max_recommended_tickets, Some(1));
+        assert_eq!(wf.effective_max_recommended_tickets(), 1);
     }
 
     #[test]
