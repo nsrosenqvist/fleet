@@ -304,9 +304,23 @@ pub fn reconcile_plans_from_sessions(
 /// `plan.items` against `sessions` and returns true iff anything
 /// changed. Factored out for testability — the store-touching
 /// half is then a thin wrapper.
+///
+/// When an item transitions from a non-Failed state into Failed,
+/// the plan's `on_item_failure` policy fires:
+///
+/// - `Stop` (default): item recorded as Failed; plan transitions
+///   to `PlanState::Paused`. User decides whether to retry / edit
+///   / abandon.
+/// - `Continue`: item recorded as Failed; plan stays `Active` so
+///   the next pending item gets picked up.
+/// - `RetryOnce`: on the first failure for this item, the item is
+///   re-marked `Pending` and `retry_count` bumps to 1 so the
+///   supervisor re-spawns it. A second failure (`retry_count >= 1`)
+///   falls through to `Stop`.
 #[must_use]
 pub fn reconcile_one_plan(sessions: &[Session], plan: &mut Plan) -> bool {
     let mut changed = false;
+    let policy = plan.on_item_failure;
     for item_idx in 0..plan.items.len() {
         let ticket_id = plan.items[item_idx].ticket_id.clone();
         let newest = sessions
@@ -319,15 +333,68 @@ pub fn reconcile_one_plan(sessions: &[Session], plan: &mut Plan) -> bool {
         let Some(target_state) = session_to_item_state(session.state) else {
             continue;
         };
-        let item = &mut plan.items[item_idx];
-        let already = item.state == target_state && item.session_id.as_ref() == Some(&session.id);
-        if !already {
-            item.state = target_state;
-            item.session_id = Some(session.id.clone());
-            changed = true;
+        let was_state = plan.items[item_idx].state;
+        let session_id_match = plan.items[item_idx].session_id.as_ref() == Some(&session.id);
+        if was_state == target_state && session_id_match {
+            continue;
         }
+
+        // Newly transitioning into Failed → apply the failure
+        // policy. `was_state == Failed` means the item was already
+        // failed on a previous reconcile pass — the policy fired
+        // then; don't fire it again.
+        if target_state == PlanItemState::Failed && was_state != PlanItemState::Failed {
+            apply_failure_policy(plan, item_idx, &session.id, policy);
+            changed = true;
+            continue;
+        }
+
+        let item = &mut plan.items[item_idx];
+        item.state = target_state;
+        item.session_id = Some(session.id.clone());
+        changed = true;
     }
     changed
+}
+
+/// Apply the `on_item_failure` policy to an item that just
+/// transitioned into Failed. See [`reconcile_one_plan`] for the
+/// per-variant semantics.
+fn apply_failure_policy(
+    plan: &mut Plan,
+    item_idx: usize,
+    session_id: &crate::session::SessionId,
+    policy: crate::plans::ItemFailurePolicy,
+) {
+    use crate::plans::ItemFailurePolicy;
+    match policy {
+        ItemFailurePolicy::Stop => {
+            plan.items[item_idx].state = PlanItemState::Failed;
+            plan.items[item_idx].session_id = Some(session_id.clone());
+            plan.state = PlanState::Paused;
+        }
+        ItemFailurePolicy::Continue => {
+            plan.items[item_idx].state = PlanItemState::Failed;
+            plan.items[item_idx].session_id = Some(session_id.clone());
+            // Plan stays Active — next pending item gets picked up.
+        }
+        ItemFailurePolicy::RetryOnce => {
+            if plan.items[item_idx].retry_count == 0 {
+                // First failure: mark Pending, bump counter, keep
+                // the failed session id so the TUI / `fleet plan
+                // show` can surface "tried once, failed". The
+                // supervisor will re-spawn on the next tick.
+                plan.items[item_idx].state = PlanItemState::Pending;
+                plan.items[item_idx].session_id = Some(session_id.clone());
+                plan.items[item_idx].retry_count = 1;
+            } else {
+                // Second failure: behave as Stop.
+                plan.items[item_idx].state = PlanItemState::Failed;
+                plan.items[item_idx].session_id = Some(session_id.clone());
+                plan.state = PlanState::Paused;
+            }
+        }
+    }
 }
 
 #[must_use]
@@ -1079,6 +1146,96 @@ mod tests {
         let s = session_with_state("s-1", "42", SessionState::Created, 100);
         let changed = reconcile_one_plan(&[s], &mut plan);
         assert!(!changed);
+    }
+
+    // ---- on_item_failure policies -----------------------------------
+
+    use crate::plans::ItemFailurePolicy;
+
+    #[test]
+    fn failure_policy_stop_pauses_plan_when_item_fails() {
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        plan.on_item_failure = ItemFailurePolicy::Stop;
+        let sessions = vec![session_with_state("s-1", "42", SessionState::Failed, 100)];
+        let _ = reconcile_one_plan(&sessions, &mut plan);
+        assert_eq!(plan.items[0].state, PlanItemState::Failed);
+        assert_eq!(plan.state, PlanState::Paused);
+    }
+
+    #[test]
+    fn failure_policy_continue_leaves_plan_active() {
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        plan.on_item_failure = ItemFailurePolicy::Continue;
+        let sessions = vec![session_with_state("s-1", "42", SessionState::Failed, 100)];
+        let _ = reconcile_one_plan(&sessions, &mut plan);
+        assert_eq!(plan.items[0].state, PlanItemState::Failed);
+        assert_eq!(plan.state, PlanState::Active);
+    }
+
+    #[test]
+    fn failure_policy_retry_once_re_marks_item_pending_first_time() {
+        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        plan.on_item_failure = ItemFailurePolicy::RetryOnce;
+        let sessions = vec![session_with_state("s-1", "42", SessionState::Failed, 100)];
+        let _ = reconcile_one_plan(&sessions, &mut plan);
+        // First Failed → Pending with retry_count=1; plan stays Active.
+        assert_eq!(plan.items[0].state, PlanItemState::Pending);
+        assert_eq!(plan.items[0].retry_count, 1);
+        assert_eq!(plan.state, PlanState::Active);
+        // session_id is still set to the failed session so the TUI
+        // can show "tried once, failed".
+        assert!(plan.items[0].session_id.is_some());
+    }
+
+    #[test]
+    fn failure_policy_retry_once_falls_back_to_stop_on_second_failure() {
+        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        plan.on_item_failure = ItemFailurePolicy::RetryOnce;
+        // Simulate first-failure-already-applied state.
+        plan.items[0].retry_count = 1;
+        plan.items[0].state = PlanItemState::InProgress;
+        plan.items[0].session_id = Some(SessionId::new("s-retry"));
+        // Now the retry session fails too.
+        let sessions = vec![session_with_state(
+            "s-retry-2",
+            "42",
+            SessionState::Failed,
+            200,
+        )];
+        let _ = reconcile_one_plan(&sessions, &mut plan);
+        // Second failure → Stop semantics.
+        assert_eq!(plan.items[0].state, PlanItemState::Failed);
+        assert_eq!(plan.state, PlanState::Paused);
+    }
+
+    #[test]
+    fn failure_policy_does_not_re_fire_once_item_already_failed() {
+        // Item is already Failed (the policy fired on a previous
+        // reconcile). The next reconcile sees the same session
+        // state and shouldn't re-pause the plan or otherwise touch
+        // anything.
+        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        plan.on_item_failure = ItemFailurePolicy::Stop;
+        plan.items[0].state = PlanItemState::Failed;
+        plan.items[0].session_id = Some(SessionId::new("s-1"));
+        plan.state = PlanState::Paused;
+        let sessions = vec![session_with_state("s-1", "42", SessionState::Failed, 100)];
+        let changed = reconcile_one_plan(&sessions, &mut plan);
+        assert!(!changed);
+        assert_eq!(plan.state, PlanState::Paused);
+    }
+
+    #[test]
+    fn failure_policy_continue_leaves_other_items_pending_for_next_spawn() {
+        // The whole point of Continue: when item 0 fails, item 1
+        // stays Pending and the supervisor's next tick will pick
+        // it up.
+        let mut plan = plan_with("plan-1", "p", &["42", "43", "44"], 1_000);
+        plan.on_item_failure = ItemFailurePolicy::Continue;
+        let sessions = vec![session_with_state("s-1", "42", SessionState::Failed, 100)];
+        let _ = reconcile_one_plan(&sessions, &mut plan);
+        assert_eq!(plan.items[1].state, PlanItemState::Pending);
+        assert_eq!(plan.items[2].state, PlanItemState::Pending);
     }
 
     #[test]

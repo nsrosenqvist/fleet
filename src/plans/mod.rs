@@ -102,6 +102,11 @@ pub enum PlanItemState {
 /// for items the `tracker-create` workflow node added mid-flight
 /// (so the TUI / CLI can flag them as "added during execution"
 /// rather than part of the original plan).
+///
+/// `retry_count` is the supervisor's bookkeeping for the
+/// `ItemFailurePolicy::RetryOnce` policy: bumps from 0→1 on the
+/// first Failed transition, and on the second Failed transition
+/// the policy behaves as `Stop` instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanItem {
     pub ticket_id: String,
@@ -110,6 +115,8 @@ pub struct PlanItem {
     pub session_id: Option<SessionId>,
     #[serde(default)]
     pub injected: bool,
+    #[serde(default)]
+    pub retry_count: u8,
 }
 
 impl PlanItem {
@@ -124,6 +131,7 @@ impl PlanItem {
             state: PlanItemState::Pending,
             session_id: None,
             injected: false,
+            retry_count: 0,
         }
     }
 
@@ -136,6 +144,7 @@ impl PlanItem {
             state: PlanItemState::Pending,
             session_id: None,
             injected: true,
+            retry_count: 0,
         }
     }
 }
