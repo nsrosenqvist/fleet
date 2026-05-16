@@ -13,17 +13,14 @@
 //! - `fleet brainstorm kill <id>` — kill the tmux session and
 //!   mark the meta as Closed.
 //!
-//! **What is *not* wired in this commit:** the brainstorm tool
-//! HTTP server (`crate::brainstorm::server::BrainstormServer`)
-//! ships in P5-C3/C4 but isn't yet started as part of the
-//! brainstorm spawn flow. The cleanest design has it run as a
-//! detached daemon outliving any single CLI invocation, which is
-//! its own piece of plumbing (PID file, cleanup on kill, etc.).
-//! For v1, the brainstorm agent has shell access via tmux and can
-//! invoke `fleet plan`, `fleet sessions`, etc. directly. The HTTP
-//! server is ready when the daemon piece lands; the env vars
-//! (`FLEET_BRAINSTORM_URL`, `FLEET_BRAINSTORM_TOKEN`) are stubbed
-//! to empty so the agent knows there's no live server yet.
+//! The brainstorm agent has full shell access via tmux and reaches
+//! fleet via the CLI — `fleet plan …`, `fleet issues …`,
+//! `fleet sessions …`. The system prompt (in
+//! `crate::brainstorm::prompt`) documents the available
+//! subcommands. There's intentionally no HTTP server / token
+//! plumbing: the agent is already on the host, the bridge's
+//! security boundary doesn't apply, and a parallel HTTP surface
+//! would just duplicate what the CLI already does.
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -76,18 +73,14 @@ pub fn run_default() -> Result<i32> {
     std::fs::write(&prompt_path, prompt_body)
         .with_context(|| format!("writing prompt at {}", prompt_path.display()))?;
 
-    // Spawn the tmux session running the agent. `FLEET_BRAINSTORM_*`
-    // env vars are stubbed to empty until the daemon orchestration
-    // lands (see module-level doc); the agent uses `fleet plan` /
-    // `fleet sessions` etc. via the shell for now.
-    let env: Vec<(String, String)> = vec![
-        ("FLEET_BRAINSTORM_URL".to_string(), String::new()),
-        ("FLEET_BRAINSTORM_TOKEN".to_string(), String::new()),
-        (
-            "FLEET_BRAINSTORM_PROMPT".to_string(),
-            prompt_path.display().to_string(),
-        ),
-    ];
+    // Spawn the tmux session running the agent. The only env var
+    // the agent needs is the prompt path — fleet CLI commands
+    // (`fleet plan …`, `fleet issues …`, etc.) are how the agent
+    // talks back to fleet, no HTTP server / token plumbing.
+    let env: Vec<(String, String)> = vec![(
+        "FLEET_BRAINSTORM_PROMPT".to_string(),
+        prompt_path.display().to_string(),
+    )];
     let command = vec![agent.to_string()];
     tmux::new_session(invoker.as_ref(), &session.tmux_session, &command, &env)
         .with_context(|| format!("spawning tmux session `{}`", session.tmux_session))?;

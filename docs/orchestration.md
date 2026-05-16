@@ -9,15 +9,11 @@ If you're looking for individual-session mechanics, see
 gets permission to mutate the tracker, see
 [`auth.md`](./auth.md#per-tracker-auth).
 
-> **Status.** All five phases have landed at the data + plumbing
-> level, with two caveats called out in the table below — the
-> brainstorm tool HTTP server is built and tested but not yet
-> daemonised + wired into the spawn flow (the agent uses fleet's
-> CLI commands directly from the tmux shell for now), and the TUI's
-> Shift+B / brainstorm-row Enter affordances are deferred until the
-> terminal-suspend dance gets wired. The table at the bottom of
-> this page tracks what's actually in the binary, including those
-> gaps.
+> **Status.** All five phases have landed. The TUI's Shift+B /
+> brainstorm-row Enter affordances remain deferred until the
+> terminal-suspend dance gets wired (the underlying
+> `fleet brainstorm` CLI works standalone); the table at the
+> bottom of this page tracks what's actually in the binary.
 
 ## The model in 30 seconds
 
@@ -577,25 +573,27 @@ cat .fleet/deps.json
 | 3a | Plans data model + `fleet plan` CLI + `fleet sessions unblock` + cycle detection + plan injection | **Shipped** |
 | 3b | TUI Plans view (key `p`) + sessions-row plan annotations + status-line plan count | **Shipped** |
 | 4 | Supervisor plan-aware scheduling + deps-blocked filter + item reconciliation + `on_item_failure` policies | **Shipped** |
-| 5 | Brainstorm agent — tmux integration, `fleet brainstorm {…}` CLI, tool HTTP server (built+tested but not daemonised yet), TUI two-section sidebar | **Shipped (with caveats)** |
+| 5 | Brainstorm agent — tmux integration, `fleet brainstorm {…}` CLI, CLI-based tool surface (`fleet plan/issues/sessions`), TUI two-section sidebar | **Shipped (one caveat)** |
 
-**Phase 5 caveats:**
+**Phase 5 caveat:**
 
-- The brainstorm tool HTTP server (`crate::brainstorm::server`)
-  is fully built + tested (30 inline tests) but is not yet
-  started as part of the `fleet brainstorm` spawn flow. The
-  cleanest design has it run as a detached daemon outliving any
-  single CLI invocation; that orchestration is its own piece of
-  plumbing and lands in a follow-up. For v1, the brainstorm
-  agent has shell access via tmux and uses `fleet plan`,
-  `fleet sessions`, `fleet issues`, etc. directly from inside
-  the pane.
 - The TUI's Shift+B (spawn brainstorm) and Enter-on-brainstorm-
   row (attach) affordances are deferred — they need ratatui's
   terminal-suspend dance plus a real tmux to verify. The
   Brainstorms section in the Sessions sidebar is live and
   shows state; spawning + attaching go through the
   `fleet brainstorm` CLI for now.
+
+**Design note: no parallel HTTP server for brainstorm.** The
+agent runs on the host inside tmux with full shell access. Every
+operation the agent needs — plan management, ticket triage,
+session unblocking — is a single `fleet …` CLI invocation. There
+is no parallel HTTP surface because there's nothing it would add
+over `Bash → fleet …` (the bridge's per-ticket scoping doesn't
+apply on the host; the duplicate surface would just be code rot).
+The bridge HTTP server still exists for the *workflow* container
+case where the agent is sandboxed and needs scoped tracker
+writes; brainstorm doesn't fit that shape.
 
 The implementation plan lives at
 `~/.claude/plans/recursive-careful-orchestrator.md` (contributor-side).

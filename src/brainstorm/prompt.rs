@@ -3,9 +3,9 @@
 //!
 //! The prompt lives at `<fleet_root>/.fleet/planning/<id>/prompt.md`
 //! and is the first thing the agent sees on startup. It establishes
-//! the agent's role, lists the available HTTP tools, and snapshots
-//! the repo's current open tickets + active plans so the agent has
-//! immediate context.
+//! the agent's role, lists the fleet CLI subcommands the agent can
+//! shell to, and snapshots the repo's current open tickets +
+//! active plans so the agent has immediate context.
 //!
 //! Pure: takes a `RepoSnapshot` value object and returns a string.
 //! The CLI in `cli::brainstorm` is responsible for building the
@@ -95,7 +95,7 @@ fn render_active_plans(plans: &[Plan]) -> String {
 }
 
 /// Static template, prepended verbatim. Defines the agent's role
-/// and the HTTP-tool surface so the agent doesn't have to guess at
+/// and the CLI-tool surface so the agent doesn't have to guess at
 /// either. The dynamic repo snapshot is appended after.
 const STATIC_TEMPLATE: &str = r#"# Fleet brainstorm session
 
@@ -108,45 +108,46 @@ closes, or moves a ticket before executing.
 
 ## How to act on the repo
 
-Fleet has a small HTTP server running on this machine. The URL
-and the bearer token are in your environment:
+You have a normal shell inside this tmux pane. Every action lands
+through fleet's CLI — no HTTP, no auth tokens. Run commands with
+the standard tool you'd use to invoke `gh` or `git`.
 
-- `FLEET_BRAINSTORM_URL` — `http://127.0.0.1:<port>`
-- `FLEET_BRAINSTORM_TOKEN` — opaque bearer
+Commands print human-readable text and exit 0 on success;
+non-zero exit + stderr surfaces what went wrong. Surface stderr
+to the user verbatim when something fails.
 
-Every request needs `Authorization: Bearer $FLEET_BRAINSTORM_TOKEN`.
-Responses are JSON. Non-200 statuses carry `{"error": {"code",
-"message"}}` bodies; surface the message to the user verbatim.
-
-### Tools (relative to `$FLEET_BRAINSTORM_URL`)
+### Tools (fleet CLI subcommands)
 
 **Plans:**
-- `GET  /plan/list`                                  — every plan + progress
-- `GET  /plan/show?id=<id>`                          — one plan, full detail
-- `POST /plan/new { name, tickets }`                 — create
-- `POST /plan/pause/<id>`                            — supervisor stops picking from it
-- `POST /plan/resume/<id>`                           — back to Active
-- `POST /plan/complete/<id>`                         — mark done
-- `POST /plan/abandon/<id>`                          — mark abandoned
-- `POST /plan/inject/<id> { ticket, before? }`       — add an item
+- `fleet plan list`                                  — every plan + progress
+- `fleet plan show <id>`                             — one plan, full detail
+- `fleet plan new "<name>" --tickets <a,b,c>`        — create
+- `fleet plan pause <id>`                            — supervisor stops picking from it
+- `fleet plan resume <id>`                           — back to Active
+- `fleet plan complete <id>`                         — mark done
+- `fleet plan abandon <id> [--reason "<text>"]`      — mark abandoned
+- `fleet plan inject <id> <ticket> [--before <other>]` — add an item
 
-**Tracker:**
-- `GET  /tracker/list`                               — all issues
-- `GET  /tracker/read?id=<id>`                       — one issue + body + comments
-- `POST /tracker/create { title, body, labels? }`    — file a new ticket
-- `POST /tracker/comment/<id> { body }`              — comment on a ticket
-- `POST /tracker/set-status/<id> { status }`         — open / in-progress / closed
-- `POST /tracker/add-label/<id> { label }`
-- `POST /tracker/remove-label/<id> { label }`
+**Tracker (issues):**
+- `fleet issues list`                                — every issue, open first
+- `fleet issues create "<title>" [--body "<body>"] [--label <name>]…` — file
+- `fleet issues comment <id> "<body>"`               — comment on a ticket
+- `fleet issues set-status <id> <open|in-progress|closed>`
+- `fleet issues add-label <id> <label>`
+- `fleet issues remove-label <id> <label>`
+
+`fleet issues create` prints the new ticket's id on stdout (one
+line) — capture it for follow-up `fleet plan new --tickets …`
+calls.
 
 **Sessions:**
-- `GET  /sessions/list`                              — all workflow sessions
-- `GET  /sessions/show?id=<id>`                      — one session, full detail
-- `POST /sessions/unblock/<id> { reason? }`          — clear deps edges
+- `fleet sessions list`                              — all workflow sessions
+- `fleet sessions show <id>`                         — one session, full detail
+- `fleet sessions unblock <id> [--reason "<text>"]`  — clear deps edges
+- `fleet sessions logs <id> [--node <name>]`         — printed captured logs
 
-**Deps (rarely needed):**
-- `GET  /deps/list`                                  — every blocked-on edge
-- `POST /deps/remove { blocked, blocked_on }`        — surgical edge removal
+**Deps (rarely needed; mostly a read for surgery):**
+- `cat .fleet/deps.json`                             — every blocked-on edge
 
 ## Behaviour expectations
 
@@ -155,8 +156,8 @@ Responses are JSON. Non-200 statuses carry `{"error": {"code",
   wait for the user to acknowledge. The user is the last line of
   defence against prompt-injected mistakes.
 - **Read before write.** When the user asks you to plan around an
-  epic / ticket, fetch the current state first (`GET /tracker/read`,
-  `GET /plan/list`) rather than guessing.
+  epic / ticket, fetch the current state first (`fleet issues
+  list`, `fleet plan list`) rather than guessing.
 - **Use plans as preference, deps as requirement.** A plan is the
   user's ordered preference; the deps graph is what physically
   blocks scheduling. They compose — when filing a follow-up that
@@ -169,15 +170,15 @@ Responses are JSON. Non-200 statuses carry `{"error": {"code",
 
 Typical patterns:
 
-- **"What's open?"** → `GET /tracker/list` + `GET /plan/list`,
+- **"What's open?"** → `fleet issues list` + `fleet plan list`,
   summarise.
-- **"Plan a refactor"** → discuss with user, then `POST /tracker/
-  create` for each ticket, then `POST /plan/new`.
-- **"Where are we on plan X?"** → `GET /plan/show?id=…`, also pull
-  recent `GET /sessions/list` entries to surface what fleet is
-  currently working.
-- **"Unblock session Y"** → `POST /sessions/unblock/<id>` (with a
-  `reason` if the user gave one).
+- **"Plan a refactor"** → discuss with user, then `fleet issues
+  create …` for each ticket (capture each id), then `fleet plan
+  new "<name>" --tickets <ids,joined,by,commas>`.
+- **"Where are we on plan X?"** → `fleet plan show <id>` + recent
+  `fleet sessions list` entries.
+- **"Unblock session Y"** → `fleet sessions unblock <id>` (with
+  `--reason` if the user gave one).
 "#;
 
 #[cfg(test)]
@@ -211,18 +212,23 @@ mod tests {
             active_plans: Vec::new(),
         };
         let p = render_prompt(&snapshot);
-        // Role section + tool surface + behaviour expectations all
-        // present.
+        // Role section + CLI tool surface + behaviour expectations
+        // all present.
         assert!(p.contains("brainstorm agent"), "missing role");
-        assert!(p.contains("FLEET_BRAINSTORM_URL"), "missing env var");
-        assert!(p.contains("FLEET_BRAINSTORM_TOKEN"), "missing token var");
-        assert!(p.contains("/plan/list"), "missing plan tool");
-        assert!(p.contains("/tracker/create"), "missing tracker tool");
-        assert!(p.contains("/sessions/unblock/"), "missing sessions tool");
+        assert!(p.contains("fleet plan list"), "missing plan tool");
+        assert!(p.contains("fleet issues create"), "missing tracker create");
+        assert!(
+            p.contains("fleet sessions unblock"),
+            "missing sessions tool"
+        );
         assert!(
             p.contains("Confirm before any write"),
             "missing behaviour rule"
         );
+        // Stale HTTP-server references shouldn't leak — the prompt
+        // is CLI-only since the parallel HTTP path got removed.
+        assert!(!p.contains("FLEET_BRAINSTORM_URL"), "stale http env var");
+        assert!(!p.contains("FLEET_BRAINSTORM_TOKEN"), "stale http token");
     }
 
     #[test]
