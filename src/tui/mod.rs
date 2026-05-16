@@ -386,11 +386,19 @@ impl AppState {
         Ok(())
     }
 
-    /// Load every brainstorm session from disk. Per-session load
-    /// failures degrade gracefully — the session is dropped from
-    /// the list and the rest continue.
+    /// Reap stale brainstorms (tmux pane gone but meta says
+    /// Active/Detached), then load the per-session metas from
+    /// disk so the sidebar reflects current state. Per-session
+    /// load failures degrade gracefully — the session is dropped
+    /// from the list and the rest continue.
     fn refresh_brainstorms(&mut self) {
         let store = BrainstormStore::for_repo(&self.root);
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+        if let Err(err) = crate::brainstorm::reaper::reap(&store, invoker.as_ref(), now_ms()) {
+            // Reap failure shouldn't blank the sidebar — surface
+            // briefly and proceed to list.
+            self.status_line = format!(" brainstorms: reap failed: {err:#} ");
+        }
         let ids = match store.list() {
             Ok(ids) => ids,
             Err(err) => {

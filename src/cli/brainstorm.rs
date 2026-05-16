@@ -139,12 +139,20 @@ pub fn run_default() -> Result<i32> {
 
 /// `fleet brainstorm list` — print each known brainstorm session
 /// with its state (Active/Detached/Closed), agent name, and the
-/// tmux pane name.
+/// tmux pane name. Reaps stale entries before printing so the
+/// listing matches what `fleet brainstorm attach <id>` would
+/// actually succeed on.
 pub fn run_list() -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
     let store = BrainstormStore::for_repo(&root);
     let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+    // Reap first: mark on-disk meta as Closed for any session
+    // whose tmux pane is gone. Failure to reap shouldn't block
+    // the listing — surface on stderr and continue.
+    if let Err(err) = crate::brainstorm::reaper::reap(&store, invoker.as_ref(), now_ms()) {
+        eprintln!("warning: brainstorm reap failed: {err:#}");
+    }
     let ids = store.list().with_context(|| {
         format!(
             "listing brainstorm sessions under {}",
