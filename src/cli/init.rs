@@ -309,15 +309,25 @@ const DEFAULT_DEVCONTAINER_JSON: &str = "\
 /// `implement`'s inputs; the reviewer's `outputs: { decision: … }`
 /// feeds the `when:`-gated fork.
 const DEFAULT_WORKFLOW_STANDARD: &str = r#"# Default `standard` workflow shipped by `fleet init`.
-# Planner -> Coder -> Reviewer -> (Revise loop | Open PR).
-# Edit freely; the reviewer is expected to write a flat-JSON
-# `review.outputs.json` under /artifacts with a `decision` key whose
-# value is either "approve" or "changes_requested".
+# Planner -> Coder -> Reviewer -> (Revise loop | Open PR), with a
+# `file-dep` branch that fires when the implementer reports
+# `outcome: blocked` and recommends a follow-up ticket.
+#
+# Implementer contract: write `implement.outputs.json` with at least
+# {outcome, summary} and — when outcome is `blocked` and a new
+# ticket would unblock — a `recommend_ticket: {title, body, labels}`
+# payload. See .fleet/prompts/implementer.md.
+#
+# Reviewer contract: write `review.outputs.json` with a `decision`
+# key whose value is `approve` or `changes_requested` (use any other
+# string, e.g. `noop`, to skip both fork branches — useful when the
+# implementer was blocked and there's no diff worth reviewing).
 name: standard
-description: Plan -> Code -> Review (+revise loop, +open PR on approve)
+description: Plan -> Code -> Review (+revise loop, +open PR on approve, +file-dep on blocked)
 trigger:
   manual: true
   autonomous: true
+max_recommended_tickets: 3
 nodes:
   - id: plan
     agent: claude-code
@@ -332,6 +342,10 @@ nodes:
     prompt_file: .fleet/prompts/implementer.md
     artifacts:
       in: [plan.md]
+    outputs:
+      outcome: outcome
+      blocker: blocker
+      recommend_ticket: recommend_ticket
   - id: review
     depends_on: [implement]
     agent: claude-code
@@ -352,6 +366,12 @@ nodes:
     when: 'review.decision == "approve"'
     type: bash
     script: 'gh pr create --title "${FLEET_ISSUE_TITLE:-fleet change}" --body "Automated PR for issue ${FLEET_ISSUE_HUMAN_ID:-?}"'
+  - id: file-dep
+    depends_on: [implement]
+    when: 'implement.outcome == "blocked" && implement.recommend_ticket != ""'
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: true
 "#;
 
 /// `.fleet/workflows/hotfix.yaml` — minimal two-step flow for small
@@ -408,8 +428,7 @@ Do NOT write code yet. Only the plan.
 ";
 
 /// Default implementer persona prompt.
-const DEFAULT_PROMPT_IMPLEMENTER: &str = "\
-You are the implementer.
+const DEFAULT_PROMPT_IMPLEMENTER: &str = r#"You are the implementer.
 
 Read /artifacts/plan.md if present and implement the changes in the
 workspace. Run the project's tests. Stage commits as you go; don't
@@ -417,7 +436,38 @@ push or open a PR.
 
 If you deviate from the plan, note the deviation in your final
 response so the reviewer can audit it.
-";
+
+When you finish, write `/artifacts/implement.outputs.json` with the
+following shape (every declared key must be present — use `null` to
+mean "doesn't apply this run"):
+
+    {
+      "outcome": "progress" | "blocked" | "done",
+      "summary": "<one-line description of what happened>",
+      "blocker": null OR "<why you're stuck, if outcome=blocked>",
+      "recommend_ticket": null OR {
+        "title": "<short ticket title>",
+        "body":  "<paragraph describing the work>",
+        "labels": ["<optional>", "<labels>"]
+      }
+    }
+
+Conventions fleet's workflow engine enforces:
+
+- `outcome` is required and must be one of the three strings above.
+- `blocker` is required to be non-empty when `outcome` is `blocked`;
+  otherwise set it to `null`.
+- `recommend_ticket` is optional even when blocked. Only emit it
+  when a NEW follow-up ticket would actually unblock the work —
+  do NOT recommend tickets for transient environmental issues
+  (flaky CI, temporary API outage, dependency build hiccup). The
+  workflow caps recommendations per session (default 3) to keep
+  runaway agents from spamming the tracker.
+
+If your outcome is `blocked` and you emit a `recommend_ticket`,
+fleet will file the new ticket via the tracker and cross-link both
+issues automatically — you don't need to call any CLI yourself.
+"#;
 
 /// Default reviewer persona prompt.
 const DEFAULT_PROMPT_REVIEWER: &str = r#"You are the reviewer.
@@ -445,8 +495,9 @@ Produce two artifacts under /artifacts:
 
      `approve` triggers `gh pr create`; `changes_requested` triggers
      the bounded revise loop. Any other value falls through both
-     branches — useful when you want neither side to fire (e.g. a
-     manual hold).
+     branches — useful when the implementer was blocked and there's
+     no real diff worth reviewing (write `{"decision": "noop"}` in
+     that case so both forks skip cleanly).
 
 Be concise.
 "#;
@@ -606,6 +657,80 @@ mod tests {
             "open_pr must gate on approve"
         );
         assert!(matches!(open_pr.kind, NodeKind::Bash { .. }));
+    }
+
+    #[test]
+    fn default_standard_workflow_wires_the_blocked_handler_branch() {
+        // Phase 2: an implementer outcome of `blocked` should route
+        // into a `tracker-create` follow-up. Lock in the exact wiring
+        // so a future regression doesn't silently strip the branch.
+        use crate::workflow::spec::{NodeKind, Workflow};
+        let wf = Workflow::from_str_at(DEFAULT_WORKFLOW_STANDARD, "/standard.yaml").unwrap();
+
+        let implement = wf.node("implement").expect("implement node");
+        assert_eq!(
+            implement.outputs.get("outcome").map(String::as_str),
+            Some("outcome"),
+            "implement must declare outputs.outcome to join the convention"
+        );
+        assert_eq!(
+            implement.outputs.get("blocker").map(String::as_str),
+            Some("blocker"),
+        );
+        assert_eq!(
+            implement
+                .outputs
+                .get("recommend_ticket")
+                .map(String::as_str),
+            Some("recommend_ticket"),
+        );
+
+        let file_dep = wf.node("file-dep").expect("file-dep node");
+        assert_eq!(
+            file_dep.when.as_deref(),
+            Some("implement.outcome == \"blocked\" && implement.recommend_ticket != \"\""),
+            "file-dep must gate on outcome=blocked AND non-empty recommend_ticket"
+        );
+        match &file_dep.kind {
+            NodeKind::TrackerCreate { from, link_parent } => {
+                assert_eq!(from, "implement.recommend_ticket");
+                assert!(*link_parent, "link_parent should default to true here");
+            }
+            other => panic!("expected TrackerCreate, got {other:?}"),
+        }
+
+        // The workflow declares the cap explicitly to make the
+        // 3-ticket runaway-protection story visible to anyone
+        // reading the YAML, even though the default is the same.
+        assert_eq!(wf.max_recommended_tickets, Some(3));
+    }
+
+    #[test]
+    fn default_implementer_prompt_documents_the_outcome_contract() {
+        // The implementer is the source of `implement.outputs.json`.
+        // The shipped prompt must spell out the contract — the
+        // outcome strings, the required-iff-blocked blocker, and
+        // the optional recommend_ticket shape — or agents will
+        // emit subtly wrong shapes and the workflow's blocked
+        // branch becomes a guessing game.
+        assert!(
+            DEFAULT_PROMPT_IMPLEMENTER.contains("implement.outputs.json"),
+            "implementer prompt must mention implement.outputs.json"
+        );
+        for outcome in ["progress", "blocked", "done"] {
+            assert!(
+                DEFAULT_PROMPT_IMPLEMENTER.contains(outcome),
+                "implementer prompt must document outcome value `{outcome}`"
+            );
+        }
+        assert!(
+            DEFAULT_PROMPT_IMPLEMENTER.contains("recommend_ticket"),
+            "implementer prompt must document the recommend_ticket shape"
+        );
+        assert!(
+            DEFAULT_PROMPT_IMPLEMENTER.contains("blocker"),
+            "implementer prompt must document the blocker field"
+        );
     }
 
     #[test]

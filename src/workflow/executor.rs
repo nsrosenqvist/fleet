@@ -1489,11 +1489,14 @@ pub fn extract_outputs(artifacts_dir: &Path, node: &Node, acc: &mut OutputMap) -
                     )
                 })?
             }
-            serde_json::Value::Null => bail!(
-                "node `{}`: output key `{source_key}` was JSON null \
-                 (the agent must produce a concrete value)",
-                node.id
-            ),
+            // Null is treated as "this optional output doesn't apply
+            // to this run" and stored as the empty string. The outcome
+            // convention's `recommend_ticket` is the canonical user:
+            // the implementer agent emits a `{title, body, labels?}`
+            // object when outcome=blocked and a follow-up would help,
+            // or `null` otherwise. Downstream `when:` predicates use
+            // `!= ""` to gate the tracker-create node.
+            serde_json::Value::Null => String::new(),
         };
         acc.insert((node.id.clone(), local_name.clone()), s);
     }
@@ -5099,18 +5102,18 @@ nodes:
     }
 
     #[test]
-    fn extract_outputs_rejects_null_values() {
-        // Null is still an error because a declared output key being
-        // explicitly null is unambiguously the agent saying "I have
-        // nothing here" — which the convention treats as a contract
-        // violation (the agent should omit the key, leave the
-        // workflow author to handle the missing-key case).
+    fn extract_outputs_maps_null_values_to_empty_string() {
+        // Null is the convention for "this optional output doesn't
+        // apply to this run" — the orchestrator's `recommend_ticket`
+        // is the canonical example. The OutputMap entry is the empty
+        // string so a downstream `when:` can gate on `!= ""`.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("n.outputs.json"), r#"{"x":null}"#).unwrap();
         let mut acc: OutputMap = HashMap::new();
         let node = agent_node_with_outputs("n", &[("x", "x")]);
-        let err = extract_outputs(tmp.path(), &node, &mut acc).unwrap_err();
-        assert!(format!("{err:#}").contains("JSON null"), "got: {err:#}");
+        extract_outputs(tmp.path(), &node, &mut acc).unwrap();
+        let v = acc.get(&("n".to_string(), "x".to_string())).unwrap();
+        assert_eq!(v, "");
     }
 
     #[test]
