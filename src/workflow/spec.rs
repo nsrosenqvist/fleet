@@ -104,6 +104,17 @@ pub enum NodeKind {
     /// Run a set of sibling nodes in parallel, gather results. The
     /// `siblings` list names other nodes in the same workflow.
     Fanout { siblings: Vec<String> },
+    /// Create a new ticket via the configured tracker. `from` is a
+    /// dotted `<node>.<output>` reference into the `OutputMap` whose
+    /// value is expected to be a JSON object shaped
+    /// `{ "title": String, "body": String, "labels"?: [String] }`.
+    /// On success the node emits `created_id` and `created_human_id`
+    /// outputs the rest of the workflow can branch on. `link_parent`
+    /// (default `true`) attaches the new ticket to the session's
+    /// bound ticket via [`crate::tracker::Tracker::link_parent`]
+    /// when an issue context is present; cross-link comments and
+    /// `.fleet/deps.json` entries land in a follow-up commit.
+    TrackerCreate { from: String, link_parent: bool },
 }
 
 /// `artifacts:` block. Both lists default to empty; bare strings are paths
@@ -188,6 +199,10 @@ struct RawNode {
     expr: Option<String>,
     #[serde(default)]
     siblings: Option<Vec<String>>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    link_parent: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -256,8 +271,19 @@ impl TryFrom<RawNode> for Node {
                     .siblings
                     .ok_or_else(|| anyhow!("fanout node `{}` missing `siblings:`", raw.id))?,
             },
+            "tracker-create" => NodeKind::TrackerCreate {
+                from: raw
+                    .from
+                    .ok_or_else(|| anyhow!("tracker-create node `{}` missing `from:`", raw.id))?,
+                // Default `true` — the v1 convention links the new
+                // ticket back to the bound ticket so the parent's
+                // task list / labels reflect the dependency without
+                // the workflow author having to spell it out.
+                link_parent: raw.link_parent.unwrap_or(true),
+            },
             other => bail!(
-                "node `{}` has unknown `type: {other}` (allowed: agent, bash, gate, assert, fanout)",
+                "node `{}` has unknown `type: {other}` \
+                 (allowed: agent, bash, gate, assert, fanout, tracker-create)",
                 raw.id
             ),
         };
@@ -556,7 +582,59 @@ nodes:
         let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("unknown `type: turbocharger`"));
-        assert!(msg.contains("allowed: agent, bash, gate, assert, fanout"));
+        assert!(msg.contains("allowed: agent, bash, gate, assert, fanout, tracker-create"));
+    }
+
+    #[test]
+    fn parses_tracker_create_node_with_default_link_parent() {
+        let yaml = "\
+name: x
+nodes:
+  - id: file-dep
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        match &wf.nodes[0].kind {
+            NodeKind::TrackerCreate { from, link_parent } => {
+                assert_eq!(from, "implement.recommend_ticket");
+                // Default is true: the v1 convention links back to
+                // the bound ticket without the YAML author opting in.
+                assert!(*link_parent);
+            }
+            other => panic!("expected TrackerCreate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tracker_create_node_with_explicit_link_parent_false() {
+        let yaml = "\
+name: x
+nodes:
+  - id: file-dep
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: false
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        match &wf.nodes[0].kind {
+            NodeKind::TrackerCreate { link_parent, .. } => {
+                assert!(!*link_parent);
+            }
+            other => panic!("expected TrackerCreate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_from_on_tracker_create_errors_clearly() {
+        let yaml = "\
+name: x
+nodes:
+  - id: f
+    type: tracker-create
+";
+        let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
+        assert!(format!("{err:#}").contains("tracker-create node `f` missing `from:`"));
     }
 
     #[test]

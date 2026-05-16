@@ -41,18 +41,26 @@ use crate::session::{IssueContext, Session, SessionId, SessionState, now_ms};
 use crate::tracker::Tracker;
 
 /// What a node's run produced *besides* a Result. Today carries any
-/// parsed agent-cost figures; future entries (resource usage, exit
-/// reason) follow the same shape. Returned from [`WorkflowExecutor::run_node`]
-/// and [`WorkflowExecutor::run_fanout_node`] so the run loop — which
-/// owns `&mut Session` — can apply the outcome without the inner
-/// functions needing mutable access. The pattern matters most for
-/// fanout, whose siblings run in `std::thread::scope` with shared
-/// access to Session only.
+/// parsed agent-cost figures and engine-emitted output map entries
+/// (used by `tracker-create` to surface the new ticket's id); future
+/// entries (resource usage, exit reason) follow the same shape.
+/// Returned from [`WorkflowExecutor::run_node`] and
+/// [`WorkflowExecutor::run_fanout_node`] so the run loop — which owns
+/// `&mut Session` — can apply the outcome without the inner functions
+/// needing mutable access. The pattern matters most for fanout, whose
+/// siblings run in `std::thread::scope` with shared access to Session
+/// only.
 #[derive(Debug, Default, Clone)]
 struct NodeOutcome {
     /// `(node_id, usd)` pairs. Usually 0 or 1 entry; a fanout returns
     /// one per agent sibling that produced a parseable cost line.
     node_costs: Vec<(String, f64)>,
+    /// `((node_id, output_name), value)` tuples the executor itself
+    /// produced (not from an artifact file). Distinct from
+    /// `extract_outputs` — that path is for agent-produced
+    /// `<node>.outputs.json` files; this is for engine-driven nodes
+    /// like `tracker-create` that compute outputs in Rust.
+    extra_outputs: Vec<((String, String), String)>,
 }
 
 impl NodeOutcome {
@@ -63,6 +71,7 @@ impl NodeOutcome {
     fn with_cost(node_id: impl Into<String>, usd: f64) -> Self {
         Self {
             node_costs: vec![(node_id.into(), usd)],
+            extra_outputs: Vec::new(),
         }
     }
 }
@@ -529,6 +538,16 @@ impl WorkflowExecutor {
                 req.store.save(session)?;
             }
 
+            // Fold engine-emitted outputs (e.g. `tracker-create`'s
+            // `created_id`) into the OutputMap before downstream
+            // `extract_outputs` runs — that way `when:` predicates on
+            // the next node can branch on them. The downstream save
+            // below picks them up via `outputs_to_persisted`.
+            let extra_outputs_produced = !outcome.extra_outputs.is_empty();
+            for (key, value) in outcome.extra_outputs {
+                outputs.insert(key, value);
+            }
+
             // After a successful run, extract any declared `outputs:`.
             // For a fanout, the outputs live on each sibling (the
             // fanout itself is just a dispatcher), so we extract per
@@ -561,12 +580,13 @@ impl WorkflowExecutor {
                 }
             }
             // Mirror the in-memory accumulator back onto the session
-            // when *any* target declared outputs (the accumulator may
-            // have new entries) so a future gate boundary or replay
+            // when *any* target declared outputs OR an engine-driven
+            // node emitted extras (the accumulator may have new
+            // entries either way) so a future gate boundary or replay
             // sees them. Skipping the save when nothing was declared
             // keeps the no-outputs workflow's disk traffic at the
             // pre-persistence level.
-            if produced_outputs {
+            if produced_outputs || extra_outputs_produced {
                 session.outputs = outputs_to_persisted(&outputs);
                 req.store.save(session)?;
             }
@@ -684,6 +704,22 @@ impl WorkflowExecutor {
             NodeKind::Assert { expr } => {
                 self.run_assert_node(req, node, expr, session, outputs)?;
                 NodeOutcome::empty()
+            }
+            // tracker-create is host-side like Bash/Assert — it reads
+            // an upstream agent's recommendation out of `outputs` and
+            // mutates the tracker, emitting `created_id` /
+            // `created_human_id` for downstream nodes. The handler
+            // returns the emitted entries; the run loop folds them
+            // into `outputs` after the dispatch returns so downstream
+            // `when:` predicates and the persisted session state both
+            // see them.
+            NodeKind::TrackerCreate { from, link_parent } => {
+                let emitted =
+                    self.run_tracker_create_node(req, node, from, *link_parent, session, outputs)?;
+                NodeOutcome {
+                    node_costs: Vec::new(),
+                    extra_outputs: emitted,
+                }
             }
             // Unsupported kinds were rejected earlier in `execute`; this
             // branch is just an exhaustiveness guard.
@@ -944,6 +980,115 @@ impl WorkflowExecutor {
     /// transitions the session to Failed; the log file records the
     /// expression that failed so the user can see *which* invariant
     /// the workflow protects.
+    /// Execute a `tracker-create` node: read the upstream agent's
+    /// recommendation from `outputs`, parse it as a `{title, body,
+    /// labels?}` JSON object, and call `Tracker::create` to file the
+    /// new ticket. When `link_parent` is true and the session has a
+    /// bound ticket, also call `Tracker::link_parent` to wire the
+    /// structural relationship. Returns the
+    /// `((node_id, output_name), value)` pairs the run loop folds
+    /// into the `OutputMap` so downstream `when:` and `extract_outputs`
+    /// see the new ticket id.
+    ///
+    /// Cross-link comments and `.fleet/deps.json` writes land in a
+    /// follow-up commit; this commit ships only the creation path.
+    fn run_tracker_create_node(
+        &self,
+        req: &ExecuteRequest<'_>,
+        node: &Node,
+        from: &str,
+        link_parent: bool,
+        session: &Session,
+        outputs: &OutputMap,
+    ) -> Result<Vec<((String, String), String)>> {
+        let tracker = self.tracker.as_ref().ok_or_else(|| {
+            anyhow!(
+                "tracker-create node `{}` requires a tracker but the executor was built \
+                 without one — pass `WorkflowExecutor::with_tracker(Some(...))`",
+                node.id
+            )
+        })?;
+
+        let (src_node, src_name) = parse_output_ref(from).with_context(|| {
+            format!("tracker-create node `{}`: parsing `from: {from}`", node.id)
+        })?;
+        let raw = outputs
+            .get(&(src_node.to_string(), src_name.to_string()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "tracker-create node `{}`: no upstream output `{from}` found \
+                     (did the producing node fail or did its `when:` skip it?)",
+                    node.id
+                )
+            })?;
+        let request: TrackerCreateRequest = serde_json::from_str(raw).with_context(|| {
+            format!(
+                "tracker-create node `{}`: parsing `{from}` value as \
+                 `{{ title, body, labels? }}` JSON failed (the agent must emit \
+                 this shape under the source key)",
+                node.id
+            )
+        })?;
+        if request.title.trim().is_empty() {
+            bail!(
+                "tracker-create node `{}`: `{from}.title` is empty — the new \
+                 ticket must have a non-empty title",
+                node.id
+            );
+        }
+
+        let log_path = self.node_log_path(req, session, &node.id);
+        let created = tracker
+            .create(
+                req.workspace,
+                &request.title,
+                &request.body,
+                &request.labels,
+            )
+            .with_context(|| {
+                format!(
+                    "tracker-create node `{}`: `Tracker::create` failed",
+                    node.id
+                )
+            })?;
+        if link_parent {
+            if let Some(parent) = req.issue.as_ref() {
+                tracker
+                    .link_parent(req.workspace, &parent.human_id, &created.human_id)
+                    .with_context(|| {
+                        format!(
+                            "tracker-create node `{}`: `Tracker::link_parent` failed \
+                             (parent={}, child={})",
+                            node.id, parent.human_id, created.human_id
+                        )
+                    })?;
+            }
+            // No bound issue → quietly skip the link. This is the
+            // honest behaviour for a workflow run that didn't bind a
+            // ticket (replay, ad-hoc smoke); the new ticket still
+            // gets created, just without a parent edge.
+        }
+
+        let body = format!(
+            "--- tracker-create ---\nfiled {} ({}): {}\n",
+            created.human_id, created.id, request.title
+        );
+        if let Err(err) = std::fs::write(&log_path, body) {
+            tracing::warn!(?err, log = %log_path.display(), "writing tracker-create log failed");
+        }
+
+        Ok(vec![
+            (
+                (node.id.clone(), "created_id".to_string()),
+                created.id.clone(),
+            ),
+            (
+                (node.id.clone(), "created_human_id".to_string()),
+                created.human_id,
+            ),
+        ])
+    }
+
     fn run_assert_node(
         &self,
         req: &ExecuteRequest<'_>,
@@ -1239,8 +1384,25 @@ pub fn extract_outputs(artifacts_dir: &Path, node: &Node, acc: &mut OutputMap) -
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Bool(b) => b.to_string(),
             serde_json::Value::Number(n) => n.to_string(),
-            other => bail!(
-                "node `{}`: output key `{source_key}` must be a scalar (string/bool/number); got: {other}",
+            // Objects and arrays JSON-encode to a single string so
+            // downstream nodes can pluck structured payloads back out
+            // — the `tracker-create` node consumes
+            // `recommend_ticket: { title, body, labels }` this way.
+            // `when:` predicates over object outputs won't match an
+            // `==` against a scalar string (the encoded form is the
+            // literal JSON), which is the same behaviour any other
+            // mismatched-shape comparison would have.
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                serde_json::to_string(raw).map_err(|e| {
+                    anyhow!(
+                        "node `{}`: serialising output key `{source_key}` failed: {e}",
+                        node.id,
+                    )
+                })?
+            }
+            serde_json::Value::Null => bail!(
+                "node `{}`: output key `{source_key}` was JSON null \
+                 (the agent must produce a concrete value)",
                 node.id
             ),
         };
@@ -1620,6 +1782,38 @@ fn shell_quote_path(p: &Path) -> String {
     }
     let escaped = s.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+/// JSON deserialisation target for the `recommend_ticket`-shaped value
+/// the `tracker-create` node consumes. `labels` defaults to empty so
+/// the agent can omit it when there's nothing to attach.
+#[derive(serde::Deserialize)]
+struct TrackerCreateRequest {
+    title: String,
+    body: String,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+/// Parse a `<node>.<output>` reference (the shape used by
+/// `tracker-create`'s `from:` field, and by `when:` predicates'
+/// left-hand sides) into `(node, output_name)`. Errors loudly on
+/// missing-dot, empty halves, or anything beyond a single dot —
+/// nested paths are explicitly not supported in v1.
+fn parse_output_ref(reference: &str) -> Result<(&str, &str)> {
+    let (node, name) = reference
+        .split_once('.')
+        .ok_or_else(|| anyhow!("`{reference}` is not a `<node>.<output>` reference"))?;
+    if node.is_empty() || name.is_empty() {
+        bail!("`{reference}` is malformed: both `<node>` and `<output>` must be non-empty");
+    }
+    if name.contains('.') {
+        bail!(
+            "`{reference}` is malformed: nested paths are not supported in v1 \
+             (use the second segment as a single output name)"
+        );
+    }
+    Ok((node, name))
 }
 
 #[cfg(test)]
@@ -4739,17 +4933,58 @@ nodes:
     }
 
     #[test]
-    fn extract_outputs_errors_when_value_is_non_scalar() {
+    fn extract_outputs_json_encodes_object_values() {
+        // Objects under a declared output key are JSON-encoded into a
+        // single string so downstream nodes (the `tracker-create`
+        // node consuming `recommend_ticket`) can plug the structured
+        // payload back out. Pre-Phase-2 fleet would have rejected
+        // this as non-scalar; the relaxation is intentional.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("n.outputs.json"),
-            r#"{"x":{"nested":"oops"}}"#,
+            r#"{"x":{"title":"hi","body":"there"}}"#,
         )
         .unwrap();
         let mut acc: OutputMap = HashMap::new();
         let node = agent_node_with_outputs("n", &[("x", "x")]);
+        extract_outputs(tmp.path(), &node, &mut acc).unwrap();
+        let v = acc.get(&("n".to_string(), "x".to_string())).unwrap();
+        // serde_json::to_string preserves object-key order for the
+        // same input shape; assert on the round-trip rather than the
+        // exact string so we don't depend on serde's iteration order.
+        let round: serde_json::Value = serde_json::from_str(v).unwrap();
+        assert_eq!(round["title"], "hi");
+        assert_eq!(round["body"], "there");
+    }
+
+    #[test]
+    fn extract_outputs_json_encodes_array_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("n.outputs.json"),
+            r#"{"labels":["a","b","c"]}"#,
+        )
+        .unwrap();
+        let mut acc: OutputMap = HashMap::new();
+        let node = agent_node_with_outputs("n", &[("labels", "labels")]);
+        extract_outputs(tmp.path(), &node, &mut acc).unwrap();
+        let v = acc.get(&("n".to_string(), "labels".to_string())).unwrap();
+        assert_eq!(v, r#"["a","b","c"]"#);
+    }
+
+    #[test]
+    fn extract_outputs_rejects_null_values() {
+        // Null is still an error because a declared output key being
+        // explicitly null is unambiguously the agent saying "I have
+        // nothing here" — which the convention treats as a contract
+        // violation (the agent should omit the key, leave the
+        // workflow author to handle the missing-key case).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("n.outputs.json"), r#"{"x":null}"#).unwrap();
+        let mut acc: OutputMap = HashMap::new();
+        let node = agent_node_with_outputs("n", &[("x", "x")]);
         let err = extract_outputs(tmp.path(), &node, &mut acc).unwrap_err();
-        assert!(format!("{err:#}").contains("must be a scalar"));
+        assert!(format!("{err:#}").contains("JSON null"), "got: {err:#}");
     }
 
     #[test]
@@ -5762,5 +5997,673 @@ nodes:
         // binary and the agent would get "exec format error."
         let adapter = ArchOnlyAdapter::returning(Some("future-arch-9000"));
         assert_eq!(fleet_tracker_mount(&adapter, &ImageId::new("img:1")), None);
+    }
+
+    // ---- tracker-create -----------------------------------------------
+
+    /// Captures every tracker write to one log + returns canned results.
+    /// Distinct from the bridge module's `MockTracker` so the executor
+    /// tests stay decoupled from the bridge's internal test fixtures.
+    struct MockCreateTracker {
+        calls: std::sync::Mutex<Vec<String>>,
+        next_create: std::sync::Mutex<Option<crate::tracker::Issue>>,
+        fail_create: std::sync::Mutex<bool>,
+        fail_link: std::sync::Mutex<bool>,
+    }
+
+    impl MockCreateTracker {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                next_create: std::sync::Mutex::new(None),
+                fail_create: std::sync::Mutex::new(false),
+                fail_link: std::sync::Mutex::new(false),
+            }
+        }
+
+        fn with_next_create(self, issue: crate::tracker::Issue) -> Self {
+            *self.next_create.lock().unwrap() = Some(issue);
+            self
+        }
+
+        fn fail_create(self) -> Self {
+            *self.fail_create.lock().unwrap() = true;
+            self
+        }
+
+        fn fail_link(self) -> Self {
+            *self.fail_link.lock().unwrap() = true;
+            self
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::tracker::Tracker for MockCreateTracker {
+        fn name(&self) -> &'static str {
+            "mock-create"
+        }
+
+        fn list_issues(&self, _: &Path) -> Result<Vec<crate::tracker::Issue>> {
+            Ok(Vec::new())
+        }
+
+        fn create(
+            &self,
+            _: &Path,
+            title: &str,
+            body: &str,
+            labels: &[String],
+        ) -> Result<crate::tracker::Issue> {
+            self.calls.lock().unwrap().push(format!(
+                "create(title={title:?}, body={body:?}, labels={labels:?})"
+            ));
+            if *self.fail_create.lock().unwrap() {
+                return Err(anyhow!("forced tracker create failure"));
+            }
+            self.next_create
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow!("no next_create configured"))
+        }
+
+        fn link_parent(&self, _: &Path, parent: &str, child: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("link_parent(parent={parent}, child={child})"));
+            if *self.fail_link.lock().unwrap() {
+                Err(anyhow!("forced link_parent failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn sample_created_issue(human: &str) -> crate::tracker::Issue {
+        crate::tracker::Issue {
+            id: format!("gh:{human}"),
+            human_id: human.to_string(),
+            title: "Created by tracker-create".to_string(),
+            status: "open".to_string(),
+            labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_output_ref_splits_node_and_name() {
+        let (n, o) = parse_output_ref("implement.recommend_ticket").unwrap();
+        assert_eq!(n, "implement");
+        assert_eq!(o, "recommend_ticket");
+    }
+
+    #[test]
+    fn parse_output_ref_errors_on_missing_dot() {
+        let err = parse_output_ref("implement").unwrap_err();
+        assert!(format!("{err}").contains("not a `<node>.<output>`"));
+    }
+
+    #[test]
+    fn parse_output_ref_errors_on_empty_halves() {
+        assert!(parse_output_ref(".name").is_err());
+        assert!(parse_output_ref("node.").is_err());
+    }
+
+    #[test]
+    fn parse_output_ref_rejects_nested_paths() {
+        let err = parse_output_ref("a.b.c").unwrap_err();
+        assert!(format!("{err}").contains("nested paths are not supported"));
+    }
+
+    #[test]
+    fn tracker_create_node_calls_create_and_emits_outputs_end_to_end() {
+        // Workflow: an upstream bash node writes the `recommend_ticket`
+        // payload as if it were an agent's output, then the
+        // tracker-create node fires and the test asserts the
+        // MockCreateTracker saw the right call + the OutputMap on
+        // disk picked up `created_id` / `created_human_id`.
+        let yaml = "\
+name: tc-happy
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: false
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-1");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        // The bash node writes `implement.outputs.json` with the
+        // structured recommend_ticket payload.
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"Missing JSON parser","body":"need it for the planner","labels":["needs-impl"]}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("87")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let session = executor.execute(&req).unwrap();
+
+        // Tracker.create saw the parsed object verbatim, link_parent
+        // was *not* called (the workflow opted out).
+        let calls = tracker.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one tracker call: {calls:?}"
+        );
+        let create_call = &calls[0];
+        assert!(create_call.contains("title=\"Missing JSON parser\""));
+        assert!(create_call.contains("body=\"need it for the planner\""));
+        assert!(create_call.contains("labels=[\"needs-impl\"]"));
+
+        // OutputMap entries persisted onto the session.
+        assert_eq!(session.state, SessionState::Completed);
+        let file_dep_outputs = session
+            .outputs
+            .get("file-dep")
+            .expect("file-dep emitted outputs");
+        assert_eq!(
+            file_dep_outputs.get("created_id"),
+            Some(&"gh:87".to_string())
+        );
+        assert_eq!(
+            file_dep_outputs.get("created_human_id"),
+            Some(&"87".to_string())
+        );
+    }
+
+    #[test]
+    fn tracker_create_node_calls_link_parent_when_issue_bound() {
+        // Same shape as above but link_parent is true (the YAML
+        // default) and we provide an issue. The tracker should see
+        // both `create` and `link_parent`.
+        let yaml = "\
+name: tc-link
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-link");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("99")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: Some(sample_issue()),
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        executor.execute(&req).unwrap();
+        let calls = tracker.calls();
+        assert_eq!(calls.len(), 2, "expected create + link_parent: {calls:?}");
+        assert!(calls[1].starts_with("link_parent("));
+        // Parent is the bound issue's human_id (`42`), child is the
+        // freshly minted `99`.
+        assert!(calls[1].contains("parent=42"));
+        assert!(calls[1].contains("child=99"));
+    }
+
+    #[test]
+    fn tracker_create_node_skips_link_parent_when_no_issue_bound() {
+        let yaml = "\
+name: tc-no-issue
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-noissue");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("11")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None, // no bound ticket
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        executor.execute(&req).unwrap();
+        let calls = tracker.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "link_parent must not fire without a bound issue: {calls:?}"
+        );
+        assert!(calls[0].starts_with("create("));
+    }
+
+    #[test]
+    fn tracker_create_node_fails_when_executor_has_no_tracker() {
+        let yaml = "\
+name: tc-no-tracker
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-notracker");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        // Executor built *without* a tracker.
+        let executor = WorkflowExecutor::new(Arc::new(mock)).with_clock(counter_clock());
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        assert!(format!("{err:#}").contains("requires a tracker"));
+    }
+
+    #[test]
+    fn tracker_create_node_fails_when_recommend_ticket_is_malformed_json() {
+        let yaml = "\
+name: tc-bad-json
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-badjson");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            // Recommend_ticket is a *string* — JSON-encoded as
+            // `"\"not-an-object\""`. The handler should bail when
+            // deserializing into `{title, body, labels?}`.
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":"not-an-object"}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker = Arc::new(MockCreateTracker::new());
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("title"), "got: {msg}");
+        // Tracker.create never gets called.
+        assert!(
+            tracker.calls().is_empty(),
+            "tracker should not be invoked on parse failure"
+        );
+    }
+
+    #[test]
+    fn tracker_create_node_fails_on_empty_title() {
+        let yaml = "\
+name: tc-empty-title
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-empty");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker = Arc::new(MockCreateTracker::new());
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        assert!(format!("{err:#}").contains("title"));
+        // Tracker.create not called because title-check runs first.
+        assert!(tracker.calls().is_empty());
+    }
+
+    #[test]
+    fn tracker_create_node_propagates_tracker_create_failures() {
+        let yaml = "\
+name: tc-create-fail
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: false
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-cf");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker = Arc::new(MockCreateTracker::new().fail_create());
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        assert!(format!("{err:#}").contains("forced tracker create failure"));
+    }
+
+    #[test]
+    fn tracker_create_node_propagates_link_parent_failures() {
+        // `link_parent` ran after `create` — its failure must surface
+        // (the ticket has been filed but the structural link is now
+        // missing, which is exactly the situation we want loud, not
+        // swallowed).
+        let yaml = "\
+name: tc-link-fail
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-lf");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker = Arc::new(
+            MockCreateTracker::new()
+                .with_next_create(sample_created_issue("55"))
+                .fail_link(),
+        );
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: Some(sample_issue()),
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        let err = executor.execute(&req).unwrap_err();
+        assert!(format!("{err:#}").contains("forced link_parent failure"));
     }
 }
