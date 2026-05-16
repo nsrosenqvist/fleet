@@ -274,6 +274,62 @@ pub fn would_create_cycle(doc: &DepsDoc, proposed: &DepEdge) -> bool {
     false
 }
 
+/// Set of ticket ids that participate in at least one cycle in
+/// the current deps graph. Used by the TUI to surface a `⚠` glyph
+/// next to sessions / plan rows whose ticket is part of a tangle
+/// the supervisor can't resolve on its own.
+///
+/// A node `X` is in a cycle iff there's a path `X → … → X`
+/// following `blocked → blocked_on` edges. Self-loops count.
+/// Pure: the caller (the TUI's reload) decides when to compute it.
+///
+/// Complexity: O(V · E) worst case, bounded by
+/// [`MAX_CYCLE_CHECK_NODES`] per starting node so a pathological
+/// graph still terminates in roughly constant time per node.
+#[must_use]
+pub fn nodes_in_cycle(doc: &DepsDoc) -> std::collections::HashSet<String> {
+    let mut starts: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for edge in &doc.edges {
+        // Only nodes with an outgoing edge can be on a cycle —
+        // right-hand-only ids (terminal freeform tags, leaf
+        // tickets) are never reachable from themselves.
+        starts.insert(edge.blocked.as_str());
+    }
+    let mut result: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for start in starts {
+        if reaches_self(doc, start) {
+            result.insert(start.to_string());
+        }
+    }
+    result
+}
+
+/// Returns `true` iff a path `start → … → start` exists in `doc`.
+/// Used by [`nodes_in_cycle`]; broken out as its own helper because
+/// the inner BFS bookkeeping is fiddly enough to be worth naming.
+fn reaches_self(doc: &DepsDoc, start: &str) -> bool {
+    let mut frontier: Vec<&str> = vec![start];
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    while let Some(current) = frontier.pop() {
+        if seen.len() > MAX_CYCLE_CHECK_NODES {
+            // Same defensive bail as `would_create_cycle`. Better
+            // to flag the node than to hang.
+            return true;
+        }
+        for edge in &doc.edges {
+            if edge.blocked == current {
+                if edge.blocked_on == start {
+                    return true;
+                }
+                if seen.insert(edge.blocked_on.as_str()) {
+                    frontier.push(edge.blocked_on.as_str());
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +606,75 @@ mod tests {
             ],
         };
         assert!(!would_create_cycle(&doc, &sample_edge("42", "43")));
+    }
+
+    #[test]
+    fn nodes_in_cycle_is_empty_on_an_acyclic_graph() {
+        // Chain 42→43→44. No back-edges, nothing in a cycle.
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![sample_edge("42", "43"), sample_edge("43", "44")],
+        };
+        assert!(nodes_in_cycle(&doc).is_empty());
+    }
+
+    #[test]
+    fn nodes_in_cycle_finds_both_members_of_a_two_cycle() {
+        // 42→43, 43→42. Both nodes are on the cycle.
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![sample_edge("42", "43"), sample_edge("43", "42")],
+        };
+        let set = nodes_in_cycle(&doc);
+        assert!(set.contains("42"), "expected 42 in {set:?}");
+        assert!(set.contains("43"), "expected 43 in {set:?}");
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn nodes_in_cycle_finds_all_members_of_a_three_cycle() {
+        // 42→43, 43→44, 44→42.
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![
+                sample_edge("42", "43"),
+                sample_edge("43", "44"),
+                sample_edge("44", "42"),
+            ],
+        };
+        let set = nodes_in_cycle(&doc);
+        for t in ["42", "43", "44"] {
+            assert!(set.contains(t), "expected {t} in {set:?}");
+        }
+    }
+
+    #[test]
+    fn nodes_in_cycle_distinguishes_cycle_members_from_attached_acyclic_tail() {
+        // Cycle on 42↔43; 44 is just blocked on 42 with no back-edge.
+        // 42 and 43 are in the cycle; 44 is not.
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![
+                sample_edge("42", "43"),
+                sample_edge("43", "42"),
+                sample_edge("44", "42"),
+            ],
+        };
+        let set = nodes_in_cycle(&doc);
+        assert!(set.contains("42"));
+        assert!(set.contains("43"));
+        assert!(!set.contains("44"), "44 has no back-edge — not in a cycle");
+    }
+
+    #[test]
+    fn nodes_in_cycle_treats_self_loop_as_a_cycle_of_one() {
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![sample_edge("42", "42")],
+        };
+        let set = nodes_in_cycle(&doc);
+        assert!(set.contains("42"));
+        assert_eq!(set.len(), 1);
     }
 
     #[test]

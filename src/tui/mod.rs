@@ -199,6 +199,12 @@ struct AppState {
     /// exist yet (the common case for repos that haven't used
     /// `fleet brainstorm`).
     brainstorms: Vec<BrainstormSession>,
+    /// Ticket ids currently sitting on a cycle in the deps graph.
+    /// Recomputed each `reload` from `.fleet/deps.json`. Drives
+    /// the `⚠` markers on session and plan rows so the user
+    /// notices a tangle the supervisor can't resolve on its own.
+    /// Empty when the deps file is missing or acyclic.
+    cycle_nodes: std::collections::HashSet<String>,
 }
 
 /// Lifecycle of the lazily-built tracker. Three states because the
@@ -328,6 +334,7 @@ impl AppState {
             plans: Vec::new(),
             plans_list_state: ListState::default(),
             brainstorms: Vec::new(),
+            cycle_nodes: std::collections::HashSet::new(),
         };
         state.reload(store)?;
         Ok(state)
@@ -382,6 +389,16 @@ impl AppState {
         // Brainstorms are similarly cheap and live in the same
         // sidebar — keep the listing fresh.
         self.refresh_brainstorms();
+        // Recompute cycle nodes from the deps file so the
+        // sidebar's ⚠ markers reflect current state. Loading a
+        // missing deps.json yields an empty doc (and thus an
+        // empty set) — the common case for repos that don't use
+        // tracker-create injection yet.
+        let deps_store = crate::deps::DepsStore::for_repo(&self.root);
+        self.cycle_nodes = deps_store
+            .load()
+            .map(|doc| crate::deps::nodes_in_cycle(&doc))
+            .unwrap_or_default();
         self.status_line = render_status_line(&self.sessions, &self.plans);
         Ok(())
     }
@@ -1363,7 +1380,12 @@ fn render_plans_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let items: Vec<ListItem<'_>> = state
         .plans
         .iter()
-        .map(|p| ListItem::new(Span::styled(plan_row_label(p), plan_row_style(p))))
+        .map(|p| {
+            ListItem::new(Span::styled(
+                plan_row_label(p, &state.cycle_nodes),
+                plan_row_style(p),
+            ))
+        })
         .collect();
     let list = List::new(items)
         .block(block)
@@ -1400,11 +1422,21 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 /// One-line label for the plans sidebar list. Pure: pulled out for
 /// testability since the ratatui frame-based renderers don't compose
 /// cleanly with assert macros.
+///
+/// `cycle_nodes` is consulted to add a leading `⚠ ` glyph when any
+/// of the plan's items is bound to a ticket sitting on a cycle.
+/// Pass an empty set to skip the warning (tests that don't care
+/// about deps state).
 #[must_use]
-fn plan_row_label(plan: &Plan) -> String {
+fn plan_row_label(plan: &Plan, cycle_nodes: &std::collections::HashSet<String>) -> String {
     let (done, total) = plan.progress();
+    let warning_prefix = if plan_in_cycle(plan, cycle_nodes) {
+        "⚠ "
+    } else {
+        ""
+    };
     format!(
-        "{} {} {done}/{total} {}",
+        "{warning_prefix}{} {} {done}/{total} {}",
         plan_state_marker(plan.state),
         plan.id,
         plan.name,
@@ -1557,7 +1589,7 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         )));
         for s in &state.sessions {
             items.push(ListItem::new(Span::styled(
-                session_row_label(s, &state.plans),
+                session_row_label(s, &state.plans, &state.cycle_nodes),
                 state_style(s.state),
             )));
         }
@@ -1636,17 +1668,32 @@ fn brainstorm_state_word(state: BrainstormState) -> &'static str {
 /// an active plan. Factored out so tests can assert on the exact
 /// surface without a ratatui Frame.
 ///
+/// `cycle_nodes` is the set of ticket ids currently part of a
+/// cycle in the deps graph — when the session's bound ticket is
+/// in that set, the label gets a leading `⚠ ` so the user
+/// notices. Pass an empty set to skip the warning entirely (e.g.
+/// from tests that don't care about deps state).
+///
 /// The plan lookup walks every active plan once — fine for typical
 /// fleet workloads (a handful of plans, dozens of items each). If
 /// that grows, swap to a precomputed `ticket_id → plan` map kept
 /// alongside `AppState.plans`.
 #[must_use]
-pub fn session_row_label(session: &Session, plans: &[Plan]) -> String {
+pub fn session_row_label(
+    session: &Session,
+    plans: &[Plan],
+    cycle_nodes: &std::collections::HashSet<String>,
+) -> String {
     let cost_suffix = session
         .total_cost_usd()
         .map_or_else(String::new, |v| format!(" ${v:.2}"));
+    let warning_prefix = if session_in_cycle(session, cycle_nodes) {
+        "⚠ "
+    } else {
+        ""
+    };
     let mut label = format!(
-        "{} {} {}{cost_suffix}",
+        "{warning_prefix}{} {} {}{cost_suffix}",
         state_marker(session.state),
         session.id,
         session.workflow,
@@ -1656,6 +1703,27 @@ pub fn session_row_label(session: &Session, plans: &[Plan]) -> String {
         let _ = write!(label, " · {annotation}");
     }
     label
+}
+
+/// `true` when the session is bound to a ticket that's part of a
+/// cycle in the deps graph. Pulled out so the row-label helper and
+/// the tests share the same definition.
+#[must_use]
+fn session_in_cycle(session: &Session, cycle_nodes: &std::collections::HashSet<String>) -> bool {
+    session
+        .issue
+        .as_ref()
+        .is_some_and(|i| cycle_nodes.contains(&i.human_id))
+}
+
+/// `true` when any item in the plan is bound to a ticket sitting on
+/// a cycle in the deps graph. Used to flag plans whose forward
+/// progress depends on a tangle the supervisor can't auto-resolve.
+#[must_use]
+fn plan_in_cycle(plan: &Plan, cycle_nodes: &std::collections::HashSet<String>) -> bool {
+    plan.items
+        .iter()
+        .any(|item| cycle_nodes.contains(&item.ticket_id))
 }
 
 /// `Some("<plan-name> (n/N)")` when the session's bound ticket is
@@ -1790,6 +1858,13 @@ pub fn detail_kv_pairs(session: &Session) -> Vec<(&'static str, String)> {
 mod tests {
     use super::*;
     use crate::session::SessionId;
+
+    /// Convenience: an empty cycle-node set for tests that don't
+    /// care about the deps graph. Saves repeating the type-spelled
+    /// `HashSet::new()` at every call site.
+    fn no_cycles() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
 
     fn session(id: &str, workflow: &str, state: SessionState, ts: u64) -> Session {
         let mut s = Session::new(SessionId::new(id), workflow, ts);
@@ -2729,7 +2804,7 @@ mod tests {
     #[test]
     fn plan_row_label_shows_marker_id_progress_and_name() {
         let p = sample_plan();
-        let label = plan_row_label(&p);
+        let label = plan_row_label(&p, &no_cycles());
         assert!(label.starts_with('●'), "active marker expected: {label}");
         assert!(label.contains("plan-1"));
         assert!(label.contains("1/3"));
@@ -2740,11 +2815,11 @@ mod tests {
     fn plan_row_label_marker_reflects_state() {
         let mut p = sample_plan();
         p.state = PlanState::Paused;
-        assert!(plan_row_label(&p).starts_with('⏸'));
+        assert!(plan_row_label(&p, &no_cycles()).starts_with('⏸'));
         p.state = PlanState::Completed;
-        assert!(plan_row_label(&p).starts_with('✓'));
+        assert!(plan_row_label(&p, &no_cycles()).starts_with('✓'));
         p.state = PlanState::Abandoned;
-        assert!(plan_row_label(&p).starts_with('✗'));
+        assert!(plan_row_label(&p, &no_cycles()).starts_with('✗'));
     }
 
     #[test]
@@ -2876,7 +2951,7 @@ mod tests {
     fn session_row_label_omits_plan_annotation_when_session_has_no_ticket() {
         let s = session("s-1", "standard", SessionState::Running, 1);
         let plans = vec![sample_plan()];
-        let label = session_row_label(&s, &plans);
+        let label = session_row_label(&s, &plans, &no_cycles());
         assert!(!label.contains('·'), "got: {label}");
     }
 
@@ -2884,7 +2959,7 @@ mod tests {
     fn session_row_label_omits_plan_annotation_when_no_active_plan_owns_the_ticket() {
         let s = session_with_ticket("s-1", "standard", "999");
         let plans = vec![sample_plan()]; // contains 42, 43, 44 only
-        let label = session_row_label(&s, &plans);
+        let label = session_row_label(&s, &plans, &no_cycles());
         assert!(!label.contains('·'), "got: {label}");
     }
 
@@ -2892,7 +2967,7 @@ mod tests {
     fn session_row_label_appends_plan_annotation_when_active_plan_contains_ticket() {
         let s = session_with_ticket("s-1", "standard", "43");
         let plans = vec![sample_plan()];
-        let label = session_row_label(&s, &plans);
+        let label = session_row_label(&s, &plans, &no_cycles());
         // 1-based position so users see "2/3", not "1/3".
         assert!(label.contains("· Parser refactor (2/3)"), "got: {label}");
     }
@@ -2905,7 +2980,7 @@ mod tests {
         let s = session_with_ticket("s-1", "standard", "43");
         let mut plan = sample_plan();
         plan.state = PlanState::Paused;
-        let label = session_row_label(&s, &[plan]);
+        let label = session_row_label(&s, &[plan], &no_cycles());
         assert!(!label.contains("· Parser"), "got: {label}");
     }
 
@@ -2913,11 +2988,59 @@ mod tests {
     fn session_row_label_preserves_cost_suffix_before_plan_annotation() {
         let mut s = session_with_ticket("s-1", "standard", "43");
         s.record_node_cost("plan", 0.5, 2);
-        let label = session_row_label(&s, &[sample_plan()]);
+        let label = session_row_label(&s, &[sample_plan()], &no_cycles());
         // Cost first ("...$0.50"), then plan annotation ("· …").
         let cost_idx = label.find("$0.50").expect("cost suffix");
         let plan_idx = label.find("· Parser").expect("plan annotation");
         assert!(cost_idx < plan_idx, "got: {label}");
+    }
+
+    #[test]
+    fn session_row_label_prepends_warning_when_session_ticket_is_in_cycle() {
+        let s = session_with_ticket("s-1", "standard", "43");
+        let mut cycles = std::collections::HashSet::new();
+        cycles.insert("43".to_string());
+        let label = session_row_label(&s, &[], &cycles);
+        assert!(label.starts_with("⚠ "), "got: {label}");
+    }
+
+    #[test]
+    fn session_row_label_omits_warning_when_ticket_is_not_in_cycle_set() {
+        let s = session_with_ticket("s-1", "standard", "43");
+        let mut cycles = std::collections::HashSet::new();
+        cycles.insert("999".to_string()); // unrelated ticket
+        let label = session_row_label(&s, &[], &cycles);
+        assert!(!label.starts_with("⚠ "), "got: {label}");
+    }
+
+    #[test]
+    fn session_row_label_omits_warning_when_session_has_no_ticket_even_with_cycles() {
+        // A session without a ticket binding can't be in a cycle —
+        // the cycle set is keyed by ticket id, and no key matches.
+        let s = session("s-1", "standard", SessionState::Running, 1);
+        let mut cycles = std::collections::HashSet::new();
+        cycles.insert("43".to_string());
+        let label = session_row_label(&s, &[], &cycles);
+        assert!(!label.starts_with("⚠ "), "got: {label}");
+    }
+
+    #[test]
+    fn plan_row_label_prepends_warning_when_any_item_ticket_is_in_cycle() {
+        // sample_plan's items reference 42, 43, 44.
+        let p = sample_plan();
+        let mut cycles = std::collections::HashSet::new();
+        cycles.insert("43".to_string());
+        let label = plan_row_label(&p, &cycles);
+        assert!(label.starts_with("⚠ "), "got: {label}");
+    }
+
+    #[test]
+    fn plan_row_label_omits_warning_when_no_item_ticket_intersects_cycle_set() {
+        let p = sample_plan();
+        let mut cycles = std::collections::HashSet::new();
+        cycles.insert("999".to_string()); // not in the plan
+        let label = plan_row_label(&p, &cycles);
+        assert!(!label.starts_with("⚠ "), "got: {label}");
     }
 
     // ---- brainstorm sidebar -----------------------------------------
