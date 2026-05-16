@@ -11,10 +11,10 @@
 //! The CLI in `cli::brainstorm` is responsible for building the
 //! snapshot from the tracker + plan store at session-spawn time.
 //!
-//! Future direction (out of scope for v1): per-repo prompt
-//! overrides under `.fleet/prompts/brainstorm.md` would let teams
-//! customise the role description without touching fleet
-//! internals — same pattern as the workflow persona prompts.
+//! Per-repo overrides land at `.fleet/prompts/brainstorm.md` —
+//! same pattern as the workflow persona prompts. Use
+//! [`render_prompt_for_repo`] to apply them; [`render_prompt`]
+//! always uses the built-in template.
 
 use crate::plans::Plan;
 use crate::tracker::Issue;
@@ -34,13 +34,54 @@ pub struct RepoSnapshot {
 /// the static template with the dynamic repo snapshot.
 #[must_use]
 pub fn render_prompt(snapshot: &RepoSnapshot) -> String {
-    let mut out = String::with_capacity(STATIC_TEMPLATE.len() + 4096);
-    out.push_str(STATIC_TEMPLATE);
+    render_prompt_with_template(STATIC_TEMPLATE, snapshot)
+}
+
+/// Same as [`render_prompt`] but with a caller-supplied template
+/// string. Used by [`render_prompt_for_repo`] to apply a per-repo
+/// override; also handy for tests that pin the exact template.
+#[must_use]
+pub fn render_prompt_with_template(template: &str, snapshot: &RepoSnapshot) -> String {
+    let mut out = String::with_capacity(template.len() + 4096);
+    out.push_str(template);
     out.push_str("\n\n## Current repo state\n\n");
     out.push_str(&render_open_issues(&snapshot.open_issues));
     out.push('\n');
     out.push_str(&render_active_plans(&snapshot.active_plans));
     out
+}
+
+/// Render the prompt with a per-repo override if present.
+/// `<fleet_root>/.fleet/prompts/brainstorm.md` overrides the
+/// built-in template when it exists — same pattern fleet uses
+/// for workflow persona prompts (`prompts/planner.md` etc.) but
+/// applied to brainstorm's system prompt. The override is the
+/// whole template; the dynamic repo snapshot (open issues +
+/// active plans) is appended after either way.
+///
+/// File-read failures other than "not found" surface in the
+/// returned [`Result`] — a malformed-encoding override is a real
+/// error, not a silent fallback to the built-in. The CLI surfaces
+/// it on stderr and proceeds with the built-in.
+pub fn render_prompt_for_repo(
+    fleet_root: &std::path::Path,
+    snapshot: &RepoSnapshot,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let override_path = fleet_root.join(".fleet/prompts/brainstorm.md");
+    let template = match std::fs::read_to_string(&override_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => STATIC_TEMPLATE.to_string(),
+        Err(e) => {
+            return Err(anyhow::Error::new(e)).with_context(|| {
+                format!(
+                    "reading brainstorm prompt override at {}",
+                    override_path.display()
+                )
+            });
+        }
+    };
+    Ok(render_prompt_with_template(&template, snapshot))
 }
 
 fn render_open_issues(issues: &[Issue]) -> String {
@@ -286,6 +327,54 @@ mod tests {
         };
         let p = render_prompt(&snapshot);
         assert!(p.contains("### Active plans\n\n(none)"));
+    }
+
+    #[test]
+    fn render_prompt_for_repo_uses_builtin_when_override_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = RepoSnapshot {
+            open_issues: Vec::new(),
+            active_plans: Vec::new(),
+        };
+        let p = render_prompt_for_repo(dir.path(), &snapshot).unwrap();
+        assert!(p.contains("fleet plan list"), "should use built-in");
+    }
+
+    #[test]
+    fn render_prompt_for_repo_uses_override_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts_dir = dir.path().join(".fleet/prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let override_body = "# Custom brainstorm role\n\nYou are the team's planner.";
+        std::fs::write(prompts_dir.join("brainstorm.md"), override_body).unwrap();
+
+        let snapshot = RepoSnapshot {
+            open_issues: Vec::new(),
+            active_plans: Vec::new(),
+        };
+        let p = render_prompt_for_repo(dir.path(), &snapshot).unwrap();
+        assert!(p.contains("# Custom brainstorm role"), "override missing");
+        assert!(p.contains("team's planner"), "override body missing");
+        // Built-in template's content shouldn't leak in.
+        assert!(!p.contains("fleet plan list"), "built-in leaked: {p}");
+        // The dynamic snapshot section is still appended.
+        assert!(p.contains("## Current repo state"), "snapshot missing");
+    }
+
+    #[test]
+    fn render_prompt_for_repo_appends_snapshot_to_override_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts_dir = dir.path().join(".fleet/prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        std::fs::write(prompts_dir.join("brainstorm.md"), "# Minimal").unwrap();
+        let snapshot = RepoSnapshot {
+            open_issues: vec![issue("42", "Fix parser", &[])],
+            active_plans: Vec::new(),
+        };
+        let p = render_prompt_for_repo(dir.path(), &snapshot).unwrap();
+        assert!(p.contains("# Minimal"));
+        assert!(p.contains("### Open issues (1)"));
+        assert!(p.contains("#42 — Fix parser"));
     }
 
     #[test]

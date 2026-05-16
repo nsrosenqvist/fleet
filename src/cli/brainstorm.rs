@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::brainstorm::prompt::{RepoSnapshot, render_prompt};
+use crate::brainstorm::prompt::{RepoSnapshot, render_prompt_for_repo};
 use crate::brainstorm::store::BrainstormStore;
 use crate::brainstorm::tmux;
 use crate::brainstorm::{
@@ -73,7 +73,14 @@ pub fn run_default() -> Result<i32> {
         .with_context(|| format!("creating brainstorm session `{id}` on disk"))?;
 
     // Write the system prompt next to the meta.
-    let prompt_body = render_prompt(&snapshot);
+    // `.fleet/prompts/brainstorm.md` overrides the built-in
+    // template if present. A malformed-encoding override fails
+    // loudly (it's a user-authored file); a plain absence falls
+    // through to the built-in silently.
+    let prompt_body = render_prompt_for_repo(&root, &snapshot).unwrap_or_else(|err| {
+        eprintln!("warning: brainstorm prompt override unreadable: {err:#}");
+        crate::brainstorm::prompt::render_prompt(&snapshot)
+    });
     let prompt_path = store.prompt_path(&id);
     std::fs::write(&prompt_path, prompt_body)
         .with_context(|| format!("writing prompt at {}", prompt_path.display()))?;
