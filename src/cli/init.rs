@@ -246,6 +246,8 @@ const DEFAULT_FLEET_GITIGNORE: &str = "\
 # config.yaml and workflows/ are intended to be checked in.
 sessions/
 crashed/
+plans/
+deps.json
 *.tmp
 ";
 
