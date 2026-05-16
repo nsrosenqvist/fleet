@@ -1,13 +1,24 @@
-//! `fleet issues list` — host-side tracker browser.
+//! `fleet issues …` — host-side tracker browser + writer.
 //!
 //! Reads `.fleet/config.yaml`'s `tracker:` choice, builds the matching
-//! impl from [`crate::tracker::build`], and prints one line per issue.
-//! For unimplemented trackers (Linear / Jira today) the command prints an
-//! actionable fallback message instead of failing — same shape as
-//! `fleet runtime doctor`'s "next steps" UX.
+//! impl from [`crate::tracker::build`], and dispatches to the trait's
+//! methods. For unimplemented trackers (Linear / Jira today) commands
+//! print an actionable fallback message instead of failing — same
+//! shape as `fleet runtime doctor`'s "next steps" UX.
 //!
-//! The render path is a pure function over the issue list so tests can
-//! assert on output without a real `git-bug` or `gh` binary.
+//! Subcommands:
+//! - `list` — every issue, one line each.
+//! - `create <title> [--body <body>] [--label <label>]...` — file a new
+//!   ticket; prints the new id on stdout.
+//! - `comment <id> <body>` — post a comment.
+//! - `set-status <id> <status>` — open / in-progress / closed.
+//! - `add-label <id> <label>` / `remove-label <id> <label>`.
+//!
+//! Write commands are the host-side mirror of what the per-session
+//! bridge exposes to workflow containers (and what the brainstorm
+//! agent invokes from inside its tmux pane). Render paths are pure
+//! functions over value objects so tests assert on output text
+//! without a real `git-bug` / `gh`.
 
 use anyhow::{Context, Result};
 use std::fmt::Write as _;
@@ -17,30 +28,109 @@ use std::sync::Arc;
 use crate::process::{ProcessInvoker, RealProcessInvoker};
 use crate::repo;
 use crate::repo_config::RepoConfig;
-use crate::tracker::{Issue, build};
+use crate::tracker::{Issue, Status, Tracker, build};
 
 /// CLI entry point for `fleet issues list`. Returns 0 on a clean listing
 /// (including the empty case), 1 on any tracker/IO failure.
 pub fn run_list() -> Result<i32> {
-    let cwd = std::env::current_dir().context("reading current directory")?;
-    let root = repo::fleet_root(&cwd);
-    let config =
-        RepoConfig::load(root.join(".fleet/config.yaml")).context("loading .fleet/config.yaml")?;
-    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
-    let Some(tracker) = build(config.tracker, invoker) else {
-        // Unimplemented plugin. Surface the actionable message instead of
-        // letting the user wonder why nothing prints.
-        eprintln!(
-            "fleet issues list: tracker `{}` is not yet implemented — pick git-bug or github in .fleet/config.yaml",
-            config.tracker.as_str()
-        );
-        return Ok(1);
-    };
+    let (root, tracker) = open_tracker("list")?;
     let issues = tracker
         .list_issues(&root)
         .with_context(|| format!("listing issues via `{}`", tracker.name()))?;
     print!("{}", render_issue_list(tracker.name(), &root, &issues));
     Ok(0)
+}
+
+/// `fleet issues create <title> [--body …] [--label …]…` — file a new
+/// ticket via the configured tracker; print the new id on stdout.
+pub fn run_create(title: &str, body: Option<&str>, labels: &[String]) -> Result<i32> {
+    if title.trim().is_empty() {
+        anyhow::bail!("issue title must be non-empty");
+    }
+    let (root, tracker) = open_tracker("create")?;
+    let body = body.unwrap_or("");
+    let issue = tracker
+        .create(&root, title, body, labels)
+        .with_context(|| format!("creating issue via `{}` (title: {title:?})", tracker.name()))?;
+    println!("{}", issue.human_id);
+    Ok(0)
+}
+
+/// `fleet issues comment <id> <body>` — comment on a ticket.
+pub fn run_comment(id: &str, body: &str) -> Result<i32> {
+    let (root, tracker) = open_tracker("comment")?;
+    tracker
+        .comment(&root, id, body)
+        .with_context(|| format!("commenting on `{id}` via `{}`", tracker.name()))?;
+    Ok(0)
+}
+
+/// `fleet issues set-status <id> <open|in-progress|closed>`.
+pub fn run_set_status(id: &str, status_word: &str) -> Result<i32> {
+    let status = parse_status(status_word)?;
+    let (root, tracker) = open_tracker("set-status")?;
+    tracker
+        .set_status(&root, id, status)
+        .with_context(|| format!("setting status on `{id}` via `{}`", tracker.name()))?;
+    Ok(0)
+}
+
+/// `fleet issues add-label <id> <label>`.
+pub fn run_add_label(id: &str, label: &str) -> Result<i32> {
+    if label.trim().is_empty() {
+        anyhow::bail!("label must be non-empty");
+    }
+    let (root, tracker) = open_tracker("add-label")?;
+    tracker
+        .add_label(&root, id, label)
+        .with_context(|| format!("adding label `{label}` to `{id}` via `{}`", tracker.name()))?;
+    Ok(0)
+}
+
+/// `fleet issues remove-label <id> <label>`.
+pub fn run_remove_label(id: &str, label: &str) -> Result<i32> {
+    if label.trim().is_empty() {
+        anyhow::bail!("label must be non-empty");
+    }
+    let (root, tracker) = open_tracker("remove-label")?;
+    tracker.remove_label(&root, id, label).with_context(|| {
+        format!(
+            "removing label `{label}` from `{id}` via `{}`",
+            tracker.name()
+        )
+    })?;
+    Ok(0)
+}
+
+/// Build the configured tracker, or `bail!` with the same "not
+/// implemented" wording `run_list` already emits. Used by every
+/// `run_*` entry point so the message stays consistent.
+fn open_tracker(subcommand: &str) -> Result<(std::path::PathBuf, Box<dyn Tracker>)> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let config =
+        RepoConfig::load(root.join(".fleet/config.yaml")).context("loading .fleet/config.yaml")?;
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+    let tracker = build(config.tracker, invoker).ok_or_else(|| {
+        anyhow::anyhow!(
+            "fleet issues {subcommand}: tracker `{}` is not yet implemented \
+             — pick git-bug or github in .fleet/config.yaml",
+            config.tracker.as_str()
+        )
+    })?;
+    Ok((root, tracker))
+}
+
+/// Parse the CLI `<status>` argument into the typed `Status` enum.
+/// Same wording the bridge + brainstorm server use, so the surface
+/// matches what users see in the docs.
+fn parse_status(word: &str) -> Result<Status> {
+    match word {
+        "open" => Ok(Status::Open),
+        "in-progress" => Ok(Status::InProgress),
+        "closed" => Ok(Status::Closed),
+        other => anyhow::bail!("unknown status `{other}` (allowed: open / in-progress / closed)"),
+    }
 }
 
 /// Pure renderer. Tested directly so the output format stays a UI
@@ -134,5 +224,26 @@ mod tests {
         let issues = vec![issue("1", "x", "open", &["bug", "p1"])];
         let out = render_issue_list("git-bug", Path::new("/r"), &issues);
         assert!(out.contains("[bug, p1]"));
+    }
+
+    #[test]
+    fn parse_status_recognises_three_canonical_words() {
+        assert!(matches!(parse_status("open").unwrap(), Status::Open));
+        assert!(matches!(
+            parse_status("in-progress").unwrap(),
+            Status::InProgress
+        ));
+        assert!(matches!(parse_status("closed").unwrap(), Status::Closed));
+    }
+
+    #[test]
+    fn parse_status_rejects_unknown_with_allowed_list_in_message() {
+        let err = parse_status("frozen").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("frozen"), "got: {msg}");
+        assert!(
+            msg.contains("open") && msg.contains("in-progress") && msg.contains("closed"),
+            "got: {msg}"
+        );
     }
 }

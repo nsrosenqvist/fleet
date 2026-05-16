@@ -238,6 +238,30 @@ pub enum IssuesSub {
     /// Print one line per issue from the configured tracker, open
     /// issues first.
     List,
+
+    /// File a new ticket. Prints the new ticket's id on stdout
+    /// (scriptable). Body defaults to empty; pass `--body` for a
+    /// description. Labels are zero or more `--label <name>` args.
+    Create {
+        title: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+
+    /// Post a comment on a ticket.
+    Comment { id: String, body: String },
+
+    /// Move a ticket's status. `<status>` must be `open`,
+    /// `in-progress`, or `closed`.
+    SetStatus { id: String, status: String },
+
+    /// Add a label to a ticket. Idempotent.
+    AddLabel { id: String, label: String },
+
+    /// Remove a label from a ticket. Idempotent.
+    RemoveLabel { id: String, label: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -363,6 +387,15 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         },
         Command::Issues { sub } => match sub {
             IssuesSub::List => issues::run_list(),
+            IssuesSub::Create {
+                title,
+                body,
+                labels,
+            } => issues::run_create(&title, body.as_deref(), &labels),
+            IssuesSub::Comment { id, body } => issues::run_comment(&id, &body),
+            IssuesSub::SetStatus { id, status } => issues::run_set_status(&id, &status),
+            IssuesSub::AddLabel { id, label } => issues::run_add_label(&id, &label),
+            IssuesSub::RemoveLabel { id, label } => issues::run_remove_label(&id, &label),
         },
         Command::Autonomous { sub } => match sub {
             AutonomousSub::Run { once, watch } => autonomous::run(once, watch),
