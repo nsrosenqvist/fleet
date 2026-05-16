@@ -193,6 +193,15 @@ struct AppState {
     /// `list_state` so the user's session-row selection survives a
     /// trip into the Plans view.
     plans_list_state: ListState,
+    /// Which pane of the Plans view has the cursor. Toggled by
+    /// `Tab`. Default: sidebar — the natural entry point when the
+    /// user presses `p`.
+    plans_focus: PlansFocus,
+    /// Cursor inside the currently-selected plan's items list,
+    /// active when `plans_focus == Items`. Cleared (`select(None)`)
+    /// whenever the sidebar selection changes so a stale item cursor
+    /// doesn't carry over to a plan with fewer items.
+    plans_items_state: ListState,
     /// Brainstorm sessions on disk, refreshed alongside workflow
     /// sessions. Displayed as a second section in the Sessions
     /// sidebar. Empty when the `.fleet/planning/` dir doesn't
@@ -233,6 +242,16 @@ enum View {
     Doctor,
     Spawn,
     Plans,
+}
+
+/// Which pane of the Plans view has the cursor. Drives where `j/k`
+/// move and which `u`/`Shift+C`/`Shift+P` operate on — the sidebar
+/// targets the whole plan, the items target one row in the detail
+/// pane. `Tab` toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlansFocus {
+    Sidebar,
+    Items,
 }
 
 /// Transient overlay rendered on top of the current view.
@@ -333,6 +352,8 @@ impl AppState {
             overlay: Overlay::None,
             plans: Vec::new(),
             plans_list_state: ListState::default(),
+            plans_focus: PlansFocus::Sidebar,
+            plans_items_state: ListState::default(),
             brainstorms: Vec::new(),
             cycle_nodes: std::collections::HashSet::new(),
         };
@@ -629,18 +650,44 @@ impl AppState {
     }
 
     fn handle_key_plans(&mut self, key: KeyEvent) -> Action {
+        // Shift+P toggles the selected plan between Active and
+        // Paused. Shift+C marks it Completed. Both target the
+        // sidebar-selected plan regardless of which pane has focus —
+        // they're plan-level operations.
+        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('P')) {
+            self.toggle_selected_plan_pause();
+            return Action::None;
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('C')) {
+            self.complete_selected_plan();
+            return Action::None;
+        }
         match key.code {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Esc | KeyCode::Char('p') => {
                 self.view = View::Sessions;
                 Action::None
             }
+            KeyCode::Tab => {
+                self.toggle_plans_focus();
+                Action::None
+            }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_plans_selection(1);
+                match self.plans_focus {
+                    PlansFocus::Sidebar => self.move_plans_selection(1),
+                    PlansFocus::Items => self.move_plans_item_selection(1),
+                }
                 Action::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_plans_selection(-1);
+                match self.plans_focus {
+                    PlansFocus::Sidebar => self.move_plans_selection(-1),
+                    PlansFocus::Items => self.move_plans_item_selection(-1),
+                }
+                Action::None
+            }
+            KeyCode::Char('u') => {
+                self.unblock_selected_plan_item();
                 Action::None
             }
             KeyCode::Char('r') => {
@@ -649,6 +696,162 @@ impl AppState {
             }
             _ => Action::None,
         }
+    }
+
+    /// Tab between sidebar (whole-plan selection) and items (per-row
+    /// cursor inside the selected plan). When switching to Items, if
+    /// the current plan has any rows and the item cursor is unset,
+    /// land on row 0; switching to an empty plan keeps the focus
+    /// flag updated but the cursor stays cleared.
+    fn toggle_plans_focus(&mut self) {
+        self.plans_focus = match self.plans_focus {
+            PlansFocus::Sidebar => PlansFocus::Items,
+            PlansFocus::Items => PlansFocus::Sidebar,
+        };
+        if self.plans_focus == PlansFocus::Items {
+            let n_items = self.selected_plan().map_or(0, |p| p.items.len());
+            if n_items > 0 && self.plans_items_state.selected().is_none() {
+                self.plans_items_state.select(Some(0));
+            }
+        }
+    }
+
+    /// Move the item cursor inside the currently-selected plan. Wraps
+    /// at the ends (same idiom as `move_plans_selection`). No-op if
+    /// no plan is selected or the plan has no items.
+    fn move_plans_item_selection(&mut self, delta: isize) {
+        let Some(plan) = self.selected_plan() else {
+            return;
+        };
+        if plan.items.is_empty() {
+            return;
+        }
+        let len = isize::try_from(plan.items.len()).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.plans_items_state.selected().unwrap_or(0)).unwrap_or(0);
+        let next = (current + delta).rem_euclid(len);
+        let next_usize = usize::try_from(next).unwrap_or(0);
+        self.plans_items_state.select(Some(next_usize));
+    }
+
+    /// Shift+P on the Plans view: flip Active↔Paused, leave anything
+    /// else (Completed/Abandoned) alone with a status-line note.
+    /// In-place mutation + atomic save; on save failure the
+    /// in-memory copy is reverted so the TUI doesn't drift from disk.
+    fn toggle_selected_plan_pause(&mut self) {
+        let Some(idx) = self.plans_list_state.selected() else {
+            self.status_line = " no plan selected ".to_string();
+            return;
+        };
+        let Some(plan) = self.plans.get_mut(idx) else {
+            return;
+        };
+        let target = match plan.state {
+            PlanState::Active => PlanState::Paused,
+            PlanState::Paused => PlanState::Active,
+            PlanState::Completed | PlanState::Abandoned => {
+                self.status_line = format!(
+                    " plan `{}` is {} — pause/resume only applies to active plans ",
+                    plan.id,
+                    plan_state_word(plan.state),
+                );
+                return;
+            }
+        };
+        let previous = plan.state;
+        plan.state = target;
+        plan.updated_at_ms = now_ms();
+        let store = PlanStore::for_repo(&self.root);
+        match store.save(plan) {
+            Ok(()) => {
+                self.status_line = format!(" plan `{}` → {} ", plan.id, plan_state_word(target));
+            }
+            Err(err) => {
+                plan.state = previous;
+                self.status_line = format!(" plan save failed: {err:#} ");
+            }
+        }
+    }
+
+    /// Shift+C on the Plans view: mark the selected plan Completed.
+    /// No-op on already-completed plans (with a status note); the
+    /// CLI surface allows the equivalent transition unconditionally,
+    /// but in the TUI a visual "already done" signal is more useful
+    /// than silently re-stamping `updated_at_ms`.
+    fn complete_selected_plan(&mut self) {
+        let Some(idx) = self.plans_list_state.selected() else {
+            self.status_line = " no plan selected ".to_string();
+            return;
+        };
+        let Some(plan) = self.plans.get_mut(idx) else {
+            return;
+        };
+        if plan.state == PlanState::Completed {
+            self.status_line = format!(" plan `{}` already completed ", plan.id);
+            return;
+        }
+        let previous = plan.state;
+        plan.state = PlanState::Completed;
+        plan.updated_at_ms = now_ms();
+        let store = PlanStore::for_repo(&self.root);
+        match store.save(plan) {
+            Ok(()) => {
+                self.status_line = format!(" plan `{}` → completed ", plan.id);
+            }
+            Err(err) => {
+                plan.state = previous;
+                self.status_line = format!(" plan save failed: {err:#} ");
+            }
+        }
+    }
+
+    /// `u` on the Plans view: drop every deps edge keyed by the
+    /// currently-selected item's ticket. Mirrors `fleet sessions
+    /// unblock` semantics but bound to the item's session id when
+    /// one's attached. Items without a bound session report a
+    /// status-line message instead — there's nothing to unblock
+    /// without knowing which ticket to clear edges for.
+    fn unblock_selected_plan_item(&mut self) {
+        if self.plans_focus != PlansFocus::Items {
+            self.status_line = " press Tab to focus items before unblocking ".to_string();
+            return;
+        }
+        let Some(plan) = self.selected_plan() else {
+            return;
+        };
+        let Some(item_idx) = self.plans_items_state.selected() else {
+            self.status_line = " no item selected ".to_string();
+            return;
+        };
+        let Some(item) = plan.items.get(item_idx) else {
+            return;
+        };
+        let ticket = item.ticket_id.clone();
+        // Operate on deps directly — the session is optional for
+        // unblock-by-ticket, and we don't want to surface a
+        // tracker-comment prompt in the TUI flow.
+        let deps_store = crate::deps::DepsStore::for_repo(&self.root);
+        match deps_store.remove_edges_for_blocked(&ticket) {
+            Ok(n) => {
+                self.status_line =
+                    format!(" ticket `{ticket}`: cleared {n} dep edge{} ", plural(n));
+                // Refresh cycle_nodes so the ⚠ marker can clear.
+                self.refresh_cycle_nodes_only();
+            }
+            Err(err) => {
+                self.status_line = format!(" unblock failed: {err:#} ");
+            }
+        }
+    }
+
+    /// Recompute `cycle_nodes` without touching the rest of the
+    /// state. Pulled out so `u` can refresh the marker after
+    /// removing edges without re-listing every session and plan.
+    fn refresh_cycle_nodes_only(&mut self) {
+        let deps_store = crate::deps::DepsStore::for_repo(&self.root);
+        self.cycle_nodes = deps_store
+            .load()
+            .map(|doc| crate::deps::nodes_in_cycle(&doc))
+            .unwrap_or_default();
     }
 
     /// Switch into the Plans view, reloading from disk so the listing
@@ -705,6 +908,10 @@ impl AppState {
         let next = (current + delta).rem_euclid(len);
         let next_usize = usize::try_from(next).unwrap_or(0);
         self.plans_list_state.select(Some(next_usize));
+        // Drop the item cursor: it indexed into the previous plan's
+        // items, and the new plan likely has a different length.
+        // The next Tab→Items will reseat it at row 0.
+        self.plans_items_state.select(None);
     }
 
     fn selected_plan(&self) -> Option<&Plan> {
@@ -1411,9 +1618,21 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         f.render_widget(body, area);
         return;
     };
-    let title = format!(" {} ", plan.id);
+    // Item-row cursor is only meaningful when Items has focus; in
+    // Sidebar focus we render without the `▸` marker so the user
+    // sees the "whole plan" framing.
+    let selected_item = if state.plans_focus == PlansFocus::Items {
+        state.plans_items_state.selected()
+    } else {
+        None
+    };
+    let title = if state.plans_focus == PlansFocus::Items {
+        format!(" {} · items ", plan.id)
+    } else {
+        format!(" {} ", plan.id)
+    };
     let block = Block::default().title(title).borders(Borders::ALL);
-    let body = Paragraph::new(plan_detail_lines(plan))
+    let body = Paragraph::new(plan_detail_lines(plan, selected_item))
         .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(body, area);
@@ -1471,8 +1690,12 @@ fn plan_state_marker(state: PlanState) -> &'static str {
 /// Pure: render the detail-pane lines for a plan. Header rows
 /// followed by one row per plan item, each carrying state + ticket
 /// id + an `(injected)` marker for tracker-create-added items.
+///
+/// `selected_item` highlights one item row with a `▸` prefix —
+/// pass `None` from the sidebar-focus rendering (or from tests
+/// that don't care about the cursor).
 #[must_use]
-fn plan_detail_lines(plan: &Plan) -> Vec<Line<'static>> {
+fn plan_detail_lines(plan: &Plan, selected_item: Option<usize>) -> Vec<Line<'static>> {
     let (done, total) = plan.progress();
     let mut out = vec![
         kv_line("name", &plan.name),
@@ -1490,8 +1713,13 @@ fn plan_detail_lines(plan: &Plan) -> Vec<Line<'static>> {
     )));
     use std::fmt::Write as _;
     for (idx, item) in plan.items.iter().enumerate() {
+        let cursor = if selected_item == Some(idx) {
+            "▸ "
+        } else {
+            "  "
+        };
         let mut row = format!(
-            "  {idx:>3}. {marker} {state:<11} {ticket}",
+            "{cursor}{idx:>3}. {marker} {state:<11} {ticket}",
             marker = plan_item_marker(item.state),
             state = plan_item_word(item.state),
             ticket = item.ticket_id,
@@ -1515,6 +1743,14 @@ fn plan_state_word(state: PlanState) -> &'static str {
         PlanState::Completed => "completed",
         PlanState::Abandoned => "abandoned",
     }
+}
+
+/// "" for `n == 1`, "s" otherwise. Used to keep status-line counts
+/// grammatical ("cleared 1 dep edge" / "cleared 2 dep edges") without
+/// pulling in a heavier i18n crate.
+#[must_use]
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 #[must_use]
@@ -1800,7 +2036,9 @@ fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         }
         View::Doctor => "[q] quit  [Esc/d] back  [r] re-probe",
         View::Spawn => "[Esc/q] cancel  [j/k] nav  [Enter] spawn",
-        View::Plans => "[q] quit  [Esc/p] back  [j/k] nav  [r] reload",
+        View::Plans => {
+            "[q] quit  [Esc/p] back  [Tab] focus  [j/k] nav  [Shift+P] pause/resume  [Shift+C] complete  [u] unblock  [r] reload"
+        }
     };
     // Autonomous status takes precedence when the engine is doing
     // something interesting (enabled, or has an override message set).
@@ -2825,7 +3063,7 @@ mod tests {
     #[test]
     fn plan_detail_lines_includes_progress_and_item_rows() {
         let p = sample_plan();
-        let lines = plan_detail_lines(&p);
+        let lines = plan_detail_lines(&p, None);
         let rendered: Vec<String> = lines
             .iter()
             .map(|l| {
@@ -2854,7 +3092,7 @@ mod tests {
     fn plan_detail_lines_marks_injected_items() {
         let mut p = sample_plan();
         p.items.insert(1, PlanItem::pending_injected("99"));
-        let lines = plan_detail_lines(&p);
+        let lines = plan_detail_lines(&p, None);
         let joined: String = lines
             .iter()
             .map(|l| {
@@ -2873,7 +3111,7 @@ mod tests {
     #[test]
     fn plan_detail_lines_emits_epic_ref_only_when_set() {
         let p = sample_plan();
-        let lines = plan_detail_lines(&p);
+        let lines = plan_detail_lines(&p, None);
         let joined: String = lines
             .iter()
             .map(|l| {
@@ -2892,7 +3130,7 @@ mod tests {
             tracker: "github".into(),
             id: "200".into(),
         });
-        let lines2 = plan_detail_lines(&p_with);
+        let lines2 = plan_detail_lines(&p_with, None);
         let joined2: String = lines2
             .iter()
             .map(|l| {
@@ -3041,6 +3279,180 @@ mod tests {
         cycles.insert("999".to_string()); // not in the plan
         let label = plan_row_label(&p, &cycles);
         assert!(!label.starts_with("⚠ "), "got: {label}");
+    }
+
+    // ---- plans view interactivity -----------------------------------
+
+    /// Build an `AppState` with a single Active plan on disk so the
+    /// Plans-view key-handler tests can drive against real `PlanStore`
+    /// I/O without re-deriving the boilerplate per test.
+    fn plans_state_with_one_active_plan(
+        tickets: &[&str],
+    ) -> (tempfile::TempDir, SessionStore, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = SessionStore::at(tmp.path().to_path_buf());
+        let plans = PlanStore::for_repo(tmp.path());
+        let tickets: Vec<String> = tickets.iter().map(|s| (*s).to_string()).collect();
+        let plan = Plan::new(crate::plans::PlanId::new("plan-1"), "Test plan", tickets, 1);
+        plans.create(&plan).unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
+        state.view = View::Plans;
+        state.refresh_plans();
+        (tmp, sessions, state)
+    }
+
+    #[test]
+    fn tab_in_plans_view_toggles_focus_between_sidebar_and_items() {
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42", "43"]);
+        assert_eq!(state.plans_focus, PlansFocus::Sidebar);
+        let _ = state.handle_key_plans(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(state.plans_focus, PlansFocus::Items);
+        // First Tab→Items lands the cursor at item 0 when there are items.
+        assert_eq!(state.plans_items_state.selected(), Some(0));
+        let _ = state.handle_key_plans(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(state.plans_focus, PlansFocus::Sidebar);
+    }
+
+    #[test]
+    fn j_in_items_focus_moves_the_item_cursor_not_the_sidebar() {
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42", "43", "44"]);
+        state.toggle_plans_focus(); // now Items, cursor at 0
+        let sidebar_before = state.plans_list_state.selected();
+        let _ = state.handle_key_plans(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        assert_eq!(state.plans_items_state.selected(), Some(1));
+        assert_eq!(state.plans_list_state.selected(), sidebar_before);
+    }
+
+    #[test]
+    fn item_cursor_clears_when_the_sidebar_selection_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = SessionStore::at(tmp.path().to_path_buf());
+        let plans = PlanStore::for_repo(tmp.path());
+        // Two plans so the sidebar has somewhere to move to.
+        plans
+            .create(&Plan::new(
+                crate::plans::PlanId::new("plan-a"),
+                "A",
+                vec!["42".into(), "43".into()],
+                1,
+            ))
+            .unwrap();
+        plans
+            .create(&Plan::new(
+                crate::plans::PlanId::new("plan-b"),
+                "B",
+                vec!["99".into()],
+                2,
+            ))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
+        state.view = View::Plans;
+        state.refresh_plans();
+        state.toggle_plans_focus(); // Items, cursor at 0
+        state.move_plans_item_selection(1); // cursor at 1
+        assert_eq!(state.plans_items_state.selected(), Some(1));
+        state.move_plans_selection(1); // sidebar moves
+        // Stale cursor (was item 1 in plan-a, plan-b only has one
+        // item) must clear so the next Tab→Items reseats from 0.
+        assert_eq!(state.plans_items_state.selected(), None);
+    }
+
+    #[test]
+    fn shift_p_in_plans_view_toggles_active_to_paused_and_back() {
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42"]);
+        // Active → Paused
+        let _ = state.handle_key_plans(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        assert_eq!(state.plans[0].state, PlanState::Paused);
+        // Disk is updated too.
+        let on_disk = PlanStore::for_repo(state.root.as_path())
+            .load(&crate::plans::PlanId::new("plan-1"))
+            .unwrap();
+        assert_eq!(on_disk.state, PlanState::Paused);
+        // Paused → Active
+        let _ = state.handle_key_plans(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        assert_eq!(state.plans[0].state, PlanState::Active);
+    }
+
+    #[test]
+    fn shift_p_is_a_noop_with_status_when_plan_is_completed() {
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42"]);
+        state.plans[0].state = PlanState::Completed;
+        PlanStore::for_repo(state.root.as_path())
+            .save(&state.plans[0])
+            .unwrap();
+        let _ = state.handle_key_plans(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        // State left alone; status line explains why.
+        assert_eq!(state.plans[0].state, PlanState::Completed);
+        assert!(
+            state.status_line.contains("completed"),
+            "got: {}",
+            state.status_line
+        );
+    }
+
+    #[test]
+    fn shift_c_marks_selected_plan_completed_and_saves_to_disk() {
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42"]);
+        let _ = state.handle_key_plans(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert_eq!(state.plans[0].state, PlanState::Completed);
+        let on_disk = PlanStore::for_repo(state.root.as_path())
+            .load(&crate::plans::PlanId::new("plan-1"))
+            .unwrap();
+        assert_eq!(on_disk.state, PlanState::Completed);
+    }
+
+    #[test]
+    fn u_in_items_focus_clears_deps_edges_keyed_by_selected_ticket() {
+        let (tmp, _store, mut state) = plans_state_with_one_active_plan(&["42", "43"]);
+        // Seed two deps edges; only the one keyed on "42" should
+        // clear when `u` runs against item-0 (which is ticket 42).
+        let deps_store = crate::deps::DepsStore::for_repo(tmp.path());
+        deps_store
+            .add_edge(crate::deps::DepEdge {
+                blocked: "42".into(),
+                blocked_on: "100".into(),
+                reason: crate::deps::BlockedReason::Ticket,
+                created_at_ms: 1,
+            })
+            .unwrap();
+        deps_store
+            .add_edge(crate::deps::DepEdge {
+                blocked: "43".into(),
+                blocked_on: "200".into(),
+                reason: crate::deps::BlockedReason::Ticket,
+                created_at_ms: 2,
+            })
+            .unwrap();
+        state.toggle_plans_focus(); // Items, cursor at item 0 (ticket 42)
+        let _ = state.handle_key_plans(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        let doc = deps_store.load().unwrap();
+        // 42→100 cleared; 43→200 survives.
+        assert_eq!(doc.edges.len(), 1, "edges: {:?}", doc.edges);
+        assert_eq!(doc.edges[0].blocked, "43");
+    }
+
+    #[test]
+    fn u_with_sidebar_focus_emits_status_message_and_does_nothing() {
+        let (tmp, _store, mut state) = plans_state_with_one_active_plan(&["42"]);
+        let deps_store = crate::deps::DepsStore::for_repo(tmp.path());
+        deps_store
+            .add_edge(crate::deps::DepEdge {
+                blocked: "42".into(),
+                blocked_on: "100".into(),
+                reason: crate::deps::BlockedReason::Ticket,
+                created_at_ms: 1,
+            })
+            .unwrap();
+        // Sidebar focus by default — pressing `u` should not clear
+        // anything; it should nudge the user to Tab into items.
+        let _ = state.handle_key_plans(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        let doc = deps_store.load().unwrap();
+        assert_eq!(doc.edges.len(), 1);
+        assert!(
+            state.status_line.contains("Tab"),
+            "got: {}",
+            state.status_line
+        );
     }
 
     // ---- brainstorm sidebar -----------------------------------------
