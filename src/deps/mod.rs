@@ -185,6 +185,67 @@ impl DepsStore {
         }
         Ok(())
     }
+
+    /// Remove every edge where `blocked_id` appears on the
+    /// `blocked` side. Used by `fleet sessions unblock` to clear
+    /// all dependencies a stuck session is waiting on, in one
+    /// atomic write. Returns the count of edges removed; zero is
+    /// not an error (the session may have had no edges to begin
+    /// with).
+    ///
+    /// `blocked_on` (the right-hand side) is left untouched —
+    /// auto-clearing a `Ticket` edge when its target ticket closes
+    /// is the supervisor's job (Phase 4), not this store's.
+    #[allow(dead_code)]
+    pub fn remove_edges_for_blocked(&self, blocked_id: &str) -> Result<usize> {
+        let mut doc = self.load()?;
+        let before = doc.edges.len();
+        doc.edges.retain(|e| e.blocked != blocked_id);
+        let removed = before - doc.edges.len();
+        if removed > 0 {
+            self.save(&doc)?;
+        }
+        Ok(removed)
+    }
+}
+
+/// Would adding `proposed` to `doc` close a cycle? Returns `true`
+/// iff a path already exists from `proposed.blocked_on` back to
+/// `proposed.blocked` — adding the new edge would then form
+/// `proposed.blocked → proposed.blocked_on → … → proposed.blocked`.
+///
+/// Pure function over the document so callers (tracker-create's
+/// plan-injector, future manual-unblock surgery) can dry-run a
+/// proposed mutation before persisting. BFS over the edge list;
+/// freeform-tag right-hand sides terminate naturally because no
+/// edge has `blocked == "free:<slug>"`.
+///
+/// Self-loops (`A → A`) are reported as cycles — `A` is trivially
+/// reachable from itself, and a self-blocked ticket isn't useful
+/// to record either way.
+#[must_use]
+#[allow(dead_code)]
+pub fn would_create_cycle(doc: &DepsDoc, proposed: &DepEdge) -> bool {
+    if proposed.blocked == proposed.blocked_on {
+        return true;
+    }
+    // BFS from `proposed.blocked_on` outward, walking
+    // `blocked -> blocked_on` edges. If we reach
+    // `proposed.blocked`, the proposed edge would close a cycle.
+    let mut frontier: Vec<&str> = vec![proposed.blocked_on.as_str()];
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    seen.insert(proposed.blocked_on.as_str());
+    while let Some(current) = frontier.pop() {
+        if current == proposed.blocked {
+            return true;
+        }
+        for edge in &doc.edges {
+            if edge.blocked == current && seen.insert(edge.blocked_on.as_str()) {
+                frontier.push(edge.blocked_on.as_str());
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -337,6 +398,132 @@ mod tests {
         // serde attribute on the enum.
         let body = std::fs::read_to_string(store.path()).unwrap();
         assert!(body.contains(r#""reason": "freeform""#), "body: {body}");
+    }
+
+    #[test]
+    fn remove_edges_for_blocked_clears_matches_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        store.add_edge(sample_edge("42", "43")).unwrap();
+        store.add_edge(sample_edge("42", "44")).unwrap();
+        store.add_edge(sample_edge("43", "44")).unwrap();
+        let removed = store.remove_edges_for_blocked("42").unwrap();
+        assert_eq!(removed, 2);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.edges.len(), 1);
+        // The unrelated 43→44 edge survives.
+        assert_eq!(loaded.edges[0].blocked, "43");
+        assert_eq!(loaded.edges[0].blocked_on, "44");
+    }
+
+    #[test]
+    fn remove_edges_for_blocked_returns_zero_when_nothing_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        store.add_edge(sample_edge("42", "43")).unwrap();
+        assert_eq!(store.remove_edges_for_blocked("999").unwrap(), 0);
+        // File untouched because no save happens.
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.edges.len(), 1);
+    }
+
+    #[test]
+    fn remove_edges_for_blocked_only_clears_left_hand_side() {
+        // The 43→42 edge should *not* be removed when we unblock 42 —
+        // its right-hand side mentions 42, but auto-clearing
+        // those is the supervisor's job, not the store's.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        store.add_edge(sample_edge("43", "42")).unwrap();
+        store.add_edge(sample_edge("42", "44")).unwrap();
+        let removed = store.remove_edges_for_blocked("42").unwrap();
+        assert_eq!(removed, 1);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.edges.len(), 1);
+        assert_eq!(loaded.edges[0].blocked, "43");
+        assert_eq!(loaded.edges[0].blocked_on, "42");
+    }
+
+    #[test]
+    fn would_create_cycle_detects_direct_back_edge() {
+        // Existing: 43→42. Proposing 42→43 closes a 2-cycle.
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![sample_edge("43", "42")],
+        };
+        assert!(would_create_cycle(&doc, &sample_edge("42", "43")));
+    }
+
+    #[test]
+    fn would_create_cycle_detects_transitive_cycle() {
+        // Chain: 43→44, 44→42. Proposing 42→43 closes
+        // 42→43→44→42.
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![sample_edge("43", "44"), sample_edge("44", "42")],
+        };
+        assert!(would_create_cycle(&doc, &sample_edge("42", "43")));
+    }
+
+    #[test]
+    fn would_create_cycle_returns_false_for_a_safe_new_edge() {
+        // Existing: 43→44. Proposing 42→43 is safe (no back-path).
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![sample_edge("43", "44")],
+        };
+        assert!(!would_create_cycle(&doc, &sample_edge("42", "43")));
+    }
+
+    #[test]
+    fn would_create_cycle_returns_false_for_an_empty_graph() {
+        let doc = DepsDoc::empty();
+        assert!(!would_create_cycle(&doc, &sample_edge("42", "43")));
+    }
+
+    #[test]
+    fn would_create_cycle_treats_freeform_tags_as_terminal() {
+        // `free:apt-mirror` has no outgoing edge (nothing blocks
+        // *on* it being something else), so a proposed
+        // 42 → free:apt-mirror is always safe.
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![DepEdge {
+                blocked: "43".to_string(),
+                blocked_on: "42".to_string(),
+                reason: BlockedReason::Ticket,
+                created_at_ms: 1,
+            }],
+        };
+        let proposed = DepEdge {
+            blocked: "42".to_string(),
+            blocked_on: "free:apt-mirror".to_string(),
+            reason: BlockedReason::Freeform,
+            created_at_ms: 1,
+        };
+        assert!(!would_create_cycle(&doc, &proposed));
+    }
+
+    #[test]
+    fn would_create_cycle_reports_self_loops_as_cycles() {
+        // Self-loop is degenerate but unambiguously cyclic — refuse.
+        let doc = DepsDoc::empty();
+        assert!(would_create_cycle(&doc, &sample_edge("42", "42")));
+    }
+
+    #[test]
+    fn would_create_cycle_handles_branching_paths_without_false_positives() {
+        // 43 → 44; 43 → 45; 45 → 50. Proposing 42→43 is safe (no
+        // path back to 42 from any branch).
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges: vec![
+                sample_edge("43", "44"),
+                sample_edge("43", "45"),
+                sample_edge("45", "50"),
+            ],
+        };
+        assert!(!would_create_cycle(&doc, &sample_edge("42", "43")));
     }
 
     #[test]
