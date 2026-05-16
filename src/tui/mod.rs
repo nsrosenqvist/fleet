@@ -352,7 +352,14 @@ impl AppState {
             });
         self.list_state.select(new_index);
         self.refresh_log_tail();
-        self.status_line = render_status_line(&self.sessions);
+        // Refresh plans alongside sessions so the sidebar
+        // annotations + status-line plan count stay current. Plans
+        // are cheap to load (one file per plan, typically a handful)
+        // and the alternative (lazy load on Plans-view entry only)
+        // would leave the Sessions view annotating against stale
+        // data.
+        self.refresh_plans();
+        self.status_line = render_status_line(&self.sessions, &self.plans);
         Ok(())
     }
 
@@ -964,19 +971,32 @@ pub fn lifetime_cost(sessions: &[Session]) -> (f64, usize) {
 
 /// Render the status-bar tail used by the sidebar when autonomous
 /// mode isn't taking over the line. Includes the session count and,
-/// when at least one session has cost data, a lifetime total. Free
+/// when at least one session has cost data, a lifetime total, and
+/// when any plan is in `Active` state, an "N active plan(s)"
+/// segment so the user sees scheduling pressure at a glance. Free
 /// function so the wording is asserted in tests.
 #[must_use]
-pub fn render_status_line(sessions: &[Session]) -> String {
+pub fn render_status_line(sessions: &[Session], plans: &[Plan]) -> String {
     let (total, samples) = lifetime_cost(sessions);
-    if samples == 0 {
-        format!(" {} sessions ", sessions.len())
-    } else {
-        format!(
-            " {} sessions · ${total:.2} total ({samples} with cost) ",
-            sessions.len(),
-        )
+    let active_plans = plans
+        .iter()
+        .filter(|p| p.state == PlanState::Active)
+        .count();
+    let mut out = format!(" {} sessions", sessions.len());
+    if samples > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(out, " · ${total:.2} total ({samples} with cost)");
     }
+    if active_plans > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            " · {active_plans} active plan{}",
+            if active_plans == 1 { "" } else { "s" }
+        );
+    }
+    out.push(' ');
+    out
 }
 
 /// Single-glyph state marker for the sidebar list.
@@ -1454,19 +1474,10 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .sessions
         .iter()
         .map(|s| {
-            // Cost suffix only when we have a figure — keeps fresh
-            // repos visually clean ("nothing to render" beats "a long
-            // row of dashes").
-            let cost_suffix = s
-                .total_cost_usd()
-                .map_or_else(String::new, |v| format!(" ${v:.2}"));
-            let label = format!(
-                "{} {} {}{cost_suffix}",
-                state_marker(s.state),
-                s.id,
-                s.workflow,
-            );
-            ListItem::new(Span::styled(label, state_style(s.state)))
+            ListItem::new(Span::styled(
+                session_row_label(s, &state.plans),
+                state_style(s.state),
+            ))
         })
         .collect();
     let list = List::new(items)
@@ -1479,6 +1490,53 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .highlight_symbol("> ");
     let mut list_state = state.list_state;
     f.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Pure: the per-session sidebar label, with cost suffix when
+/// present and a plan annotation when the session's ticket is in
+/// an active plan. Factored out so tests can assert on the exact
+/// surface without a ratatui Frame.
+///
+/// The plan lookup walks every active plan once — fine for typical
+/// fleet workloads (a handful of plans, dozens of items each). If
+/// that grows, swap to a precomputed `ticket_id → plan` map kept
+/// alongside `AppState.plans`.
+#[must_use]
+pub fn session_row_label(session: &Session, plans: &[Plan]) -> String {
+    let cost_suffix = session
+        .total_cost_usd()
+        .map_or_else(String::new, |v| format!(" ${v:.2}"));
+    let mut label = format!(
+        "{} {} {}{cost_suffix}",
+        state_marker(session.state),
+        session.id,
+        session.workflow,
+    );
+    if let Some(annotation) = plan_annotation_for(session, plans) {
+        use std::fmt::Write as _;
+        let _ = write!(label, " · {annotation}");
+    }
+    label
+}
+
+/// `Some("<plan-name> (n/N)")` when the session's bound ticket is
+/// an item in an active plan, `None` otherwise. Skips non-active
+/// plans for the same reason the tracker-create injector does — a
+/// paused/completed/abandoned plan shouldn't claim ownership of a
+/// session row visually.
+#[must_use]
+fn plan_annotation_for(session: &Session, plans: &[Plan]) -> Option<String> {
+    let ticket = &session.issue.as_ref()?.human_id;
+    let active_plan = plans
+        .iter()
+        .find(|p| p.state == PlanState::Active && p.position_of(ticket).is_some())?;
+    let idx = active_plan.position_of(ticket)?;
+    Some(format!(
+        "{} ({}/{})",
+        active_plan.name,
+        idx + 1,
+        active_plan.items.len()
+    ))
 }
 
 fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -1688,7 +1746,7 @@ mod tests {
             session("s-1", "wf", SessionState::Running, 1),
             session("s-2", "wf", SessionState::Completed, 2),
         ];
-        assert_eq!(render_status_line(&sessions), " 2 sessions ");
+        assert_eq!(render_status_line(&sessions, &[]), " 2 sessions ");
     }
 
     #[test]
@@ -1696,9 +1754,42 @@ mod tests {
         let mut s = session("s-1", "wf", SessionState::Completed, 1);
         s.record_node_cost("plan", 0.42, 2);
         assert_eq!(
-            render_status_line(&[s]),
+            render_status_line(&[s], &[]),
             " 1 sessions · $0.42 total (1 with cost) "
         );
+    }
+
+    #[test]
+    fn render_status_line_shows_active_plan_count() {
+        let s = session("s-1", "wf", SessionState::Running, 1);
+        let plans = vec![sample_plan()]; // 1 active by default
+        let line = render_status_line(&[s], &plans);
+        assert!(line.contains("1 active plan"), "got: {line}");
+        // No trailing 's' for the singular case.
+        assert!(!line.contains("1 active plans"), "got: {line}");
+    }
+
+    #[test]
+    fn render_status_line_pluralises_when_more_than_one_active_plan() {
+        let s = session("s-1", "wf", SessionState::Running, 1);
+        let mut p2 = sample_plan();
+        p2.id = PlanId::new("plan-2");
+        let plans = vec![sample_plan(), p2];
+        let line = render_status_line(&[s], &plans);
+        assert!(line.contains("2 active plans"), "got: {line}");
+    }
+
+    #[test]
+    fn render_status_line_omits_plan_segment_when_no_active_plans() {
+        // Paused / completed / abandoned shouldn't be counted.
+        let s = session("s-1", "wf", SessionState::Running, 1);
+        let mut paused = sample_plan();
+        paused.state = PlanState::Paused;
+        let mut done = sample_plan();
+        done.id = PlanId::new("plan-2");
+        done.state = PlanState::Completed;
+        let line = render_status_line(&[s], &[paused, done]);
+        assert!(!line.contains("active plan"), "got: {line}");
     }
 
     #[test]
@@ -2625,5 +2716,68 @@ mod tests {
             plan_failure_word(ItemFailurePolicy::RetryOnce),
             "retry-once"
         );
+    }
+
+    // ---- session row plan annotations ---------------------------------
+
+    use crate::session::IssueContext;
+
+    fn session_with_ticket(id: &str, workflow: &str, ticket_human_id: &str) -> Session {
+        let mut s = session(id, workflow, SessionState::Running, 1);
+        s.issue = Some(IssueContext {
+            id: format!("gh:{ticket_human_id}"),
+            human_id: ticket_human_id.to_string(),
+            title: "T".into(),
+            labels: Vec::new(),
+        });
+        s
+    }
+
+    #[test]
+    fn session_row_label_omits_plan_annotation_when_session_has_no_ticket() {
+        let s = session("s-1", "standard", SessionState::Running, 1);
+        let plans = vec![sample_plan()];
+        let label = session_row_label(&s, &plans);
+        assert!(!label.contains('·'), "got: {label}");
+    }
+
+    #[test]
+    fn session_row_label_omits_plan_annotation_when_no_active_plan_owns_the_ticket() {
+        let s = session_with_ticket("s-1", "standard", "999");
+        let plans = vec![sample_plan()]; // contains 42, 43, 44 only
+        let label = session_row_label(&s, &plans);
+        assert!(!label.contains('·'), "got: {label}");
+    }
+
+    #[test]
+    fn session_row_label_appends_plan_annotation_when_active_plan_contains_ticket() {
+        let s = session_with_ticket("s-1", "standard", "43");
+        let plans = vec![sample_plan()];
+        let label = session_row_label(&s, &plans);
+        // 1-based position so users see "2/3", not "1/3".
+        assert!(label.contains("· Parser refactor (2/3)"), "got: {label}");
+    }
+
+    #[test]
+    fn session_row_label_skips_paused_plans_for_annotation() {
+        // A paused plan's tickets shouldn't display as plan-bound —
+        // the scheduler doesn't claim them, and the visual should
+        // reflect that.
+        let s = session_with_ticket("s-1", "standard", "43");
+        let mut plan = sample_plan();
+        plan.state = PlanState::Paused;
+        let label = session_row_label(&s, &[plan]);
+        assert!(!label.contains("· Parser"), "got: {label}");
+    }
+
+    #[test]
+    fn session_row_label_preserves_cost_suffix_before_plan_annotation() {
+        let mut s = session_with_ticket("s-1", "standard", "43");
+        s.record_node_cost("plan", 0.5, 2);
+        let label = session_row_label(&s, &[sample_plan()]);
+        // Cost first ("...$0.50"), then plan annotation ("· …").
+        let cost_idx = label.find("$0.50").expect("cost suffix");
+        let plan_idx = label.find("· Parser").expect("plan annotation");
+        assert!(cost_idx < plan_idx, "got: {label}");
     }
 }
