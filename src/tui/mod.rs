@@ -55,6 +55,8 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use crate::autonomous;
+use crate::brainstorm::store::BrainstormStore;
+use crate::brainstorm::{BrainstormSession, BrainstormState};
 use crate::plans::store::PlanStore;
 use crate::plans::{Plan, PlanItemState, PlanState};
 use crate::process::{ProcessInvoker, RealProcessInvoker};
@@ -191,6 +193,12 @@ struct AppState {
     /// `list_state` so the user's session-row selection survives a
     /// trip into the Plans view.
     plans_list_state: ListState,
+    /// Brainstorm sessions on disk, refreshed alongside workflow
+    /// sessions. Displayed as a second section in the Sessions
+    /// sidebar. Empty when the `.fleet/planning/` dir doesn't
+    /// exist yet (the common case for repos that haven't used
+    /// `fleet brainstorm`).
+    brainstorms: Vec<BrainstormSession>,
 }
 
 /// Lifecycle of the lazily-built tracker. Three states because the
@@ -319,6 +327,7 @@ impl AppState {
             overlay: Overlay::None,
             plans: Vec::new(),
             plans_list_state: ListState::default(),
+            brainstorms: Vec::new(),
         };
         state.reload(store)?;
         Ok(state)
@@ -370,8 +379,33 @@ impl AppState {
         // would leave the Sessions view annotating against stale
         // data.
         self.refresh_plans();
+        // Brainstorms are similarly cheap and live in the same
+        // sidebar — keep the listing fresh.
+        self.refresh_brainstorms();
         self.status_line = render_status_line(&self.sessions, &self.plans);
         Ok(())
+    }
+
+    /// Load every brainstorm session from disk. Per-session load
+    /// failures degrade gracefully — the session is dropped from
+    /// the list and the rest continue.
+    fn refresh_brainstorms(&mut self) {
+        let store = BrainstormStore::for_repo(&self.root);
+        let ids = match store.list() {
+            Ok(ids) => ids,
+            Err(err) => {
+                self.status_line = format!(" brainstorms: list failed: {err:#} ");
+                self.brainstorms.clear();
+                return;
+            }
+        };
+        let mut sessions = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(s) = store.load(&id) {
+                sessions.push(s);
+            }
+        }
+        self.brainstorms = sessions;
     }
 
     fn selected(&self) -> Option<&Session> {
@@ -1485,27 +1519,58 @@ fn plan_failure_word(policy: crate::plans::ItemFailurePolicy) -> &'static str {
 }
 
 fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let title = format!(" Sessions ({}) ", state.sessions.len());
+    let title = if state.brainstorms.is_empty() {
+        format!(" Sessions ({}) ", state.sessions.len())
+    } else {
+        format!(
+            " Sessions ({}) · Brainstorms ({}) ",
+            state.sessions.len(),
+            state.brainstorms.len(),
+        )
+    };
     let block = Block::default().title(title).borders(Borders::ALL);
-    if state.sessions.is_empty() {
+    if state.sessions.is_empty() && state.brainstorms.is_empty() {
         let body = Paragraph::new(
-            "(no sessions)\n\nUse `fleet workflow run <name>` from the shell to create one.",
+            "(no sessions)\n\n\
+             Use `fleet workflow run <name>` from the shell to create a workflow session, \
+             or `fleet brainstorm` for an interactive planning session.",
         )
         .block(block)
         .wrap(Wrap { trim: false });
         f.render_widget(body, area);
         return;
     }
-    let items: Vec<ListItem<'_>> = state
-        .sessions
-        .iter()
-        .map(|s| {
-            ListItem::new(Span::styled(
+    let mut items: Vec<ListItem<'_>> =
+        Vec::with_capacity(state.sessions.len() + state.brainstorms.len() + 2);
+    if !state.sessions.is_empty() {
+        items.push(ListItem::new(Span::styled(
+            "── Workflows ──".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+        for s in &state.sessions {
+            items.push(ListItem::new(Span::styled(
                 session_row_label(s, &state.plans),
                 state_style(s.state),
-            ))
-        })
-        .collect();
+            )));
+        }
+    }
+    if !state.brainstorms.is_empty() {
+        items.push(ListItem::new(Span::styled(
+            "── Brainstorms ──".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+        for b in &state.brainstorms {
+            items.push(ListItem::new(Span::styled(
+                brainstorm_row_label(b),
+                brainstorm_row_style(b.state),
+            )));
+        }
+    }
+    // `list_state` indexes into the original Sessions slice; the
+    // selection still applies to the Workflows section. Selecting
+    // a Brainstorm row is reserved for the follow-up commit that
+    // ships terminal-suspend → tmux-attach (needs ratatui's
+    // alternate-screen toggle dance and a real tmux to verify).
     let list = List::new(items)
         .block(block)
         .highlight_style(
@@ -1516,6 +1581,46 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .highlight_symbol("> ");
     let mut list_state = state.list_state;
     f.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// One-line label for a brainstorm row in the sidebar. Pure helper
+/// so tests can assert on the exact text without a ratatui Frame.
+#[must_use]
+pub fn brainstorm_row_label(session: &BrainstormSession) -> String {
+    format!(
+        "{} {}  agent={}  ({})",
+        brainstorm_state_marker(session.state),
+        session.id,
+        session.agent,
+        brainstorm_state_word(session.state),
+    )
+}
+
+#[must_use]
+fn brainstorm_row_style(state: BrainstormState) -> Style {
+    match state {
+        BrainstormState::Active => Style::default().fg(Color::Cyan),
+        BrainstormState::Detached => Style::default().fg(Color::Yellow),
+        BrainstormState::Closed => Style::default().fg(Color::DarkGray),
+    }
+}
+
+#[must_use]
+fn brainstorm_state_marker(state: BrainstormState) -> &'static str {
+    match state {
+        BrainstormState::Active => "◐",
+        BrainstormState::Detached => "⏸",
+        BrainstormState::Closed => "✗",
+    }
+}
+
+#[must_use]
+fn brainstorm_state_word(state: BrainstormState) -> &'static str {
+    match state {
+        BrainstormState::Active => "active",
+        BrainstormState::Detached => "detached",
+        BrainstormState::Closed => "closed",
+    }
 }
 
 /// Pure: the per-session sidebar label, with cost suffix when
@@ -2805,5 +2910,36 @@ mod tests {
         let cost_idx = label.find("$0.50").expect("cost suffix");
         let plan_idx = label.find("· Parser").expect("plan annotation");
         assert!(cost_idx < plan_idx, "got: {label}");
+    }
+
+    // ---- brainstorm sidebar -----------------------------------------
+
+    use crate::brainstorm::{BrainstormId, BrainstormSession, BrainstormState};
+
+    fn brainstorm(id: &str, agent: &str, state: BrainstormState) -> BrainstormSession {
+        let mut s = BrainstormSession::new(BrainstormId::new(id), agent, 1);
+        s.state = state;
+        s
+    }
+
+    #[test]
+    fn brainstorm_row_label_carries_marker_id_agent_and_state_word() {
+        let s = brainstorm("b-1", "claude", BrainstormState::Active);
+        let label = brainstorm_row_label(&s);
+        assert!(label.starts_with('◐'), "marker missing: {label}");
+        assert!(label.contains("b-1"));
+        assert!(label.contains("agent=claude"));
+        assert!(label.contains("(active)"));
+    }
+
+    #[test]
+    fn brainstorm_row_label_marker_reflects_state() {
+        assert!(
+            brainstorm_row_label(&brainstorm("b-1", "x", BrainstormState::Detached))
+                .starts_with('⏸')
+        );
+        assert!(
+            brainstorm_row_label(&brainstorm("b-1", "x", BrainstormState::Closed)).starts_with('✗')
+        );
     }
 }
