@@ -18,10 +18,6 @@
 
 mod agent;
 mod autonomous;
-// Dead-code allow lifts once the brainstorm CLI + tool server + tmux
-// integration wire the public surface — the data layer ships first
-// (P5-C1), the consumers follow over the next few commits.
-#[allow(dead_code)]
 mod brainstorm;
 mod bridge;
 mod cli;

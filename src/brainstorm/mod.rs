@@ -29,6 +29,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod prompt;
+// The tool server (P5-C3/C4) is fully built + tested but isn't yet
+// hooked into the brainstorm spawn flow — the orchestration
+// (server-as-daemon outliving the CLI invocation) is its own
+// piece of plumbing and lands after Phase 5's other commits. The
+// allow lifts when the spawn flow is finished.
+#[allow(dead_code)]
 pub mod server;
 pub mod store;
 pub mod tmux;

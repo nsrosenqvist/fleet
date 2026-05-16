@@ -63,9 +63,10 @@ impl BrainstormStore {
     }
 
     /// Path of the captured transcript file for a given session id.
-    /// Used by the tmux pipe-pane integration in P5-C2 and by the
-    /// re-attach surface in P5-C6.
+    /// Reserved for the future tmux `pipe-pane` capture (not wired
+    /// in v1).
     #[must_use]
+    #[allow(dead_code)]
     pub fn transcript_path(&self, id: &BrainstormId) -> PathBuf {
         self.session_dir(id).join("transcript.log")
     }

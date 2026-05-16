@@ -144,7 +144,9 @@ fn is_missing_session_error(msg: &str) -> bool {
 /// `tmux list-sessions -F '#S'` → vec of session names. Returns
 /// an empty vec when no tmux server is running (common on a fresh
 /// shell), distinguishing "no sessions" from "tmux missing"
-/// upfront via [`probe`].
+/// upfront via [`probe`]. Reserved for a future brainstorm reaper
+/// pass; not wired in v1.
+#[allow(dead_code)]
 pub fn list_session_names(invoker: &dyn ProcessInvoker) -> Result<Vec<String>> {
     let result = invoker.run(
         "tmux",
@@ -173,9 +175,10 @@ pub fn list_session_names(invoker: &dyn ProcessInvoker) -> Result<Vec<String>> {
 }
 
 /// `tmux display-message -p -t <name> '#{pid}'` → the tmux server
-/// pid. Used by the brainstorm session reaper to detect a dead
-/// tmux server and mark the session Closed without leaving stale
-/// meta on disk.
+/// pid. Reserved for the brainstorm reaper (detect a dead tmux
+/// server and mark the session Closed without leaving stale meta
+/// on disk); not wired in v1.
+#[allow(dead_code)]
 pub fn server_pid_for(invoker: &dyn ProcessInvoker, name: &str) -> Result<u32> {
     let stdout = invoker
         .run(
@@ -197,8 +200,10 @@ pub fn server_pid_for(invoker: &dyn ProcessInvoker, name: &str) -> Result<u32> {
 
 /// Construct an `Arc<dyn ProcessInvoker>` from the real shell so
 /// production code paths don't have to. Test code constructs its
-/// own mock. Convenience helper for the brainstorm CLI.
+/// own mock. Convenience helper for the brainstorm CLI; not yet
+/// consumed since the CLI builds its invoker inline.
 #[must_use]
+#[allow(dead_code)]
 pub fn real_invoker() -> Arc<dyn ProcessInvoker> {
     Arc::new(crate::process::RealProcessInvoker)
 }

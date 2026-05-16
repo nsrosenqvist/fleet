@@ -7,6 +7,7 @@
 use clap::{Parser, Subcommand};
 
 pub mod autonomous;
+pub mod brainstorm;
 pub mod init;
 pub mod issues;
 pub mod plan;
@@ -73,6 +74,14 @@ pub enum Command {
     Plan {
         #[command(subcommand)]
         sub: PlanSub,
+    },
+
+    /// Brainstorm sessions: interactive host-side agent panes for
+    /// planning + ticket triage. With no subcommand, mints a new
+    /// session and attaches the caller's terminal to it.
+    Brainstorm {
+        #[command(subcommand)]
+        sub: Option<BrainstormSub>,
     },
 
     /// Launch the ratatui session browser.
@@ -232,6 +241,18 @@ pub enum IssuesSub {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum BrainstormSub {
+    /// List known brainstorm sessions with their state + tmux pane
+    /// name. Live tmux pane → active/detached; tmux gone → closed.
+    List,
+    /// Re-attach to an existing brainstorm session's tmux pane.
+    Attach { id: String },
+    /// Kill a brainstorm session: tear down the tmux pane and
+    /// mark the meta as Closed.
+    Kill { id: String },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum PlanSub {
     /// List plans discovered under `.fleet/plans/`, sorted by id.
     List,
@@ -345,6 +366,12 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         },
         Command::Autonomous { sub } => match sub {
             AutonomousSub::Run { once, watch } => autonomous::run(once, watch),
+        },
+        Command::Brainstorm { sub } => match sub {
+            None => brainstorm::run_default(),
+            Some(BrainstormSub::List) => brainstorm::run_list(),
+            Some(BrainstormSub::Attach { id }) => brainstorm::run_attach(&id),
+            Some(BrainstormSub::Kill { id }) => brainstorm::run_kill(&id),
         },
         Command::Plan { sub } => match sub {
             PlanSub::List => plan::run_list(),
