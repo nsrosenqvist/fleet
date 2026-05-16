@@ -346,6 +346,144 @@ fn open_store() -> Result<SessionStore> {
     Ok(SessionStore::for_repo(&root))
 }
 
+/// `fleet sessions unblock <session-id> [--reason <text>]`. Thin
+/// CLI wrapper that loads the per-repo config + stores and
+/// delegates to [`unblock_session`] for the actual mutation.
+///
+/// Returns 0 even when the session had no edges to clear; the
+/// operation is idempotent.
+pub fn run_unblock(id: &str, reason: Option<&str>) -> Result<i32> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let store = SessionStore::for_repo(&root);
+    let deps_store = crate::deps::DepsStore::for_repo(&root);
+    let session_id = SessionId::new(id);
+
+    // Resolve the tracker lazily: only --reason needs it, so a repo
+    // without a configured tracker can still clear deps locally.
+    let tracker: Option<Box<dyn crate::tracker::Tracker>> = if reason.is_some() {
+        let config = crate::repo_config::RepoConfig::load(root.join(".fleet/config.yaml"))
+            .with_context(|| format!("loading repo config under {}", root.display()))?;
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+        Some(
+            crate::tracker::build(config.tracker, invoker).ok_or_else(|| {
+                anyhow!(
+                    "session `{id}`: --reason posts a tracker comment, but no tracker \
+                 is configured for this repo (.fleet/config.yaml `tracker:`)"
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let outcome = unblock_session(
+        &store,
+        &deps_store,
+        tracker.as_deref(),
+        &root,
+        &session_id,
+        reason,
+    )?;
+    print!("{}", render_unblock_outcome(&outcome));
+    Ok(0)
+}
+
+/// Outcome of an unblock operation. Pure value object so tests can
+/// assert on the report without screen-scraping the CLI output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnblockOutcome {
+    pub session_id: String,
+    pub ticket_id: String,
+    pub edges_removed: usize,
+    pub comment_posted: bool,
+}
+
+/// Drop every deps edge keyed by `session`'s bound ticket; when a
+/// `reason` and a `tracker` are both supplied, also post a comment
+/// explaining why. Pure-ish — takes the dependencies as parameters
+/// instead of reaching for the cwd/config, so tests can exercise it
+/// against a tempdir-rooted set of stores.
+///
+/// Errors when:
+/// - the session isn't found, or
+/// - the session has no bound issue, or
+/// - `reason` is set but no tracker was provided, or
+/// - the tracker call fails.
+pub fn unblock_session(
+    store: &SessionStore,
+    deps_store: &crate::deps::DepsStore,
+    tracker: Option<&dyn crate::tracker::Tracker>,
+    repo_root: &Path,
+    session_id: &SessionId,
+    reason: Option<&str>,
+) -> Result<UnblockOutcome> {
+    let session = store
+        .load(session_id)
+        .with_context(|| format!("loading session `{session_id}`"))?;
+    let issue = session.issue.as_ref().ok_or_else(|| {
+        anyhow!(
+            "session `{session_id}` has no bound issue — `unblock` removes deps \
+             edges keyed by the session's ticket id, so there's nothing to do here"
+        )
+    })?;
+
+    let removed = deps_store
+        .remove_edges_for_blocked(&issue.human_id)
+        .with_context(|| {
+            format!(
+                "removing deps edges for ticket `{}` (session `{session_id}`)",
+                issue.human_id
+            )
+        })?;
+
+    let comment_posted = if let Some(reason) = reason {
+        let tracker = tracker.ok_or_else(|| {
+            anyhow!(
+                "session `{session_id}`: --reason requires a tracker, but the \
+                 caller did not pass one"
+            )
+        })?;
+        let body = format!("Unblocked manually: {reason}");
+        tracker
+            .comment(repo_root, &issue.human_id, &body)
+            .with_context(|| format!("posting unblock comment on ticket `{}`", issue.human_id))?;
+        true
+    } else {
+        false
+    };
+
+    Ok(UnblockOutcome {
+        session_id: session_id.as_str().to_string(),
+        ticket_id: issue.human_id.clone(),
+        edges_removed: removed,
+        comment_posted,
+    })
+}
+
+/// Render the user-visible summary of an unblock outcome.
+#[must_use]
+pub fn render_unblock_outcome(outcome: &UnblockOutcome) -> String {
+    let edges_phrase = if outcome.edges_removed == 0 {
+        "no deps edges to clear".to_string()
+    } else {
+        format!(
+            "cleared {} deps edge{}",
+            outcome.edges_removed,
+            if outcome.edges_removed == 1 { "" } else { "s" }
+        )
+    };
+    let comment_phrase = if outcome.comment_posted {
+        " · posted comment"
+    } else {
+        ""
+    };
+    format!(
+        "session `{}` (ticket `{}`): {}{}\n",
+        outcome.session_id, outcome.ticket_id, edges_phrase, comment_phrase
+    )
+}
+
 /// Discover `.log` files under a session's logs directory. Returns
 /// absolute paths sorted alphabetically; missing dir → empty.
 fn list_log_files(store: &SessionStore, id: &SessionId) -> Result<Vec<PathBuf>> {
@@ -1140,5 +1278,216 @@ mod tests {
         });
         assert!(r.contains("stopped 2 leaked container(s): c-aaa, c-bbb"));
         assert!(r.contains("failed to stop 1 leaked container(s); reclaim manually: c-ccc"));
+    }
+
+    // ---- unblock --------------------------------------------------
+
+    use crate::deps::{DepEdge, DepsStore};
+    use crate::session::IssueContext;
+    use crate::tracker::Tracker;
+
+    /// Tiny mock tracker that records every `comment` call. Used by
+    /// the unblock-with-reason test below; other Tracker methods
+    /// panic so a mistaken caller blows up rather than passing
+    /// silently.
+    struct CommentRecordingTracker {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl CommentRecordingTracker {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Tracker for CommentRecordingTracker {
+        fn name(&self) -> &'static str {
+            "mock-comment-recording"
+        }
+        fn list_issues(&self, _: &Path) -> Result<Vec<crate::tracker::Issue>> {
+            Ok(Vec::new())
+        }
+        fn comment(&self, _: &Path, id: &str, body: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((id.to_string(), body.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Set up: a tempdir-rooted `SessionStore` with one session
+    /// bound to ticket `42`, a `DepsStore` pre-seeded with edges
+    /// where 42 is blocked on 43 and 44 plus an unrelated 43→44
+    /// edge.
+    fn unblock_fixture() -> (tempfile::TempDir, SessionStore, DepsStore, SessionId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path().join("sessions"));
+        let deps = DepsStore::at(dir.path().join("deps.json"));
+        let session_id = SessionId::new("s-blocked");
+        let mut session = Session::new(session_id.clone(), "standard", 0);
+        session.issue = Some(IssueContext {
+            id: "gh:42".to_string(),
+            human_id: "42".to_string(),
+            title: "Stuck ticket".to_string(),
+            labels: Vec::new(),
+        });
+        store.create(&session).unwrap();
+        deps.add_edge(DepEdge {
+            blocked: "42".to_string(),
+            blocked_on: "43".to_string(),
+            reason: crate::deps::BlockedReason::Ticket,
+            created_at_ms: 1,
+        })
+        .unwrap();
+        deps.add_edge(DepEdge {
+            blocked: "42".to_string(),
+            blocked_on: "44".to_string(),
+            reason: crate::deps::BlockedReason::Ticket,
+            created_at_ms: 2,
+        })
+        .unwrap();
+        deps.add_edge(DepEdge {
+            blocked: "43".to_string(),
+            blocked_on: "44".to_string(),
+            reason: crate::deps::BlockedReason::Ticket,
+            created_at_ms: 3,
+        })
+        .unwrap();
+        (dir, store, deps, session_id)
+    }
+
+    #[test]
+    fn unblock_session_clears_only_edges_keyed_by_the_sessions_ticket() {
+        let (dir, store, deps, session_id) = unblock_fixture();
+        let outcome = unblock_session(&store, &deps, None, dir.path(), &session_id, None).unwrap();
+        assert_eq!(outcome.ticket_id, "42");
+        assert_eq!(outcome.edges_removed, 2);
+        assert!(!outcome.comment_posted);
+        // 43→44 edge survives.
+        let remaining = deps.load().unwrap();
+        assert_eq!(remaining.edges.len(), 1);
+        assert_eq!(remaining.edges[0].blocked, "43");
+    }
+
+    #[test]
+    fn unblock_session_with_reason_posts_a_tracker_comment() {
+        let (dir, store, deps, session_id) = unblock_fixture();
+        let tracker = CommentRecordingTracker::new();
+        let outcome = unblock_session(
+            &store,
+            &deps,
+            Some(&tracker as &dyn Tracker),
+            dir.path(),
+            &session_id,
+            Some("apt mirror recovered"),
+        )
+        .unwrap();
+        assert!(outcome.comment_posted);
+        let calls = tracker.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "42");
+        assert!(
+            calls[0]
+                .1
+                .contains("Unblocked manually: apt mirror recovered"),
+            "got: {}",
+            calls[0].1
+        );
+    }
+
+    #[test]
+    fn unblock_session_with_reason_but_no_tracker_errors() {
+        let (dir, store, deps, session_id) = unblock_fixture();
+        let err = unblock_session(
+            &store,
+            &deps,
+            None,
+            dir.path(),
+            &session_id,
+            Some("needed-to-comment"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--reason requires a tracker"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn unblock_session_errors_when_session_has_no_bound_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path().join("sessions"));
+        let deps = DepsStore::at(dir.path().join("deps.json"));
+        let session_id = SessionId::new("s-noissue");
+        // Session created without an issue — typical of an ad-hoc
+        // smoke run that didn't bind a ticket.
+        let session = Session::new(session_id.clone(), "standard", 0);
+        store.create(&session).unwrap();
+        let err = unblock_session(&store, &deps, None, dir.path(), &session_id, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no bound issue"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn unblock_session_is_idempotent_with_zero_edges() {
+        // A session with a ticket the deps map doesn't reference at
+        // all should report zero edges removed and not error.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path().join("sessions"));
+        let deps = DepsStore::at(dir.path().join("deps.json"));
+        let session_id = SessionId::new("s-unrelated");
+        let mut session = Session::new(session_id.clone(), "standard", 0);
+        session.issue = Some(IssueContext {
+            id: "gh:999".to_string(),
+            human_id: "999".to_string(),
+            title: "Unrelated".to_string(),
+            labels: Vec::new(),
+        });
+        store.create(&session).unwrap();
+        let outcome = unblock_session(&store, &deps, None, dir.path(), &session_id, None).unwrap();
+        assert_eq!(outcome.edges_removed, 0);
+        assert!(!outcome.comment_posted);
+    }
+
+    #[test]
+    fn render_unblock_outcome_pluralises_correctly() {
+        let one = UnblockOutcome {
+            session_id: "s-1".into(),
+            ticket_id: "42".into(),
+            edges_removed: 1,
+            comment_posted: false,
+        };
+        let multi = UnblockOutcome {
+            edges_removed: 3,
+            ..one.clone()
+        };
+        let none = UnblockOutcome {
+            edges_removed: 0,
+            ..one.clone()
+        };
+        assert!(render_unblock_outcome(&one).contains("cleared 1 deps edge\n"));
+        assert!(render_unblock_outcome(&multi).contains("cleared 3 deps edges"));
+        assert!(render_unblock_outcome(&none).contains("no deps edges to clear"));
+    }
+
+    #[test]
+    fn render_unblock_outcome_notes_when_comment_posted() {
+        let with_comment = UnblockOutcome {
+            session_id: "s-1".into(),
+            ticket_id: "42".into(),
+            edges_removed: 2,
+            comment_posted: true,
+        };
+        let out = render_unblock_outcome(&with_comment);
+        assert!(out.contains("· posted comment"), "got: {out}");
     }
 }

@@ -186,6 +186,16 @@ pub enum SessionsSub {
     /// subcommand exists for scripted/manual use.
     Reap,
 
+    /// Clear `.fleet/deps.json` edges where this session's bound
+    /// ticket is `blocked`. With `--reason`, also posts a comment
+    /// on the ticket explaining why the unblock was done. Errors
+    /// when the session has no bound issue.
+    Unblock {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
     /// Remove a session's per-session git worktree, freeing the
     /// checked-out source code from disk. The branch and the
     /// session's logs/artifacts/meta.json are kept — `git checkout
@@ -322,6 +332,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             SessionsSub::Show { id } => sessions::run_show(&id),
             SessionsSub::Logs { id, node } => sessions::run_logs(&id, node.as_deref()),
             SessionsSub::Reap => sessions::run_reap(),
+            SessionsSub::Unblock { id, reason } => sessions::run_unblock(&id, reason.as_deref()),
             SessionsSub::Prune {
                 id,
                 completed,
