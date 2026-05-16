@@ -97,6 +97,16 @@ pub fn run_default() -> Result<i32> {
     tmux::new_session(invoker.as_ref(), &session.tmux_session, &command, &env)
         .with_context(|| format!("spawning tmux session `{}`", session.tmux_session))?;
 
+    // Capture the pane to disk so a detach + re-attach (or a post-
+    // hoc audit of the conversation) has the full context. Failure
+    // to start the pipe is non-fatal — the agent still runs, just
+    // without a transcript.
+    let transcript_path = store.transcript_path(&id);
+    if let Err(err) = tmux::pipe_pane_to(invoker.as_ref(), &session.tmux_session, &transcript_path)
+    {
+        eprintln!("warning: tmux pipe-pane failed (no transcript will be captured): {err:#}");
+    }
+
     println!("brainstorm session: {id}");
     println!("attaching to tmux session: {}", session.tmux_session);
 

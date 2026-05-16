@@ -141,6 +141,56 @@ fn is_missing_session_error(msg: &str) -> bool {
         || lower.contains("session not found")
 }
 
+/// Pipe pane output to `transcript_path` via
+/// `tmux pipe-pane -t <session> -o 'cat >> "<path>"'`. Captures
+/// everything the user sees in the pane plus what the agent
+/// writes; tmux flushes incrementally so a detach (or a fleet
+/// crash) doesn't lose recent content. Idempotent against
+/// repeated invocations on the same session: tmux's `-o`
+/// toggles the pipe, so the second call would *stop* it — we
+/// only call this once at spawn time.
+///
+/// Path is single-quoted to survive spaces in the fleet root.
+pub fn pipe_pane_to(
+    invoker: &dyn ProcessInvoker,
+    session_name: &str,
+    transcript_path: &std::path::Path,
+) -> Result<()> {
+    let escaped = shell_single_quote(&transcript_path.display().to_string());
+    let cmd = format!("cat >> {escaped}");
+    invoker
+        .run(
+            "tmux",
+            vec![
+                "pipe-pane".to_string(),
+                "-t".to_string(),
+                session_name.to_string(),
+                "-o".to_string(),
+                cmd,
+            ],
+        )
+        .with_context(|| format!("`tmux pipe-pane -t {session_name}` failed"))?;
+    Ok(())
+}
+
+/// POSIX single-quote escape (a→'a', a'b → 'a'\''b'). Paths
+/// embedded in tmux pipe-pane's shell command go through here
+/// so spaces / special chars don't break the redirect.
+#[must_use]
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// `tmux list-sessions -F '#S'` → vec of session names. Returns
 /// an empty vec when no tmux server is running (common on a fresh
 /// shell), distinguishing "no sessions" from "tmux missing"
@@ -389,6 +439,57 @@ mod tests {
             "12345\n".to_string(),
         )]);
         assert_eq!(server_pid_for(invoker.as_ref(), "s").unwrap(), 12345);
+    }
+
+    #[test]
+    fn pipe_pane_to_shells_cat_append_with_quoted_path() {
+        let invoker = invoker_with(vec![(
+            "tmux",
+            vec![
+                "pipe-pane".to_string(),
+                "-t".to_string(),
+                "fleet-brainstorm-b-1".to_string(),
+                "-o".to_string(),
+                "cat >> '/repo/.fleet/planning/b-1/transcript.log'".to_string(),
+            ],
+            String::new(),
+        )]);
+        pipe_pane_to(
+            invoker.as_ref(),
+            "fleet-brainstorm-b-1",
+            std::path::Path::new("/repo/.fleet/planning/b-1/transcript.log"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        // Standard POSIX trick: close-quote, backslash-quote,
+        // re-open-quote.
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_single_quote("with space"), "'with space'");
+    }
+
+    #[test]
+    fn pipe_pane_to_handles_paths_with_spaces() {
+        let invoker = invoker_with(vec![(
+            "tmux",
+            vec![
+                "pipe-pane".to_string(),
+                "-t".to_string(),
+                "s".to_string(),
+                "-o".to_string(),
+                "cat >> '/path with spaces/transcript.log'".to_string(),
+            ],
+            String::new(),
+        )]);
+        pipe_pane_to(
+            invoker.as_ref(),
+            "s",
+            std::path::Path::new("/path with spaces/transcript.log"),
+        )
+        .unwrap();
     }
 
     #[test]

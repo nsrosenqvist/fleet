@@ -63,10 +63,9 @@ impl BrainstormStore {
     }
 
     /// Path of the captured transcript file for a given session id.
-    /// Reserved for the future tmux `pipe-pane` capture (not wired
-    /// in v1).
+    /// Populated by tmux `pipe-pane` after `fleet brainstorm`
+    /// spawns the session — see [`crate::brainstorm::tmux::pipe_pane_to`].
     #[must_use]
-    #[allow(dead_code)]
     pub fn transcript_path(&self, id: &BrainstormId) -> PathBuf {
         self.session_dir(id).join("transcript.log")
     }
