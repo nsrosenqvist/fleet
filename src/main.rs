@@ -22,10 +22,6 @@ mod bridge;
 mod cli;
 mod deps;
 mod egress;
-// Dead-code allow lifts once Phase 3a's CLI commits wire `fleet plan
-// {list,show,new,…}` and the tracker-create plan-injector — the
-// public surface of this module is consumed exclusively from there.
-#[allow(dead_code)]
 mod plans;
 mod process;
 mod repo;

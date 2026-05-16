@@ -204,9 +204,11 @@ impl Plan {
     }
 
     /// True iff every item is `Completed`. Used by the supervisor
-    /// to advance the plan to `PlanState::Completed` when it
-    /// finishes the last item.
+    /// (Phase 4) to advance the plan to `PlanState::Completed` when
+    /// it finishes the last item. Not yet wired — `#[allow(dead_code)]`
+    /// lifts when the supervisor consumes it.
     #[must_use]
+    #[allow(dead_code)]
     pub fn all_items_done(&self) -> bool {
         !self.items.is_empty()
             && self

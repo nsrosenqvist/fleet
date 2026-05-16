@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 pub mod autonomous;
 pub mod init;
 pub mod issues;
+pub mod plan;
 pub mod runtime;
 pub mod sessions;
 pub mod workflow;
@@ -63,6 +64,15 @@ pub enum Command {
     Autonomous {
         #[command(subcommand)]
         sub: AutonomousSub,
+    },
+
+    /// Plan management: ordered ticket lists the autonomous
+    /// supervisor walks through in sequence. Plans encode preference
+    /// (this is the order I want); the deps graph encodes
+    /// requirement (this can't run until that closes).
+    Plan {
+        #[command(subcommand)]
+        sub: PlanSub,
     },
 
     /// Launch the ratatui session browser.
@@ -212,6 +222,62 @@ pub enum IssuesSub {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum PlanSub {
+    /// List plans discovered under `.fleet/plans/`, sorted by id.
+    List,
+
+    /// Print a plan's metadata + every item with its state.
+    Show { id: String },
+
+    /// Create a new plan in the `Active` state. Mints a fresh id;
+    /// prints it on stdout.
+    New {
+        /// Human-readable plan name (e.g. "Parser refactor").
+        name: String,
+        /// Comma-separated list of ticket ids the plan walks through
+        /// in order. Whitespace around commas is trimmed.
+        #[arg(long)]
+        tickets: String,
+    },
+
+    /// Open the plan YAML in `$EDITOR` (or `$VISUAL`), parse the
+    /// edited content back, and save it. The on-disk plan is left
+    /// untouched if the edit produces malformed YAML.
+    Edit { id: String },
+
+    /// Pause an active plan. Supervisor stops picking items from
+    /// it on subsequent ticks; existing in-flight sessions finish.
+    Pause { id: String },
+
+    /// Resume a paused plan. Returns to `Active` state.
+    Resume { id: String },
+
+    /// Mark a plan completed. Items aren't touched; user signal
+    /// only.
+    Complete { id: String },
+
+    /// Mark a plan abandoned. Optional `--reason` is recorded to
+    /// stderr (future: posted as a comment on the epic).
+    Abandon {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Manually inject a ticket id into a plan as a `Pending`
+    /// item. Default position is the end; `--before <other>`
+    /// inserts immediately before another item.
+    Inject {
+        id: String,
+        /// Ticket id to insert as a new pending item.
+        ticket: String,
+        /// Existing item to insert before. Defaults to appending.
+        #[arg(long)]
+        before: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum AutonomousSub {
     /// Tick the supervisor. `--once` runs a single tick and exits
     /// (suitable for cron). `--watch` loops, sleeping
@@ -268,6 +334,19 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         },
         Command::Autonomous { sub } => match sub {
             AutonomousSub::Run { once, watch } => autonomous::run(once, watch),
+        },
+        Command::Plan { sub } => match sub {
+            PlanSub::List => plan::run_list(),
+            PlanSub::Show { id } => plan::run_show(&id),
+            PlanSub::New { name, tickets } => plan::run_new(&name, &tickets),
+            PlanSub::Edit { id } => plan::run_edit(&id),
+            PlanSub::Pause { id } => plan::run_pause(&id),
+            PlanSub::Resume { id } => plan::run_resume(&id),
+            PlanSub::Complete { id } => plan::run_complete(&id),
+            PlanSub::Abandon { id, reason } => plan::run_abandon(&id, reason.as_deref()),
+            PlanSub::Inject { id, ticket, before } => {
+                plan::run_inject(&id, &ticket, before.as_deref())
+            }
         },
     }
 }
