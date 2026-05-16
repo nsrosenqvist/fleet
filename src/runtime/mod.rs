@@ -225,10 +225,9 @@ pub trait RuntimeAdapter: Send + Sync {
     ///
     /// Default impl returns `Ok(None)` so adapters that don't (or can't)
     /// implement image inspection don't have to write a stub each.
-    /// Used by the workflow executor to decide whether to bind-mount
-    /// the host's `fleet-tracker` binary into the agent container —
-    /// `#[allow(dead_code)]` until that gate lands.
-    #[allow(dead_code)]
+    /// Used by the workflow executor's `fleet_tracker_mount` gate to
+    /// decide whether to bind-mount the host's `fleet-tracker` binary
+    /// into the agent container.
     fn inspect_image_arch(&self, image: &ImageId) -> Result<Option<String>> {
         let _ = image;
         Ok(None)
@@ -323,12 +322,9 @@ impl crate::session::reaper::ContainerStopper for AdapterStopper {
 ///
 /// Pure helper so callers comparing "what arch is the image built for"
 /// against "what arch is this host" don't have to keep the mapping
-/// table in their head.
-///
-/// Wired up by the workflow executor's fleet-tracker mount gate; the
-/// `#[allow(dead_code)]` is removed when that gate lands.
+/// table in their head. Used by [`host_arch_oci`] and the workflow
+/// executor's fleet-tracker mount gate.
 #[must_use]
-#[allow(dead_code)]
 pub fn normalize_arch_to_oci(rust_arch: &str) -> &str {
     match rust_arch {
         "x86_64" => "amd64",
@@ -341,7 +337,6 @@ pub fn normalize_arch_to_oci(rust_arch: &str) -> &str {
 /// Convenience wrapper around [`normalize_arch_to_oci`] so callsites
 /// don't have to spell out the constant.
 #[must_use]
-#[allow(dead_code)]
 pub fn host_arch_oci() -> &'static str {
     normalize_arch_to_oci(std::env::consts::ARCH)
 }

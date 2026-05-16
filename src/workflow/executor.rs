@@ -34,7 +34,7 @@ use crate::agent::registry::AgentSpec;
 use crate::bridge::{BRIDGE_HOST, Bridge};
 use crate::process::ProcessInvoker;
 use crate::runtime::devcontainer::Devcontainer;
-use crate::runtime::{ContainerSpec, ExecOpts, MountSpec, RuntimeAdapter};
+use crate::runtime::{ContainerSpec, ExecOpts, ImageId, MountSpec, RuntimeAdapter, host_arch_oci};
 use crate::session::store::SessionStore;
 use crate::session::{IssueContext, Session, SessionId, SessionState, now_ms};
 use crate::tracker::Tracker;
@@ -785,12 +785,13 @@ impl WorkflowExecutor {
             .with_context(|| format!("building image for node `{}`", node.id))?;
         let artifacts_dir = req.store.session_dir(&session.id).join("artifacts");
         // Bind-mount fleet-tracker into the agent container when the
-        // bridge is active and a host binary is locatable. The mount
-        // is read-only because the agent shouldn't be able to rewrite
-        // its own write-authority binary mid-run. See
-        // `fleet_tracker_mount` for the cross-arch caveat.
+        // bridge is active, a host binary is locatable, and the image
+        // arch matches the host. The mount is read-only because the
+        // agent shouldn't be able to rewrite its own write-authority
+        // binary mid-run. `fleet_tracker_mount` handles the gating
+        // (see its doc-comment for the exact skip conditions).
         let extra_mounts = if bridge.is_some() {
-            fleet_tracker_mount().map_or_else(Vec::new, |m| vec![m])
+            fleet_tracker_mount(req.adapter, &image).map_or_else(Vec::new, |m| vec![m])
         } else {
             Vec::new()
         };
@@ -1312,7 +1313,8 @@ pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String
 
 /// Locate the sibling `fleet-tracker` binary and render it as a
 /// read-only bind mount at `/usr/local/bin/fleet-tracker`. Returns
-/// `None` when:
+/// `None` (mount is skipped, bridge HTTP endpoint stays reachable
+/// either way) when:
 ///
 /// - The host isn't Linux. macOS / other-OS fleet builds produce a
 ///   non-ELF `fleet-tracker` binary that the in-container Linux
@@ -1323,30 +1325,53 @@ pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String
 /// - The sibling binary isn't where `current_exe()` says it should
 ///   be (e.g. fleet was installed via cargo and the user only
 ///   installed `fleet`, not `fleet-tracker`).
-///
-/// Cross-arch caveat: a linux/amd64 fleet host running a linux/arm64
-/// container (or vice versa) would still try to mount the
-/// non-matching `fleet-tracker`. Detection would require shelling out
-/// to `docker image inspect`; deferred to a follow-up. The honest
-/// failure mode in that case is the same "exec format error" the
-/// agent sees if it tries to run the binary, which is recoverable
-/// (the bridge HTTP endpoint still works; the agent's tool just
-/// fails).
-fn fleet_tracker_mount() -> Option<MountSpec> {
+/// - The container image's architecture doesn't match the host's
+///   (e.g. a linux/amd64 fleet host running a linux/arm64 image).
+///   The adapter's `inspect_image_arch` answer is the source of truth;
+///   any of `Err`, `Ok(None)`, or `Ok(Some(arch))` with `arch !=
+///   host_arch_oci()` collapse to "don't mount." Engine errors are
+///   intentionally treated as "can't tell" — failing the workflow
+///   over an inspect glitch when the bridge HTTP path still works
+///   would be over-strict.
+fn fleet_tracker_mount(adapter: &dyn RuntimeAdapter, image: &ImageId) -> Option<MountSpec> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let candidate = dir.join("fleet-tracker");
-    if !candidate.is_file() {
+    let host_path = locate_sibling_fleet_tracker()?;
+    if !host_arch_matches_image(adapter, image) {
         return None;
     }
     Some(MountSpec {
-        host_path: candidate,
+        host_path,
         container_path: PathBuf::from("/usr/local/bin/fleet-tracker"),
         read_only: true,
     })
+}
+
+/// Resolve the host path of the sibling `fleet-tracker` binary
+/// (alongside `current_exe()`'s `fleet`). `None` when the path can't
+/// be resolved or the candidate file doesn't exist.
+fn locate_sibling_fleet_tracker() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidate = dir.join("fleet-tracker");
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Pure predicate: does this adapter report the image's arch as a
+/// match for the host's? `inspect_image_arch` returning Err or
+/// Ok(None) both collapse to `false` ("can't tell, skip"). Factored
+/// out so the gate logic is unit-testable without a real binary on
+/// disk.
+fn host_arch_matches_image(adapter: &dyn RuntimeAdapter, image: &ImageId) -> bool {
+    matches!(
+        adapter.inspect_image_arch(image),
+        Ok(Some(ref arch)) if arch == host_arch_oci()
+    )
 }
 
 /// Append `FLEET_BRIDGE_URL`, `FLEET_BRIDGE_TOKEN`, and `NO_PROXY` to
@@ -5611,5 +5636,121 @@ nodes:
         let log =
             std::fs::read_to_string(store.session_dir(&session_id).join("logs/check.log")).unwrap();
         assert!(log.contains("--- skipped:"), "got: {log}");
+    }
+
+    /// Minimal `RuntimeAdapter` whose only real method is
+    /// `inspect_image_arch`. The other trait methods panic with a
+    /// clear message if anyone accidentally calls them — these
+    /// tests only exercise the arch gate.
+    struct ArchOnlyAdapter {
+        arch: Result<Option<String>, ()>,
+    }
+
+    impl ArchOnlyAdapter {
+        fn returning(arch: Option<&str>) -> Self {
+            Self {
+                arch: Ok(arch.map(str::to_string)),
+            }
+        }
+
+        fn erroring() -> Self {
+            Self { arch: Err(()) }
+        }
+    }
+
+    impl crate::runtime::RuntimeAdapter for ArchOnlyAdapter {
+        fn name(&self) -> &'static str {
+            "arch-only"
+        }
+        fn capabilities(&self) -> crate::runtime::Capabilities {
+            unimplemented!("arch-only adapter is for fleet_tracker_mount tests")
+        }
+        fn ensure_image(
+            &self,
+            _devcontainer: &crate::runtime::Devcontainer,
+        ) -> Result<crate::runtime::ImageId> {
+            unimplemented!("arch-only adapter is for fleet_tracker_mount tests")
+        }
+        fn inspect_image_arch(&self, _image: &crate::runtime::ImageId) -> Result<Option<String>> {
+            match &self.arch {
+                Ok(a) => Ok(a.clone()),
+                Err(()) => Err(anyhow!("simulated engine error")),
+            }
+        }
+        fn start_container(
+            &self,
+            _spec: &crate::runtime::ContainerSpec,
+        ) -> Result<crate::runtime::ContainerId> {
+            unimplemented!("arch-only adapter is for fleet_tracker_mount tests")
+        }
+        fn exec(
+            &self,
+            _container: &crate::runtime::ContainerId,
+            _argv: &[String],
+            _opts: crate::runtime::ExecOpts,
+        ) -> Result<crate::runtime::ExecHandle> {
+            unimplemented!("arch-only adapter is for fleet_tracker_mount tests")
+        }
+        fn attach_pty(
+            &self,
+            _container: &crate::runtime::ContainerId,
+            _argv: &[String],
+        ) -> Result<crate::runtime::PtyHandle> {
+            unimplemented!("arch-only adapter is for fleet_tracker_mount tests")
+        }
+        fn stop(&self, _container: &crate::runtime::ContainerId) -> Result<()> {
+            unimplemented!("arch-only adapter is for fleet_tracker_mount tests")
+        }
+        fn inspect(
+            &self,
+            _container: &crate::runtime::ContainerId,
+        ) -> Result<crate::runtime::ContainerState> {
+            unimplemented!("arch-only adapter is for fleet_tracker_mount tests")
+        }
+    }
+
+    #[test]
+    fn host_arch_matches_image_returns_true_for_matching_arch() {
+        let adapter = ArchOnlyAdapter::returning(Some(host_arch_oci()));
+        assert!(host_arch_matches_image(&adapter, &ImageId::new("img:1")));
+    }
+
+    #[test]
+    fn host_arch_matches_image_returns_false_for_mismatch() {
+        // Pick the *other* arch from the two we natively translate, so
+        // this test stays meaningful on either amd64 or arm64 hosts.
+        let other = if host_arch_oci() == "amd64" {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        let adapter = ArchOnlyAdapter::returning(Some(other));
+        assert!(!host_arch_matches_image(&adapter, &ImageId::new("img:1")));
+    }
+
+    #[test]
+    fn host_arch_matches_image_returns_false_when_adapter_reports_none() {
+        let adapter = ArchOnlyAdapter::returning(None);
+        assert!(!host_arch_matches_image(&adapter, &ImageId::new("img:1")));
+    }
+
+    #[test]
+    fn host_arch_matches_image_returns_false_when_adapter_errors() {
+        // Engine errors collapse to "can't tell, skip" — failing the
+        // workflow over an inspect glitch when the bridge HTTP path
+        // still works would be over-strict.
+        let adapter = ArchOnlyAdapter::erroring();
+        assert!(!host_arch_matches_image(&adapter, &ImageId::new("img:1")));
+    }
+
+    #[test]
+    fn fleet_tracker_mount_returns_none_on_arch_mismatch_even_when_binary_present() {
+        // On any host, an adapter reporting a clearly-foreign arch
+        // ("future-arch-9000") must result in no mount, regardless of
+        // whether the sibling binary exists. This is the cross-arch
+        // bug we're closing: previously we'd mount the wrong-arch
+        // binary and the agent would get "exec format error."
+        let adapter = ArchOnlyAdapter::returning(Some("future-arch-9000"));
+        assert_eq!(fleet_tracker_mount(&adapter, &ImageId::new("img:1")), None);
     }
 }
