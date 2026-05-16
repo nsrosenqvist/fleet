@@ -59,10 +59,15 @@ pub fn run_default() -> Result<i32> {
         }
     });
 
+    // `brainstorm.agent` in `.fleet/config.yaml` overrides the default
+    // (`claude`); load it here so the user can swap in `claude-code`,
+    // `aider`, or a wrapper script without touching fleet itself.
+    let config = RepoConfig::load(root.join(".fleet/config.yaml"))
+        .with_context(|| format!("loading repo config at {}", root.display()))?;
     let store = BrainstormStore::for_repo(&root);
     let id = ClockBrainstormIdSource.mint();
-    let agent = "claude"; // v1: hard-coded; future: config-driven.
-    let session = BrainstormSession::new(id.clone(), agent, now_ms());
+    let agent = &config.brainstorm.agent;
+    let session = BrainstormSession::new(id.clone(), agent.as_str(), now_ms());
     store
         .create(&session)
         .with_context(|| format!("creating brainstorm session `{id}` on disk"))?;
@@ -81,7 +86,7 @@ pub fn run_default() -> Result<i32> {
         "FLEET_BRAINSTORM_PROMPT".to_string(),
         prompt_path.display().to_string(),
     )];
-    let command = vec![agent.to_string()];
+    let command = vec![agent.clone()];
     tmux::new_session(invoker.as_ref(), &session.tmux_session, &command, &env)
         .with_context(|| format!("spawning tmux session `{}`", session.tmux_session))?;
 

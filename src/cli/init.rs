@@ -293,6 +293,12 @@ agents:
 
 workflows:
   default: standard
+
+# brainstorm:
+#   # Binary fleet exec's inside the tmux pane for `fleet brainstorm`.
+#   # Override when your agent runtime is `claude-code`, `aider`, or a
+#   # wrapper script. v1 doesn't support multi-word commands.
+#   agent: claude
 ";
 
 /// Default `.devcontainer/devcontainer.json`. Minimal so it always

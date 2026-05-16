@@ -33,6 +33,7 @@ pub struct RepoConfig {
     pub autonomous: AutonomousConfig,
     pub cleanup: CleanupConfig,
     pub cost: CostConfig,
+    pub brainstorm: BrainstormConfig,
 }
 
 /// `runtime:` block — which adapter to instantiate, how to harden it, where
@@ -336,6 +337,28 @@ pub struct CleanupConfig {
     pub auto_prune_completed: bool,
 }
 
+/// `brainstorm:` block — interactive planning-session config.
+/// `agent` is the binary fleet exec's inside the tmux pane (e.g.
+/// `claude`, `claude-code`, `aider`, ...). Defaults to `claude`
+/// because that's what most fleet users are running today; the
+/// brainstorm prompt assumes Claude Code's tool-use semantics but
+/// any agent that takes a system prompt + shell access works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrainstormConfig {
+    /// Command fleet exec's. A bare program name (no spaces) so
+    /// the tmux invocation stays simple. v1 doesn't support
+    /// multi-word commands; embed any flags via a wrapper script.
+    pub agent: String,
+}
+
+impl Default for BrainstormConfig {
+    fn default() -> Self {
+        Self {
+            agent: String::from("claude"),
+        }
+    }
+}
+
 /// `cost:` block — spend guardrails. Both fields default to `None`
 /// (no budget). Budgets are *hard stops on new agent spawns*; an
 /// in-flight agent isn't interrupted mid-run when the budget is
@@ -403,6 +426,14 @@ struct Raw {
     cleanup: Option<RawCleanup>,
     #[serde(default)]
     cost: Option<RawCost>,
+    #[serde(default)]
+    brainstorm: Option<RawBrainstorm>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawBrainstorm {
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -490,6 +521,7 @@ impl From<Raw> for RepoConfig {
             autonomous: default_autonomous,
             cleanup: default_cleanup,
             cost: default_cost,
+            brainstorm: default_brainstorm,
         } = Self::default();
 
         let runtime = match raw.runtime {
@@ -569,6 +601,12 @@ impl From<Raw> for RepoConfig {
             },
             None => default_cost,
         };
+        let brainstorm = match raw.brainstorm {
+            Some(b) => BrainstormConfig {
+                agent: b.agent.unwrap_or(default_brainstorm.agent),
+            },
+            None => default_brainstorm,
+        };
         Self {
             runtime,
             tracker,
@@ -577,6 +615,7 @@ impl From<Raw> for RepoConfig {
             autonomous,
             cleanup,
             cost,
+            brainstorm,
         }
     }
 }
@@ -622,6 +661,26 @@ mod tests {
         let yaml = "tracker: github\n";
         let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
         assert!(!cfg.cleanup.auto_prune_completed);
+    }
+
+    #[test]
+    fn brainstorm_agent_defaults_to_claude() {
+        let cfg = RepoConfig::default();
+        assert_eq!(cfg.brainstorm.agent, "claude");
+    }
+
+    #[test]
+    fn brainstorm_agent_can_be_overridden_per_repo() {
+        let yaml = "brainstorm:\n  agent: aider\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.brainstorm.agent, "aider");
+    }
+
+    #[test]
+    fn missing_brainstorm_block_keeps_the_default() {
+        let yaml = "tracker: github\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.brainstorm.agent, "claude");
     }
 
     #[test]
