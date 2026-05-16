@@ -9,12 +9,15 @@ If you're looking for individual-session mechanics, see
 gets permission to mutate the tracker, see
 [`auth.md`](./auth.md#per-tracker-auth).
 
-> **Status.** Phases 1 and 2 have shipped — the bridge CLI, the
-> outcome convention, the `tracker-create` workflow node, and the
-> `.fleet/deps.json` store are live. Plans, the autonomous-supervisor
-> integration, and the brainstorm agent are future phases described
-> here as target shape; the table at the bottom of this page tracks
-> what's actually in the binary.
+> **Status.** Phases 1, 2, and 3a have shipped — the bridge CLI, the
+> outcome convention, the `tracker-create` workflow node, the
+> `.fleet/deps.json` store, the plans data model + `fleet plan` CLI,
+> `fleet sessions unblock`, and tracker-create's cycle check + plan
+> injection are live. The TUI Plans view (3b), the
+> autonomous-supervisor's plan consumption (Phase 4), and the
+> brainstorm agent (Phase 5) are future phases described here as
+> target shape; the table at the bottom of this page tracks what's
+> actually in the binary.
 
 ## The model in 30 seconds
 
@@ -181,11 +184,10 @@ from the fleet host's own install location. The mount fires only when:
   binaries are dropped together by your packaging). Installations
   that only ship `fleet` skip the mount.
 
-Cross-arch is best-effort: a linux/amd64 fleet host running a
-linux/arm64 container (or vice versa) bind-mounts a non-matching
-binary that fails the same "exec format error" the agent's
-`fleet-tracker` call would otherwise see. The bridge's HTTP endpoint
-remains reachable. Container-arch detection is on the v2 list.
+Cross-arch is handled: fleet inspects the container image's arch
+via the engine's `image inspect` and skips the bind-mount when it
+doesn't match the host's. The bridge HTTP endpoint stays reachable
+either way, so curl-based agents still work.
 
 ## Recommending new tickets
 
@@ -199,8 +201,10 @@ workflow's `tracker-create` node turns the recommendation into reality:
 3. When `link_parent: true` (the default) and the session is bound
    to a ticket: posts cross-link comments on both the parent and
    the new ticket, calls `Tracker::link_parent` for the structural
-   relationship, and appends a `<parent> → blocked_on: <new>` edge
-   to `.fleet/deps.json`.
+   relationship, appends a `<parent> → blocked_on: <new>` edge to
+   `.fleet/deps.json` (cycle-checked first), and — when an active
+   fleet plan contains the bound ticket — injects the new ticket
+   into the plan immediately before its dependent.
 
 The agent can't call `create` directly — only the workflow can, via
 the `tracker-create` node. This is by design: the bridge CLI is
@@ -225,37 +229,62 @@ The node's emitted outputs are:
 
 Downstream nodes can branch on either via `when:` predicates.
 
-Future phases (3+) layer plan-injection on top: if the bound ticket
-is in an active fleet plan, the new ticket gets injected into the
-plan immediately before its dependent. The dependency map is
-already written today (Phase 2), so the scheduler integration
-is purely additive when Phase 4 lands.
+Plan-injection is wired up today (Phase 3a): if the bound ticket
+is in an active fleet plan, the new ticket gets inserted into the
+plan items just before its dependent, with `injected: true` so the
+TUI / CLI can flag it as "added during execution." Paused /
+completed / abandoned plans are intentionally not touched.
+Supervisor-side consumption (the scheduler reading these injections)
+is Phase 4.
 
 ## Plans
 
 A plan is a named, ordered list of tickets the supervisor walks
-through in sequence:
+through in sequence. The data model and CLI ship today (Phase 3a);
+the supervisor's plan-consumption tick lands in Phase 4.
+
+On-disk shape (`.fleet/plans/<id>.yaml`, one file per plan,
+gitignored):
 
 ```yaml
-# .fleet/plans/plan-018f-7c2a3b9d-0001.yaml
-id: plan-018f-7c2a3b9d-0001
-name: "Parser refactor"
+id: plan-018f7c2a3b9-0001
+name: Parser refactor
 state: active                       # active | paused | completed | abandoned
 on_item_failure: stop               # stop | continue | retry-once
-epic_ref:
+epic_ref:                           # optional; populated by the brainstorm agent (Phase 5)
   tracker: github
   id: "200"
 items:
   - { ticket_id: "42", state: completed, session_id: s-abc... }
   - { ticket_id: "43", state: completed, session_id: s-def... }
   - { ticket_id: "44", state: in-progress, session_id: s-ghi... }
+  - { ticket_id: "51", state: pending, injected: true }   # added by tracker-create
   - { ticket_id: "45", state: pending }
   - { ticket_id: "46", state: pending }
 created_at_ms: 1747...
 updated_at_ms: 1747...
 ```
 
-The supervisor's tick:
+### CLI surface
+
+```sh
+fleet plan list                            # all plans, state + progress
+fleet plan show <id>                       # full plan + per-item state
+fleet plan new "<name>" --tickets 42,43,44 # create active plan
+fleet plan edit <id>                       # $EDITOR on the YAML
+fleet plan pause <id>
+fleet plan resume <id>
+fleet plan complete <id>
+fleet plan abandon <id> --reason "..."
+fleet plan inject <id> <ticket> [--before <other>]
+```
+
+Plan ids are `plan-<13 hex ms>-<4 hex counter>` — mirrors the
+session id format so lexicographic ≈ chronological.
+
+### How plans compose with the deps graph (Phase 4 target shape)
+
+The supervisor's tick (not yet shipped):
 
 1. List active plans (oldest-first).
 2. For each plan, find the first `pending` item whose ticket isn't
@@ -267,8 +296,8 @@ Plans and the blocked-on graph compose:
 
 - A plan is `[A, B, C, D]`. The agent on B says it's blocked on a
   newly-recommended X. The `tracker-create` node files X, the plan
-  becomes `[A, X, B, C, D]` with B's state staying `pending` but the
-  blocked-on graph holding it back until X closes.
+  becomes `[A, X, B, C, D]` (X with `injected: true`) and the
+  blocked-on graph holds B back until X closes.
 - Multiple active plans round-robin (oldest first). Item-level
   parallelism is bounded by `autonomous.max_parallel` globally.
 
@@ -317,27 +346,39 @@ edge:
 - **Free-form blocker** (`42 → blocked_on: "free:apt-mirror"`): no
   close event. Clears via explicit human action.
 
-Manual unblock:
+Manual unblock — the session id is the argument; fleet looks up the
+session's bound ticket and clears every `blocked_on` edge keyed by
+that ticket:
 
 ```sh
-fleet sessions unblock 42
-fleet sessions unblock 42 --reason "apt mirror recovered"
+fleet sessions unblock s-abc123
+fleet sessions unblock s-abc123 --reason "apt mirror recovered"
 ```
 
 The `--reason` posts a comment on the bound ticket explaining the
 unblock — useful audit trail when you come back to it weeks later.
+Without `--reason`, the operation is purely local (no tracker
+calls), so it works in repos with `tracker: none` configured.
 
 ### Cycle detection
 
-Future: when you try to record `A → blocked_on: B` and `B` is already
-(transitively) blocked on `A`, fleet will refuse the addition and
-surface "cycle detected" via the sessions list / TUI Plans view, plus
-fail the `tracker-create` node that would create the cycle. The
-detection helper lands with Phase 3 (Plans). Today the deps store
-records edges without graph-walk validation — single-level cycles
-are unlikely in practice (a follow-up filed by `tracker-create`
-always points from parent to a fresh child) but multi-step cycles
-introduced by hand-editing `.fleet/deps.json` aren't caught yet.
+Cycle detection is wired into the `tracker-create` workflow node
+today: before persisting a new `parent → blocked_on: child` edge,
+fleet walks the existing deps graph to check whether `child` already
+has a path back to `parent`. If so, the workflow node fails with a
+clear "would close a cycle" message — the new ticket has been filed,
+but the structural link is refused; the user resolves manually
+(`fleet sessions unblock` on one side, or surgical edit of
+`.fleet/deps.json`) before re-running.
+
+In practice tracker-create's checker can only fire when a future
+write path re-uses an existing id (today's child is always fresh and
+has no outgoing edges); the safety net belongs at the mutation
+point regardless. The helper is also available as
+`crate::deps::would_create_cycle` for future manual-unblock or
+plan-editing surgery. Phase 3b surfaces cycle warnings in the TUI
+(sessions list `⚠ cycle: A ↔ B`, Plans view per-plan banner) —
+those visual flags ship with the TUI Plans view.
 
 ### What if a plan item just fails?
 
@@ -494,7 +535,8 @@ cat .fleet/deps.json
 |---|---|---|
 | 1 | Bridge CLI + `Tracker` write methods | **Shipped** |
 | 2 | Outcome convention + `tracker-create` node + deps.json | **Shipped** |
-| 3 | Plans data model + CLI + TUI Plans view | Not yet shipped |
+| 3a | Plans data model + `fleet plan` CLI + `fleet sessions unblock` + cycle detection + plan injection | **Shipped** |
+| 3b | TUI Plans view + sessions-row plan annotations + cycle warnings | Not yet shipped |
 | 4 | Supervisor plan consumption + failure policy | Not yet shipped |
 | 5 | Brainstorm agent + TUI attach/detach | Not yet shipped |
 
