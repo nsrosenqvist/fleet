@@ -1,9 +1,9 @@
 //! `fleet plan …` — CLI surface over [`crate::plans::store::PlanStore`].
 //!
-//! Nine subcommands: `list`, `show`, `new`, `edit`, `pause`, `resume`,
-//! `complete`, `abandon`, `inject`. Render helpers are pure functions
-//! over `Plan` so output tests don't need a real filesystem; the
-//! `run_*` wrappers do the I/O.
+//! Ten subcommands: `list`, `show`, `new`, `edit`, `pause`, `resume`,
+//! `complete`, `abandon`, `inject`, `sync`. Render helpers are pure
+//! functions over `Plan` so output tests don't need a real filesystem;
+//! the `run_*` wrappers do the I/O.
 //!
 //! State transitions are user-driven through this module — the
 //! autonomous supervisor (Phase 4) only advances *item* states; plan-
@@ -113,6 +113,163 @@ pub fn run_inject(id: &str, ticket_id: &str, before: Option<&str>) -> Result<i32
         .save(&plan)
         .with_context(|| format!("saving plan `{id}` after inject"))?;
     Ok(0)
+}
+
+/// `fleet plan sync <id>` — additively reconcile a plan with its
+/// tracker-native epic. Reads the epic body, parses the markdown
+/// task-list lines, and appends every referenced ticket that
+/// isn't already a plan item. Existing items keep their state and
+/// order; the epic itself isn't written back.
+///
+/// Errors out when:
+/// - the plan has no `epic_ref` (nothing to sync against),
+/// - no tracker is configured (`.fleet/config.yaml` `tracker:`),
+/// - the configured tracker's `read` impl bails (Linear/Jira at
+///   v1 — git-bug supports it because epics are encoded via
+///   labels, but `parse_task_list_tickets` won't find anything in
+///   that body and will report 0 new items).
+pub fn run_sync(id: &str) -> Result<i32> {
+    use std::sync::Arc;
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let store = PlanStore::for_repo(&root);
+    let mut plan = load_plan(&store, id)?;
+    let epic = plan.epic_ref.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "plan `{id}` has no epic_ref; `fleet plan sync` needs an epic \
+             to reconcile against. Edit the plan (`fleet plan edit {id}`) \
+             and add an `epic_ref:` block, or let the brainstorm agent \
+             populate it via the supervisor."
+        )
+    })?;
+    let config = crate::repo_config::RepoConfig::load(root.join(".fleet/config.yaml"))
+        .with_context(|| format!("loading repo config under {}", root.display()))?;
+    let invoker: Arc<dyn crate::process::ProcessInvoker> =
+        Arc::new(crate::process::RealProcessInvoker);
+    let tracker = crate::tracker::build(config.tracker, invoker).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no tracker configured for this repo (.fleet/config.yaml `tracker:`); \
+             `fleet plan sync` needs one to read the epic body"
+        )
+    })?;
+    let detail = tracker
+        .read(&root, &epic.id)
+        .with_context(|| format!("reading epic `{}:{}`", epic.tracker, epic.id))?;
+    let outcome = sync_plan_against_body(&mut plan, &detail.body);
+    if outcome.added_ticket_ids.is_empty() {
+        println!(
+            "plan `{id}` already in sync with epic `{}:{}` ({} items)",
+            epic.tracker,
+            epic.id,
+            plan.items.len()
+        );
+        return Ok(0);
+    }
+    plan.updated_at_ms = now_ms();
+    store
+        .save(&plan)
+        .with_context(|| format!("saving plan `{id}` after sync"))?;
+    println!(
+        "plan `{id}`: added {} item{} from epic `{}:{}` ({} items total)",
+        outcome.added_ticket_ids.len(),
+        if outcome.added_ticket_ids.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        epic.tracker,
+        epic.id,
+        plan.items.len()
+    );
+    for tid in &outcome.added_ticket_ids {
+        println!("  + {tid}");
+    }
+    Ok(0)
+}
+
+/// Outcome of a plan-sync mutation. Pure value object so tests
+/// can assert on the report without re-reading the plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncOutcome {
+    /// Ticket ids appended to the plan in this sync, in the order
+    /// they were discovered in the epic body.
+    pub added_ticket_ids: Vec<String>,
+}
+
+/// Append every ticket id mentioned in `body`'s task-list lines
+/// that isn't already a plan item. Pure: doesn't touch
+/// `updated_at_ms` (the caller does, only when there's something
+/// to save). Items are appended at the end so the existing plan
+/// order is preserved.
+#[must_use]
+pub fn sync_plan_against_body(plan: &mut Plan, body: &str) -> SyncOutcome {
+    let found = parse_task_list_tickets(body);
+    let mut added = Vec::new();
+    for tid in found {
+        if plan.position_of(&tid).is_some() {
+            continue;
+        }
+        plan.items.push(PlanItem::pending(tid.clone()));
+        added.push(tid);
+    }
+    SyncOutcome {
+        added_ticket_ids: added,
+    }
+}
+
+/// Pure parser for GitHub-flavored task-list lines. Recognises:
+///
+/// - `- [ ] #42` / `- [x] #42` (open / completed; we treat both
+///   as "in the epic" and don't distinguish state here — the
+///   supervisor will reconcile item state via session results),
+/// - leading whitespace (so nested task lists work),
+/// - trailing text after the ticket id (descriptions are
+///   ignored).
+///
+/// Ticket ids are returned in the order they appear in `body`,
+/// with duplicates dropped after the first occurrence (so a
+/// task-list line that repeats a ticket doesn't double-count).
+#[must_use]
+pub fn parse_task_list_tickets(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        // Match `- [ ] ` or `- [x] ` / `- [X] ` at the start of a
+        // task-list line. Anything else is skipped — we don't
+        // want to pick up `#42` mentions in prose.
+        let rest = if let Some(r) = trimmed.strip_prefix("- [ ] ") {
+            r
+        } else if let Some(r) = trimmed.strip_prefix("- [x] ") {
+            r
+        } else if let Some(r) = trimmed.strip_prefix("- [X] ") {
+            r
+        } else {
+            continue;
+        };
+        // First whitespace-delimited token after the checkbox.
+        let token = rest.split_whitespace().next().unwrap_or("");
+        let ticket = if let Some(stripped) = token.strip_prefix('#') {
+            stripped.to_string()
+        } else {
+            // No `#` prefix — accept bare ids too (git-bug doesn't
+            // use `#` in human ids). Refuse anything that doesn't
+            // start with an alphanumeric, though, so prose lines
+            // that happen to start with `- [ ] note...` don't get
+            // picked up.
+            if !token.chars().next().is_some_and(char::is_alphanumeric) {
+                continue;
+            }
+            token.to_string()
+        };
+        if ticket.is_empty() {
+            continue;
+        }
+        if seen.insert(ticket.clone()) {
+            out.push(ticket);
+        }
+    }
+    out
 }
 
 /// `fleet plan edit <id>` — open the YAML in `$EDITOR`, parse the
@@ -401,5 +558,111 @@ mod tests {
         // The on-disk YAML uses `in-progress`; the rendered label
         // should match so users grep across both surfaces.
         assert_eq!(item_state_label(PlanItemState::InProgress), "in-progress");
+    }
+
+    // ---- parse_task_list_tickets ------------------------------------
+
+    #[test]
+    fn parse_task_list_tickets_recognises_open_and_completed_boxes() {
+        let body = "- [ ] #42 open one\n- [x] #43 done\n- [X] #44 also done";
+        let v = parse_task_list_tickets(body);
+        assert_eq!(v, vec!["42", "43", "44"]);
+    }
+
+    #[test]
+    fn parse_task_list_tickets_skips_prose_lines_with_hash_mentions() {
+        let body = "We need to fix #42 soon.\n- [ ] #43 actually scheduled";
+        let v = parse_task_list_tickets(body);
+        assert_eq!(v, vec!["43"]);
+    }
+
+    #[test]
+    fn parse_task_list_tickets_handles_leading_whitespace_for_nested_lists() {
+        let body = "  - [ ] #42\n    - [x] #43";
+        let v = parse_task_list_tickets(body);
+        assert_eq!(v, vec!["42", "43"]);
+    }
+
+    #[test]
+    fn parse_task_list_tickets_dedupes_repeated_ids_after_first_occurrence() {
+        let body = "- [ ] #42\n- [x] #42 same ticket twice";
+        let v = parse_task_list_tickets(body);
+        assert_eq!(v, vec!["42"]);
+    }
+
+    #[test]
+    fn parse_task_list_tickets_accepts_bare_ids_for_non_github_trackers() {
+        // git-bug uses opaque hash ids without the `#` prefix.
+        let body = "- [ ] abc1234 first\n- [x] def5678 second";
+        let v = parse_task_list_tickets(body);
+        assert_eq!(v, vec!["abc1234", "def5678"]);
+    }
+
+    #[test]
+    fn parse_task_list_tickets_skips_lines_with_no_id_token() {
+        // An empty checkbox row contributes nothing.
+        let body = "- [ ] \n- [x] #42";
+        let v = parse_task_list_tickets(body);
+        assert_eq!(v, vec!["42"]);
+    }
+
+    #[test]
+    fn parse_task_list_tickets_skips_non_alphanumeric_first_chars() {
+        // A free-text line beginning with `- [ ] ...` shouldn't
+        // pollute the list. We guard the bare-id branch with an
+        // is_alphanumeric() check on the first character.
+        let body = "- [ ] ...placeholder";
+        let v = parse_task_list_tickets(body);
+        assert!(v.is_empty(), "got: {v:?}");
+    }
+
+    // ---- sync_plan_against_body -------------------------------------
+
+    #[test]
+    fn sync_plan_against_body_is_a_noop_when_epic_matches_plan() {
+        let mut plan = sample_plan(); // items: 42, 43, 44
+        let body = "- [ ] #42\n- [x] #43\n- [ ] #44";
+        let outcome = sync_plan_against_body(&mut plan, body);
+        assert!(outcome.added_ticket_ids.is_empty());
+        assert_eq!(plan.items.len(), 3);
+    }
+
+    #[test]
+    fn sync_plan_against_body_appends_new_ticket_ids_in_epic_order() {
+        // Epic mentions 42 (already in plan), 99 (new), 100 (new).
+        // The order of appended items should match epic order.
+        let mut plan = sample_plan();
+        let body = "- [ ] #42\n- [ ] #99\n- [ ] #100";
+        let outcome = sync_plan_against_body(&mut plan, body);
+        assert_eq!(outcome.added_ticket_ids, vec!["99", "100"]);
+        // Existing items kept their position; new ones appended.
+        let ticket_ids: Vec<&str> = plan.items.iter().map(|i| i.ticket_id.as_str()).collect();
+        assert_eq!(ticket_ids, vec!["42", "43", "44", "99", "100"]);
+    }
+
+    #[test]
+    fn sync_plan_against_body_preserves_existing_item_states() {
+        // Even if the epic has the ticket as `- [x] #42`, the in-plan
+        // item state must not be touched by sync — item state moves
+        // happen through the supervisor and the workflow engine, not
+        // through reconcile.
+        let mut plan = sample_plan();
+        plan.items[0].state = PlanItemState::InProgress;
+        let body = "- [x] #42 done in epic\n- [ ] #99 new";
+        let _ = sync_plan_against_body(&mut plan, body);
+        assert_eq!(plan.items[0].state, PlanItemState::InProgress);
+    }
+
+    #[test]
+    fn sync_outcome_uses_epic_ref_to_be_distinguishable_from_inject() {
+        // EpicRef isn't part of SyncOutcome but tests can rely on
+        // the plan field staying populated through a sync.
+        let mut plan = sample_plan();
+        plan.epic_ref = Some(EpicRef {
+            tracker: "github".into(),
+            id: "200".into(),
+        });
+        let _ = sync_plan_against_body(&mut plan, "- [ ] #99");
+        assert!(plan.epic_ref.is_some());
     }
 }

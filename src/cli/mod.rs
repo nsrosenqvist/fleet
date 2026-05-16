@@ -330,6 +330,13 @@ pub enum PlanSub {
         #[arg(long)]
         before: Option<String>,
     },
+
+    /// Reconcile a plan with its tracker-native epic. Reads the
+    /// epic body, parses `- [ ] #<id>` / `- [x] #<id>` task-list
+    /// lines, and appends any tickets that aren't already plan
+    /// items. Idempotent and additive — existing items aren't
+    /// reordered or removed, and the epic isn't written back.
+    Sync { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -415,6 +422,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             PlanSub::Resume { id } => plan::run_resume(&id),
             PlanSub::Complete { id } => plan::run_complete(&id),
             PlanSub::Abandon { id, reason } => plan::run_abandon(&id, reason.as_deref()),
+            PlanSub::Sync { id } => plan::run_sync(&id),
             PlanSub::Inject { id, ticket, before } => {
                 plan::run_inject(&id, &ticket, before.as_deref())
             }
