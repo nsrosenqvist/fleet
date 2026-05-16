@@ -296,10 +296,10 @@ FLEET deps list                          # back to 2 edges, both forward
 FLEET runtime doctor
 ```
 
-Look for ✓ on at least one engine and on `devcontainer`. If the
-probe reports `git-bug` missing while `which git-bug` says
-otherwise — that's a known doctor-probe quirk; fleet's tracker
-calls still work. See *Known quirks* at the bottom.
+Look for ✓ on at least one engine and on `devcontainer`. When
+`tracker: git-bug` is configured (the init default), `git-bug`
+should also show ✓ — if it doesn't, install it before continuing
+(`cargo install git-bug` or `brew install git-bug`).
 
 ### 3.2 Workflow inspection
 
@@ -452,11 +452,6 @@ rm -rf tmp/todomvc
 
 ## Known quirks
 
-- **`fleet runtime doctor` reports `git-bug` missing even when
-  installed.** The probe currently doesn't see git-bug on every
-  `$PATH` layout. Fleet's tracker path uses git-bug directly so
-  the rest of fleet still works; check with
-  `git-bug --version` if in doubt.
 - **`fleet issues create` exits 0 on a git-bug identity error.**
   The error text is printed to stdout but the exit code doesn't
   propagate. Always inspect the first line of stdout — if it's

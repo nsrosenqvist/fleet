@@ -56,12 +56,18 @@ impl BackendKind {
     }
 
     /// Argv to invoke for the presence-probe. Most tools accept
-    /// `--version`; tinyproxy is the exception (uses `-v`); tmux
-    /// uses `-V`.
+    /// `--version`; the exceptions:
+    /// - `tinyproxy -v` (the long form prints help instead),
+    /// - `tmux -V` (capital V; lowercase opens a session),
+    /// - `git-bug version` — subcommand, not a flag. `git-bug
+    ///   --version` errors with `unknown flag: --version` and
+    ///   exits 1, which the probe would otherwise treat as
+    ///   "missing".
     pub const fn probe_arg(self) -> &'static str {
         match self {
             Self::Tinyproxy => "-v",
             Self::Tmux => "-V",
+            Self::GitBug => "version",
             _ => "--version",
         }
     }
@@ -420,6 +426,47 @@ mod tests {
     }
 
     #[test]
+    fn probe_arg_matches_each_tool_actual_version_invocation() {
+        // Regression: git-bug doesn't accept `--version` as a
+        // flag — it uses a `version` *subcommand* and exits 1 on
+        // the flag form. probe_one treats exit 1 as "missing",
+        // so for a long time `fleet runtime doctor` always
+        // reported git-bug absent on hosts where it was
+        // installed. Pin the per-tool invocation here so the
+        // table can't silently regress to a uniform
+        // `--version`.
+        assert_eq!(BackendKind::Podman.probe_arg(), "--version");
+        assert_eq!(BackendKind::Docker.probe_arg(), "--version");
+        assert_eq!(BackendKind::AppleContainer.probe_arg(), "--version");
+        assert_eq!(BackendKind::GVisor.probe_arg(), "--version");
+        assert_eq!(BackendKind::DevcontainerCli.probe_arg(), "--version");
+        assert_eq!(BackendKind::Tinyproxy.probe_arg(), "-v");
+        assert_eq!(BackendKind::Tmux.probe_arg(), "-V");
+        assert_eq!(BackendKind::GitBug.probe_arg(), "version");
+    }
+
+    #[test]
+    fn probe_invokes_git_bug_with_version_subcommand_not_flag() {
+        // Tightly observe the argv `probe` passes to git-bug — a
+        // typo on the probe_arg table (or a future refactor that
+        // collapses the match) shouldn't silently re-break the
+        // probe on every git-bug-using repo.
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run()
+            .with(eq("git-bug"), eq(vec!["version".to_string()]))
+            .returning(|_, _| Ok("git-bug version: v0.8.0".to_string()));
+        // Catch-all: any other tool the broader probe queries.
+        mock.expect_run()
+            .returning(|prog, _| Err(anyhow::anyhow!("no such command: {prog}")));
+        let r = probe(&mock);
+        assert!(r.git_bug.present);
+        assert_eq!(
+            r.git_bug.version.as_deref(),
+            Some("git-bug version: v0.8.0")
+        );
+    }
+
+    #[test]
     fn probe_picks_up_git_bug_and_tinyproxy_independently_of_engine() {
         // The two host-tool probes are wholly independent of the engine
         // selection: they appear in the report regardless of whether
@@ -465,19 +512,4 @@ mod tests {
         assert_eq!(BackendKind::Tinyproxy.program(), "tinyproxy");
     }
 
-    #[test]
-    fn backend_kind_probe_arg_is_dash_v_for_tinyproxy_otherwise_dash_dash_version() {
-        // tinyproxy is the lone exception — it predates --version.
-        assert_eq!(BackendKind::Tinyproxy.probe_arg(), "-v");
-        for kind in [
-            BackendKind::Podman,
-            BackendKind::Docker,
-            BackendKind::AppleContainer,
-            BackendKind::GVisor,
-            BackendKind::DevcontainerCli,
-            BackendKind::GitBug,
-        ] {
-            assert_eq!(kind.probe_arg(), "--version", "{kind:?}");
-        }
-    }
 }
