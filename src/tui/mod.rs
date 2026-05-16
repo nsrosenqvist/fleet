@@ -352,6 +352,17 @@ impl AppState {
             });
         self.list_state.select(new_index);
         self.refresh_log_tail();
+        // Reconcile plan-item state with the latest session states
+        // *before* we load plans for display, so the rendering pass
+        // sees post-reconcile data. Reconcile errors degrade
+        // gracefully into a status-line message so a corrupt plan
+        // file doesn't block the reload.
+        let plan_store = crate::plans::store::PlanStore::for_repo(&self.root);
+        if let Err(err) =
+            crate::autonomous::reconcile_plans_from_sessions(&self.sessions, &plan_store, now_ms())
+        {
+            self.status_line = format!(" reconcile failed: {err:#} ");
+        }
         // Refresh plans alongside sessions so the sidebar
         // annotations + status-line plan count stay current. Plans
         // are cheap to load (one file per plan, typically a handful)

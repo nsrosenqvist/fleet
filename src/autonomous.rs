@@ -24,7 +24,10 @@
 
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
+
 use crate::deps::{BlockedReason, DepsDoc};
+use crate::plans::store::PlanStore;
 use crate::plans::{Plan, PlanItemState, PlanState};
 use crate::repo_config::AutonomousConfig;
 use crate::session::{IssueContext, Session, SessionState};
@@ -250,6 +253,104 @@ pub fn rank_candidates_by_plan(
     leftover.retain(|i| !is_blocked(&i.human_id));
     prioritized.extend(leftover);
     prioritized
+}
+
+/// Walk active plans and advance each item's state + `session_id` to
+/// reflect the newest session bound to its ticket. Persists only
+/// plans that actually changed; returns the count of plans saved.
+///
+/// Resolution rule: for a given (plan, item), the newest session
+/// bound to `item.ticket_id` wins (highest `updated_at_ms`). This
+/// makes re-spawn-after-Failed cleanly update the item to the new
+/// state.
+///
+/// Mapping:
+/// - `SessionState::Running` | `AwaitingGate` → `PlanItemState::InProgress`
+/// - `SessionState::Completed` → `PlanItemState::Completed`
+/// - `SessionState::Failed` | `Crashed` → `PlanItemState::Failed`
+/// - `SessionState::Created` → no-op (transient — `Created` normally
+///   transitions to `Running` within a tick; updating items on
+///   `Created` would just flicker the state to `InProgress` and back).
+///
+/// Plan-level state transitions (Active → Paused on a Failed item,
+/// per the `on_item_failure` policy) land in the next commit; this
+/// one only advances *item* state.
+pub fn reconcile_plans_from_sessions(
+    sessions: &[Session],
+    store: &PlanStore,
+    now_ms: u64,
+) -> Result<usize> {
+    let plan_ids = store.list()?;
+    let mut saved = 0;
+    for plan_id in plan_ids {
+        let mut plan = match store.load(&plan_id) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(plan = %plan_id, error = %err, "reconcile: skipping unreadable plan");
+                continue;
+            }
+        };
+        let changed = reconcile_one_plan(sessions, &mut plan);
+        if changed {
+            plan.updated_at_ms = now_ms;
+            store.save(&plan).with_context_for_plan(&plan_id)?;
+            saved += 1;
+        }
+    }
+    Ok(saved)
+}
+
+/// Pure mutation half of [`reconcile_plans_from_sessions`]. Updates
+/// `plan.items` against `sessions` and returns true iff anything
+/// changed. Factored out for testability — the store-touching
+/// half is then a thin wrapper.
+#[must_use]
+pub fn reconcile_one_plan(sessions: &[Session], plan: &mut Plan) -> bool {
+    let mut changed = false;
+    for item_idx in 0..plan.items.len() {
+        let ticket_id = plan.items[item_idx].ticket_id.clone();
+        let newest = sessions
+            .iter()
+            .filter(|s| s.issue.as_ref().is_some_and(|i| i.human_id == ticket_id))
+            .max_by_key(|s| s.updated_at_ms);
+        let Some(session) = newest else {
+            continue;
+        };
+        let Some(target_state) = session_to_item_state(session.state) else {
+            continue;
+        };
+        let item = &mut plan.items[item_idx];
+        let already = item.state == target_state && item.session_id.as_ref() == Some(&session.id);
+        if !already {
+            item.state = target_state;
+            item.session_id = Some(session.id.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[must_use]
+fn session_to_item_state(state: SessionState) -> Option<PlanItemState> {
+    match state {
+        SessionState::Running | SessionState::AwaitingGate => Some(PlanItemState::InProgress),
+        SessionState::Completed => Some(PlanItemState::Completed),
+        SessionState::Failed | SessionState::Crashed => Some(PlanItemState::Failed),
+        SessionState::Created => None,
+    }
+}
+
+/// Internal extension trait that annotates save errors with the
+/// plan id without sprinkling `with_context` calls everywhere.
+trait WithPlanContext<T> {
+    fn with_context_for_plan(self, plan_id: &crate::plans::PlanId) -> Result<T>;
+}
+
+impl<T> WithPlanContext<T> for Result<T> {
+    fn with_context_for_plan(self, plan_id: &crate::plans::PlanId) -> Self {
+        use anyhow::Context as _;
+        self.with_context(|| format!("saving plan `{plan_id}` after reconcile"))
+    }
 }
 
 /// `true` iff `ticket` is currently blocked per the deps graph:
@@ -864,6 +965,120 @@ mod tests {
         let ordered = rank_candidates_by_plan(open, &[], &empty_deps());
         let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
         assert_eq!(ids, vec!["99", "42", "77"]);
+    }
+
+    // ---- reconcile_one_plan -------------------------------------------
+
+    fn session_with_state(id: &str, ticket: &str, state: SessionState, updated_ms: u64) -> Session {
+        let mut s = Session::new(SessionId::new(id), "standard", 0);
+        if state != SessionState::Created {
+            s.transition_to(SessionState::Running, 1).unwrap();
+            if state == SessionState::Running {
+                // updated_at_ms doesn't normally tick without a
+                // transition; bump it via record_node_cost so tests
+                // can pin which session is "newest".
+                s.record_node_cost("noop", 0.0, updated_ms);
+            } else {
+                s.transition_to(state, updated_ms).unwrap();
+            }
+        }
+        s.issue = Some(issue(ticket));
+        s
+    }
+
+    #[test]
+    fn reconcile_one_plan_promotes_pending_to_in_progress_when_session_running() {
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let sessions = vec![session_with_state("s-1", "42", SessionState::Running, 100)];
+        let changed = reconcile_one_plan(&sessions, &mut plan);
+        assert!(changed);
+        assert_eq!(plan.items[0].state, PlanItemState::InProgress);
+        assert_eq!(
+            plan.items[0].session_id.as_ref().map(SessionId::as_str),
+            Some("s-1")
+        );
+        // Item 1 untouched.
+        assert_eq!(plan.items[1].state, PlanItemState::Pending);
+    }
+
+    #[test]
+    fn reconcile_one_plan_completes_item_when_session_completed() {
+        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let sessions = vec![session_with_state(
+            "s-1",
+            "42",
+            SessionState::Completed,
+            200,
+        )];
+        let changed = reconcile_one_plan(&sessions, &mut plan);
+        assert!(changed);
+        assert_eq!(plan.items[0].state, PlanItemState::Completed);
+    }
+
+    #[test]
+    fn reconcile_one_plan_marks_failed_for_failed_or_crashed_sessions() {
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let sessions = vec![
+            session_with_state("s-1", "42", SessionState::Failed, 100),
+            session_with_state("s-2", "43", SessionState::Crashed, 100),
+        ];
+        let _ = reconcile_one_plan(&sessions, &mut plan);
+        assert_eq!(plan.items[0].state, PlanItemState::Failed);
+        assert_eq!(plan.items[1].state, PlanItemState::Failed);
+    }
+
+    #[test]
+    fn reconcile_one_plan_uses_newest_session_when_multiple_bind_same_ticket() {
+        // A retry: an older session Failed at updated_ms=100, a newer
+        // session is now Running at updated_ms=300. Item state should
+        // reflect the newer session.
+        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let sessions = vec![
+            session_with_state("s-old", "42", SessionState::Failed, 100),
+            session_with_state("s-new", "42", SessionState::Running, 300),
+        ];
+        let _ = reconcile_one_plan(&sessions, &mut plan);
+        assert_eq!(plan.items[0].state, PlanItemState::InProgress);
+        assert_eq!(
+            plan.items[0].session_id.as_ref().map(SessionId::as_str),
+            Some("s-new")
+        );
+    }
+
+    #[test]
+    fn reconcile_one_plan_is_idempotent_when_state_already_matches() {
+        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        plan.items[0].state = PlanItemState::Completed;
+        plan.items[0].session_id = Some(SessionId::new("s-1"));
+        let sessions = vec![session_with_state(
+            "s-1",
+            "42",
+            SessionState::Completed,
+            100,
+        )];
+        let changed = reconcile_one_plan(&sessions, &mut plan);
+        assert!(!changed, "no save needed when state already matches");
+    }
+
+    #[test]
+    fn reconcile_one_plan_ignores_sessions_with_no_bound_ticket() {
+        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut s = Session::new(SessionId::new("s-orphan"), "standard", 0);
+        s.transition_to(SessionState::Running, 1).unwrap();
+        // session.issue = None
+        let changed = reconcile_one_plan(&[s], &mut plan);
+        assert!(!changed);
+        assert_eq!(plan.items[0].state, PlanItemState::Pending);
+    }
+
+    #[test]
+    fn reconcile_one_plan_skips_sessions_in_created_state() {
+        // Created is transient — promoting items based on it would
+        // flicker InProgress and back to Pending within a tick.
+        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let s = session_with_state("s-1", "42", SessionState::Created, 100);
+        let changed = reconcile_one_plan(&[s], &mut plan);
+        assert!(!changed);
     }
 
     #[test]

@@ -169,6 +169,18 @@ fn tick(
     sessions: &[crate::session::Session],
     spawner: &dyn Spawner,
 ) -> AutonomousOutcome {
+    // Reconcile plan-item states against current sessions before
+    // the scan picks a candidate. This catches the "session finished
+    // between ticks" case so the plan-aware ranker sees the
+    // updated state (a Completed item doesn't get re-prioritized).
+    let plan_store_pre = crate::plans::store::PlanStore::for_repo(&setup.repo_root);
+    if let Err(err) = crate::autonomous::reconcile_plans_from_sessions(
+        sessions,
+        &plan_store_pre,
+        crate::session::now_ms(),
+    ) {
+        tracing::warn!(error = %err, "autonomous tick: plan reconcile failed");
+    }
     let tracker = Arc::clone(&setup.tracker);
     let root = setup.repo_root.clone();
     let list_open = move || -> Result<Vec<IssueContext>, String> {
