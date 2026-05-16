@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod prompt;
 pub mod server;
 pub mod store;
 pub mod tmux;

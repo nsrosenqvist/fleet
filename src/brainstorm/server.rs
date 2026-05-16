@@ -567,7 +567,7 @@ fn handle_sessions_list(sessions: &SessionStore) -> JsonResponse {
                 issue_human_id: s.issue.map(|i| i.human_id),
             }),
             Err(err) => {
-                tracing::warn!(session = %id, error = %err, "brainstorm: skipping unreadable session")
+                tracing::warn!(session = %id, error = %err, "brainstorm: skipping unreadable session");
             }
         }
     }
