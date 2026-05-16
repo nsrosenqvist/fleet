@@ -247,6 +247,7 @@ const DEFAULT_FLEET_GITIGNORE: &str = "\
 sessions/
 crashed/
 plans/
+planning/
 deps.json
 *.tmp
 ";
