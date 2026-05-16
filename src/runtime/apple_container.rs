@@ -82,6 +82,22 @@ impl RuntimeAdapter for AppleContainerAdapter {
         self.cli.build(&workspace, devcontainer)
     }
 
+    fn inspect_image_arch(&self, image: &ImageId) -> Result<Option<String>> {
+        // Apple's CLI mirrors `docker image inspect`'s JSON shape (the
+        // OCI image manifest); read it with the same flexible
+        // top-level-or-singleton-array tolerance the container inspect
+        // path uses. Engine errors propagate verbatim.
+        let stdout = self.invoker.run(
+            "container",
+            vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                image.as_str().to_string(),
+            ],
+        )?;
+        Ok(parse_image_arch_json(&stdout))
+    }
+
     fn start_container(&self, spec: &ContainerSpec) -> Result<ContainerId> {
         let req = UpRequest {
             workspace: &spec.workspace,
@@ -255,6 +271,32 @@ fn parse_inspect_json(stdout: &str) -> ContainerState {
         "dead" => ContainerState::Dead,
         "" => ContainerState::Unknown("empty status".to_string()),
         other => ContainerState::Unknown(other.to_string()),
+    }
+}
+
+/// Pluck the OCI `architecture` field out of `container image inspect`
+/// JSON. Same defensive flexibility as [`parse_inspect_json`]: accept
+/// either a single object or a one-element array at the root, and check
+/// the docker-style top-level `Architecture` as well as the lower-case
+/// OCI-style `architecture`. Anything unparseable returns `None`.
+fn parse_image_arch_json(stdout: &str) -> Option<String> {
+    use serde_json::Value;
+
+    let value: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let object = match &value {
+        Value::Array(a) => a.first()?,
+        Value::Object(_) => &value,
+        _ => return None,
+    };
+    let arch = object
+        .get("architecture")
+        .or_else(|| object.get("Architecture"))?
+        .as_str()?
+        .trim();
+    if arch.is_empty() {
+        None
+    } else {
+        Some(arch.to_string())
     }
 }
 
@@ -494,6 +536,83 @@ mod tests {
             ContainerState::Unknown(s) => assert_eq!(s, "frozen"),
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inspect_image_arch_reads_oci_architecture_field_from_top_level_object() {
+        let invoker = invoker_with(vec![(
+            "container",
+            vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "fleet/img:abc".to_string(),
+            ],
+            r#"{"architecture":"arm64","os":"linux"}"#.to_string(),
+        )]);
+        let a = AppleContainerAdapter::new(invoker);
+        assert_eq!(
+            a.inspect_image_arch(&ImageId::new("fleet/img:abc"))
+                .unwrap(),
+            Some("arm64".to_string())
+        );
+    }
+
+    #[test]
+    fn inspect_image_arch_unwraps_singleton_array_root() {
+        // Newer CLI versions wrap inspect output in a one-element
+        // array (mirrors docker's `[{...}]`); the parser must
+        // tolerate both shapes.
+        let invoker = invoker_with(vec![(
+            "container",
+            vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "fleet/img:multi".to_string(),
+            ],
+            r#"[{"architecture":"amd64"}]"#.to_string(),
+        )]);
+        let a = AppleContainerAdapter::new(invoker);
+        assert_eq!(
+            a.inspect_image_arch(&ImageId::new("fleet/img:multi"))
+                .unwrap(),
+            Some("amd64".to_string())
+        );
+    }
+
+    #[test]
+    fn inspect_image_arch_propagates_engine_errors_for_missing_image() {
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(|_, _| {
+            Err(anyhow!(
+                "`container image inspect` exited with 1: Error: image not found: fleet/ghost"
+            ))
+        });
+        let a = AppleContainerAdapter::new(Arc::new(mock));
+        let err = a
+            .inspect_image_arch(&ImageId::new("fleet/ghost"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("image not found"));
+    }
+
+    #[test]
+    fn parse_image_arch_json_returns_none_for_garbage_input() {
+        assert_eq!(parse_image_arch_json("not json at all"), None);
+        assert_eq!(parse_image_arch_json(""), None);
+    }
+
+    #[test]
+    fn parse_image_arch_json_accepts_docker_style_capitalised_key() {
+        // Older docker-flavoured inspect outputs `Architecture`; the
+        // OCI-native shape uses lower-case. Accept both.
+        assert_eq!(
+            parse_image_arch_json(r#"{"Architecture":"amd64"}"#),
+            Some("amd64".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_image_arch_json_returns_none_when_field_absent() {
+        assert_eq!(parse_image_arch_json(r#"{"os":"linux"}"#), None);
     }
 
     #[test]

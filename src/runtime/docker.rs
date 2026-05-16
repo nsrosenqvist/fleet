@@ -85,6 +85,28 @@ impl RuntimeAdapter for DockerAdapter {
         self.cli.build(&workspace, devcontainer)
     }
 
+    fn inspect_image_arch(&self, image: &ImageId) -> Result<Option<String>> {
+        // Same `--format '{{.Architecture}}'` shape as podman — Docker
+        // and Podman speak the same go-template surface for `image
+        // inspect`. Engine errors propagate verbatim.
+        let stdout = self.invoker.run(
+            "docker",
+            vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.Architecture}}".to_string(),
+                image.as_str().to_string(),
+            ],
+        )?;
+        let arch = stdout.trim();
+        if arch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(arch.to_string()))
+        }
+    }
+
     fn start_container(&self, spec: &ContainerSpec) -> Result<ContainerId> {
         let req = UpRequest {
             workspace: &spec.workspace,
@@ -533,6 +555,62 @@ mod tests {
             ContainerState::Unknown(_) => {}
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inspect_image_arch_shells_image_inspect_with_arch_format_template() {
+        let invoker = invoker_with(vec![(
+            "docker",
+            vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.Architecture}}".to_string(),
+                "fleet/img:abc".to_string(),
+            ],
+            "arm64\n".to_string(),
+        )]);
+        let a = DockerAdapter::new(invoker, false);
+        assert_eq!(
+            a.inspect_image_arch(&ImageId::new("fleet/img:abc"))
+                .unwrap(),
+            Some("arm64".to_string())
+        );
+    }
+
+    #[test]
+    fn inspect_image_arch_returns_none_for_empty_engine_output() {
+        let invoker = invoker_with(vec![(
+            "docker",
+            vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.Architecture}}".to_string(),
+                "fleet/img:1".to_string(),
+            ],
+            "\n".to_string(),
+        )]);
+        let a = DockerAdapter::new(invoker, false);
+        assert_eq!(
+            a.inspect_image_arch(&ImageId::new("fleet/img:1")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn inspect_image_arch_propagates_engine_errors_for_missing_image() {
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(|_, _| {
+            Err(anyhow!(
+                "`docker image inspect` exited with 1: Error: No such image: fleet/ghost"
+            ))
+        });
+        let a = DockerAdapter::new(Arc::new(mock), false);
+        let err = a
+            .inspect_image_arch(&ImageId::new("fleet/ghost"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("No such image"));
     }
 
     #[test]

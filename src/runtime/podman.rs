@@ -100,6 +100,29 @@ impl RuntimeAdapter for PodmanAdapter {
         self.cli.build(&workspace, devcontainer)
     }
 
+    fn inspect_image_arch(&self, image: &ImageId) -> Result<Option<String>> {
+        // `podman image inspect --format '{{.Architecture}}'` returns
+        // the OCI arch (`amd64`, `arm64`, …) on one line. Engine errors
+        // propagate verbatim — the caller can treat them as "can't
+        // tell" if its policy is permissive.
+        let stdout = self.invoker.run(
+            "podman",
+            vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.Architecture}}".to_string(),
+                image.as_str().to_string(),
+            ],
+        )?;
+        let arch = stdout.trim();
+        if arch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(arch.to_string()))
+        }
+    }
+
     fn start_container(&self, spec: &ContainerSpec) -> Result<ContainerId> {
         // Egress enforcement: when the executor passes a network name,
         // pin the workflow container to that network via podman's
@@ -698,6 +721,64 @@ mod tests {
             ContainerState::Unknown(_) => {}
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inspect_image_arch_shells_image_inspect_with_arch_format_template() {
+        let invoker = invoker_with(vec![(
+            "podman",
+            vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.Architecture}}".to_string(),
+                "fleet/img:abc".to_string(),
+            ],
+            "amd64\n".to_string(),
+        )]);
+        let a = PodmanAdapter::new(invoker, false);
+        assert_eq!(
+            a.inspect_image_arch(&ImageId::new("fleet/img:abc"))
+                .unwrap(),
+            Some("amd64".to_string())
+        );
+    }
+
+    #[test]
+    fn inspect_image_arch_returns_none_for_empty_engine_output() {
+        // Defensive: if the engine returns blank (unusual), the caller
+        // should treat it as "can't tell" rather than `Some("")`.
+        let invoker = invoker_with(vec![(
+            "podman",
+            vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.Architecture}}".to_string(),
+                "fleet/img:1".to_string(),
+            ],
+            "   \n".to_string(),
+        )]);
+        let a = PodmanAdapter::new(invoker, false);
+        assert_eq!(
+            a.inspect_image_arch(&ImageId::new("fleet/img:1")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn inspect_image_arch_propagates_engine_errors_for_missing_image() {
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(|_, _| {
+            Err(anyhow!(
+                "`podman image inspect` exited with 125: Error: fleet/ghost: image not known"
+            ))
+        });
+        let a = PodmanAdapter::new(Arc::new(mock), false);
+        let err = a
+            .inspect_image_arch(&ImageId::new("fleet/ghost"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("image not known"));
     }
 
     #[test]
