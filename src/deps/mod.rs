@@ -209,6 +209,21 @@ impl DepsStore {
     }
 }
 
+/// Hard ceiling on the number of distinct nodes the cycle BFS
+/// will visit before bailing. For typical fleet workloads (≪ 100
+/// edges) the search terminates in a handful of iterations; the
+/// limit is a paranoid second line of defence against
+/// pathological deps graphs (e.g. a hand-edited `.fleet/deps.json`
+/// with thousands of edges that would block the workflow engine
+/// noticeably).
+///
+/// When the cap is hit, [`would_create_cycle`] returns `true` —
+/// the conservative choice: refuse the mutation rather than
+/// either letting it through unchecked or hanging the caller.
+/// A `tracing::warn!` event fires so the operator sees what
+/// happened.
+const MAX_CYCLE_CHECK_NODES: usize = 100;
+
 /// Would adding `proposed` to `doc` close a cycle? Returns `true`
 /// iff a path already exists from `proposed.blocked_on` back to
 /// `proposed.blocked` — adding the new edge would then form
@@ -218,7 +233,8 @@ impl DepsStore {
 /// plan-injector, future manual-unblock surgery) can dry-run a
 /// proposed mutation before persisting. BFS over the edge list;
 /// freeform-tag right-hand sides terminate naturally because no
-/// edge has `blocked == "free:<slug>"`.
+/// edge has `blocked == "free:<slug>"`. Bounded by
+/// [`MAX_CYCLE_CHECK_NODES`] — see the constant's doc-comment.
 ///
 /// Self-loops (`A → A`) are reported as cycles — `A` is trivially
 /// reachable from itself, and a self-blocked ticket isn't useful
@@ -237,6 +253,16 @@ pub fn would_create_cycle(doc: &DepsDoc, proposed: &DepEdge) -> bool {
     seen.insert(proposed.blocked_on.as_str());
     while let Some(current) = frontier.pop() {
         if current == proposed.blocked {
+            return true;
+        }
+        if seen.len() > MAX_CYCLE_CHECK_NODES {
+            tracing::warn!(
+                blocked = %proposed.blocked,
+                blocked_on = %proposed.blocked_on,
+                seen = seen.len(),
+                limit = MAX_CYCLE_CHECK_NODES,
+                "would_create_cycle hit node limit; refusing mutation conservatively",
+            );
             return true;
         }
         for edge in &doc.edges {
@@ -524,6 +550,31 @@ mod tests {
             ],
         };
         assert!(!would_create_cycle(&doc, &sample_edge("42", "43")));
+    }
+
+    #[test]
+    fn would_create_cycle_refuses_pathological_graphs_at_the_node_cap() {
+        // Build a long acyclic chain longer than the BFS node cap.
+        // The proposed edge is genuinely safe (no back-edge), but
+        // the chain forces the BFS past MAX_CYCLE_CHECK_NODES, so
+        // the helper conservatively reports "would create cycle".
+        // Better to refuse a probably-fine mutation on a graph that
+        // shouldn't exist than to spend unbounded CPU on it.
+        let n = MAX_CYCLE_CHECK_NODES + 50;
+        let mut edges = Vec::with_capacity(n);
+        for i in 0..n {
+            // chain: 0→1, 1→2, …, (n-1)→n
+            edges.push(sample_edge(&i.to_string(), &(i + 1).to_string()));
+        }
+        let doc = DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges,
+        };
+        // Proposing top → 0 is *safe* on a true acyclic chain,
+        // but the BFS from 0 walks the whole chain and exceeds the
+        // cap, so we expect the defensive `true`.
+        let proposed = sample_edge("top", "0");
+        assert!(would_create_cycle(&doc, &proposed));
     }
 
     #[test]
