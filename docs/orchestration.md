@@ -9,15 +9,15 @@ If you're looking for individual-session mechanics, see
 gets permission to mutate the tracker, see
 [`auth.md`](./auth.md#per-tracker-auth).
 
-> **Status.** Phases 1, 2, and 3a have shipped — the bridge CLI, the
-> outcome convention, the `tracker-create` workflow node, the
-> `.fleet/deps.json` store, the plans data model + `fleet plan` CLI,
-> `fleet sessions unblock`, and tracker-create's cycle check + plan
-> injection are live. The TUI Plans view (3b), the
-> autonomous-supervisor's plan consumption (Phase 4), and the
-> brainstorm agent (Phase 5) are future phases described here as
-> target shape; the table at the bottom of this page tracks what's
-> actually in the binary.
+> **Status.** Phases 1, 2, 3a, 3b, and 4 have shipped — the bridge
+> CLI, the outcome convention, the `tracker-create` workflow node,
+> the `.fleet/deps.json` store, the plans data model + `fleet plan`
+> CLI, `fleet sessions unblock`, tracker-create's cycle check + plan
+> injection, the TUI Plans view + sessions-row plan annotations, and
+> the autonomous supervisor's plan-aware scheduling (with
+> `on_item_failure` policies) are live. The brainstorm agent
+> (Phase 5) is the remaining target. The table at the bottom of
+> this page tracks what's actually in the binary.
 
 ## The model in 30 seconds
 
@@ -282,15 +282,25 @@ fleet plan inject <id> <ticket> [--before <other>]
 Plan ids are `plan-<13 hex ms>-<4 hex counter>` — mirrors the
 session id format so lexicographic ≈ chronological.
 
-### How plans compose with the deps graph (Phase 4 target shape)
+### How plans compose with the deps graph
 
-The supervisor's tick (not yet shipped):
+The supervisor's tick:
 
-1. List active plans (oldest-first).
-2. For each plan, find the first `pending` item whose ticket isn't
-   blocked on any open ticket.
-3. Spawn the first candidate (respecting `autonomous.max_parallel`).
-4. If no candidate from any plan, fall back to "any open issue."
+1. List active plans (oldest-first by `created_at_ms`).
+2. For each plan, walk items in order; for each `Pending` item
+   whose ticket isn't deps-blocked, add it to the candidate list.
+3. Append any open issue not currently in any active plan as the
+   "any-open-issue" fallback tail.
+4. Engine picks the first unclaimed entry (respecting
+   `autonomous.max_parallel`).
+
+A ticket is **deps-blocked** when at least one edge in
+`.fleet/deps.json` keyed by it is still active: either a
+`Ticket`-reason edge whose target ticket is still in the open
+set, or a `Freeform` edge (which only clears via `fleet sessions
+unblock`). `Ticket` edges whose target has already closed are
+auto-cleared by the scheduler — the deps store retains them for
+audit, but the supervisor stops acting on them.
 
 Plans and the blocked-on graph compose:
 
@@ -300,6 +310,37 @@ Plans and the blocked-on graph compose:
   blocked-on graph holds B back until X closes.
 - Multiple active plans round-robin (oldest first). Item-level
   parallelism is bounded by `autonomous.max_parallel` globally.
+
+### Plan item lifecycle
+
+The supervisor reconciles each plan's item states against the
+current session set at the top of every tick (and the TUI does
+the same on every `r` reload). The mapping:
+
+- `SessionState::Running` | `AwaitingGate` → `PlanItemState::InProgress`
+- `SessionState::Completed` → `PlanItemState::Completed`
+- `SessionState::Failed` | `Crashed` → `PlanItemState::Failed`
+
+When multiple sessions bind the same ticket (a retry), the newest
+session by `updated_at_ms` wins.
+
+### `on_item_failure` policy
+
+When an item transitions into `Failed`, the plan's
+`on_item_failure` policy fires:
+
+- **`stop`** (default) — plan transitions to `Paused`. The user
+  decides next steps (`fleet plan resume`, edit, abandon). The
+  conservative choice for chained migrations where a mid-item
+  failure would corrupt later items.
+- **`continue`** — item stays `Failed`; plan stays `Active`; next
+  pending item gets picked up on the following tick.
+- **`retry-once`** — first failure re-marks the item `Pending`
+  and bumps `retry_count` to 1; the supervisor re-spawns on the
+  next tick. A second failure (`retry_count >= 1`) falls back to
+  `stop` semantics.
+
+Set per-plan in the YAML under `on_item_failure:`.
 
 ### Plans vs. epics: local vs. tracker-canonical
 
@@ -379,20 +420,6 @@ point regardless. The helper is also available as
 plan-editing surgery. Phase 3b surfaces cycle warnings in the TUI
 (sessions list `⚠ cycle: A ↔ B`, Plans view per-plan banner) —
 those visual flags ship with the TUI Plans view.
-
-### What if a plan item just fails?
-
-`on_item_failure` controls behaviour:
-
-- `stop` (default) — the plan transitions to `paused`. Other plans
-  continue. User inspects the failed session, decides whether to
-  retry, edit the prompt, abandon the item, etc.
-- `continue` — supervisor moves to the next item.
-- `retry-once` — re-mark the failed item `pending` once; on second
-  failure, behave as `stop`.
-
-Set per-plan in the YAML, or globally in `.fleet/config.yaml` under
-`plans.on_item_failure`.
 
 ## The brainstorm agent
 
@@ -536,8 +563,8 @@ cat .fleet/deps.json
 | 1 | Bridge CLI + `Tracker` write methods | **Shipped** |
 | 2 | Outcome convention + `tracker-create` node + deps.json | **Shipped** |
 | 3a | Plans data model + `fleet plan` CLI + `fleet sessions unblock` + cycle detection + plan injection | **Shipped** |
-| 3b | TUI Plans view + sessions-row plan annotations + cycle warnings | Not yet shipped |
-| 4 | Supervisor plan consumption + failure policy | Not yet shipped |
+| 3b | TUI Plans view (key `p`) + sessions-row plan annotations + status-line plan count | **Shipped** |
+| 4 | Supervisor plan-aware scheduling + deps-blocked filter + item reconciliation + `on_item_failure` policies | **Shipped** |
 | 5 | Brainstorm agent + TUI attach/detach | Not yet shipped |
 
 The implementation plan lives at

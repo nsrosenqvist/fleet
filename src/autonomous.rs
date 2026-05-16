@@ -1226,6 +1226,64 @@ mod tests {
     }
 
     #[test]
+    fn plan_aware_scheduling_block_then_clear_end_to_end() {
+        // End-to-end story for Phase 4 acceptance: a plan [42, 43]
+        // with 42 currently blocked on 51. First tick should
+        // prioritize 43 (the second plan item) and drop 42; once 51
+        // closes (out of the open set), a second tick should
+        // prioritize 42 again in plan order.
+
+        let plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+
+        // First tick: 42 is blocked on the still-open 51.
+        let open_with_blocker = vec![issue("42"), issue("43"), issue("51")];
+        let deps = deps_with(vec![DepEdge {
+            blocked: "42".into(),
+            blocked_on: "51".into(),
+            reason: BlockedReason::Ticket,
+            created_at_ms: 1,
+        }]);
+        let ranked = rank_candidates_by_plan(open_with_blocker, std::slice::from_ref(&plan), &deps);
+        let ids: Vec<&str> = ranked.iter().map(|i| i.human_id.as_str()).collect();
+        // 42 dropped (blocked); 43 prioritized (plan); 51 leftover.
+        assert_eq!(ids, vec!["43", "51"]);
+
+        // Now 51 closes — it's not in the open list any more. Even
+        // though the deps edge is still on disk, the scheduler
+        // treats it as cleared since `blocked_on` isn't open.
+        let open_after_clear = vec![issue("42"), issue("43")];
+        let ranked_after = rank_candidates_by_plan(open_after_clear, &[plan], &deps);
+        let ids_after: Vec<&str> = ranked_after.iter().map(|i| i.human_id.as_str()).collect();
+        // Plan order restored: 42 first, 43 second.
+        assert_eq!(ids_after, vec!["42", "43"]);
+    }
+
+    #[test]
+    fn plan_aware_scheduling_injected_ticket_runs_before_its_parent() {
+        // Mirrors what `tracker-create`'s plan-injector achieves: a
+        // newly-filed prerequisite is inserted before the bound
+        // parent in the plan. The ranker should pick it up first on
+        // the next tick.
+        let mut plan = plan_with("plan-1", "p", &["42", "44"], 1_000);
+        // Simulate tracker-create injecting #51 before #42.
+        plan.items
+            .insert(0, crate::plans::PlanItem::pending_injected("51"));
+        let open = vec![issue("42"), issue("44"), issue("51")];
+        // 42 is now blocked on the freshly filed 51.
+        let deps = deps_with(vec![DepEdge {
+            blocked: "42".into(),
+            blocked_on: "51".into(),
+            reason: BlockedReason::Ticket,
+            created_at_ms: 1,
+        }]);
+        let ranked = rank_candidates_by_plan(open, &[plan], &deps);
+        let ids: Vec<&str> = ranked.iter().map(|i| i.human_id.as_str()).collect();
+        // 51 runs first (injected, position 0 in the plan).
+        // 42 is blocked; dropped. 44 follows from the plan.
+        assert_eq!(ids, vec!["51", "44"]);
+    }
+
+    #[test]
     fn failure_policy_continue_leaves_other_items_pending_for_next_spawn() {
         // The whole point of Continue: when item 0 fails, item 1
         // stays Pending and the supervisor's next tick will pick
