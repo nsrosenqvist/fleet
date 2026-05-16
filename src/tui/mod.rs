@@ -35,7 +35,7 @@
 //! are exercised by manual smoke; the helpers carry the behavioural
 //! contract.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -56,7 +56,7 @@ use std::sync::Arc;
 
 use crate::autonomous;
 use crate::brainstorm::store::BrainstormStore;
-use crate::brainstorm::{BrainstormSession, BrainstormState};
+use crate::brainstorm::{BrainstormId, BrainstormSession, BrainstormState};
 use crate::plans::store::PlanStore;
 use crate::plans::{Plan, PlanItemState, PlanState};
 use crate::process::{ProcessInvoker, RealProcessInvoker};
@@ -135,6 +135,33 @@ fn event_loop(
                 match state.handle_key(key, store) {
                     Action::Quit => return Ok(0),
                     Action::None => {}
+                    Action::NewBrainstorm => {
+                        if let Err(err) = run_brainstorm_suspended(terminal, &["brainstorm"]) {
+                            state.status_line = format!(" brainstorm failed: {err:#} ");
+                        }
+                        // After the subprocess returns, the
+                        // brainstorm session list on disk has
+                        // changed (a new one was created). Refresh
+                        // so the sidebar reflects it.
+                        if let Err(err) = state.reload(store) {
+                            state.status_line = format!(" reload failed: {err:#} ");
+                        }
+                    }
+                    Action::AttachBrainstorm(id) => {
+                        let id_str = id.as_str().to_string();
+                        if let Err(err) = run_brainstorm_suspended(
+                            terminal,
+                            &["brainstorm", "attach", id_str.as_str()],
+                        ) {
+                            state.status_line = format!(" brainstorm attach failed: {err:#} ");
+                        }
+                        // Brainstorm meta may have flipped to
+                        // Detached/Closed on detach; reload so the
+                        // marker is current.
+                        if let Err(err) = state.reload(store) {
+                            state.status_line = format!(" reload failed: {err:#} ");
+                        }
+                    }
                 }
             }
         }
@@ -144,6 +171,43 @@ fn event_loop(
         // iteration.
         state.autonomous_tick(store, std::time::Instant::now());
     }
+}
+
+/// Suspend the alternate-screen + raw-mode dance, run the current
+/// fleet binary with `args` inheriting stdio, then re-enter the
+/// alternate screen. The terminal is left in a usable raw-mode
+/// alternate-screen state whether or not the subprocess succeeds.
+///
+/// Uses [`std::env::current_exe`] to locate the binary so the
+/// behaviour works under `cargo run` as well as a release install.
+fn run_brainstorm_suspended(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    args: &[&str],
+) -> Result<()> {
+    let exe = std::env::current_exe().context("locating current fleet binary")?;
+    // Tear down — order mirrors the setup in `run` (reverse).
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+
+    let exe_display = exe.display().to_string();
+    let args_joined = args.join(" ");
+    let result = std::process::Command::new(&exe)
+        .args(args)
+        .status()
+        .with_context(|| format!("running {exe_display} {args_joined}"));
+
+    // Re-enter even if the subprocess errored — otherwise the user
+    // is dropped into a half-broken terminal.
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = enable_raw_mode();
+    let _ = terminal.clear();
+
+    let status = result?;
+    if !status.success() {
+        bail!("{exe_display} {args_joined} exited with {status}");
+    }
+    Ok(())
 }
 
 /// In-memory app state. Held by the event loop, mutated by key handlers,
@@ -208,6 +272,15 @@ struct AppState {
     /// exist yet (the common case for repos that haven't used
     /// `fleet brainstorm`).
     brainstorms: Vec<BrainstormSession>,
+    /// Which sidebar sub-list (Workflows / Brainstorms) is
+    /// focused — `Tab` toggles. Drives where `j/k` move and what
+    /// `Enter` does in the Sessions view.
+    sessions_focus: SessionsFocus,
+    /// Cursor inside the Brainstorms sub-list. Independent of
+    /// `list_state` (which tracks Workflows) so the user's
+    /// workflow-row selection survives a trip into the Brainstorms
+    /// section.
+    brainstorms_list_state: ListState,
     /// Ticket ids currently sitting on a cycle in the deps graph.
     /// Recomputed each `reload` from `.fleet/deps.json`. Drives
     /// the `⚠` markers on session and plan rows so the user
@@ -252,6 +325,15 @@ enum View {
 enum PlansFocus {
     Sidebar,
     Items,
+}
+
+/// Which sub-list of the Sessions sidebar has the cursor. Workflows
+/// is the default — that's the existing surface; Brainstorms is
+/// reached by `Tab` and unlocks the `Enter`-to-attach affordance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionsFocus {
+    Workflows,
+    Brainstorms,
 }
 
 /// Transient overlay rendered on top of the current view.
@@ -355,6 +437,8 @@ impl AppState {
             plans_focus: PlansFocus::Sidebar,
             plans_items_state: ListState::default(),
             brainstorms: Vec::new(),
+            sessions_focus: SessionsFocus::Workflows,
+            brainstorms_list_state: ListState::default(),
             cycle_nodes: std::collections::HashSet::new(),
         };
         state.reload(store)?;
@@ -526,6 +610,13 @@ impl AppState {
             self.toggle_autonomous();
             return Action::None;
         }
+        // Shift+B from any view spawns a fresh brainstorm session
+        // and attaches to it. The actual suspend-terminal /
+        // exec-subprocess / resume dance happens at the event-loop
+        // level — we just signal it via the Action.
+        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('B')) {
+            return Action::NewBrainstorm;
+        }
         // Dispatch by view. Each view owns its own keybindings; common
         // ones (`q` quit, `Esc` close) are handled per-view so an `Esc`
         // out of a modal doesn't also quit the app.
@@ -611,12 +702,35 @@ impl AppState {
                 }
                 Action::None
             }
+            KeyCode::Tab => {
+                self.toggle_sessions_focus();
+                Action::None
+            }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
+                match self.sessions_focus {
+                    SessionsFocus::Workflows => self.move_selection(1),
+                    SessionsFocus::Brainstorms => self.move_brainstorms_selection(1),
+                }
                 Action::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
+                match self.sessions_focus {
+                    SessionsFocus::Workflows => self.move_selection(-1),
+                    SessionsFocus::Brainstorms => self.move_brainstorms_selection(-1),
+                }
+                Action::None
+            }
+            KeyCode::Enter => {
+                // Enter is only bound when Brainstorms has focus —
+                // attach to the selected brainstorm. In Workflows
+                // focus the key is reserved for a future
+                // attach-workflow flow.
+                if self.sessions_focus == SessionsFocus::Brainstorms {
+                    if let Some(id) = self.selected_brainstorm_id() {
+                        return Action::AttachBrainstorm(id);
+                    }
+                    self.status_line = " no brainstorm selected ".to_string();
+                }
                 Action::None
             }
             KeyCode::Char('p') => {
@@ -629,6 +743,47 @@ impl AppState {
             }
             _ => Action::None,
         }
+    }
+
+    /// Tab between the Workflows and Brainstorms sub-lists in the
+    /// Sessions sidebar. Switching to Brainstorms with no row
+    /// selected lands the cursor at row 0 when there's anything to
+    /// land on; empty sections keep the focus flag but the cursor
+    /// stays cleared.
+    fn toggle_sessions_focus(&mut self) {
+        self.sessions_focus = match self.sessions_focus {
+            SessionsFocus::Workflows => SessionsFocus::Brainstorms,
+            SessionsFocus::Brainstorms => SessionsFocus::Workflows,
+        };
+        if self.sessions_focus == SessionsFocus::Brainstorms
+            && !self.brainstorms.is_empty()
+            && self.brainstorms_list_state.selected().is_none()
+        {
+            self.brainstorms_list_state.select(Some(0));
+        }
+    }
+
+    /// Move the Brainstorms sub-list cursor. Same wrap-around idiom
+    /// as `move_selection`. No-op when there are no brainstorms.
+    fn move_brainstorms_selection(&mut self, delta: isize) {
+        if self.brainstorms.is_empty() {
+            return;
+        }
+        let len = isize::try_from(self.brainstorms.len()).unwrap_or(isize::MAX);
+        let current =
+            isize::try_from(self.brainstorms_list_state.selected().unwrap_or(0)).unwrap_or(0);
+        let next = (current + delta).rem_euclid(len);
+        let next_usize = usize::try_from(next).unwrap_or(0);
+        self.brainstorms_list_state.select(Some(next_usize));
+    }
+
+    /// Selected brainstorm session id, if a row is selected and
+    /// in-range. Used by `Enter` to surface the attach action.
+    fn selected_brainstorm_id(&self) -> Option<BrainstormId> {
+        self.brainstorms_list_state
+            .selected()
+            .and_then(|i| self.brainstorms.get(i))
+            .map(|b| b.id.clone())
     }
 
     fn handle_key_doctor(&mut self, key: KeyEvent, store: &SessionStore) -> Action {
@@ -1156,6 +1311,15 @@ impl AppState {
 enum Action {
     None,
     Quit,
+    /// Suspend the alternate screen and `exec fleet brainstorm` so
+    /// the user lands inside a fresh brainstorm tmux pane. On
+    /// detach the event loop re-enters the alternate screen and
+    /// resumes. Triggered by `Shift+B` from any view.
+    NewBrainstorm,
+    /// Suspend the alternate screen and `tmux attach-session` to
+    /// the brainstorm with this id. Triggered by `Enter` on a
+    /// Brainstorms-focused sidebar row.
+    AttachBrainstorm(BrainstormId),
 }
 
 /// List the workflows available to launch from this repo. Returns the
@@ -1804,59 +1968,134 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
             state.brainstorms.len(),
         )
     };
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let outer = Block::default().title(title).borders(Borders::ALL);
     if state.sessions.is_empty() && state.brainstorms.is_empty() {
         let body = Paragraph::new(
             "(no sessions)\n\n\
              Use `fleet workflow run <name>` from the shell to create a workflow session, \
              or `fleet brainstorm` for an interactive planning session.",
         )
-        .block(block)
+        .block(outer)
         .wrap(Wrap { trim: false });
         f.render_widget(body, area);
         return;
     }
-    let mut items: Vec<ListItem<'_>> =
-        Vec::with_capacity(state.sessions.len() + state.brainstorms.len() + 2);
-    if !state.sessions.is_empty() {
-        items.push(ListItem::new(Span::styled(
-            "── Workflows ──".to_string(),
-            Style::default().fg(Color::DarkGray),
-        )));
-        for s in &state.sessions {
-            items.push(ListItem::new(Span::styled(
-                session_row_label(s, &state.plans, &state.cycle_nodes),
-                state_style(s.state),
-            )));
-        }
+    // Render the outer titled border, then split the inner area
+    // into Workflows / Brainstorms regions. When one of the two
+    // sections is empty, we skip its allocation and the other
+    // takes the full inner space.
+    f.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+    let (workflow_area, brainstorm_area) = split_sidebar_areas(
+        inner,
+        state.sessions.len(),
+        state.brainstorms.len(),
+    );
+    if let Some(area) = workflow_area {
+        render_workflow_list(f, area, state);
     }
-    if !state.brainstorms.is_empty() {
-        items.push(ListItem::new(Span::styled(
-            "── Brainstorms ──".to_string(),
-            Style::default().fg(Color::DarkGray),
-        )));
-        for b in &state.brainstorms {
-            items.push(ListItem::new(Span::styled(
-                brainstorm_row_label(b),
-                brainstorm_row_style(b.state),
-            )));
-        }
+    if let Some(area) = brainstorm_area {
+        render_brainstorm_list(f, area, state);
     }
-    // `list_state` indexes into the original Sessions slice; the
-    // selection still applies to the Workflows section. Selecting
-    // a Brainstorm row is reserved for the follow-up commit that
-    // ships terminal-suspend → tmux-attach (needs ratatui's
-    // alternate-screen toggle dance and a real tmux to verify).
+}
+
+/// Split the sidebar's inner area into Workflows / Brainstorms
+/// sub-regions. Either side gets `None` when the corresponding list
+/// is empty (and the other takes the full area). When both have
+/// content, the split is proportional to the row counts plus the
+/// one-line section header — that way a 10-workflow / 1-brainstorm
+/// repo doesn't waste half the sidebar on a single brainstorm row.
+#[must_use]
+fn split_sidebar_areas(
+    inner: Rect,
+    n_workflows: usize,
+    n_brainstorms: usize,
+) -> (Option<Rect>, Option<Rect>) {
+    if n_workflows == 0 && n_brainstorms == 0 {
+        return (None, None);
+    }
+    if n_brainstorms == 0 {
+        return (Some(inner), None);
+    }
+    if n_workflows == 0 {
+        return (None, Some(inner));
+    }
+    // +1 in each numerator: one line for the section header. The
+    // u32 cap below clamps the very-unlikely case of a repo with
+    // millions of either kind of session — the ratio will be
+    // wildly skewed long before we hit the cast limit.
+    let workflow_share = u32::try_from(n_workflows + 1).unwrap_or(u32::MAX);
+    let brainstorm_share = u32::try_from(n_brainstorms + 1).unwrap_or(u32::MAX);
+    let total = workflow_share.saturating_add(brainstorm_share);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Ratio(workflow_share, total),
+            Constraint::Ratio(brainstorm_share, total),
+        ])
+        .split(inner);
+    (Some(chunks[0]), Some(chunks[1]))
+}
+
+fn render_workflow_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let mut items: Vec<ListItem<'_>> = Vec::with_capacity(state.sessions.len() + 1);
+    items.push(ListItem::new(Span::styled(
+        "── Workflows ──".to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+    for s in &state.sessions {
+        items.push(ListItem::new(Span::styled(
+            session_row_label(s, &state.plans, &state.cycle_nodes),
+            state_style(s.state),
+        )));
+    }
+    let highlight = if state.sessions_focus == SessionsFocus::Workflows {
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let list = List::new(items)
-        .block(block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(highlight)
         .highlight_symbol("> ");
-    let mut list_state = state.list_state;
-    f.render_stateful_widget(list, area, &mut list_state);
+    // The list_state index is 0-based on the workflow rows, but the
+    // rendered list has a header at row 0. Shift by one so the
+    // highlight lands on the right row.
+    let mut shifted = state.list_state;
+    if let Some(i) = shifted.selected() {
+        shifted.select(Some(i + 1));
+    }
+    f.render_stateful_widget(list, area, &mut shifted);
+}
+
+fn render_brainstorm_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let mut items: Vec<ListItem<'_>> = Vec::with_capacity(state.brainstorms.len() + 1);
+    items.push(ListItem::new(Span::styled(
+        "── Brainstorms ──".to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+    for b in &state.brainstorms {
+        items.push(ListItem::new(Span::styled(
+            brainstorm_row_label(b),
+            brainstorm_row_style(b.state),
+        )));
+    }
+    let highlight = if state.sessions_focus == SessionsFocus::Brainstorms {
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let list = List::new(items)
+        .highlight_style(highlight)
+        .highlight_symbol("> ");
+    let mut shifted = state.brainstorms_list_state;
+    if let Some(i) = shifted.selected() {
+        shifted.select(Some(i + 1));
+    }
+    f.render_stateful_widget(list, area, &mut shifted);
 }
 
 /// One-line label for a brainstorm row in the sidebar. Pure helper
@@ -2032,7 +2271,7 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let help = match state.view {
         View::Sessions => {
-            "[q] quit  [j/k] nav  [r] reload  [d] doctor  [p] plans  [Shift+K] kill  [n] spawn  [Shift+A] auto"
+            "[q] quit  [Tab] focus  [j/k] nav  [Enter] attach  [r] reload  [d] doctor  [p] plans  [Shift+K] kill  [n] spawn  [Shift+A] auto  [Shift+B] brainstorm"
         }
         View::Doctor => "[q] quit  [Esc/d] back  [r] re-probe",
         View::Spawn => "[Esc/q] cancel  [j/k] nav  [Enter] spawn",
@@ -3453,6 +3692,106 @@ mod tests {
             "got: {}",
             state.status_line
         );
+    }
+
+    // ---- sessions view brainstorm bindings --------------------------
+
+    /// Seed a TempDir-rooted state with one workflow session and one
+    /// brainstorm session — enough surface to exercise the Tab/j/k/
+    /// Enter/Shift+B handlers against real on-disk metadata.
+    fn sessions_state_with_one_of_each() -> (
+        tempfile::TempDir,
+        SessionStore,
+        AppState,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = SessionStore::at(tmp.path().to_path_buf());
+        sessions
+            .create(&session("s-1", "standard", SessionState::Running, 100))
+            .unwrap();
+        let bstore = BrainstormStore::for_repo(tmp.path());
+        let b = BrainstormSession::new(BrainstormId::new("b-1"), "claude", 200);
+        bstore.save(&b).unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
+        (tmp, sessions, state)
+    }
+
+    #[test]
+    fn tab_in_sessions_view_toggles_focus_between_workflows_and_brainstorms() {
+        let (_tmp, store, mut state) = sessions_state_with_one_of_each();
+        assert_eq!(state.sessions_focus, SessionsFocus::Workflows);
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
+        assert_eq!(state.sessions_focus, SessionsFocus::Brainstorms);
+        // First Tab to Brainstorms lands the cursor at row 0.
+        assert_eq!(state.brainstorms_list_state.selected(), Some(0));
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
+        assert_eq!(state.sessions_focus, SessionsFocus::Workflows);
+    }
+
+    #[test]
+    fn enter_with_brainstorms_focus_returns_attach_brainstorm_action() {
+        let (_tmp, store, mut state) = sessions_state_with_one_of_each();
+        state.toggle_sessions_focus();
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &store,
+        );
+        match action {
+            Action::AttachBrainstorm(id) => assert_eq!(id.as_str(), "b-1"),
+            _ => panic!("expected AttachBrainstorm, got something else"),
+        }
+    }
+
+    #[test]
+    fn enter_with_workflows_focus_is_a_noop_for_now() {
+        let (_tmp, store, mut state) = sessions_state_with_one_of_each();
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &store,
+        );
+        assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn shift_b_returns_new_brainstorm_from_any_view() {
+        let (_tmp, store, mut state) = sessions_state_with_one_of_each();
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert!(matches!(action, Action::NewBrainstorm));
+        // From the Plans view, too.
+        state.view = View::Plans;
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert!(matches!(action, Action::NewBrainstorm));
+    }
+
+    #[test]
+    fn j_in_brainstorms_focus_moves_brainstorm_cursor_not_workflow_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = SessionStore::at(tmp.path().to_path_buf());
+        sessions
+            .create(&session("s-1", "standard", SessionState::Running, 100))
+            .unwrap();
+        let bstore = BrainstormStore::for_repo(tmp.path());
+        bstore
+            .save(&BrainstormSession::new(BrainstormId::new("b-1"), "claude", 1))
+            .unwrap();
+        bstore
+            .save(&BrainstormSession::new(BrainstormId::new("b-2"), "claude", 2))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
+        state.toggle_sessions_focus(); // Brainstorms, cursor at 0
+        let workflow_before = state.list_state.selected();
+        let _ = state.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            &sessions,
+        );
+        assert_eq!(state.brainstorms_list_state.selected(), Some(1));
+        assert_eq!(state.list_state.selected(), workflow_before);
     }
 
     // ---- brainstorm sidebar -----------------------------------------
