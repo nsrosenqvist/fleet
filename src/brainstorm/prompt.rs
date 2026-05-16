@@ -184,11 +184,18 @@ calls.
 **Sessions:**
 - `fleet sessions list`                              — all workflow sessions
 - `fleet sessions show <id>`                         — one session, full detail
-- `fleet sessions unblock <id> [--reason "<text>"]`  — clear deps edges
+- `fleet sessions unblock <id> [--reason "<text>"]`  — clear *all* deps edges keyed by this session's ticket
 - `fleet sessions logs <id> [--node <name>]`         — printed captured logs
 
-**Deps (rarely needed; mostly a read for surgery):**
-- `cat .fleet/deps.json`                             — every blocked-on edge
+**Deps (cross-ticket blocked-on edges):**
+- `fleet deps list`                                  — every blocked-on edge with its kind
+- `fleet deps add <blocked> --blocked-on <ticket>`   — record a ticket-blocks-ticket edge
+- `fleet deps add <blocked> --blocked-on-tag <slug>` — record a freeform-tag edge (e.g. blocked on the apt mirror)
+- `fleet deps remove <blocked> --blocked-on <id>`    — surgical single-edge removal
+
+`fleet deps add` refuses to create cycles — if the proposed edge
+would close a path back to itself, you'll see a clear error and no
+edge will be recorded.
 
 ## Behaviour expectations
 
@@ -198,7 +205,31 @@ calls.
   defence against prompt-injected mistakes.
 - **Read before write.** When the user asks you to plan around an
   epic / ticket, fetch the current state first (`fleet issues
-  list`, `fleet plan list`) rather than guessing.
+  list`, `fleet plan list`, `fleet deps list`) rather than
+  guessing.
+- **Decompose multi-component work contracts-first.** When the
+  proposed work spans more than one independently-deployable
+  component (backend + frontend, service + client, library +
+  consumer, schema + migrations), file a *contracts* ticket
+  first — the API shape, message schemas, type definitions, or
+  an ADR capturing the architectural decision. Then file the
+  per-component implementation tickets, each with a
+  `fleet deps add <impl-ticket> --blocked-on <contracts-ticket>`
+  edge. The supervisor will leave the implementation tickets
+  alone until the contracts ticket closes, so two agents can't
+  diverge into incompatible shapes. **Trigger check:** "could
+  two implementations land in parallel and discover at
+  integration time that they assumed different interfaces?" If
+  yes, contracts-first. Single-component work doesn't need this.
+- **ADRs vs schemas.** If the interface is executable (OpenAPI,
+  protobuf, shared types package, SQL migration) the contracts
+  ticket produces that artifact. If the decision is
+  architectural with no single executable shape (auth strategy,
+  state machine boundaries, ownership of a concept) the
+  contracts ticket produces an ADR in `docs/decisions/<n>-<slug>.md`
+  capturing the choice + rationale. Pick the lighter of the two
+  that still pins the interface enough for the implementation
+  tickets to proceed independently.
 - **Use plans as preference, deps as requirement.** A plan is the
   user's ordered preference; the deps graph is what physically
   blocks scheduling. They compose — when filing a follow-up that
@@ -211,15 +242,36 @@ calls.
 
 Typical patterns:
 
-- **"What's open?"** → `fleet issues list` + `fleet plan list`,
-  summarise.
+- **"What's open?"** → `fleet issues list` + `fleet plan list` +
+  `fleet deps list`, summarise.
 - **"Plan a refactor"** → discuss with user, then `fleet issues
   create …` for each ticket (capture each id), then `fleet plan
   new "<name>" --tickets <ids,joined,by,commas>`.
+- **"Plan a feature spanning backend + frontend"** (or any
+  multi-component work) → propose the contracts-first
+  decomposition to the user:
+    1. Decide with the user whether the contracts ticket is an
+       executable schema (OpenAPI/protobuf/types) or an ADR. If
+       in doubt, ask. Either way it's one ticket.
+    2. `fleet issues create "Define <feature> contracts" …` →
+       capture the new id as `T-contracts`.
+    3. `fleet issues create "Implement <feature> backend" …` →
+       capture as `T-backend`.
+    4. `fleet issues create "Implement <feature> frontend" …` →
+       capture as `T-frontend`.
+    5. `fleet deps add T-backend --blocked-on T-contracts`
+    6. `fleet deps add T-frontend --blocked-on T-contracts`
+    7. `fleet plan new "<feature>" --tickets T-contracts,T-backend,T-frontend`
+   The supervisor will pick `T-contracts` first; only after it
+   closes will the implementation tickets become eligible. The
+   plan keeps them visible together so the user can `fleet plan
+   show` and see the whole feature at a glance.
 - **"Where are we on plan X?"** → `fleet plan show <id>` + recent
   `fleet sessions list` entries.
 - **"Unblock session Y"** → `fleet sessions unblock <id>` (with
-  `--reason` if the user gave one).
+  `--reason` if the user gave one). When you want to remove a
+  specific dep edge rather than clear all of them, use
+  `fleet deps remove <blocked> --blocked-on <id>` instead.
 "#;
 
 #[cfg(test)]
@@ -270,6 +322,79 @@ mod tests {
         // is CLI-only since the parallel HTTP path got removed.
         assert!(!p.contains("FLEET_BRAINSTORM_URL"), "stale http env var");
         assert!(!p.contains("FLEET_BRAINSTORM_TOKEN"), "stale http token");
+    }
+
+    #[test]
+    fn render_prompt_advertises_deps_cli_instead_of_cat_jsonfile() {
+        // After the `fleet deps add/list/remove` CLI shipped, the
+        // prompt must point the agent at the real surface, not at
+        // `cat .fleet/deps.json`. Catches a stale-doc regression.
+        let snapshot = RepoSnapshot {
+            open_issues: Vec::new(),
+            active_plans: Vec::new(),
+        };
+        let p = render_prompt(&snapshot);
+        assert!(p.contains("fleet deps list"), "missing deps list tool");
+        assert!(p.contains("fleet deps add"), "missing deps add tool");
+        assert!(p.contains("fleet deps remove"), "missing deps remove tool");
+        assert!(
+            !p.contains("cat .fleet/deps.json"),
+            "stale deps.json reference leaked: prompt now uses fleet deps list"
+        );
+    }
+
+    #[test]
+    fn render_prompt_includes_contracts_first_decomposition_rule() {
+        // The contracts-first behaviour rule is the load-bearing
+        // bit of guidance this prompt carries — without it the
+        // agent will happily file a backend + frontend ticket
+        // pair without an interface ticket. Pin both the rule and
+        // the trigger language so the prompt can't silently lose
+        // either half.
+        let snapshot = RepoSnapshot {
+            open_issues: Vec::new(),
+            active_plans: Vec::new(),
+        };
+        let p = render_prompt(&snapshot);
+        assert!(
+            p.contains("contracts-first") || p.contains("Decompose multi-component"),
+            "missing contracts-first behaviour rule"
+        );
+        assert!(
+            p.contains("integration time"),
+            "missing trigger-check phrasing"
+        );
+        // ADR vs schema choice is documented.
+        assert!(p.contains("ADR"), "ADR option missing");
+        assert!(
+            p.contains("docs/decisions/"),
+            "ADR file location missing"
+        );
+    }
+
+    #[test]
+    fn render_prompt_walks_through_multi_component_workflow_pattern() {
+        // The Workflow section's multi-component pattern should
+        // spell out the exact CLI sequence — agents pattern-match
+        // on examples, so the worked example matters more than the
+        // abstract rule.
+        let snapshot = RepoSnapshot {
+            open_issues: Vec::new(),
+            active_plans: Vec::new(),
+        };
+        let p = render_prompt(&snapshot);
+        assert!(
+            p.contains("backend + frontend"),
+            "missing multi-component pattern label"
+        );
+        assert!(
+            p.contains("--blocked-on T-contracts"),
+            "missing deps edge example"
+        );
+        assert!(
+            p.contains("fleet plan new") && p.contains("T-contracts,T-backend,T-frontend"),
+            "missing plan-creation step that ties the three tickets together"
+        );
     }
 
     #[test]
