@@ -1161,20 +1161,69 @@ impl WorkflowExecutor {
             })?;
         // Record the dependency edge so the supervisor's scheduler
         // (Phase 4) can skip the parent until the child closes.
+        // Cycle-check first: in v1 the new ticket has no outgoing
+        // edges so the check is defensive (it can only fire if a
+        // future write path re-uses an existing id under
+        // `tracker-create`), but the helper is cheap and the safety
+        // net belongs at the mutation point, not on the caller.
         let deps_store = crate::deps::DepsStore::at(deps_path_for(req.store));
-        deps_store
-            .add_edge(crate::deps::DepEdge {
-                blocked: parent.human_id.clone(),
-                blocked_on: created.human_id.clone(),
-                reason: crate::deps::BlockedReason::Ticket,
-                created_at_ms: (self.clock)(),
-            })
+        let proposed = crate::deps::DepEdge {
+            blocked: parent.human_id.clone(),
+            blocked_on: created.human_id.clone(),
+            reason: crate::deps::BlockedReason::Ticket,
+            created_at_ms: (self.clock)(),
+        };
+        let existing = deps_store.load().with_context(|| {
+            format!(
+                "tracker-create node `{}`: loading deps for cycle-check failed",
+                node.id
+            )
+        })?;
+        if crate::deps::would_create_cycle(&existing, &proposed) {
+            bail!(
+                "tracker-create node `{}`: refusing to record dep edge {} -> {} \
+                 because it would close a cycle (the new ticket was filed; \
+                 resolve the cycle in `.fleet/deps.json` or close one side \
+                 before re-running)",
+                node.id,
+                parent.human_id,
+                created.human_id
+            );
+        }
+        deps_store.add_edge(proposed).with_context(|| {
+            format!(
+                "tracker-create node `{}`: recording deps edge {} -> {} failed",
+                node.id, parent.human_id, created.human_id
+            )
+        })?;
+        // Plan injection: when the parent is an item in an active
+        // fleet plan, insert the newly-filed child immediately
+        // before the parent's position so the supervisor's tick
+        // sees the prerequisite first. Plans not containing the
+        // parent (or paused/completed/abandoned plans) are left
+        // alone — the new ticket is filed regardless.
+        let plan_store = crate::plans::store::PlanStore::at(plans_root_for(req.store));
+        if let Some((mut plan, idx)) = plan_store
+            .find_plan_containing(&parent.human_id)
             .with_context(|| {
                 format!(
-                    "tracker-create node `{}`: recording deps edge {} -> {} failed",
-                    node.id, parent.human_id, created.human_id
+                    "tracker-create node `{}`: looking up parent plan for #{} failed",
+                    node.id, parent.human_id
+                )
+            })?
+        {
+            plan.items.insert(
+                idx,
+                crate::plans::PlanItem::pending_injected(&created.human_id),
+            );
+            plan.updated_at_ms = (self.clock)();
+            plan_store.save(&plan).with_context(|| {
+                format!(
+                    "tracker-create node `{}`: persisting injected item in plan {} failed",
+                    node.id, plan.id
                 )
             })?;
+        }
         Ok(())
     }
 
@@ -1900,6 +1949,17 @@ fn deps_path_for(store: &SessionStore) -> PathBuf {
         .root()
         .parent()
         .map_or_else(|| store.root().join("deps.json"), |p| p.join("deps.json"))
+}
+
+/// Resolve the `.fleet/plans/` directory from the executor's session
+/// store, same sibling-relationship as [`deps_path_for`]. Used by the
+/// `tracker-create` plan-injector so the workflow engine doesn't
+/// need a separate `plans:` field threaded through `ExecuteRequest`.
+fn plans_root_for(store: &SessionStore) -> PathBuf {
+    store
+        .root()
+        .parent()
+        .map_or_else(|| store.root().join("plans"), |p| p.join("plans"))
 }
 
 /// Count how many distinct `tracker-create` nodes in `workflow`
@@ -6510,6 +6570,250 @@ nodes:
         assert_eq!(doc.edges[0].blocked, "42");
         assert_eq!(doc.edges[0].blocked_on, "99");
         assert_eq!(doc.edges[0].reason, crate::deps::BlockedReason::Ticket);
+    }
+
+    #[test]
+    fn tracker_create_node_injects_new_ticket_before_parent_in_active_plan() {
+        // Setup: an active plan owns the bound parent (#42) at
+        // position 1. After tracker-create fires, the plan should
+        // have the freshly-filed child injected at position 1 (just
+        // before the parent), with `injected: true`.
+        let yaml = "\
+name: tc-inject
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path().join("sessions"));
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-inject");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        // Pre-seed the plan: 3 items, parent #42 in the middle.
+        let plans_root = plans_root_for(&store);
+        let plan_store = crate::plans::store::PlanStore::at(&plans_root);
+        let plan = crate::plans::Plan::new(
+            crate::plans::PlanId::new("plan-preexisting"),
+            "Parser refactor",
+            vec!["40".to_string(), "42".to_string(), "44".to_string()],
+            1_700_000_000_000,
+        );
+        plan_store.save(&plan).unwrap();
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("99")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: Some(sample_issue()),
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        executor.execute(&req).unwrap();
+
+        let loaded = plan_store
+            .load(&crate::plans::PlanId::new("plan-preexisting"))
+            .unwrap();
+        assert_eq!(loaded.items.len(), 4);
+        // Order: 40, 99 (injected), 42, 44.
+        assert_eq!(loaded.items[0].ticket_id, "40");
+        assert_eq!(loaded.items[1].ticket_id, "99");
+        assert!(loaded.items[1].injected);
+        assert_eq!(loaded.items[1].state, crate::plans::PlanItemState::Pending);
+        assert_eq!(loaded.items[2].ticket_id, "42");
+        assert_eq!(loaded.items[3].ticket_id, "44");
+    }
+
+    #[test]
+    fn tracker_create_node_does_not_inject_when_parent_plan_is_paused() {
+        // A paused plan must not be mutated by the workflow engine;
+        // `find_plan_containing` already filters to active plans,
+        // and this test pins the contract down end-to-end.
+        let yaml = "\
+name: tc-noinject-paused
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path().join("sessions"));
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-paused");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let plans_root = plans_root_for(&store);
+        let plan_store = crate::plans::store::PlanStore::at(&plans_root);
+        let mut plan = crate::plans::Plan::new(
+            crate::plans::PlanId::new("plan-paused"),
+            "Paused refactor",
+            vec!["42".to_string(), "44".to_string()],
+            1_700_000_000_000,
+        );
+        plan.state = crate::plans::PlanState::Paused;
+        plan_store.save(&plan).unwrap();
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("99")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: Some(sample_issue()),
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        executor.execute(&req).unwrap();
+
+        // Plan unchanged: still 2 items, no injected child.
+        let loaded = plan_store
+            .load(&crate::plans::PlanId::new("plan-paused"))
+            .unwrap();
+        assert_eq!(loaded.items.len(), 2);
+        assert!(!loaded.items.iter().any(|i| i.ticket_id == "99"));
+    }
+
+    #[test]
+    fn tracker_create_node_skips_plan_injection_when_no_plan_owns_parent() {
+        // No plan exists at all → tracker-create still files the
+        // ticket + records deps, but the plan-injection branch is a
+        // clean no-op (no error, nothing to inject into).
+        let yaml = "\
+name: tc-noplan
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(dir.path().join("sessions"));
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-noplan");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b"}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("99")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ));
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: Some(sample_issue()),
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+        };
+        executor.execute(&req).unwrap();
+        // Plans directory may not even exist; tracker-create
+        // shouldn't have created one for no reason.
+        let plans_dir = plans_root_for(&store);
+        if plans_dir.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&plans_dir).unwrap().collect();
+            assert!(
+                entries.is_empty(),
+                "plans dir should have no plan files: {entries:?}"
+            );
+        }
     }
 
     #[test]
