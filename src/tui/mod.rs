@@ -55,6 +55,8 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use crate::autonomous;
+use crate::plans::store::PlanStore;
+use crate::plans::{Plan, PlanItemState, PlanState};
 use crate::process::{ProcessInvoker, RealProcessInvoker};
 use crate::repo;
 use crate::repo_config::RepoConfig;
@@ -180,6 +182,15 @@ struct AppState {
     /// Active transient overlay (confirm dialog or error message).
     /// Rendered on top of whatever `view` is currently drawing.
     overlay: Overlay,
+    /// Loaded plans, refreshed on entry to the Plans view. Empty
+    /// until the user presses `p` (or after a `reload` from inside
+    /// the Plans view). Sorted by id (lexicographic ≈ chronological
+    /// thanks to the ms-prefixed id format).
+    plans: Vec<Plan>,
+    /// Cursor for the Plans view's sidebar. Independent of
+    /// `list_state` so the user's session-row selection survives a
+    /// trip into the Plans view.
+    plans_list_state: ListState,
 }
 
 /// Lifecycle of the lazily-built tracker. Three states because the
@@ -199,12 +210,15 @@ enum TrackerState {
 
 /// Top-level view enum. `Sessions` is the default; `Doctor` shows the
 /// adapter + tracker + agents introspection pane; `Spawn` shows the
-/// workflow picker for kicking off a new `fleet workflow run`.
+/// workflow picker for kicking off a new `fleet workflow run`;
+/// `Plans` shows the plans-management surface (sibling to Sessions —
+/// entered via `p`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Sessions,
     Doctor,
     Spawn,
+    Plans,
 }
 
 /// Transient overlay rendered on top of the current view.
@@ -303,6 +317,8 @@ impl AppState {
             autonomous: autonomous::AutonomousEngine::new(),
             tracker: TrackerState::Pending,
             overlay: Overlay::None,
+            plans: Vec::new(),
+            plans_list_state: ListState::default(),
         };
         state.reload(store)?;
         Ok(state)
@@ -419,6 +435,7 @@ impl AppState {
             View::Sessions => self.handle_key_sessions(key, store),
             View::Doctor => self.handle_key_doctor(key, store),
             View::Spawn => self.handle_key_spawn(key),
+            View::Plans => self.handle_key_plans(key),
         }
     }
 
@@ -504,6 +521,10 @@ impl AppState {
                 self.move_selection(-1);
                 Action::None
             }
+            KeyCode::Char('p') => {
+                self.open_plans_view();
+                Action::None
+            }
             KeyCode::Char('n') => {
                 self.open_spawn_picker();
                 Action::None
@@ -528,6 +549,91 @@ impl AppState {
             }
             _ => Action::None,
         }
+    }
+
+    fn handle_key_plans(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Char('q') => Action::Quit,
+            KeyCode::Esc | KeyCode::Char('p') => {
+                self.view = View::Sessions;
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_plans_selection(1);
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_plans_selection(-1);
+                Action::None
+            }
+            KeyCode::Char('r') => {
+                self.refresh_plans();
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Switch into the Plans view, reloading from disk so the listing
+    /// matches the latest `.fleet/plans/<id>.yaml` state. Empty list
+    /// is fine — the renderer shows a hint instead.
+    fn open_plans_view(&mut self) {
+        self.refresh_plans();
+        self.view = View::Plans;
+    }
+
+    /// Reload plans from disk and restore the previous selection by
+    /// id (or default to the first plan when the previous one was
+    /// deleted). Errors from a corrupt plan file surface in the
+    /// status line — we don't want one bad file to break the
+    /// listing.
+    fn refresh_plans(&mut self) {
+        let store = PlanStore::for_repo(&self.root);
+        let prev_id = self
+            .plans_list_state
+            .selected()
+            .and_then(|i| self.plans.get(i))
+            .map(|p| p.id.clone());
+        let ids = match store.list() {
+            Ok(ids) => ids,
+            Err(err) => {
+                self.status_line = format!(" plans: list failed: {err:#} ");
+                self.plans.clear();
+                self.plans_list_state.select(None);
+                return;
+            }
+        };
+        let mut plans = Vec::with_capacity(ids.len());
+        for id in ids {
+            match store.load(&id) {
+                Ok(p) => plans.push(p),
+                Err(err) => {
+                    self.status_line = format!(" plans: load `{id}` failed: {err:#} ");
+                }
+            }
+        }
+        self.plans = plans;
+        let new_index = prev_id
+            .and_then(|id| self.plans.iter().position(|p| p.id == id))
+            .or(if self.plans.is_empty() { None } else { Some(0) });
+        self.plans_list_state.select(new_index);
+    }
+
+    fn move_plans_selection(&mut self, delta: isize) {
+        if self.plans.is_empty() {
+            return;
+        }
+        let len = isize::try_from(self.plans.len()).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.plans_list_state.selected().unwrap_or(0)).unwrap_or(0);
+        let next = (current + delta).rem_euclid(len);
+        let next_usize = usize::try_from(next).unwrap_or(0);
+        self.plans_list_state.select(Some(next_usize));
+    }
+
+    fn selected_plan(&self) -> Option<&Plan> {
+        self.plans_list_state
+            .selected()
+            .and_then(|i| self.plans.get(i))
     }
 
     fn handle_key_spawn(&mut self, key: KeyEvent) -> Action {
@@ -953,6 +1059,14 @@ fn render(f: &mut Frame<'_>, state: &AppState) {
         View::Doctor => {
             render_doctor(f, outer[0], state);
         }
+        View::Plans => {
+            let body = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .split(outer[0]);
+            render_plans_sidebar(f, body[0], state);
+            render_plans_detail(f, body[1], state);
+        }
     }
     if state.view == View::Spawn {
         let modal = centered_rect(outer[0], 60, 60);
@@ -1146,6 +1260,184 @@ fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
+fn render_plans_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let title = format!(" Plans ({}) ", state.plans.len());
+    let block = Block::default().title(title).borders(Borders::ALL);
+    if state.plans.is_empty() {
+        let body = Paragraph::new(
+            "(no plans yet)\n\nUse `fleet plan new \"<name>\" --tickets a,b,c` to create one.",
+        )
+        .block(block)
+        .wrap(Wrap { trim: false });
+        f.render_widget(body, area);
+        return;
+    }
+    let items: Vec<ListItem<'_>> = state
+        .plans
+        .iter()
+        .map(|p| ListItem::new(Span::styled(plan_row_label(p), plan_row_style(p))))
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    let mut list_state = state.plans_list_state;
+    f.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let Some(plan) = state.selected_plan() else {
+        let body = Paragraph::new("Select a plan — j/k or arrows. r refresh, Esc/p back, q quit.")
+            .block(
+                Block::default()
+                    .title(" Plan detail ")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false });
+        f.render_widget(body, area);
+        return;
+    };
+    let title = format!(" {} ", plan.id);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let body = Paragraph::new(plan_detail_lines(plan))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(body, area);
+}
+
+/// One-line label for the plans sidebar list. Pure: pulled out for
+/// testability since the ratatui frame-based renderers don't compose
+/// cleanly with assert macros.
+#[must_use]
+fn plan_row_label(plan: &Plan) -> String {
+    let (done, total) = plan.progress();
+    format!(
+        "{} {} {done}/{total} {}",
+        plan_state_marker(plan.state),
+        plan.id,
+        plan.name,
+    )
+}
+
+/// Color the plan row according to its state — active plans pop in
+/// the default style, paused/completed/abandoned recede in darker
+/// shades so the sidebar's "what should I look at" line of sight
+/// stays on Active.
+#[must_use]
+fn plan_row_style(plan: &Plan) -> Style {
+    match plan.state {
+        PlanState::Active => Style::default().fg(Color::Green),
+        PlanState::Paused => Style::default().fg(Color::Yellow),
+        PlanState::Completed | PlanState::Abandoned => Style::default().fg(Color::DarkGray),
+    }
+}
+
+/// One-letter prefix for the plan-row label, mirroring the
+/// state-marker idiom the sessions list uses.
+#[must_use]
+fn plan_state_marker(state: PlanState) -> &'static str {
+    match state {
+        PlanState::Active => "●",
+        PlanState::Paused => "⏸",
+        PlanState::Completed => "✓",
+        PlanState::Abandoned => "✗",
+    }
+}
+
+/// Pure: render the detail-pane lines for a plan. Header rows
+/// followed by one row per plan item, each carrying state + ticket
+/// id + an `(injected)` marker for tracker-create-added items.
+#[must_use]
+fn plan_detail_lines(plan: &Plan) -> Vec<Line<'static>> {
+    let (done, total) = plan.progress();
+    let mut out = vec![
+        kv_line("name", &plan.name),
+        kv_line("state", plan_state_word(plan.state)),
+        kv_line("progress", &format!("{done}/{total}")),
+        kv_line("policy", plan_failure_word(plan.on_item_failure)),
+    ];
+    if let Some(epic) = &plan.epic_ref {
+        out.push(kv_line("epic", &format!("{}:{}", epic.tracker, epic.id)));
+    }
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        format!("Items ({total})"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    use std::fmt::Write as _;
+    for (idx, item) in plan.items.iter().enumerate() {
+        let mut row = format!(
+            "  {idx:>3}. {marker} {state:<11} {ticket}",
+            marker = plan_item_marker(item.state),
+            state = plan_item_word(item.state),
+            ticket = item.ticket_id,
+        );
+        if item.injected {
+            row.push_str("  (injected)");
+        }
+        if let Some(session) = &item.session_id {
+            let _ = write!(row, "  · session {session}");
+        }
+        out.push(Line::from(Span::styled(row, plan_item_style(item.state))));
+    }
+    out
+}
+
+#[must_use]
+fn plan_state_word(state: PlanState) -> &'static str {
+    match state {
+        PlanState::Active => "active",
+        PlanState::Paused => "paused",
+        PlanState::Completed => "completed",
+        PlanState::Abandoned => "abandoned",
+    }
+}
+
+#[must_use]
+fn plan_item_word(state: PlanItemState) -> &'static str {
+    match state {
+        PlanItemState::Pending => "pending",
+        PlanItemState::InProgress => "in-progress",
+        PlanItemState::Completed => "completed",
+        PlanItemState::Skipped => "skipped",
+        PlanItemState::Failed => "failed",
+    }
+}
+
+#[must_use]
+fn plan_item_marker(state: PlanItemState) -> &'static str {
+    match state {
+        PlanItemState::Pending => "○",
+        PlanItemState::InProgress => "◐",
+        PlanItemState::Completed => "✓",
+        PlanItemState::Skipped => "⊝",
+        PlanItemState::Failed => "✗",
+    }
+}
+
+#[must_use]
+fn plan_item_style(state: PlanItemState) -> Style {
+    match state {
+        PlanItemState::Pending => Style::default(),
+        PlanItemState::InProgress => Style::default().fg(Color::Cyan),
+        PlanItemState::Completed | PlanItemState::Skipped => Style::default().fg(Color::DarkGray),
+        PlanItemState::Failed => Style::default().fg(Color::Red),
+    }
+}
+
+#[must_use]
+fn plan_failure_word(policy: crate::plans::ItemFailurePolicy) -> &'static str {
+    match policy {
+        crate::plans::ItemFailurePolicy::Stop => "stop",
+        crate::plans::ItemFailurePolicy::Continue => "continue",
+        crate::plans::ItemFailurePolicy::RetryOnce => "retry-once",
+    }
+}
+
 fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let title = format!(" Sessions ({}) ", state.sessions.len());
     let block = Block::default().title(title).borders(Borders::ALL);
@@ -1239,10 +1531,11 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let help = match state.view {
         View::Sessions => {
-            "[q] quit  [j/k] nav  [r] reload  [d] doctor  [Shift+K] kill  [n] spawn  [Shift+A] auto"
+            "[q] quit  [j/k] nav  [r] reload  [d] doctor  [p] plans  [Shift+K] kill  [n] spawn  [Shift+A] auto"
         }
         View::Doctor => "[q] quit  [Esc/d] back  [r] re-probe",
         View::Spawn => "[Esc/q] cancel  [j/k] nav  [Enter] spawn",
+        View::Plans => "[q] quit  [Esc/p] back  [j/k] nav  [r] reload",
     };
     // Autonomous status takes precedence when the engine is doing
     // something interesting (enabled, or has an override message set).
@@ -2185,5 +2478,152 @@ mod tests {
             &store,
         );
         assert_eq!(state.config.autonomous.max_parallel, 7);
+    }
+
+    // ---- plans view ---------------------------------------------------
+
+    use crate::plans::{ItemFailurePolicy, Plan, PlanId, PlanItem, PlanItemState, PlanState};
+
+    fn sample_plan() -> Plan {
+        let mut p = Plan::new(
+            PlanId::new("plan-1"),
+            "Parser refactor",
+            vec!["42".into(), "43".into(), "44".into()],
+            1_700_000_000_000,
+        );
+        p.items[0].state = PlanItemState::Completed;
+        p.items[1].state = PlanItemState::InProgress;
+        p
+    }
+
+    #[test]
+    fn plan_row_label_shows_marker_id_progress_and_name() {
+        let p = sample_plan();
+        let label = plan_row_label(&p);
+        assert!(label.starts_with('●'), "active marker expected: {label}");
+        assert!(label.contains("plan-1"));
+        assert!(label.contains("1/3"));
+        assert!(label.contains("Parser refactor"));
+    }
+
+    #[test]
+    fn plan_row_label_marker_reflects_state() {
+        let mut p = sample_plan();
+        p.state = PlanState::Paused;
+        assert!(plan_row_label(&p).starts_with('⏸'));
+        p.state = PlanState::Completed;
+        assert!(plan_row_label(&p).starts_with('✓'));
+        p.state = PlanState::Abandoned;
+        assert!(plan_row_label(&p).starts_with('✗'));
+    }
+
+    #[test]
+    fn plan_detail_lines_includes_progress_and_item_rows() {
+        let p = sample_plan();
+        let lines = plan_detail_lines(&p);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        let joined = rendered.join("\n");
+        assert!(joined.contains("Parser refactor"));
+        assert!(joined.contains("1/3"));
+        assert!(joined.contains("Items (3)"));
+        // Each item is rendered with its state word.
+        assert!(joined.contains("completed"));
+        assert!(joined.contains("in-progress"));
+        assert!(joined.contains("pending"));
+        // Tickets ids appear verbatim.
+        assert!(joined.contains("42"));
+        assert!(joined.contains("43"));
+        assert!(joined.contains("44"));
+    }
+
+    #[test]
+    fn plan_detail_lines_marks_injected_items() {
+        let mut p = sample_plan();
+        p.items.insert(1, PlanItem::pending_injected("99"));
+        let lines = plan_detail_lines(&p);
+        let joined: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("(injected)"), "got: {joined}");
+        assert!(joined.contains("99"), "got: {joined}");
+    }
+
+    #[test]
+    fn plan_detail_lines_emits_epic_ref_only_when_set() {
+        let p = sample_plan();
+        let lines = plan_detail_lines(&p);
+        let joined: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("epic"));
+
+        let mut p_with = sample_plan();
+        p_with.epic_ref = Some(crate::plans::EpicRef {
+            tracker: "github".into(),
+            id: "200".into(),
+        });
+        let lines2 = plan_detail_lines(&p_with);
+        let joined2: String = lines2
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined2.contains("github:200"), "got: {joined2}");
+    }
+
+    #[test]
+    fn plan_state_word_round_trip() {
+        assert_eq!(plan_state_word(PlanState::Active), "active");
+        assert_eq!(plan_state_word(PlanState::Paused), "paused");
+        assert_eq!(plan_state_word(PlanState::Completed), "completed");
+        assert_eq!(plan_state_word(PlanState::Abandoned), "abandoned");
+    }
+
+    #[test]
+    fn plan_item_word_uses_kebab_case_for_in_progress() {
+        // Match the on-disk YAML so users can grep both surfaces.
+        assert_eq!(plan_item_word(PlanItemState::InProgress), "in-progress");
+        assert_eq!(plan_item_word(PlanItemState::Pending), "pending");
+    }
+
+    #[test]
+    fn plan_failure_word_renders_kebab_case() {
+        assert_eq!(plan_failure_word(ItemFailurePolicy::Stop), "stop");
+        assert_eq!(plan_failure_word(ItemFailurePolicy::Continue), "continue");
+        assert_eq!(
+            plan_failure_word(ItemFailurePolicy::RetryOnce),
+            "retry-once"
+        );
     }
 }
