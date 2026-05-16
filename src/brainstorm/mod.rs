@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod store;
+pub mod tmux;
 
 /// Stable identifier for a brainstorm session. Mirrors the
 /// [`crate::session::SessionId`] /
