@@ -216,6 +216,24 @@ pub trait RuntimeAdapter: Send + Sync {
     /// [`ImageId`] without rebuilding.
     fn ensure_image(&self, devcontainer: &Devcontainer) -> Result<ImageId>;
 
+    /// Best-effort OCI architecture of an already-built image (e.g.
+    /// `"amd64"`, `"arm64"`). `Ok(None)` means the adapter can't tell —
+    /// either the backend has no image concept (Local) or the engine
+    /// doesn't surface the field. Callers treat `None` the same as a
+    /// mismatch: skip whatever cross-arch-sensitive plumbing was
+    /// gated on the answer.
+    ///
+    /// Default impl returns `Ok(None)` so adapters that don't (or can't)
+    /// implement image inspection don't have to write a stub each.
+    /// Used by the workflow executor to decide whether to bind-mount
+    /// the host's `fleet-tracker` binary into the agent container —
+    /// `#[allow(dead_code)]` until that gate lands.
+    #[allow(dead_code)]
+    fn inspect_image_arch(&self, image: &ImageId) -> Result<Option<String>> {
+        let _ = image;
+        Ok(None)
+    }
+
     /// Start a container from a built image; return its id. The container
     /// is running when this returns (or the call errors).
     fn start_container(&self, spec: &ContainerSpec) -> Result<ContainerId>;
@@ -294,6 +312,38 @@ impl crate::session::reaper::ContainerStopper for AdapterStopper {
             _ => self.adapter.stop(&id),
         }
     }
+}
+
+/// Translate the Rust/host architecture string ([`std::env::consts::ARCH`])
+/// into the OCI-image convention that engines report from
+/// `image inspect` (`Architecture` field). Rust uses `x86_64` /
+/// `aarch64`; OCI uses `amd64` / `arm64`. Anything else is passed through
+/// verbatim — the OCI table covers `arm`, `riscv64`, `s390x`, `ppc64le`,
+/// `mips64le`, `386` with the same names Rust uses.
+///
+/// Pure helper so callers comparing "what arch is the image built for"
+/// against "what arch is this host" don't have to keep the mapping
+/// table in their head.
+///
+/// Wired up by the workflow executor's fleet-tracker mount gate; the
+/// `#[allow(dead_code)]` is removed when that gate lands.
+#[must_use]
+#[allow(dead_code)]
+pub fn normalize_arch_to_oci(rust_arch: &str) -> &str {
+    match rust_arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Host-side OCI architecture, derived from [`std::env::consts::ARCH`].
+/// Convenience wrapper around [`normalize_arch_to_oci`] so callsites
+/// don't have to spell out the constant.
+#[must_use]
+#[allow(dead_code)]
+pub fn host_arch_oci() -> &'static str {
+    normalize_arch_to_oci(std::env::consts::ARCH)
 }
 
 #[cfg(test)]
@@ -457,6 +507,58 @@ mod tests {
             !FakeInspectAdapter::new(ContainerState::Created)
                 .is_running(&cid)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn normalize_arch_maps_rust_to_oci_for_the_two_aliased_arches() {
+        assert_eq!(normalize_arch_to_oci("x86_64"), "amd64");
+        assert_eq!(normalize_arch_to_oci("aarch64"), "arm64");
+    }
+
+    #[test]
+    fn normalize_arch_passes_oci_native_names_through_verbatim() {
+        // OCI's table uses these names directly — Rust agrees, so the
+        // helper must not double-translate.
+        assert_eq!(normalize_arch_to_oci("arm"), "arm");
+        assert_eq!(normalize_arch_to_oci("riscv64"), "riscv64");
+        assert_eq!(normalize_arch_to_oci("s390x"), "s390x");
+        assert_eq!(normalize_arch_to_oci("ppc64le"), "ppc64le");
+        assert_eq!(normalize_arch_to_oci("386"), "386");
+    }
+
+    #[test]
+    fn normalize_arch_does_not_invent_translations_for_unknown_input() {
+        // Unknown / future-arch input passes through; the workflow
+        // executor treats "no match" the same regardless, but we want
+        // an unknown arch to surface in error messages verbatim rather
+        // than silently mapped to something else.
+        assert_eq!(
+            normalize_arch_to_oci("future-arch-9000"),
+            "future-arch-9000"
+        );
+    }
+
+    #[test]
+    fn host_arch_oci_returns_a_normalised_alias() {
+        // Whatever the test host is, the helper must produce an OCI
+        // name (never `x86_64` / `aarch64`), so a contains-check
+        // covering the two aliased arches plus the verbatim cases
+        // catches any regression that forgets to normalise.
+        let arch = host_arch_oci();
+        assert_ne!(arch, "x86_64", "x86_64 must be normalised to amd64");
+        assert_ne!(arch, "aarch64", "aarch64 must be normalised to arm64");
+    }
+
+    #[test]
+    fn default_inspect_image_arch_returns_none_for_adapters_that_do_not_override() {
+        // FakeInspectAdapter doesn't override the trait method, so it
+        // exercises the default impl. Local and any future no-image
+        // adapter inherit the same "I don't know" answer.
+        let a = FakeInspectAdapter::new(ContainerState::Running);
+        assert_eq!(
+            a.inspect_image_arch(&ImageId::new("anything")).unwrap(),
+            None
         );
     }
 }
