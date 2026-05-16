@@ -9,12 +9,12 @@ If you're looking for individual-session mechanics, see
 gets permission to mutate the tracker, see
 [`auth.md`](./auth.md#per-tracker-auth).
 
-> **Status.** This page documents the v2-extension design. As of this
-> writing, the bridge CLI, outcome convention, plans, and brainstorm
-> agent are designed but not all phases have shipped — see the table at
-> the bottom of this page for current state. Behaviour described here
-> is the target shape; check the linked plan or recent commits if
-> something doesn't match.
+> **Status.** Phases 1 and 2 have shipped — the bridge CLI, the
+> outcome convention, the `tracker-create` workflow node, and the
+> `.fleet/deps.json` store are live. Plans, the autonomous-supervisor
+> integration, and the brainstorm agent are future phases described
+> here as target shape; the table at the bottom of this page tracks
+> what's actually in the binary.
 
 ## The model in 30 seconds
 
@@ -37,64 +37,107 @@ gets permission to mutate the tracker, see
 
 ## Outcomes: how a workflow knows what just happened
 
-Agent nodes in a workflow declare an outcome in their output:
+Agent nodes in a workflow declare an outcome in their `outputs:`
+block. The agent writes the matching keys into
+`<node>.outputs.json` under `/artifacts`:
 
 ```yaml
 - id: implement
   agent: claude-code
   prompt_file: prompts/implementer.md
   outputs:
-    outcome: result.outcome          # progress | blocked | done
-    summary: result.summary
-    blocker: result.blocker          # required when outcome=blocked
-    recommend_ticket:                # optional, only when blocked
-      title: result.recommend_ticket.title
-      body:  result.recommend_ticket.body
-      labels: result.recommend_ticket.labels
+    outcome: outcome
+    blocker: blocker
+    recommend_ticket: recommend_ticket
 ```
 
-The agent writes `artifacts/result.json` with these keys; fleet's
-executor extracts them and surfaces them to downstream nodes via the
-`outputs:` accumulator (the same mechanism that's powered review-vs-
-revise routing since v2).
+The output declarations are flat `local-name: source-key` pairs — the
+executor reads `<node>.outputs.json`, looks up each `source-key` at
+the top level, and stores the value under `(<node>, <local-name>)` in
+the in-memory `OutputMap`. Scalars (string/bool/number) round-trip
+verbatim; objects and arrays are JSON-encoded as a single string so
+structured payloads like `recommend_ticket` can flow through; JSON
+`null` maps to the empty string so the workflow author can use
+`recommend_ticket != ""` as a presence check.
 
-Workflows branch on the outcome. The default `standard.yaml` shape:
+Validation runs immediately after extraction:
+
+- When a node declares `outputs.outcome`, the value must be one of
+  `"progress"`, `"blocked"`, or `"done"` (lowercase, exact). Anything
+  else fails the node with a clear "got `<bad>`" message.
+- When `outcome == "blocked"` AND the node also declared `blocker`
+  in its outputs, the blocker must be non-empty (whitespace-trimmed).
+  Workflows that omit `blocker` aren't held to this — they've opted
+  out of capturing the reason.
+
+The convention is opt-in. Nodes that don't declare `outcome` get the
+pre-convention "node succeeded / failed" semantics, unchanged.
+
+Workflows branch on the outcome. The default `standard.yaml` shape
+(shipped by `fleet init`):
 
 ```yaml
 - id: implement
   agent: claude-code
-  outputs: { outcome: result.outcome, ... }
+  outputs:
+    outcome: outcome
+    blocker: blocker
+    recommend_ticket: recommend_ticket
 
 - id: review
   depends_on: [implement]
-  when: 'implement.outcome == "done"'
   agent: claude-code
+  outputs: { decision: decision }
+
+- id: revise
+  depends_on: [review]
+  when: 'review.decision == "changes_requested"'
+  agent: claude-code
+  loop_back_to: review
+  max_loops: 2
+
+- id: open_pr
+  depends_on: [review]
+  when: 'review.decision == "approve"'
+  type: bash
+  script: 'gh pr create ...'
 
 - id: file-dep
   depends_on: [implement]
-  when: 'implement.outcome == "blocked" && implement.recommend_ticket'
+  when: 'implement.outcome == "blocked" && implement.recommend_ticket != ""'
   type: tracker-create
   from: implement.recommend_ticket
   link_parent: true
-  add_to_plan: same
-
-- id: block-comment
-  depends_on: [implement]
-  when: 'implement.outcome == "blocked"'
-  type: bash
-  script: 'fleet-tracker comment "Blocked: $(jq -r .blocker artifacts/result.json)"'
-
-- id: block-gate
-  depends_on: [block-comment]
-  when: 'implement.outcome == "blocked"'
-  type: gate
-  summary: "Implementer blocked. See ticket comment."
 ```
 
-A blocked outcome routes to: (a) post a comment via the bridge CLI,
-(b) optionally file a follow-up ticket via `tracker-create`, (c) park
-the session at a gate for human attention. The reviewer never starts
-on incomplete work because its `when:` requires `outcome == "done"`.
+A blocked outcome routes to the `file-dep` branch: file a follow-up
+ticket via `tracker-create`, cross-link both tickets, record the
+dependency. The review / open_pr / revise branches still run — the
+reviewer's prompt (in `.fleet/prompts/reviewer.md`) is asked to
+write `decision: "noop"` when there's no real diff to review,
+which cleanly skips both forks. A future short-circuit fix to
+`when:` evaluation will let `review` be gated on
+`implement.outcome != "blocked"` directly; today the workaround
+keeps the flow predictable without it.
+
+The agent contract is documented in `.fleet/prompts/implementer.md`
+(also shipped by `fleet init`). Required JSON shape:
+
+```json
+{
+  "outcome": "progress" | "blocked" | "done",
+  "summary": "<one line>",
+  "blocker": null OR "<why you're stuck>",
+  "recommend_ticket": null OR {
+    "title": "<short>",
+    "body":  "<paragraph>",
+    "labels": ["..."]
+  }
+}
+```
+
+Every declared key must be present — use `null` to mean "doesn't
+apply this run."
 
 ## The bridge CLI
 
@@ -150,22 +193,43 @@ When an agent's `outcome` is `blocked` and it would need a new ticket
 to unblock, it includes a `recommend_ticket` in its result. The
 workflow's `tracker-create` node turns the recommendation into reality:
 
-1. Reads `recommend_ticket` from upstream outputs.
+1. Reads `recommend_ticket` from upstream outputs (the JSON-encoded
+   `{title, body, labels?}` object that flowed through extraction).
 2. Calls fleet's host-side tracker → creates the issue.
-3. Posts cross-link comments on both the original and the new
-   ticket (configurable via `link_parent: true|false`).
-4. Records the dependency: `<original> blocked_on [<new>]` in
-   `.fleet/deps.json`.
-5. If the original ticket is in an active plan, injects the new
-   ticket into the plan immediately before its dependent.
+3. When `link_parent: true` (the default) and the session is bound
+   to a ticket: posts cross-link comments on both the parent and
+   the new ticket, calls `Tracker::link_parent` for the structural
+   relationship, and appends a `<parent> → blocked_on: <new>` edge
+   to `.fleet/deps.json`.
 
 The agent can't call `create` directly — only the workflow can, via
 the `tracker-create` node. This is by design: the bridge CLI is
 scoped to one ticket; creation is a different authority that lives in
-the workflow definition and the supervisor.
+the workflow definition (and, later, in the supervisor and brainstorm
+agent).
 
 A per-session cap (`max_recommended_tickets`, default 3) prevents a
 runaway agent from spawning a hundred follow-ups in one session.
+The cap counts distinct `tracker-create` nodes in the workflow whose
+`created_id` output is already populated; same-node re-fires via
+`loop_back_to` don't inflate it (they overwrite the existing entry).
+Exceeding the cap fails the node with a message naming the
+configured limit. Set at workflow level (`max_recommended_tickets: N`
+under the top-level workflow document, alongside `name:`).
+
+The node's emitted outputs are:
+
+- `created_id` — fleet's opaque id for the new ticket (`gh:87`,
+  git-bug hash, …).
+- `created_human_id` — the user-visible short id (`87`).
+
+Downstream nodes can branch on either via `when:` predicates.
+
+Future phases (3+) layer plan-injection on top: if the bound ticket
+is in an active fleet plan, the new ticket gets injected into the
+plan immediately before its dependent. The dependency map is
+already written today (Phase 2), so the scheduler integration
+is purely additive when Phase 4 lands.
 
 ## Plans
 
@@ -265,17 +329,15 @@ unblock — useful audit trail when you come back to it weeks later.
 
 ### Cycle detection
 
-If you try to record `A → blocked_on: B` and `B` is already
-(transitively) blocked on `A`, fleet refuses the addition and
-surfaces "cycle detected" via:
-
-- `fleet sessions list`: the affected session row shows `⚠ cycle: A ↔ B`.
-- TUI Plans view: the plan's status shows ⚠ with detail.
-- The `tracker-create` node that would create the cycle fails the
-  workflow rather than silently doing the wrong thing.
-
-Resolve via `fleet sessions unblock` on one side, or surgical edit of
-`.fleet/deps.json`.
+Future: when you try to record `A → blocked_on: B` and `B` is already
+(transitively) blocked on `A`, fleet will refuse the addition and
+surface "cycle detected" via the sessions list / TUI Plans view, plus
+fail the `tracker-create` node that would create the cycle. The
+detection helper lands with Phase 3 (Plans). Today the deps store
+records edges without graph-walk validation — single-level cycles
+are unlikely in practice (a follow-up filed by `tracker-create`
+always points from parent to a fresh child) but multi-step cycles
+introduced by hand-editing `.fleet/deps.json` aren't caught yet.
 
 ### What if a plan item just fails?
 
@@ -430,11 +492,11 @@ cat .fleet/deps.json
 
 | Phase | What it ships | Status |
 |---|---|---|
-| 1 | Bridge CLI + `Tracker` write methods | **Not yet shipped** |
-| 2 | Outcome convention + `tracker-create` node + deps.json | **Not yet shipped** |
-| 3 | Plans data model + CLI + TUI Plans view | **Not yet shipped** |
-| 4 | Supervisor plan consumption + failure policy | **Not yet shipped** |
-| 5 | Brainstorm agent + TUI attach/detach | **Not yet shipped** |
+| 1 | Bridge CLI + `Tracker` write methods | **Shipped** |
+| 2 | Outcome convention + `tracker-create` node + deps.json | **Shipped** |
+| 3 | Plans data model + CLI + TUI Plans view | Not yet shipped |
+| 4 | Supervisor plan consumption + failure policy | Not yet shipped |
+| 5 | Brainstorm agent + TUI attach/detach | Not yet shipped |
 
 The implementation plan lives at
 `~/.claude/plans/recursive-careful-orchestrator.md` (contributor-side).

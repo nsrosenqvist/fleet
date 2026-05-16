@@ -150,10 +150,53 @@ purpose so you can pull context from related tickets.
 
 If `fleet-tracker` is missing from the container, the host either
 isn't Linux (Mach-O binaries can't exec under the container's ELF
-loader) or didn't install the binary alongside `fleet`. The bridge
-HTTP endpoint at `$FLEET_BRIDGE_URL` is still reachable via curl in
-that case — see [`docs/orchestration.md`](./docs/orchestration.md)
-for the route surface and the bridge's security model.
+loader), is running a non-matching arch (linux/amd64 host running
+a linux/arm64 container or vice versa — fleet inspects the image's
+arch and skips the bind-mount on mismatch), or didn't install the
+binary alongside `fleet`. The bridge HTTP endpoint at
+`$FLEET_BRIDGE_URL` is still reachable via curl in that case — see
+[`docs/orchestration.md`](./docs/orchestration.md) for the route
+surface and the bridge's security model.
+
+## The outcome convention (`implement.outputs.json`)
+
+When you're the implementer in a workflow that follows the default
+`standard.yaml` shape (the one shipped by `fleet init`), the
+workflow expects a structured outcome report in
+`/artifacts/implement.outputs.json`. The shape:
+
+```json
+{
+  "outcome": "progress" | "blocked" | "done",
+  "summary": "<one-line description of what you did>",
+  "blocker": null,
+  "recommend_ticket": null
+}
+```
+
+Every declared key must be present; use `null` to mean "doesn't
+apply this run."
+
+When `outcome` is `"blocked"`:
+
+- `blocker` must be a non-empty string explaining what you're stuck
+  on (workflow validation fails the node otherwise).
+- `recommend_ticket` is optional but valuable: when a new follow-up
+  ticket would actually unblock the work, emit
+  `{ "title": "...", "body": "...", "labels": ["..."] }`. Fleet's
+  `tracker-create` node will file it, post cross-link comments on
+  both tickets, and record the dependency in `.fleet/deps.json`.
+
+Don't recommend tickets for transient environmental issues (flaky
+CI, temporary API outage, dependency build hiccup). The workflow
+caps recommendations at 3 per session by default; spend the budget
+on real work.
+
+The reviewer follows the same pattern via
+`/artifacts/review.outputs.json` with a `decision` key whose value
+is `approve` / `changes_requested` / anything else (`noop` is the
+shipped convention for "no diff worth reviewing" — e.g. when the
+implementer was blocked).
 
 ## Things not to touch without coordination
 
