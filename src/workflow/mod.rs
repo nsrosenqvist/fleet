@@ -13,5 +13,6 @@
 
 pub mod executor;
 pub mod expr;
+pub mod outcome;
 pub mod spec;
 pub mod validate;

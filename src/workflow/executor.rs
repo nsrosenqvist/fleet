@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::expr::{self, OutputMap};
+use super::outcome::validate_outcome;
 use super::spec::{Node, NodeKind, Workflow};
 use super::validate::validate;
 use crate::agent::AgentRegistry;
@@ -546,6 +547,15 @@ impl WorkflowExecutor {
                     produced_outputs = true;
                 }
                 if let Err(err) = extract_outputs(&artifacts_dir, target, &mut outputs) {
+                    self.mark_failed(req, session, &err);
+                    return Err(err);
+                }
+                // Outcome-convention check: opt-in per node (a node
+                // that declares `outputs.outcome` joins the protocol).
+                // Runs after extraction so the validator sees what the
+                // executor actually committed to the OutputMap, not
+                // the raw artifact bytes.
+                if let Err(err) = validate_outcome(target, &outputs) {
                     self.mark_failed(req, session, &err);
                     return Err(err);
                 }
