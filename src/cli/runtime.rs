@@ -262,6 +262,9 @@ pub fn render_doctor(report: &ProbeReport) -> String {
     out.push_str(&render_backend("git-bug", &report.git_bug));
     out.push_str(&render_backend("tinyproxy", &report.tinyproxy));
 
+    out.push_str("\nBrainstorm:\n");
+    out.push_str(&render_backend("tmux", &report.tmux));
+
     out.push_str("\nRecommended engine: ");
     match report.recommended {
         Some(BackendKind::Podman) => out.push_str("podman\n"),
@@ -333,6 +336,7 @@ mod tests {
             devcontainer_cli: present(BackendKind::DevcontainerCli, "devcontainer 0.1.12"),
             git_bug: present(BackendKind::GitBug, "git-bug version: 0.10.0"),
             tinyproxy: present(BackendKind::Tinyproxy, "tinyproxy 1.11.1"),
+            tmux: present(BackendKind::Tmux, "tmux 3.4"),
             recommended: Some(BackendKind::AppleContainer),
         }
     }
@@ -346,6 +350,7 @@ mod tests {
             devcontainer_cli: absent(BackendKind::DevcontainerCli),
             git_bug: absent(BackendKind::GitBug),
             tinyproxy: absent(BackendKind::Tinyproxy),
+            tmux: absent(BackendKind::Tmux),
             recommended: None,
         }
     }

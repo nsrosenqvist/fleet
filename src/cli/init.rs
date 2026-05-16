@@ -912,6 +912,7 @@ mod tests {
             devcontainer_cli: missing(K::DevcontainerCli),
             git_bug: missing(K::GitBug),
             tinyproxy: missing(K::Tinyproxy),
+            tmux: missing(K::Tmux),
             recommended: None,
         }
     }
@@ -927,6 +928,7 @@ mod tests {
             devcontainer_cli: present_b(K::DevcontainerCli, "0.1.12"),
             git_bug: present_b(K::GitBug, "0.10.0"),
             tinyproxy: present_b(K::Tinyproxy, "1.11.1"),
+            tmux: present_b(K::Tmux, "3.4"),
             recommended: Some(K::Podman),
         };
         assert_eq!(render_bootstrap_section(&r, "linux"), String::new());

@@ -9,15 +9,15 @@ If you're looking for individual-session mechanics, see
 gets permission to mutate the tracker, see
 [`auth.md`](./auth.md#per-tracker-auth).
 
-> **Status.** Phases 1, 2, 3a, 3b, and 4 have shipped — the bridge
-> CLI, the outcome convention, the `tracker-create` workflow node,
-> the `.fleet/deps.json` store, the plans data model + `fleet plan`
-> CLI, `fleet sessions unblock`, tracker-create's cycle check + plan
-> injection, the TUI Plans view + sessions-row plan annotations, and
-> the autonomous supervisor's plan-aware scheduling (with
-> `on_item_failure` policies) are live. The brainstorm agent
-> (Phase 5) is the remaining target. The table at the bottom of
-> this page tracks what's actually in the binary.
+> **Status.** All five phases have landed at the data + plumbing
+> level, with two caveats called out in the table below — the
+> brainstorm tool HTTP server is built and tested but not yet
+> daemonised + wired into the spawn flow (the agent uses fleet's
+> CLI commands directly from the tmux shell for now), and the TUI's
+> Shift+B / brainstorm-row Enter affordances are deferred until the
+> terminal-suspend dance gets wired. The table at the bottom of
+> this page tracks what's actually in the binary, including those
+> gaps.
 
 ## The model in 30 seconds
 
@@ -456,17 +456,29 @@ fleet brainstorm kill <id>        # end session
 ```
 
 Each brainstorm runs inside a tmux session named
-`fleet-brainstorm-<id>` so you can detach and reattach freely (or
-even attach from a second terminal to watch). The transcript is
-captured to `.fleet/planning/<id>/transcript.log`.
+`fleet-brainstorm-<id>` so you can detach (Ctrl-B D) and reattach
+freely from any terminal. The per-session directory at
+`.fleet/planning/<id>/` carries:
+
+- `meta.json` — the `BrainstormSession` value (id, agent, state,
+  tmux session name, server pid, timestamps).
+- `prompt.md` — the system prompt rendered at spawn-time (static
+  template + snapshot of open issues + active plans).
+- `transcript.log` — *reserved*; tmux pipe-pane capture isn't
+  wired in v1.
 
 ### In the TUI
 
-The Sessions view has two sections — Workflows (the executor's
-sessions) and Brainstorms (planning sessions). `Enter` on a
-brainstorm row attaches (TUI temporarily releases the terminal,
-execs `tmux attach`, returns on detach). `Shift+B` spawns a new
-brainstorm. Same nav keys (`j/k`, `r`, `q`).
+The Sessions view's sidebar shows a second section listing every
+known brainstorm session with state markers (◐ active, ⏸
+detached, ✗ closed) — tmux is the source of truth for liveness,
+so an externally-killed pane shows as `closed` even when the
+meta still says Active.
+
+Spawning + attaching from inside the TUI are *not yet wired*
+— they need ratatui's terminal-suspend dance plus a real tmux
+to verify the round-trip. Use the `fleet brainstorm` CLI for
+both today; the TUI surfaces what exists.
 
 ### Typical workflows
 
@@ -565,7 +577,25 @@ cat .fleet/deps.json
 | 3a | Plans data model + `fleet plan` CLI + `fleet sessions unblock` + cycle detection + plan injection | **Shipped** |
 | 3b | TUI Plans view (key `p`) + sessions-row plan annotations + status-line plan count | **Shipped** |
 | 4 | Supervisor plan-aware scheduling + deps-blocked filter + item reconciliation + `on_item_failure` policies | **Shipped** |
-| 5 | Brainstorm agent + TUI attach/detach | Not yet shipped |
+| 5 | Brainstorm agent — tmux integration, `fleet brainstorm {…}` CLI, tool HTTP server (built+tested but not daemonised yet), TUI two-section sidebar | **Shipped (with caveats)** |
+
+**Phase 5 caveats:**
+
+- The brainstorm tool HTTP server (`crate::brainstorm::server`)
+  is fully built + tested (30 inline tests) but is not yet
+  started as part of the `fleet brainstorm` spawn flow. The
+  cleanest design has it run as a detached daemon outliving any
+  single CLI invocation; that orchestration is its own piece of
+  plumbing and lands in a follow-up. For v1, the brainstorm
+  agent has shell access via tmux and uses `fleet plan`,
+  `fleet sessions`, `fleet issues`, etc. directly from inside
+  the pane.
+- The TUI's Shift+B (spawn brainstorm) and Enter-on-brainstorm-
+  row (attach) affordances are deferred — they need ratatui's
+  terminal-suspend dance plus a real tmux to verify. The
+  Brainstorms section in the Sessions sidebar is live and
+  shows state; spawning + attaching go through the
+  `fleet brainstorm` CLI for now.
 
 The implementation plan lives at
 `~/.claude/plans/recursive-careful-orchestrator.md` (contributor-side).

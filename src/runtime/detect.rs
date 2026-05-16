@@ -31,12 +31,17 @@ pub enum BackendKind {
     /// force. Not used by the Linux Podman path, which runs tinyproxy
     /// inside a sidecar container.
     Tinyproxy,
+    /// `tmux` host binary — needed for `fleet brainstorm` interactive
+    /// planning sessions. Not used by workflow execution, so its
+    /// absence is only a problem when the user reaches for the
+    /// brainstorm flow.
+    Tmux,
 }
 
 impl BackendKind {
     pub const fn program(self) -> &'static str {
         use BackendKind::{
-            AppleContainer, DevcontainerCli, Docker, GVisor, GitBug, Podman, Tinyproxy,
+            AppleContainer, DevcontainerCli, Docker, GVisor, GitBug, Podman, Tinyproxy, Tmux,
         };
         match self {
             Podman => "podman",
@@ -46,14 +51,17 @@ impl BackendKind {
             DevcontainerCli => "devcontainer",
             GitBug => "git-bug",
             Tinyproxy => "tinyproxy",
+            Tmux => "tmux",
         }
     }
 
     /// Argv to invoke for the presence-probe. Most tools accept
-    /// `--version`; tinyproxy is the exception (uses `-v`).
+    /// `--version`; tinyproxy is the exception (uses `-v`); tmux
+    /// uses `-V`.
     pub const fn probe_arg(self) -> &'static str {
         match self {
             Self::Tinyproxy => "-v",
+            Self::Tmux => "-V",
             _ => "--version",
         }
     }
@@ -97,6 +105,8 @@ pub struct ProbeReport {
     /// is the chosen egress backend — macOS Apple Container / Docker
     /// with `policy: allowlist`).
     pub tinyproxy: BackendStatus,
+    /// `tmux` binary (host-side, needed for `fleet brainstorm`).
+    pub tmux: BackendStatus,
     /// Recommended *engine* (not hardening or devcontainer CLI). `None`
     /// when nothing usable was found — `fleet doctor` surfaces install hints
     /// in that case.
@@ -143,6 +153,13 @@ impl ProbeReport {
                  (Fedora). Only needed on macOS Apple Container / Docker with \
                  `runtime.network.policy: allowlist`; Linux Podman uses a sidecar \
                  container instead.",
+            );
+        }
+        if !self.tmux.present {
+            hints.push(
+                "tmux missing — `brew install tmux` (macOS) or `apt install tmux` \
+                 (Debian/Ubuntu) / `dnf install tmux` (Fedora). Only needed when \
+                 you run `fleet brainstorm`; workflow sessions don't use it.",
             );
         }
         hints
@@ -203,6 +220,18 @@ impl ProbeReport {
                     .to_string(),
             });
         }
+        if !self.tmux.present {
+            hints.push(BootstrapHint {
+                tool: "tmux".to_string(),
+                command: match os {
+                    "macos" => "brew install tmux".to_string(),
+                    "linux" => "sudo apt install tmux    # or: sudo dnf install tmux".to_string(),
+                    _ => "install tmux from your distro's repos".to_string(),
+                },
+                note: "only needed when running `fleet brainstorm` interactive sessions"
+                    .to_string(),
+            });
+        }
         hints
     }
 }
@@ -226,6 +255,7 @@ pub fn probe(invoker: &dyn ProcessInvoker) -> ProbeReport {
     let devcontainer_cli = probe_one(invoker, BackendKind::DevcontainerCli);
     let git_bug = probe_one(invoker, BackendKind::GitBug);
     let tinyproxy = probe_one(invoker, BackendKind::Tinyproxy);
+    let tmux = probe_one(invoker, BackendKind::Tmux);
 
     // Preference order: Apple Container (strongest isolation, native on
     // macOS 26+) > Podman (rootless + optional gVisor on Linux) > Docker
@@ -244,6 +274,7 @@ pub fn probe(invoker: &dyn ProcessInvoker) -> ProbeReport {
         devcontainer_cli,
         git_bug,
         tinyproxy,
+        tmux,
         recommended,
     }
 }
@@ -383,6 +414,7 @@ mod tests {
             ("devcontainer", "devcontainer 0.1.12"),
             ("git-bug", "git-bug version: 0.10.0"),
             ("tinyproxy", "tinyproxy 1.11.1"),
+            ("tmux", "tmux 3.4"),
         ]));
         assert!(r.install_hints().is_empty());
     }

@@ -221,6 +221,7 @@ mod tests {
             devcontainer_cli: absent(BackendKind::DevcontainerCli),
             git_bug: absent(BackendKind::GitBug),
             tinyproxy: absent(BackendKind::Tinyproxy),
+            tmux: absent(BackendKind::Tmux),
             recommended: None,
         }
     }
