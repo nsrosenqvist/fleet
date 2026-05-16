@@ -778,7 +778,7 @@ impl AppState {
         let root = self.root.clone();
         let list_open = move || -> Result<Vec<crate::session::IssueContext>, String> {
             let issues = tracker.list_issues(&root).map_err(|e| format!("{e:#}"))?;
-            Ok(issues
+            let open: Vec<crate::session::IssueContext> = issues
                 .into_iter()
                 .filter(|i| i.status == "open")
                 .map(|i| crate::session::IssueContext {
@@ -787,7 +787,22 @@ impl AppState {
                     title: i.title,
                     labels: i.labels,
                 })
-                .collect())
+                .collect();
+            // Reorder so active-plan items come first; drop deps-
+            // blocked tickets. Matches the CLI tick exactly so the
+            // TUI's `Shift+A` mode behaves identically to a
+            // scripted `fleet autonomous run --once`. Plan/deps
+            // load failures collapse to empty so a corrupt local
+            // file falls back to the pre-plans behaviour.
+            let plans = crate::plans::store::PlanStore::for_repo(&root)
+                .list_active()
+                .unwrap_or_default();
+            let deps = crate::deps::DepsStore::for_repo(&root)
+                .load()
+                .unwrap_or_default();
+            Ok(crate::autonomous::rank_candidates_by_plan(
+                open, &plans, &deps,
+            ))
         };
         let outcome = self
             .autonomous

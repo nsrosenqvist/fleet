@@ -173,7 +173,7 @@ fn tick(
     let root = setup.repo_root.clone();
     let list_open = move || -> Result<Vec<IssueContext>, String> {
         let issues = tracker.list_issues(&root).map_err(|e| format!("{e:#}"))?;
-        Ok(issues
+        let open: Vec<IssueContext> = issues
             .into_iter()
             .filter(|i| i.status == "open")
             .map(|i| IssueContext {
@@ -182,7 +182,22 @@ fn tick(
                 title: i.title,
                 labels: i.labels,
             })
-            .collect())
+            .collect();
+        // Reorder so active-plan items come first (oldest-plan
+        // priority), and drop tickets currently blocked by an open
+        // dependency or a freeform tag. Plan/deps load failures
+        // collapse to empty — the supervisor falls back to the
+        // pre-plans "any open issue" path rather than aborting the
+        // tick over a corrupt local file.
+        let plans = crate::plans::store::PlanStore::for_repo(&root)
+            .list_active()
+            .unwrap_or_default();
+        let deps = crate::deps::DepsStore::for_repo(&root)
+            .load()
+            .unwrap_or_default();
+        Ok(crate::autonomous::rank_candidates_by_plan(
+            open, &plans, &deps,
+        ))
     };
     let outcome = engine.step(now, &setup.config.autonomous, sessions, list_open);
     if let AutonomousOutcome::Spawn(cmd) = &outcome {

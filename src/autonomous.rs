@@ -24,6 +24,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::deps::{BlockedReason, DepsDoc};
+use crate::plans::{Plan, PlanItemState, PlanState};
 use crate::repo_config::AutonomousConfig;
 use crate::session::{IssueContext, Session, SessionState};
 
@@ -188,6 +190,89 @@ impl AutonomousEngine {
             issue: candidate,
         })
     }
+}
+
+/// Reorder candidate open issues so active-plan items come first,
+/// in plan order, with the oldest plan considered first. Items that
+/// would be blocked by an open dependency (or a freeform tag) are
+/// dropped from the candidate list entirely — they're never going
+/// to make progress on this tick.
+///
+/// Pure free function so both call sites (CLI's `tick` + TUI's
+/// `autonomous_tick`) share the same logic, and tests can pin the
+/// behaviour without standing up the full closure.
+///
+/// Plans considered: `Active` only. Items considered: `Pending`
+/// only (items already `InProgress` are presumably claimed by an
+/// in-flight session; `Completed`/`Skipped`/`Failed` are done). The
+/// fallback "any open issue" tail preserves the pre-plans
+/// behaviour for tickets not currently owned by any active plan.
+#[must_use]
+pub fn rank_candidates_by_plan(
+    open: Vec<IssueContext>,
+    plans: &[Plan],
+    deps: &DepsDoc,
+) -> Vec<IssueContext> {
+    use std::collections::HashSet;
+    let open_set: HashSet<String> = open.iter().map(|i| i.human_id.clone()).collect();
+    let is_blocked = |ticket: &str| ticket_is_blocked(ticket, &open_set, deps);
+
+    let mut prioritized: Vec<IssueContext> = Vec::new();
+    let mut leftover = open;
+
+    // Active plans, oldest-first. The plan author's expectation is
+    // that A → B → C means A goes first; multi-plan ordering is
+    // determined by which plan was created first (a v1 convention
+    // that buys deterministic behaviour without needing a separate
+    // priority field).
+    let mut sorted_plans: Vec<&Plan> = plans
+        .iter()
+        .filter(|p| p.state == PlanState::Active)
+        .collect();
+    sorted_plans.sort_by_key(|p| p.created_at_ms);
+
+    for plan in sorted_plans {
+        for item in &plan.items {
+            if item.state != PlanItemState::Pending {
+                continue;
+            }
+            if is_blocked(&item.ticket_id) {
+                continue;
+            }
+            if let Some(pos) = leftover.iter().position(|i| i.human_id == item.ticket_id) {
+                prioritized.push(leftover.remove(pos));
+            }
+        }
+    }
+    // Append non-blocked leftover (the any-open-issue fallback) so
+    // tickets not currently in any plan still get picked once the
+    // plan queue is exhausted.
+    leftover.retain(|i| !is_blocked(&i.human_id));
+    prioritized.extend(leftover);
+    prioritized
+}
+
+/// `true` iff `ticket` is currently blocked per the deps graph:
+/// either a `Freeform` edge keyed by it exists, or a `Ticket` edge
+/// keyed by it points at a ticket that's still in `open_set`. A
+/// `Ticket` edge whose target has closed (no longer open) is
+/// considered cleared by the scheduler — the deps store keeps the
+/// edge for audit, but it doesn't block scheduling any more.
+#[must_use]
+pub fn ticket_is_blocked(
+    ticket: &str,
+    open_set: &std::collections::HashSet<String>,
+    deps: &DepsDoc,
+) -> bool {
+    deps.edges.iter().any(|e| {
+        if e.blocked != ticket {
+            return false;
+        }
+        match e.reason {
+            BlockedReason::Freeform => true,
+            BlockedReason::Ticket => open_set.contains(&e.blocked_on),
+        }
+    })
 }
 
 /// Returned by [`AutonomousEngine::step`]. Indicates whether the
@@ -647,5 +732,165 @@ mod tests {
             }
             other => panic!("expected Spawn, got {other:?}"),
         }
+    }
+
+    // ---- rank_candidates_by_plan / ticket_is_blocked ------------------
+
+    use crate::deps::{DEPS_SCHEMA_VERSION, DepEdge, DepsDoc};
+    use crate::plans::{Plan, PlanId};
+
+    fn plan_with(id: &str, name: &str, tickets: &[&str], created_at_ms: u64) -> Plan {
+        Plan::new(
+            PlanId::new(id),
+            name,
+            tickets.iter().map(|s| (*s).to_string()).collect(),
+            created_at_ms,
+        )
+    }
+
+    fn empty_deps() -> DepsDoc {
+        DepsDoc::empty()
+    }
+
+    fn deps_with(edges: Vec<DepEdge>) -> DepsDoc {
+        DepsDoc {
+            version: DEPS_SCHEMA_VERSION,
+            edges,
+        }
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_pulls_plan_items_to_the_front_in_order() {
+        let open = vec![issue("99"), issue("43"), issue("42"), issue("100")];
+        let plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        // Plan items first (42, 43 — in plan order), then leftover
+        // (99, 100 — in their original arrival order).
+        assert_eq!(ids, vec!["42", "43", "99", "100"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_uses_oldest_plan_first_across_multiple() {
+        let open = vec![issue("88"), issue("42"), issue("77")];
+        let older = plan_with("plan-A", "first", &["42"], 1_000);
+        let newer = plan_with("plan-B", "second", &["77"], 2_000);
+        // Pass plans in the "wrong" order to confirm the sort fires.
+        let ordered = rank_candidates_by_plan(open, &[newer, older], &empty_deps());
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        assert_eq!(ids, vec!["42", "77", "88"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_skips_non_active_plans() {
+        let open = vec![issue("99"), issue("42")];
+        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        plan.state = PlanState::Paused;
+        let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        // Paused plan doesn't prioritize anything; order is open's
+        // natural order.
+        assert_eq!(ids, vec!["99", "42"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_skips_non_pending_items() {
+        let open = vec![issue("99"), issue("42"), issue("43")];
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        // Item 0 (42) is already in progress; should not be
+        // re-prioritized. Item 1 (43) stays pending.
+        plan.items[0].state = PlanItemState::InProgress;
+        let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        // Only 43 is prioritized; 99 + 42 fall through as leftover.
+        assert_eq!(ids, vec!["43", "99", "42"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_drops_deps_blocked_tickets() {
+        let open = vec![issue("99"), issue("42"), issue("43")];
+        let plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        // 42 → blocked_on 43; 43 is still open, so 42 is blocked.
+        let deps = deps_with(vec![DepEdge {
+            blocked: "42".into(),
+            blocked_on: "43".into(),
+            reason: BlockedReason::Ticket,
+            created_at_ms: 1,
+        }]);
+        let ordered = rank_candidates_by_plan(open, &[plan], &deps);
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        // 42 is filtered out; the plan-prioritized list contains just
+        // 43; leftover (99) trails.
+        assert_eq!(ids, vec!["43", "99"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_clears_ticket_block_when_target_already_closed() {
+        // 42 → blocked_on 99, but 99 isn't in the open list (it has
+        // closed). The edge is still in deps.json (the store doesn't
+        // auto-clear), but the scheduler treats it as cleared.
+        let open = vec![issue("42")];
+        let plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let deps = deps_with(vec![DepEdge {
+            blocked: "42".into(),
+            blocked_on: "99".into(),
+            reason: BlockedReason::Ticket,
+            created_at_ms: 1,
+        }]);
+        let ordered = rank_candidates_by_plan(open, &[plan], &deps);
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        assert_eq!(ids, vec!["42"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_freeform_edges_always_block() {
+        // Freeform blockers (`free:apt-mirror`) only clear via
+        // `fleet sessions unblock`. The scheduler never auto-clears
+        // them.
+        let open = vec![issue("42")];
+        let deps = deps_with(vec![DepEdge {
+            blocked: "42".into(),
+            blocked_on: "free:apt-mirror".into(),
+            reason: BlockedReason::Freeform,
+            created_at_ms: 1,
+        }]);
+        let ordered = rank_candidates_by_plan(open, &[], &deps);
+        assert!(ordered.is_empty(), "got: {ordered:?}");
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_with_no_plans_preserves_open_order() {
+        let open = vec![issue("99"), issue("42"), issue("77")];
+        let ordered = rank_candidates_by_plan(open, &[], &empty_deps());
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        assert_eq!(ids, vec!["99", "42", "77"]);
+    }
+
+    #[test]
+    fn ticket_is_blocked_matches_specifically_keyed_edges() {
+        let deps = deps_with(vec![
+            DepEdge {
+                blocked: "42".into(),
+                blocked_on: "43".into(),
+                reason: BlockedReason::Ticket,
+                created_at_ms: 1,
+            },
+            DepEdge {
+                blocked: "44".into(),
+                blocked_on: "42".into(),
+                reason: BlockedReason::Ticket,
+                created_at_ms: 2,
+            },
+        ]);
+        let open: std::collections::HashSet<String> =
+            ["43".to_string(), "42".to_string()].into_iter().collect();
+        // 42 is blocked (blocked_on 43, which is open).
+        assert!(ticket_is_blocked("42", &open, &deps));
+        // 44 is blocked (blocked_on 42, which is open).
+        assert!(ticket_is_blocked("44", &open, &deps));
+        // 43 isn't blocked — no edge has it as the LHS.
+        assert!(!ticket_is_blocked("43", &open, &deps));
+        // 99 isn't blocked.
+        assert!(!ticket_is_blocked("99", &open, &deps));
     }
 }
