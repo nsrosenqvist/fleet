@@ -515,18 +515,10 @@ pub(super) fn append_deps_lines(
     if !blocked_on.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("Blocked on ({}):", blocked_on.len()),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
         for edge in &blocked_on {
-            let kind = match edge.reason {
-                crate::deps::BlockedReason::Ticket => "ticket",
-                crate::deps::BlockedReason::Freeform => "freeform",
-            };
-            let title_suffix = format_title_suffix(&edge.blocked_on, edge.reason, titles);
-            lines.push(Line::from(format!(
-                "  • {}{title_suffix}  [{kind}]",
-                edge.blocked_on
-            )));
+            lines.push(dep_row(&edge.blocked_on, edge.reason, titles));
         }
     }
     if !blocks.is_empty() {
@@ -535,15 +527,17 @@ pub(super) fn append_deps_lines(
         }
         lines.push(Line::from(Span::styled(
             format!("Blocks ({}):", blocks.len()),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
         for edge in &blocks {
-            let title_suffix = format_title_suffix(
+            // Left-hand side is always a ticket id (only the right
+            // side carries `free:` prefixes for freeform edges), so
+            // pass Ticket reason unconditionally.
+            lines.push(dep_row(
                 &edge.blocked,
                 crate::deps::BlockedReason::Ticket,
                 titles,
-            );
-            lines.push(Line::from(format!("  • {}{title_suffix}", edge.blocked)));
+            ));
         }
     }
     if in_cycle {
@@ -555,19 +549,38 @@ pub(super) fn append_deps_lines(
     }
 }
 
-#[must_use]
-fn format_title_suffix(
+/// One row of the "Blocked on" / "Blocks" list. Composed of styled
+/// spans so the ticket id picks up the IDENT colour used in the items
+/// list and the issue-detail header — the user reads the same id the
+/// same way wherever it appears. Freeform edges use the muted palette
+/// since their `free:<slug>` payload isn't a real ticket reference.
+fn dep_row(
     id: &str,
     reason: crate::deps::BlockedReason,
     titles: &std::collections::HashMap<String, crate::tracker::Issue>,
-) -> String {
-    if matches!(reason, crate::deps::BlockedReason::Freeform) {
-        return String::new();
+) -> Line<'static> {
+    let muted = Style::default().fg(MUTED);
+    let is_freeform = matches!(reason, crate::deps::BlockedReason::Freeform);
+    let id_style = if is_freeform {
+        muted.add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(IDENT).add_modifier(Modifier::BOLD)
+    };
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled("  • ", muted),
+        Span::styled(id.to_string(), id_style),
+    ];
+    if !is_freeform {
+        if let Some(title) = titles.get(id).map(|i| i.title.clone()) {
+            spans.push(Span::styled(" — ", muted));
+            spans.push(Span::raw(title));
+        }
     }
-    titles
-        .get(id)
-        .map(|i| format!(" — {}", i.title))
-        .unwrap_or_default()
+    // Trailing `[ticket]` / `[freeform]` tag in muted so it reads as
+    // an annotation, not part of the row's primary content.
+    let kind = if is_freeform { "freeform" } else { "ticket" };
+    spans.push(Span::styled(format!("  [{kind}]"), muted));
+    Line::from(spans)
 }
 
 #[must_use]
