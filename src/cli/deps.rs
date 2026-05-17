@@ -13,11 +13,25 @@
 //! body in place via the store. Cycles are refused at `add` time
 //! by pre-checking [`crate::deps::would_create_cycle`] against
 //! the proposed edge.
+//!
+//! `add` also posts a pair of cross-link comments — one on the
+//! `blocked` ticket, one on the `blocked_on` ticket — so a human
+//! reading either ticket in the tracker sees the relationship
+//! without consulting fleet's deps render. Freeform-tag edges
+//! only comment on the `blocked` side (the right-hand is a slug,
+//! not a ticket). Unlike the `tracker-create` workflow node, `add`
+//! does not call `Tracker::link_parent`: that encodes a sub-issue
+//! hierarchy and would misrepresent a plain blocks-relationship
+//! between two independently-scoped tickets.
 
 use anyhow::{Context, Result, bail};
+use std::path::Path;
+use std::sync::Arc;
 
 use crate::deps::{BlockedReason, DepEdge, DepsDoc, DepsStore, would_create_cycle};
+use crate::process::{ProcessInvoker, RealProcessInvoker};
 use crate::repo;
+use crate::repo_config::RepoConfig;
 use crate::session::now_ms;
 
 /// `fleet deps list` — human-readable view of every edge in the
@@ -37,14 +51,73 @@ pub fn run_list() -> Result<i32> {
 /// non-empty. Bails on cycle creation (the proposed edge would
 /// close a path from the blocked side back to itself).
 /// Idempotent: re-adding the same edge is a no-op, preserving the
-/// original `created_at_ms`.
+/// original `created_at_ms` and skipping comment posting so retries
+/// don't spam the ticket thread.
+///
+/// Thin shell: resolves the deps store + tracker from the repo
+/// root and delegates the actual work to [`add_dep_edge`] so tests
+/// can drive that function against a tempdir + mock tracker
+/// without touching cwd or `.fleet/config.yaml`.
 pub fn run_add(
     blocked: &str,
     blocked_on: Option<&str>,
     blocked_on_tag: Option<&str>,
 ) -> Result<i32> {
     let edge = build_edge(blocked, blocked_on, blocked_on_tag)?;
-    let store = open_store()?;
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let store = DepsStore::for_repo(&root);
+
+    // Resolve the tracker for cross-link comments. Best-effort: a
+    // missing config or an unimplemented plugin (Linear / Jira)
+    // leaves the edge recordable without comments — the deps graph
+    // is still useful even when the narrative breadcrumb can't be
+    // posted.
+    let config = RepoConfig::load(root.join(".fleet/config.yaml"))
+        .with_context(|| format!("loading repo config under {}", root.display()))?;
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+    let tracker = crate::tracker::build(config.tracker, invoker);
+
+    let outcome = add_dep_edge(&store, tracker.as_deref(), &root, edge)?;
+    print!("{}", render_add_outcome(&outcome));
+    Ok(0)
+}
+
+/// Result of an [`add_dep_edge`] call. Pure value object so tests
+/// (and any future caller wanting a structured report) don't have
+/// to screen-scrape [`render_add_outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddOutcome {
+    pub blocked: String,
+    pub blocked_on: String,
+    pub reason: BlockedReason,
+    pub already_present: bool,
+    /// 0 if the edge was already present (re-add skips commenting)
+    /// or if no tracker was configured; 1 for a freeform-tag edge
+    /// (only the `blocked` side has a ticket to comment on); 2 for
+    /// a ticket→ticket edge.
+    pub comments_posted: u8,
+    /// `false` when the repo's tracker config didn't resolve to an
+    /// adapter (Linear / Jira today). Lets the renderer explain why
+    /// `comments_posted == 0` to the user.
+    pub tracker_available: bool,
+}
+
+/// Record a deps edge plus its cross-link comments. Bails on cycle
+/// creation. Comments are posted *before* the edge is written so a
+/// transient tracker failure leaves both stores intact — the user
+/// re-runs and both halves happen together.
+///
+/// Re-adding an already-present edge is a no-op: no comments, no
+/// store write churn. This keeps `fleet deps add` safe to re-run in
+/// scripts and stops a retry from spamming the ticket with
+/// duplicate breadcrumbs.
+pub fn add_dep_edge(
+    store: &DepsStore,
+    tracker: Option<&dyn crate::tracker::Tracker>,
+    repo_root: &Path,
+    edge: DepEdge,
+) -> Result<AddOutcome> {
     let doc = store.load().context("loading deps file")?;
     if would_create_cycle(&doc, &edge) {
         bail!(
@@ -57,18 +130,89 @@ pub fn run_add(
         .edges
         .iter()
         .any(|e| e.blocked == edge.blocked && e.blocked_on == edge.blocked_on);
+
+    let tracker_available = tracker.is_some();
+    let mut comments_posted: u8 = 0;
+
+    if !already_present {
+        if let Some(tracker) = tracker {
+            let blocked_body = match edge.reason {
+                BlockedReason::Ticket => {
+                    format!("fleet: marked as blocked by #{}", edge.blocked_on)
+                }
+                BlockedReason::Freeform => {
+                    // Strip the on-disk `free:` prefix for display:
+                    // a human reader thinks of the tag as the slug
+                    // they passed on the CLI, not the internal form.
+                    let tag = edge
+                        .blocked_on
+                        .strip_prefix("free:")
+                        .unwrap_or(&edge.blocked_on);
+                    format!("fleet: marked as blocked on external tag `{tag}`")
+                }
+            };
+            tracker
+                .comment(repo_root, &edge.blocked, &blocked_body)
+                .with_context(|| {
+                    format!(
+                        "posting cross-link comment on `{}` (blocked side)",
+                        edge.blocked
+                    )
+                })?;
+            comments_posted += 1;
+
+            // The right-hand side only has a ticket when the edge is
+            // ticket→ticket. Freeform tags are slugs, not tickets.
+            if matches!(edge.reason, BlockedReason::Ticket) {
+                let blocked_on_body = format!("fleet: marked as blocking #{}", edge.blocked);
+                tracker
+                    .comment(repo_root, &edge.blocked_on, &blocked_on_body)
+                    .with_context(|| {
+                        format!(
+                            "posting cross-link comment on `{}` (blocked_on side)",
+                            edge.blocked_on
+                        )
+                    })?;
+                comments_posted += 1;
+            }
+        }
+    }
+
     store
         .add_edge(edge.clone())
         .with_context(|| format!("recording edge `{} → {}`", edge.blocked, edge.blocked_on))?;
-    if already_present {
-        println!(
-            "edge `{} → {}` already recorded — left in place",
-            edge.blocked, edge.blocked_on
+
+    Ok(AddOutcome {
+        blocked: edge.blocked,
+        blocked_on: edge.blocked_on,
+        reason: edge.reason,
+        already_present,
+        comments_posted,
+        tracker_available,
+    })
+}
+
+/// Render the user-visible summary of an [`AddOutcome`]. Always
+/// ends in a single `\n` so the CLI `print!` matches the
+/// `render_list` / `render_unblock_outcome` shape.
+#[must_use]
+pub fn render_add_outcome(o: &AddOutcome) -> String {
+    if o.already_present {
+        return format!(
+            "edge `{} → {}` already recorded — left in place\n",
+            o.blocked, o.blocked_on
         );
-    } else {
-        println!("added edge: {} → {}", edge.blocked, edge.blocked_on);
     }
-    Ok(0)
+    let suffix: String = if !o.tracker_available {
+        " (no tracker configured for this repo — cross-link comments skipped)".to_string()
+    } else {
+        match o.comments_posted {
+            0 => String::new(),
+            1 => "; posted 1 cross-link comment".to_string(),
+            n => format!("; posted {n} cross-link comments"),
+        }
+    };
+    format!("added edge: {} → {}{}\n", o.blocked, o.blocked_on, suffix)
 }
 
 /// `fleet deps remove <blocked> --blocked-on <id>` or
@@ -260,5 +404,277 @@ mod tests {
     fn resolve_blocked_on_prefixes_freeform_tag() {
         let s = resolve_blocked_on(None, Some("apt-mirror")).unwrap();
         assert_eq!(s, "free:apt-mirror");
+    }
+
+    // ---- add_dep_edge ---------------------------------------------
+
+    use crate::tracker::{Issue, Tracker};
+    use std::sync::Mutex;
+
+    /// Minimal mock that records every `comment` call. `fail_after`
+    /// makes the *next* call return an error so tests can exercise
+    /// the "tracker post failed, don't record edge" path. Other
+    /// `Tracker` methods are left at the trait default (which bails)
+    /// — anything that reaches for them is a test bug.
+    struct CommentRecordingTracker {
+        calls: Mutex<Vec<(String, String)>>,
+        fail_after: Mutex<Option<usize>>,
+    }
+
+    impl CommentRecordingTracker {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail_after: Mutex::new(None),
+            }
+        }
+
+        fn failing_after(n: usize) -> Self {
+            let t = Self::new();
+            *t.fail_after.lock().unwrap() = Some(n);
+            t
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Tracker for CommentRecordingTracker {
+        fn name(&self) -> &'static str {
+            "mock-comment-recording"
+        }
+        fn list_issues(&self, _: &Path) -> Result<Vec<Issue>> {
+            Ok(Vec::new())
+        }
+        fn comment(&self, _: &Path, id: &str, body: &str) -> Result<()> {
+            let count = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push((id.to_string(), body.to_string()));
+                calls.len()
+            };
+            if let Some(n) = *self.fail_after.lock().unwrap() {
+                if count > n {
+                    bail!("forced comment failure");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn ticket_edge(blocked: &str, blocked_on: &str) -> DepEdge {
+        DepEdge {
+            blocked: blocked.to_string(),
+            blocked_on: blocked_on.to_string(),
+            reason: BlockedReason::Ticket,
+            created_at_ms: 1,
+        }
+    }
+
+    fn freeform_edge(blocked: &str, tag: &str) -> DepEdge {
+        DepEdge {
+            blocked: blocked.to_string(),
+            blocked_on: format!("free:{tag}"),
+            reason: BlockedReason::Freeform,
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn add_dep_edge_posts_a_comment_on_both_tickets_for_ticket_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        let tracker = CommentRecordingTracker::new();
+        let outcome = add_dep_edge(
+            &store,
+            Some(&tracker as &dyn Tracker),
+            dir.path(),
+            ticket_edge("42", "43"),
+        )
+        .unwrap();
+
+        assert!(!outcome.already_present);
+        assert_eq!(outcome.comments_posted, 2);
+        assert!(outcome.tracker_available);
+
+        let calls = tracker.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "42");
+        assert!(calls[0].1.contains("blocked by #43"), "got: {}", calls[0].1);
+        assert_eq!(calls[1].0, "43");
+        assert!(calls[1].1.contains("blocking #42"), "got: {}", calls[1].1);
+
+        // Edge was actually written.
+        let doc = store.load().unwrap();
+        assert_eq!(doc.edges.len(), 1);
+        assert_eq!(doc.edges[0].blocked, "42");
+        assert_eq!(doc.edges[0].blocked_on, "43");
+    }
+
+    #[test]
+    fn add_dep_edge_posts_only_blocked_side_comment_for_freeform_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        let tracker = CommentRecordingTracker::new();
+        let outcome = add_dep_edge(
+            &store,
+            Some(&tracker as &dyn Tracker),
+            dir.path(),
+            freeform_edge("42", "apt-mirror"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.comments_posted, 1);
+        let calls = tracker.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "42");
+        // Comment uses the user-facing slug, not the on-disk `free:` form.
+        assert!(
+            calls[0].1.contains("`apt-mirror`"),
+            "expected slug rendering, got: {}",
+            calls[0].1
+        );
+        assert!(
+            !calls[0].1.contains("free:apt-mirror"),
+            "should strip the `free:` prefix for display, got: {}",
+            calls[0].1
+        );
+    }
+
+    #[test]
+    fn add_dep_edge_skips_comments_on_idempotent_re_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        let tracker = CommentRecordingTracker::new();
+
+        // First call: posts both comments.
+        add_dep_edge(
+            &store,
+            Some(&tracker as &dyn Tracker),
+            dir.path(),
+            ticket_edge("42", "43"),
+        )
+        .unwrap();
+        assert_eq!(tracker.calls().len(), 2);
+
+        // Second call with the same pair: no new comments.
+        let outcome = add_dep_edge(
+            &store,
+            Some(&tracker as &dyn Tracker),
+            dir.path(),
+            ticket_edge("42", "43"),
+        )
+        .unwrap();
+        assert!(outcome.already_present);
+        assert_eq!(outcome.comments_posted, 0);
+        assert_eq!(tracker.calls().len(), 2, "should not re-post on a re-add");
+    }
+
+    #[test]
+    fn add_dep_edge_records_edge_when_no_tracker_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+
+        let outcome = add_dep_edge(&store, None, dir.path(), ticket_edge("42", "43")).unwrap();
+
+        assert!(!outcome.tracker_available);
+        assert_eq!(outcome.comments_posted, 0);
+        // The edge still landed; the dep graph is useful on its own.
+        let doc = store.load().unwrap();
+        assert_eq!(doc.edges.len(), 1);
+    }
+
+    #[test]
+    fn add_dep_edge_bails_and_does_not_record_edge_when_comment_post_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        // First comment succeeds, second fails — exercises the "edge
+        // not recorded after a partial comment posting" guarantee.
+        let tracker = CommentRecordingTracker::failing_after(1);
+
+        let err = add_dep_edge(
+            &store,
+            Some(&tracker as &dyn Tracker),
+            dir.path(),
+            ticket_edge("42", "43"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked_on side"),
+            "got: {err:#}"
+        );
+
+        // No edge was recorded — the user can retry once the tracker
+        // is reachable again and both halves will land together.
+        let doc = store.load().unwrap();
+        assert_eq!(doc.edges.len(), 0);
+    }
+
+    #[test]
+    fn add_dep_edge_refuses_cycle_creating_edges_and_skips_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DepsStore::at(dir.path().join("deps.json"));
+        // Seed: 43 → 42 already exists; proposing 42 → 43 would close
+        // a cycle.
+        store.add_edge(ticket_edge("43", "42")).unwrap();
+        let tracker = CommentRecordingTracker::new();
+
+        let err = add_dep_edge(
+            &store,
+            Some(&tracker as &dyn Tracker),
+            dir.path(),
+            ticket_edge("42", "43"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cycle"), "got: {err:#}");
+        assert_eq!(
+            tracker.calls().len(),
+            0,
+            "must not post comments before the cycle check passes"
+        );
+    }
+
+    #[test]
+    fn render_add_outcome_mentions_comment_count_for_ticket_edges() {
+        let o = AddOutcome {
+            blocked: "42".to_string(),
+            blocked_on: "43".to_string(),
+            reason: BlockedReason::Ticket,
+            already_present: false,
+            comments_posted: 2,
+            tracker_available: true,
+        };
+        let s = render_add_outcome(&o);
+        assert!(s.contains("added edge: 42 → 43"), "got: {s}");
+        assert!(s.contains("2 cross-link comments"), "got: {s}");
+    }
+
+    #[test]
+    fn render_add_outcome_calls_out_missing_tracker() {
+        let o = AddOutcome {
+            blocked: "42".to_string(),
+            blocked_on: "43".to_string(),
+            reason: BlockedReason::Ticket,
+            already_present: false,
+            comments_posted: 0,
+            tracker_available: false,
+        };
+        let s = render_add_outcome(&o);
+        assert!(s.contains("no tracker configured"), "got: {s}");
+    }
+
+    #[test]
+    fn render_add_outcome_already_present_says_left_in_place() {
+        let o = AddOutcome {
+            blocked: "42".to_string(),
+            blocked_on: "43".to_string(),
+            reason: BlockedReason::Ticket,
+            already_present: true,
+            comments_posted: 0,
+            tracker_available: true,
+        };
+        let s = render_add_outcome(&o);
+        assert!(s.contains("already recorded"), "got: {s}");
+        assert!(s.contains("left in place"), "got: {s}");
     }
 }

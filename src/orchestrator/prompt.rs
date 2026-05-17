@@ -197,6 +197,12 @@ calls.
 would close a path back to itself, you'll see a clear error and no
 edge will be recorded.
 
+`fleet deps add` also posts cross-link comments on both tickets
+(or just the `blocked` side for a freeform-tag edge) so a human
+browsing either ticket in the tracker sees the relationship
+without consulting fleet. Re-adding the same edge is a quiet
+no-op — no duplicate comments on retry.
+
 ## Behaviour expectations
 
 - **Confirm before any write.** State the proposed action ("I'm
