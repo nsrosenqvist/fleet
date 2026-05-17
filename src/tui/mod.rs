@@ -2107,6 +2107,63 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_active_pane_border_uses_accent_color() {
+        // Visual focus contract: the active sidebar pane gets an
+        // ACCENT-coloured border; the inactive one stays MUTED.
+        // Matches the convention the Plans view already uses, so
+        // the user can tell at a glance which pane j/k targets.
+        use super::theme::{ACCENT, MUTED};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-1", "wf", SessionState::Running, 100))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        assert_eq!(state.sessions_focus, SessionsFocus::Workflows);
+
+        // Sidebar lives in the left 35% of the body row. With a
+        // 24-row layout: row 0 is the breadcrumb, rows 1..4 are
+        // the 3-row orchestrator pane, row 4 is the top border of
+        // the workers pane below.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        let orchestrator_border_fg = buf[(0_u16, 1_u16)].fg;
+        let workers_border_fg = buf[(0_u16, 4_u16)].fg;
+        assert_eq!(
+            workers_border_fg, ACCENT,
+            "workers focused → its border should be ACCENT",
+        );
+        assert_eq!(
+            orchestrator_border_fg, MUTED,
+            "orchestrator unfocused → its border should be MUTED",
+        );
+
+        // Tab → focus moves to orchestrator; border colours invert.
+        let _ = state.handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        let orchestrator_border_fg = buf[(0_u16, 1_u16)].fg;
+        let workers_border_fg = buf[(0_u16, 4_u16)].fg;
+        assert_eq!(
+            orchestrator_border_fg, ACCENT,
+            "orchestrator focused → its border should be ACCENT",
+        );
+        assert_eq!(
+            workers_border_fg, MUTED,
+            "workers unfocused → its border should be MUTED",
+        );
+    }
+
+    #[test]
     fn fresh_repo_with_workers_defaults_focus_to_workflows() {
         // When workers exist on first load, the default focus
         // stays on the Workflows pane (the more dynamic content),
