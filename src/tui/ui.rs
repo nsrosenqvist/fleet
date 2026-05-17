@@ -7,34 +7,44 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 
 use crate::brainstorm::{BrainstormSession, BrainstormState};
 use crate::plans::{Plan, PlanItemState, PlanState};
 use crate::session::{Session, SessionState};
 
 use super::app::{AppState, Overlay, PlansFocus, SessionsFocus, View};
+use super::theme::{
+    ACCENT, ERR, MUTED, OK, SELECT_BG, SELECT_FG, WARN, badge, chip, framed_block,
+    framed_block_titled, key as theme_key, kv_line, modal_key, sep,
+};
 
 /// Full-frame render entry point. Called once per event-loop tick from
 /// [`super::terminal::run`].
 pub(super) fn render(f: &mut Frame<'_>, state: &AppState) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1), // breadcrumb
+            Constraint::Min(0),    // body
+            Constraint::Length(1), // status bar
+        ])
         .split(f.area());
+    render_breadcrumb(f, outer[0], state);
+    let body_area = outer[1];
     match state.view {
         View::Sessions | View::Spawn => {
             let body = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-                .split(outer[0]);
+                .split(body_area);
             render_sidebar(f, body[0], state);
             render_detail(f, body[1], state);
         }
         View::Doctor => {
-            render_doctor(f, outer[0], state);
+            render_doctor(f, body_area, state);
         }
         View::Plans => {
             let body = Layout::default()
@@ -44,67 +54,139 @@ pub(super) fn render(f: &mut Frame<'_>, state: &AppState) {
                     Constraint::Percentage(40),
                     Constraint::Percentage(35),
                 ])
-                .split(outer[0]);
+                .split(body_area);
             render_plans_sidebar(f, body[0], state);
             render_plans_detail(f, body[1], state);
             render_plans_ticket(f, body[2], state);
         }
     }
     if state.view == View::Spawn {
-        let modal = centered_rect(outer[0], 60, 60);
+        let modal = centered_rect(body_area, 60, 60);
         f.render_widget(Clear, modal);
         render_spawn(f, modal, state);
     }
     match &state.overlay {
         Overlay::Confirm { prompt, .. } => {
-            let modal = centered_rect(outer[0], 50, 30);
+            let modal = centered_rect(body_area, 50, 30);
             f.render_widget(Clear, modal);
             render_confirm(f, modal, prompt);
         }
         Overlay::Error { message } => {
-            let modal = centered_rect(outer[0], 50, 25);
+            let modal = centered_rect(body_area, 50, 25);
             f.render_widget(Clear, modal);
             render_error(f, modal, message);
         }
         Overlay::None => {}
     }
-    render_status(f, outer[1], state);
+    render_status(f, outer[2], state);
+}
+
+/// Top breadcrumb row. Left side: `fleet | <repo> | <session-id> <state>`
+/// (or `(no sessions)` when nothing's selected). Right side: a pair of
+/// dot badges for the runtime adapter (probed at startup) and the
+/// autonomous engine (off until `Shift+A`).
+fn render_breadcrumb(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(22)])
+        .split(area);
+
+    let repo_chip = state
+        .root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fleet");
+    let muted = Style::default().fg(MUTED);
+    let mut left: Vec<Span<'_>> = vec![
+        chip("fleet", ACCENT),
+        Span::styled(" | ", muted),
+        chip(repo_chip, ACCENT),
+        Span::styled(" | ", muted),
+    ];
+    match state.selected() {
+        Some(s) => {
+            left.push(Span::raw(s.id.to_string()));
+            left.push(Span::raw(" "));
+            left.push(Span::styled(state_word(s.state).to_string(), muted));
+        }
+        None => {
+            left.push(Span::styled("(no sessions)", muted));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(left)), cols[0]);
+
+    // Right: runtime + autonomous dots. `runtime:●` derives from the
+    // doctor snapshot probed in `terminal::run`; muted when missing
+    // (e.g. tests that bypass `run`). `auto:●` is green when the
+    // engine is on, muted when off.
+    let runtime_color = match state.doctor.as_ref() {
+        Some(d) if d.adapter.is_ok() => OK,
+        Some(_) => ERR,
+        None => MUTED,
+    };
+    let auto_color = if state.autonomous.enabled() { OK } else { MUTED };
+    let right = Line::from(vec![
+        Span::styled("runtime", muted),
+        Span::raw(":"),
+        Span::styled("●", Style::default().fg(runtime_color)),
+        Span::raw("  "),
+        Span::styled("auto", muted),
+        Span::raw(":"),
+        Span::styled("●", Style::default().fg(auto_color)),
+        Span::raw(" "),
+    ]);
+    f.render_widget(
+        Paragraph::new(right).alignment(ratatui::layout::Alignment::Right),
+        cols[1],
+    );
 }
 
 fn render_confirm(f: &mut Frame<'_>, area: Rect, prompt: &str) {
-    let mut lines: Vec<Line<'static>> = prompt.lines().map(|l| Line::from(l.to_string())).collect();
+    let muted = Style::default().fg(MUTED);
+    let mut lines: Vec<Line<'static>> = prompt
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default())))
+        .collect();
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "[y] yes    [n / Esc] cancel",
-        Style::default().fg(Color::Yellow),
-    )));
-    let body = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Confirm ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: false });
+    lines.push(Line::from(vec![
+        modal_key("y"),
+        Span::styled(" yes    ", muted),
+        modal_key("n"),
+        Span::styled(" / ", muted),
+        modal_key("esc"),
+        Span::styled(" cancel", muted),
+    ]));
+    let title = Line::from(Span::styled(
+        " Confirm ",
+        Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(WARN))
+        .title(title)
+        .padding(Padding::horizontal(2));
+    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
 
 fn render_error(f: &mut Frame<'_>, area: Rect, message: &str) {
+    let muted = Style::default().fg(MUTED);
     let mut lines: Vec<Line<'static>> =
         message.lines().map(|l| Line::from(l.to_string())).collect();
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "press any key to dismiss",
-        Style::default().fg(Color::DarkGray),
-    )));
-    let body = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Error ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
-        )
-        .wrap(Wrap { trim: false });
+    lines.push(Line::from(Span::styled("press any key to dismiss", muted)));
+    let title = Line::from(Span::styled(
+        " Error ",
+        Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ERR))
+        .title(title)
+        .padding(Padding::horizontal(2));
+    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
 
@@ -133,9 +215,13 @@ pub fn centered_rect(parent: Rect, pct_x: u16, pct_y: u16) -> Rect {
 }
 
 fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let block = Block::default().title(" Doctor ").borders(Borders::ALL);
+    let block = framed_block(" doctor ").padding(Padding::horizontal(2));
     let Some(snapshot) = state.doctor.as_ref() else {
-        let body = Paragraph::new("(probing host...)").block(block);
+        let body = Paragraph::new(Span::styled(
+            "(probing host...)",
+            Style::default().fg(MUTED),
+        ))
+        .block(block);
         f.render_widget(body, area);
         return;
     };
@@ -154,7 +240,7 @@ fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     lines.push(Line::from(Span::styled(
         "runtime adapter:",
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
     lines.push(kv_line(
         "configured",
@@ -169,8 +255,8 @@ fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         }
         Err(msg) => {
             lines.push(Line::from(vec![
-                Span::styled("resolved  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(msg.clone(), Style::default().fg(Color::Red)),
+                Span::styled(format!("{:<14}", "resolved"), Style::default().fg(MUTED)),
+                Span::styled(msg.clone(), Style::default().fg(ERR)),
             ]));
         }
     }
@@ -178,12 +264,12 @@ fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     lines.push(Line::from(Span::styled(
         "agents:",
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
     if snapshot.agents.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (none)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(MUTED),
         )));
     } else {
         for (name, env) in &snapshot.agents {
@@ -206,17 +292,26 @@ fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let block = Block::default()
-        .title(" Spawn workflow ")
-        .borders(Borders::ALL);
+    let block = framed_block(" spawn workflow ").padding(Padding::horizontal(2));
     if state.spawn_workflows.is_empty() {
-        let body = Paragraph::new(
-            "(no workflows found under .fleet/workflows/)\n\n\
-             Run `fleet init` to scaffold the default standard / hotfix / review-only\n\
-             workflows, or drop a `<name>.yaml` into `.fleet/workflows/` by hand.",
-        )
-        .block(block)
-        .wrap(Wrap { trim: false });
+        let muted = Style::default().fg(MUTED);
+        let lines = vec![
+            Line::from(Span::styled(
+                "(no workflows found under .fleet/workflows/)",
+                muted,
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Run `fleet init` to scaffold the default standard / hotfix /",
+                muted,
+            )),
+            Line::from(Span::styled(
+                "review-only workflows, or drop a `<name>.yaml` into",
+                muted,
+            )),
+            Line::from(Span::styled("`.fleet/workflows/` by hand.", muted)),
+        ];
+        let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
         f.render_widget(body, area);
         return;
     }
@@ -229,23 +324,32 @@ fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .block(block)
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .fg(SELECT_FG)
+                .bg(SELECT_BG)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("> ");
+        .highlight_symbol("▸ ");
     let mut list_state = state.spawn_list_state.clone();
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn render_plans_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let title = format!(" Plans ({}) ", state.plans.len());
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let title = format!(" plans ({}) ", state.plans.len());
+    let block = framed_block(&title);
     if state.plans.is_empty() {
-        let body = Paragraph::new(
-            "(no plans yet)\n\nUse `fleet plan new \"<name>\" --tickets a,b,c` to create one.",
-        )
-        .block(block)
-        .wrap(Wrap { trim: false });
+        let muted = Style::default().fg(MUTED);
+        let lines = vec![
+            Line::from(Span::styled("(no plans yet)", muted)),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Use `fleet plan new \"<name>\" --tickets a,b,c`",
+                muted,
+            )),
+            Line::from(Span::styled("to create one.", muted)),
+        ];
+        let body = Paragraph::new(lines)
+            .block(block.padding(Padding::horizontal(2)))
+            .wrap(Wrap { trim: false });
         f.render_widget(body, area);
         return;
     }
@@ -263,23 +367,23 @@ fn render_plans_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .block(block)
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .fg(SELECT_FG)
+                .bg(SELECT_BG)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("> ");
+        .highlight_symbol("▸ ");
     let mut list_state = state.plans_list_state.clone();
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let Some(plan) = state.selected_plan() else {
-        let body = Paragraph::new("Select a plan — j/k or arrows. r refresh, Esc/p back, q quit.")
-            .block(
-                Block::default()
-                    .title(" Plan detail ")
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false });
+        let body = Paragraph::new(Line::from(Span::styled(
+            "Select a plan — j/k or arrows. r refresh, Esc/p back, q quit.",
+            Style::default().fg(MUTED),
+        )))
+        .block(framed_block(" plan detail ").padding(Padding::horizontal(2)))
+        .wrap(Wrap { trim: false });
         f.render_widget(body, area);
         return;
     };
@@ -288,12 +392,27 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     } else {
         None
     };
-    let title = if state.plans_focus == PlansFocus::Items {
-        format!(" {} · items ", plan.id)
+    // Mirror keel's info-panel header: bold-accent name + italic-dim
+    // kind tag.
+    let kind = if state.plans_focus == PlansFocus::Items {
+        "items"
     } else {
-        format!(" {} ", plan.id)
+        "plan"
     };
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            plan.id.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            kind,
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        ),
+        Span::raw(" "),
+    ]);
+    let block = framed_block_titled(title).padding(Padding::horizontal(2));
     let body = Paragraph::new(plan_detail_lines(plan, selected_item, &state.tickets_by_id))
         .block(block)
         .wrap(Wrap { trim: false });
@@ -301,11 +420,9 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn render_plans_ticket(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let block = Block::default().title(" Ticket ").borders(Borders::ALL);
+    let block = framed_block(" ticket ").padding(Padding::horizontal(2));
     let lines = ticket_detail_lines(state);
-    let body = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
 
@@ -315,46 +432,35 @@ fn render_plans_ticket(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 /// rendered surface without a ratatui Frame.
 #[must_use]
 pub(super) fn ticket_detail_lines(state: &AppState) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(MUTED);
     if state.plans_focus == PlansFocus::Sidebar {
         return vec![Line::from(Span::styled(
             "Tab to focus items, then j/k to navigate. Selected item's tracker issue will appear here.",
-            Style::default().fg(Color::DarkGray),
+            muted,
         ))];
     }
     let Some(plan) = state.selected_plan() else {
-        return vec![Line::from(Span::styled(
-            "(no plan selected)",
-            Style::default().fg(Color::DarkGray),
-        ))];
+        return vec![Line::from(Span::styled("(no plan selected)", muted))];
     };
     let Some(item_idx) = state.plans_items_state.selected() else {
-        return vec![Line::from(Span::styled(
-            "(plan has no items)",
-            Style::default().fg(Color::DarkGray),
-        ))];
+        return vec![Line::from(Span::styled("(plan has no items)", muted))];
     };
     let Some(item) = plan.items.get(item_idx) else {
-        return vec![Line::from(Span::styled(
-            "(item index out of range)",
-            Style::default().fg(Color::DarkGray),
-        ))];
+        return vec![Line::from(Span::styled("(item index out of range)", muted))];
     };
     let ticket_id = &item.ticket_id;
     let mut lines = match state.focused_issue_cache.get(ticket_id) {
         None => vec![
             kv_line("ticket", ticket_id),
             Line::from(""),
-            Line::from(Span::styled(
-                "(fetching…)",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled("(fetching…)", muted)),
         ],
         Some(Err(msg)) => vec![
             kv_line("ticket", ticket_id),
             Line::from(""),
             Line::from(Span::styled(
                 format!("tracker read failed: {msg}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(ERR),
             )),
         ],
         Some(Ok(detail)) => issue_detail_lines(detail),
@@ -432,7 +538,7 @@ pub(super) fn append_deps_lines(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "⚠  Part of a deps cycle — supervisor can't auto-resolve.",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(WARN),
         )));
     }
 }
@@ -475,7 +581,7 @@ pub(super) fn issue_detail_lines(detail: &crate::tracker::IssueDetail) -> Vec<Li
     if detail.body.trim().is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no body)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(MUTED),
         )));
     } else {
         for line in detail.body.lines() {
@@ -504,9 +610,9 @@ pub(super) fn plan_row_label(plan: &Plan, cycle_nodes: &std::collections::HashSe
 #[must_use]
 fn plan_row_style(plan: &Plan) -> Style {
     match plan.state {
-        PlanState::Active => Style::default().fg(Color::Green),
-        PlanState::Paused => Style::default().fg(Color::Yellow),
-        PlanState::Completed | PlanState::Abandoned => Style::default().fg(Color::DarkGray),
+        PlanState::Active => Style::default().fg(OK),
+        PlanState::Paused => Style::default().fg(WARN),
+        PlanState::Completed | PlanState::Abandoned => Style::default().fg(MUTED),
     }
 }
 
@@ -539,7 +645,7 @@ pub(super) fn plan_detail_lines(
     out.push(Line::from(""));
     out.push(Line::from(Span::styled(
         format!("Items ({total})"),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(MUTED),
     )));
     use std::fmt::Write as _;
     for (idx, item) in plan.items.iter().enumerate() {
@@ -604,9 +710,9 @@ fn plan_item_marker(state: PlanItemState) -> &'static str {
 fn plan_item_style(state: PlanItemState) -> Style {
     match state {
         PlanItemState::Pending => Style::default(),
-        PlanItemState::InProgress => Style::default().fg(Color::Cyan),
-        PlanItemState::Completed | PlanItemState::Skipped => Style::default().fg(Color::DarkGray),
-        PlanItemState::Failed => Style::default().fg(Color::Red),
+        PlanItemState::InProgress => Style::default().fg(ACCENT),
+        PlanItemState::Completed | PlanItemState::Skipped => Style::default().fg(MUTED),
+        PlanItemState::Failed => Style::default().fg(ERR),
     }
 }
 
@@ -621,23 +727,40 @@ pub(super) fn plan_failure_word(policy: crate::plans::ItemFailurePolicy) -> &'st
 
 fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let title = if state.brainstorms.is_empty() {
-        format!(" Sessions ({}) ", state.sessions.len())
+        format!(" sessions ({}) ", state.sessions.len())
     } else {
         format!(
-            " Sessions ({}) · Brainstorms ({}) ",
+            " sessions ({}) · brainstorms ({}) ",
             state.sessions.len(),
             state.brainstorms.len(),
         )
     };
-    let outer = Block::default().title(title).borders(Borders::ALL);
+    let outer = framed_block(&title);
     if state.sessions.is_empty() && state.brainstorms.is_empty() {
-        let body = Paragraph::new(
-            "(no sessions)\n\n\
-             Use `fleet workflow run <name>` from the shell to create a workflow session, \
-             or `fleet brainstorm` for an interactive planning session.",
-        )
-        .block(outer)
-        .wrap(Wrap { trim: false });
+        let muted = Style::default().fg(MUTED);
+        let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let lines = vec![
+            Line::from(Span::styled("(no sessions yet)", muted)),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("n", bold_key),
+                Span::styled("       open the workflow picker", muted),
+            ]),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("B", bold_key),
+                Span::styled("       start a brainstorm (Shift+B)", muted),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Or from a shell:  fleet workflow run <name>",
+                muted,
+            )),
+        ];
+        let body = Paragraph::new(lines)
+            .block(outer.padding(Padding::horizontal(2)))
+            .wrap(Wrap { trim: false });
         f.render_widget(body, area);
         return;
     }
@@ -685,7 +808,7 @@ fn render_workflow_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let mut items: Vec<ListItem<'_>> = Vec::with_capacity(state.sessions.len() + 1);
     items.push(ListItem::new(Span::styled(
         "── Workflows ──".to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(MUTED),
     )));
     for s in &state.sessions {
         items.push(ListItem::new(Span::styled(
@@ -695,14 +818,15 @@ fn render_workflow_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
     let highlight = if state.sessions_focus == SessionsFocus::Workflows {
         Style::default()
-            .bg(Color::DarkGray)
+            .fg(SELECT_FG)
+            .bg(SELECT_BG)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
     let list = List::new(items)
         .highlight_style(highlight)
-        .highlight_symbol("> ");
+        .highlight_symbol("▸ ");
     let mut shifted = state.list_state.clone();
     if let Some(i) = shifted.selected() {
         shifted.select(Some(i + 1));
@@ -714,7 +838,7 @@ fn render_brainstorm_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let mut items: Vec<ListItem<'_>> = Vec::with_capacity(state.brainstorms.len() + 1);
     items.push(ListItem::new(Span::styled(
         "── Brainstorms ──".to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(MUTED),
     )));
     for b in &state.brainstorms {
         items.push(ListItem::new(Span::styled(
@@ -724,14 +848,15 @@ fn render_brainstorm_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
     let highlight = if state.sessions_focus == SessionsFocus::Brainstorms {
         Style::default()
-            .bg(Color::DarkGray)
+            .fg(SELECT_FG)
+            .bg(SELECT_BG)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
     let list = List::new(items)
         .highlight_style(highlight)
-        .highlight_symbol("> ");
+        .highlight_symbol("▸ ");
     let mut shifted = state.brainstorms_list_state.clone();
     if let Some(i) = shifted.selected() {
         shifted.select(Some(i + 1));
@@ -753,9 +878,9 @@ pub fn brainstorm_row_label(session: &BrainstormSession) -> String {
 #[must_use]
 fn brainstorm_row_style(state: BrainstormState) -> Style {
     match state {
-        BrainstormState::Active => Style::default().fg(Color::Cyan),
-        BrainstormState::Detached => Style::default().fg(Color::Yellow),
-        BrainstormState::Closed => Style::default().fg(Color::DarkGray),
+        BrainstormState::Active => Style::default().fg(ACCENT),
+        BrainstormState::Detached => Style::default().fg(WARN),
+        BrainstormState::Closed => Style::default().fg(MUTED),
     }
 }
 
@@ -835,12 +960,39 @@ fn plan_annotation_for(session: &Session, plans: &[Plan]) -> Option<String> {
 }
 
 fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let muted = Style::default().fg(MUTED);
+    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     let Some(session) = state.selected() else {
-        let body = Paragraph::new(
-            "Select a session — j/k or arrows. r refresh, Shift+K mark failed, q quit.",
-        )
-        .block(Block::default().title(" Detail ").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
+        let lines = vec![
+            Line::from(Span::styled(
+                "Select a session, or use one of:",
+                muted,
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("j/k", bold_key),
+                Span::styled("     navigate", muted),
+            ]),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("r", bold_key),
+                Span::styled("       reload from disk", muted),
+            ]),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("Shift+K", bold_key),
+                Span::styled(" mark selected session failed", muted),
+            ]),
+            Line::from(vec![
+                Span::styled("  ", muted),
+                Span::styled("q", bold_key),
+                Span::styled("       quit", muted),
+            ]),
+        ];
+        let body = Paragraph::new(lines)
+            .block(framed_block(" detail ").padding(Padding::horizontal(2)))
+            .wrap(Wrap { trim: false });
         f.render_widget(body, area);
         return;
     };
@@ -853,7 +1005,7 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "node costs:",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
         for (node, usd) in &session.node_costs {
             lines.push(Line::from(format!("  {node:<16} ${usd:.4}")));
@@ -862,52 +1014,198 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "log tail:",
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
     if state.log_tail.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no logs yet)",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled("  (no logs yet)", muted)));
     } else {
         for log_line in &state.log_tail {
             lines.push(Line::from(format!("  {log_line}")));
         }
     }
-    let title = format!(" {} ", session.id);
+    // Mirror keel's info-panel header: bold-accent id + italic-dim state.
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            session.id.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            state_word(session.state),
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        ),
+        Span::raw(" "),
+    ]);
     let body = Paragraph::new(lines)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(framed_block_titled(title).padding(Padding::horizontal(2)))
         .wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
 
 fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let help = match state.view {
-        View::Sessions => {
-            "[q] quit  [Tab] focus  [j/k] nav  [Enter] attach  [r] reload  [d] doctor  [p] plans  [Shift+K] kill  [n] spawn  [Shift+A] auto  [Shift+B] brainstorm"
-        }
-        View::Doctor => "[q] quit  [Esc/d] back  [r] re-probe",
-        View::Spawn => "[Esc/q] cancel  [j/k] nav  [Enter] spawn",
-        View::Plans => {
-            "[q] quit  [Esc/p] back  [Tab] focus  [j/k] nav  [Shift+P] pause/resume  [Shift+C] complete  [u] unblock  [r] reload"
-        }
-    };
-    let tail = if state.autonomous.enabled() || state.autonomous.status() != "autonomous: OFF" {
-        state.autonomous.status().to_string()
-    } else {
-        state.status_line.clone()
-    };
-    let bar = format!("{help} — {tail}");
-    let p = Paragraph::new(bar).style(Style::default().bg(Color::Black).fg(Color::Gray));
-    f.render_widget(p, area);
+    // Action-driven flashes replace the legend rather than appending to
+    // it — long error messages from a real shell-out can run past the
+    // right edge of a typical terminal and chop off the relevant text.
+    // Anything load-bearing belongs on the left.
+    if state.autonomous.enabled() || state.autonomous.status() != "autonomous: OFF" {
+        let line = Line::from(vec![
+            badge(" auto ", ACCENT),
+            Span::raw(" "),
+            Span::styled(state.autonomous.status().to_string(), Style::default().fg(ACCENT)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    let trimmed = state.status_line.trim();
+    if !trimmed.is_empty() && trimmed != "ready" && !is_steady_state_line(trimmed) {
+        // Heuristic: status messages naming a failure (kill rejected,
+        // spawn failed, reload failed) get the error badge; everything
+        // else is treated as info. The wording is deliberate — every
+        // failure path in `app.rs` includes "failed" or "rejected" in
+        // its status line.
+        let is_error =
+            trimmed.contains("failed") || trimmed.contains("rejected") || trimmed.contains("error");
+        let (glyph, color) = if is_error { (" ! ", ERR) } else { (" ✓ ", OK) };
+        let line = Line::from(vec![
+            badge(glyph, color),
+            Span::raw(" "),
+            Span::styled(trimmed.to_string(), Style::default().fg(color)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    let spans = status_legend_spans(state);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().fg(MUTED)),
+        area,
+    );
 }
 
-fn kv_line(key: &str, value: &str) -> Line<'static> {
-    let key_owned = format!("{key:<9} ");
-    Line::from(vec![
-        Span::styled(key_owned, Style::default().fg(Color::DarkGray)),
-        Span::raw(value.to_string()),
-    ])
+/// `true` when `s` is the steady-state status line produced by
+/// [`render_status_line`] (`N sessions`, possibly with cost/plan
+/// suffixes). Those aren't action results — they're the default the
+/// app resets to on every `reload`, so we should show the legend
+/// instead of badging them as a flash.
+fn is_steady_state_line(s: &str) -> bool {
+    // The render_status_line shape always begins with a digit count
+    // followed by " sessions". Anything matching that is the
+    // information line, not a transient flash.
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_digit() {
+        return false;
+    }
+    // Skip the rest of the leading number, then look for ` sessions`.
+    while let Some(c) = chars.clone().next() {
+        if c.is_ascii_digit() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    chars.as_str().starts_with(" sessions")
+}
+
+/// Build the bottom-bar legend for the active view. Capital letters
+/// stand for Shift-modified bindings (`K` = Shift+K, etc.) — no `⇧`
+/// glyph because the case already carries the meaning.
+fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = vec![chip("[fleet]", ACCENT), sep()];
+    match state.view {
+        View::Sessions => {
+            spans.extend([
+                theme_key("↑/↓"),
+                Span::raw(" nav"),
+                sep(),
+                theme_key("tab"),
+                Span::raw(" focus"),
+                sep(),
+                theme_key("enter"),
+                Span::raw(" attach"),
+                sep(),
+                theme_key("n"),
+                Span::raw(" new"),
+                sep(),
+                theme_key("d"),
+                Span::raw(" doctor"),
+                sep(),
+                theme_key("p"),
+                Span::raw(" plans"),
+                sep(),
+                theme_key("K"),
+                Span::raw(" kill"),
+                sep(),
+                theme_key("A"),
+                Span::raw(" auto"),
+                sep(),
+                theme_key("B"),
+                Span::raw(" brainstorm"),
+                sep(),
+                theme_key("r"),
+                Span::raw(" reload"),
+                sep(),
+                theme_key("q"),
+                Span::raw(" quit"),
+            ]);
+        }
+        View::Doctor => {
+            spans.extend([
+                theme_key("esc"),
+                Span::raw("/"),
+                theme_key("d"),
+                Span::raw(" back"),
+                sep(),
+                theme_key("r"),
+                Span::raw(" re-probe"),
+                sep(),
+                theme_key("q"),
+                Span::raw(" quit"),
+            ]);
+        }
+        View::Spawn => {
+            spans.extend([
+                theme_key("↑/↓"),
+                Span::raw(" nav"),
+                sep(),
+                theme_key("enter"),
+                Span::raw(" spawn"),
+                sep(),
+                theme_key("esc"),
+                Span::raw(" cancel"),
+            ]);
+        }
+        View::Plans => {
+            spans.extend([
+                theme_key("↑/↓"),
+                Span::raw(" nav"),
+                sep(),
+                theme_key("tab"),
+                Span::raw(" focus"),
+                sep(),
+                theme_key("P"),
+                Span::raw(" pause/resume"),
+                sep(),
+                theme_key("C"),
+                Span::raw(" complete"),
+                sep(),
+                theme_key("u"),
+                Span::raw(" unblock"),
+                sep(),
+                theme_key("r"),
+                Span::raw(" reload"),
+                sep(),
+                theme_key("esc"),
+                Span::raw("/"),
+                theme_key("p"),
+                Span::raw(" back"),
+            ]);
+        }
+    }
+    spans
 }
 
 /// Pure helper: build the (label, value) pairs the detail view shows
@@ -962,10 +1260,10 @@ pub const fn state_marker(s: SessionState) -> &'static str {
 
 fn state_style(s: SessionState) -> Style {
     match s {
-        SessionState::Completed => Style::default().fg(Color::Green),
-        SessionState::Failed | SessionState::Crashed => Style::default().fg(Color::Red),
-        SessionState::Running => Style::default().fg(Color::Yellow),
-        SessionState::AwaitingGate => Style::default().fg(Color::Cyan),
+        SessionState::Completed => Style::default().fg(OK),
+        SessionState::Failed | SessionState::Crashed => Style::default().fg(ERR),
+        SessionState::Running => Style::default().fg(WARN),
+        SessionState::AwaitingGate => Style::default().fg(ACCENT),
         SessionState::Created => Style::default(),
     }
 }

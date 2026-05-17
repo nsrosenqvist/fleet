@@ -29,10 +29,6 @@ pub const OK: Color = Color::Green;
 pub const ERR: Color = Color::Red;
 pub const WARN: Color = Color::Yellow;
 
-/// Foreground for hotkey glyphs in the status bar — bright white against the
-/// muted-grey body of the bar so the keys read at a glance.
-pub const KEY_FG: Color = Color::White;
-
 /// Indexed background for the selected sidebar row — a dark grey one step
 /// brighter than the terminal default so the selection reads against
 /// black/near-black backgrounds without competing with the accent border.

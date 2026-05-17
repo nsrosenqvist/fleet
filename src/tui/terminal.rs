@@ -27,7 +27,7 @@ use crate::session::store::SessionStore;
 use crate::session::{now_ms};
 use crate::runtime::factory::build_stopper;
 
-use super::app::{Action, AppState};
+use super::app::{Action, AppState, DoctorSnapshot};
 use super::input;
 use super::ui;
 
@@ -78,6 +78,14 @@ fn event_loop(
     reap_report: Option<reaper::ReapReport>,
 ) -> Result<i32> {
     let mut state = AppState::new(root.to_path_buf(), store)?;
+    // Eagerly probe the runtime adapter so the breadcrumb's
+    // `runtime:●` badge is meaningful from the very first frame. The
+    // doctor view re-probes on entry, so this initial snapshot can
+    // legitimately go stale across long sessions — that's fine, the
+    // badge is a hint, not the source of truth. Tests construct
+    // `AppState` directly and skip this path, so the probe doesn't
+    // burden the suite.
+    state.doctor = Some(DoctorSnapshot::probe(root.to_path_buf()));
     // Surface the reap outcome in the status bar so the user sees what
     // happened without scrolling through logs. Silent when nothing was
     // reaped — the default "N sessions" line is more useful.

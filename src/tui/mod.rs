@@ -939,12 +939,12 @@ mod tests {
             .join("\n");
         // Sidebar background still rendered.
         assert!(
-            dumped.contains("Sessions"),
+            dumped.contains("sessions"),
             "background sidebar missing; got:\n{dumped}"
         );
         // Overlay's title and entries on top.
         assert!(
-            dumped.contains("Spawn workflow"),
+            dumped.contains("spawn workflow"),
             "overlay title missing; got:\n{dumped}"
         );
         assert!(
