@@ -1,4 +1,4 @@
-//! Brainstorm-agent system prompt: a static template + a per-
+//! Orchestrator-agent system prompt: a static template + a per-
 //! session repo snapshot.
 //!
 //! The prompt lives at `<fleet_root>/.fleet/planning/<id>/prompt.md`
@@ -8,10 +8,10 @@
 //! active plans so the agent has immediate context.
 //!
 //! Pure: takes a `RepoSnapshot` value object and returns a string.
-//! The CLI in `cli::brainstorm` is responsible for building the
+//! The CLI in `cli::orchestrator` is responsible for building the
 //! snapshot from the tracker + plan store at session-spawn time.
 //!
-//! Per-repo overrides land at `.fleet/prompts/brainstorm.md` —
+//! Per-repo overrides land at `.fleet/prompts/orchestrator.md` —
 //! same pattern as the workflow persona prompts. Use
 //! [`render_prompt_for_repo`] to apply them; [`render_prompt`]
 //! always uses the built-in template.
@@ -19,7 +19,7 @@
 use crate::plans::Plan;
 use crate::tracker::Issue;
 
-/// Snapshot of the repo state shown to the brainstorm agent at
+/// Snapshot of the repo state shown to the orchestrator agent at
 /// startup. Tracker issues are filtered to "open" by the caller;
 /// plans are filtered to "Active". Both lists are passed as-is in
 /// their existing sort order (open-first for issues; ms-prefixed
@@ -30,7 +30,7 @@ pub struct RepoSnapshot {
     pub active_plans: Vec<Plan>,
 }
 
-/// Render the system prompt for a fresh brainstorm session. Combines
+/// Render the system prompt for a fresh orchestrator session. Combines
 /// the static template with the dynamic repo snapshot.
 #[must_use]
 pub fn render_prompt(snapshot: &RepoSnapshot) -> String {
@@ -52,10 +52,10 @@ pub fn render_prompt_with_template(template: &str, snapshot: &RepoSnapshot) -> S
 }
 
 /// Render the prompt with a per-repo override if present.
-/// `<fleet_root>/.fleet/prompts/brainstorm.md` overrides the
+/// `<fleet_root>/.fleet/prompts/orchestrator.md` overrides the
 /// built-in template when it exists — same pattern fleet uses
 /// for workflow persona prompts (`prompts/planner.md` etc.) but
-/// applied to brainstorm's system prompt. The override is the
+/// applied to orchestrator's system prompt. The override is the
 /// whole template; the dynamic repo snapshot (open issues +
 /// active plans) is appended after either way.
 ///
@@ -68,14 +68,14 @@ pub fn render_prompt_for_repo(
     snapshot: &RepoSnapshot,
 ) -> anyhow::Result<String> {
     use anyhow::Context as _;
-    let override_path = fleet_root.join(".fleet/prompts/brainstorm.md");
+    let override_path = fleet_root.join(".fleet/prompts/orchestrator.md");
     let template = match std::fs::read_to_string(&override_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => STATIC_TEMPLATE.to_string(),
         Err(e) => {
             return Err(anyhow::Error::new(e)).with_context(|| {
                 format!(
-                    "reading brainstorm prompt override at {}",
+                    "reading orchestrator prompt override at {}",
                     override_path.display()
                 )
             });
@@ -138,9 +138,9 @@ fn render_active_plans(plans: &[Plan]) -> String {
 /// Static template, prepended verbatim. Defines the agent's role
 /// and the CLI-tool surface so the agent doesn't have to guess at
 /// either. The dynamic repo snapshot is appended after.
-const STATIC_TEMPLATE: &str = r#"# Fleet brainstorm session
+const STATIC_TEMPLATE: &str = r#"# Fleet orchestrator session
 
-You are the **brainstorm agent** for this fleet-managed repo. Your
+You are the **orchestrator agent** for this fleet-managed repo. Your
 job is to help the user plan work, triage and file tickets, and
 manage fleet plans + dependency edges. You run on the *host*, not
 in a container, with broad authority — but the user is in the
@@ -307,7 +307,7 @@ mod tests {
         let p = render_prompt(&snapshot);
         // Role section + CLI tool surface + behaviour expectations
         // all present.
-        assert!(p.contains("brainstorm agent"), "missing role");
+        assert!(p.contains("orchestrator agent"), "missing role");
         assert!(p.contains("fleet plan list"), "missing plan tool");
         assert!(p.contains("fleet issues create"), "missing tracker create");
         assert!(
@@ -320,8 +320,8 @@ mod tests {
         );
         // Stale HTTP-server references shouldn't leak — the prompt
         // is CLI-only since the parallel HTTP path got removed.
-        assert!(!p.contains("FLEET_BRAINSTORM_URL"), "stale http env var");
-        assert!(!p.contains("FLEET_BRAINSTORM_TOKEN"), "stale http token");
+        assert!(!p.contains("FLEET_ORCHESTRATOR_URL"), "stale http env var");
+        assert!(!p.contains("FLEET_ORCHESTRATOR_TOKEN"), "stale http token");
     }
 
     #[test]
@@ -470,15 +470,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prompts_dir = dir.path().join(".fleet/prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
-        let override_body = "# Custom brainstorm role\n\nYou are the team's planner.";
-        std::fs::write(prompts_dir.join("brainstorm.md"), override_body).unwrap();
+        let override_body = "# Custom orchestrator role\n\nYou are the team's planner.";
+        std::fs::write(prompts_dir.join("orchestrator.md"), override_body).unwrap();
 
         let snapshot = RepoSnapshot {
             open_issues: Vec::new(),
             active_plans: Vec::new(),
         };
         let p = render_prompt_for_repo(dir.path(), &snapshot).unwrap();
-        assert!(p.contains("# Custom brainstorm role"), "override missing");
+        assert!(p.contains("# Custom orchestrator role"), "override missing");
         assert!(p.contains("team's planner"), "override body missing");
         // Built-in template's content shouldn't leak in.
         assert!(!p.contains("fleet plan list"), "built-in leaked: {p}");
@@ -491,7 +491,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prompts_dir = dir.path().join(".fleet/prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
-        std::fs::write(prompts_dir.join("brainstorm.md"), "# Minimal").unwrap();
+        std::fs::write(prompts_dir.join("orchestrator.md"), "# Minimal").unwrap();
         let snapshot = RepoSnapshot {
             open_issues: vec![issue("42", "Fix parser", &[])],
             active_plans: Vec::new(),

@@ -210,7 +210,7 @@ impl DepsStore {
 
     /// Surgical: remove the single edge `(blocked, blocked_on)` if
     /// present. Returns `true` when an edge was removed, `false`
-    /// when there was nothing matching (idempotent — the brainstorm
+    /// when there was nothing matching (idempotent — the orchestrator
     /// agent doesn't need to dry-run first). Used by
     /// `fleet deps remove` to surgically drop one edge without
     /// touching others a ticket might still have.

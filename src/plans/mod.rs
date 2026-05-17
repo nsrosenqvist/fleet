@@ -121,7 +121,7 @@ pub struct PlanItem {
 
 impl PlanItem {
     /// Build a fresh pending item from a ticket id. Most callers
-    /// (the `fleet plan new` CLI, the brainstorm agent) construct
+    /// (the `fleet plan new` CLI, the orchestrator agent) construct
     /// items this way; only the supervisor and the tracker-create
     /// plan-injector set the other fields directly.
     #[must_use]
@@ -153,7 +153,7 @@ impl PlanItem {
 /// shadows. GitHub uses "tracking issues" with task lists; Linear
 /// has actual epics; git-bug uses a `parent:<id>` label
 /// convention. v1 fleet doesn't auto-create these — the field is
-/// reserved space the brainstorm agent populates in Phase 5.
+/// reserved space the orchestrator agent populates in Phase 5.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpicRef {
     /// Tracker plugin name (`"github"` / `"git-bug"` / future).
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn plan_yaml_tolerates_missing_optional_fields_on_load() {
         // A minimal hand-written plan file the user might commit
-        // before the brainstorm agent fills in epic_ref. Optional
+        // before the orchestrator agent fills in epic_ref. Optional
         // fields default cleanly.
         let yaml = "\
 id: plan-1

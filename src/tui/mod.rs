@@ -38,8 +38,8 @@ mod tests {
     use ratatui::text::Line;
     use std::path::{Path, PathBuf};
 
-    use crate::brainstorm::store::BrainstormStore;
-    use crate::brainstorm::{BrainstormId, BrainstormSession, BrainstormState};
+    use crate::orchestrator::store::OrchestratorStore;
+    use crate::orchestrator::{OrchestratorSession, OrchestratorState};
     use crate::plans::store::PlanStore;
     use crate::plans::{ItemFailurePolicy, Plan, PlanId, PlanItem, PlanItemState, PlanState};
     use crate::session::store::SessionStore;
@@ -939,7 +939,7 @@ mod tests {
             .join("\n");
         // Sidebar background still rendered.
         assert!(
-            dumped.contains("sessions"),
+            dumped.contains("workers"),
             "background sidebar missing; got:\n{dumped}"
         );
         // Overlay's title and entries on top.
@@ -1917,52 +1917,48 @@ mod tests {
         );
     }
 
-    // ---- sessions view brainstorm bindings --------------------------
+    // ---- sessions view orchestrator bindings ------------------------
 
-    /// Seed a TempDir-rooted state with one workflow session and one
-    /// brainstorm session — enough surface to exercise the Tab/j/k/
-    /// Enter/Shift+B handlers against real on-disk metadata.
-    fn sessions_state_with_one_of_each() -> (
-        tempfile::TempDir,
-        SessionStore,
-        AppState,
-    ) {
+    /// Seed a TempDir-rooted state with one workflow session and an
+    /// orchestrator — enough surface to exercise the Tab/j/k/
+    /// Enter/Shift+O handlers against real on-disk metadata.
+    fn sessions_state_with_one_of_each() -> (tempfile::TempDir, SessionStore, AppState) {
         let tmp = tempfile::tempdir().unwrap();
         let sessions = SessionStore::at(tmp.path().to_path_buf());
         sessions
             .create(&session("s-1", "standard", SessionState::Running, 100))
             .unwrap();
-        let bstore = BrainstormStore::for_repo(tmp.path());
-        let b = BrainstormSession::new(BrainstormId::new("b-1"), "claude", 200);
-        bstore.save(&b).unwrap();
+        let ostore = OrchestratorStore::for_repo(tmp.path());
+        ostore.save(&OrchestratorSession::new("claude", 200)).unwrap();
         let state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
         (tmp, sessions, state)
     }
 
     #[test]
-    fn tab_in_sessions_view_toggles_focus_between_workflows_and_brainstorms() {
+    fn tab_in_sessions_view_toggles_focus_between_workflows_and_orchestrator() {
         let (_tmp, store, mut state) = sessions_state_with_one_of_each();
         assert_eq!(state.sessions_focus, SessionsFocus::Workflows);
         let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
-        assert_eq!(state.sessions_focus, SessionsFocus::Brainstorms);
-        // First Tab to Brainstorms lands the cursor at row 0.
-        assert_eq!(state.brainstorms_list_state.selected(), Some(0));
+        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
+        // First Tab to Orchestrator lands the cursor at row 0
+        // (the one orchestrator row).
+        assert_eq!(state.orchestrators_list_state.selected(), Some(0));
         let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
         assert_eq!(state.sessions_focus, SessionsFocus::Workflows);
     }
 
     #[test]
-    fn enter_with_brainstorms_focus_returns_attach_brainstorm_action() {
+    fn enter_with_orchestrator_focus_returns_open_orchestrator_action() {
+        // Single-session model: Enter on the orchestrator row
+        // collapses to OpenOrchestrator (the CLI's reuse-or-spawn
+        // command does the right thing regardless of current state).
         let (_tmp, store, mut state) = sessions_state_with_one_of_each();
         state.toggle_sessions_focus();
         let action = state.handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
             &store,
         );
-        match action {
-            Action::AttachBrainstorm(id) => assert_eq!(id.as_str(), "b-1"),
-            _ => panic!("expected AttachBrainstorm, got something else"),
-        }
+        assert!(matches!(action, Action::OpenOrchestrator));
     }
 
     #[test]
@@ -1976,73 +1972,51 @@ mod tests {
     }
 
     #[test]
-    fn shift_b_returns_new_brainstorm_from_any_view() {
+    fn shift_o_returns_open_orchestrator_from_any_view() {
         let (_tmp, store, mut state) = sessions_state_with_one_of_each();
         let action = state.handle_key(
-            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
             &store,
         );
-        assert!(matches!(action, Action::NewBrainstorm));
-        // From the Plans view, too.
+        assert!(matches!(action, Action::OpenOrchestrator));
+        // From the Plans view, too — Shift+O is a global hotkey.
         state.view = View::Plans;
         let action = state.handle_key(
-            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
             &store,
         );
-        assert!(matches!(action, Action::NewBrainstorm));
+        assert!(matches!(action, Action::OpenOrchestrator));
     }
 
-    #[test]
-    fn j_in_brainstorms_focus_moves_brainstorm_cursor_not_workflow_cursor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = SessionStore::at(tmp.path().to_path_buf());
-        sessions
-            .create(&session("s-1", "standard", SessionState::Running, 100))
-            .unwrap();
-        let bstore = BrainstormStore::for_repo(tmp.path());
-        bstore
-            .save(&BrainstormSession::new(BrainstormId::new("b-1"), "claude", 1))
-            .unwrap();
-        bstore
-            .save(&BrainstormSession::new(BrainstormId::new("b-2"), "claude", 2))
-            .unwrap();
-        let mut state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
-        state.toggle_sessions_focus(); // Brainstorms, cursor at 0
-        let workflow_before = state.list_state.selected();
-        let _ = state.handle_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &sessions,
-        );
-        assert_eq!(state.brainstorms_list_state.selected(), Some(1));
-        assert_eq!(state.list_state.selected(), workflow_before);
-    }
+    // ---- orchestrator sidebar ---------------------------------------
 
-    // ---- brainstorm sidebar -----------------------------------------
-
-    fn brainstorm(id: &str, agent: &str, state: BrainstormState) -> BrainstormSession {
-        let mut s = BrainstormSession::new(BrainstormId::new(id), agent, 1);
+    fn orchestrator(agent: &str, state: OrchestratorState) -> OrchestratorSession {
+        let mut s = OrchestratorSession::new(agent, 1);
         s.state = state;
         s
     }
 
     #[test]
-    fn brainstorm_row_label_carries_marker_id_agent_and_state_word() {
-        let s = brainstorm("b-1", "claude", BrainstormState::Active);
-        let label = brainstorm_row_label(&s);
+    fn orchestrator_row_label_carries_marker_tmux_name_agent_and_state_word() {
+        // The row label always shows the fixed `fl-orchestrator`
+        // tmux name — there's no per-id variation in the
+        // single-session model.
+        let s = orchestrator("claude", OrchestratorState::Active);
+        let label = orchestrator_row_label(&s);
         assert!(label.starts_with('◐'), "marker missing: {label}");
-        assert!(label.contains("b-1"));
+        assert!(label.contains("fl-orchestrator"));
         assert!(label.contains("agent=claude"));
         assert!(label.contains("(active)"));
     }
 
     #[test]
-    fn brainstorm_row_label_marker_reflects_state() {
+    fn orchestrator_row_label_marker_reflects_state() {
         assert!(
-            brainstorm_row_label(&brainstorm("b-1", "x", BrainstormState::Detached))
+            orchestrator_row_label(&orchestrator("x", OrchestratorState::Detached))
                 .starts_with('⏸')
         );
         assert!(
-            brainstorm_row_label(&brainstorm("b-1", "x", BrainstormState::Closed)).starts_with('✗')
+            orchestrator_row_label(&orchestrator("x", OrchestratorState::Closed)).starts_with('✗')
         );
     }
 }

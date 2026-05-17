@@ -1,6 +1,6 @@
-//! tmux invocation primitives for the brainstorm subsystem.
+//! tmux invocation primitives for the orchestrator subsystem.
 //!
-//! Brainstorm sessions live inside tmux panes so the user can
+//! Orchestrator sessions live inside tmux panes so the user can
 //! attach / detach without losing context. This module wraps the
 //! `tmux` CLI behind a small Rust surface — every call shells
 //! through [`ProcessInvoker`] so tests can stub the binary without
@@ -10,7 +10,7 @@
 //! - [`probe`] — is `tmux` on PATH? Returns the version string when
 //!   present, an error describing the absence when not.
 //! - [`new_session`] — `tmux new-session -d -s <name> …` to spawn a
-//!   detached session running the brainstorm agent.
+//!   detached session running the orchestrator agent.
 //! - [`has_session`] — `tmux has-session -t <name>`.
 //! - [`kill_session`] — `tmux kill-session -t <name>`.
 //! - [`list_session_names`] — `tmux list-sessions -F '#S'`.
@@ -19,7 +19,7 @@
 //!
 //! Interactive attach is intentionally NOT here — `tmux attach` has
 //! to exec-replace (or inherit stdio) the calling process, which
-//! happens in the `fleet brainstorm attach` CLI (P5-C6). Putting
+//! happens in the `fleet orchestrator attach` CLI (P5-C6). Putting
 //! that here would muddy the ProcessInvoker-based abstraction.
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -49,7 +49,7 @@ pub fn probe(invoker: &dyn ProcessInvoker) -> Result<String> {
 /// `command` is the agent command (e.g. `["claude", "code"]`).
 /// `env` is a list of `(KEY, VAL)` pairs; tmux applies them with
 /// `set-environment` after the session starts (so the agent sees
-/// the brainstorm tool-server URL + bearer token).
+/// the orchestrator tool-server URL + bearer token).
 pub fn new_session(
     invoker: &dyn ProcessInvoker,
     name: &str,
@@ -194,7 +194,7 @@ fn shell_single_quote(s: &str) -> String {
 /// `tmux list-sessions -F '#S'` → vec of session names. Returns
 /// an empty vec when no tmux server is running (common on a fresh
 /// shell), distinguishing "no sessions" from "tmux missing"
-/// upfront via [`probe`]. Reserved for a future brainstorm reaper
+/// upfront via [`probe`]. Reserved for a future orchestrator reaper
 /// pass; not wired in v1.
 #[allow(dead_code)]
 pub fn list_session_names(invoker: &dyn ProcessInvoker) -> Result<Vec<String>> {
@@ -225,7 +225,7 @@ pub fn list_session_names(invoker: &dyn ProcessInvoker) -> Result<Vec<String>> {
 }
 
 /// `tmux display-message -p -t <name> '#{pid}'` → the tmux server
-/// pid. Reserved for the brainstorm reaper (detect a dead tmux
+/// pid. Reserved for the orchestrator reaper (detect a dead tmux
 /// server and mark the session Closed without leaving stale meta
 /// on disk); not wired in v1.
 #[allow(dead_code)]
@@ -250,7 +250,7 @@ pub fn server_pid_for(invoker: &dyn ProcessInvoker, name: &str) -> Result<u32> {
 
 /// Construct an `Arc<dyn ProcessInvoker>` from the real shell so
 /// production code paths don't have to. Test code constructs its
-/// own mock. Convenience helper for the brainstorm CLI; not yet
+/// own mock. Convenience helper for the orchestrator CLI; not yet
 /// consumed since the CLI builds its invoker inline.
 #[must_use]
 #[allow(dead_code)]
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn new_session_argv_emits_detached_named_session_with_command() {
         let argv = new_session_argv(
-            "fleet-brainstorm-b-1",
+            "fleet-orchestrator-b-1",
             &["claude".to_string(), "code".to_string()],
             &[],
         );
@@ -327,7 +327,7 @@ mod tests {
                 "new-session",
                 "-d",
                 "-s",
-                "fleet-brainstorm-b-1",
+                "fleet-orchestrator-b-1",
                 "--",
                 "claude",
                 "code",
@@ -410,10 +410,10 @@ mod tests {
                 "-F".to_string(),
                 "#S".to_string(),
             ],
-            "fleet-brainstorm-b-1\nfleet-brainstorm-b-2\n\n".to_string(),
+            "fleet-orchestrator-b-1\nfleet-orchestrator-b-2\n\n".to_string(),
         )]);
         let names = list_session_names(invoker.as_ref()).unwrap();
-        assert_eq!(names, vec!["fleet-brainstorm-b-1", "fleet-brainstorm-b-2"]);
+        assert_eq!(names, vec!["fleet-orchestrator-b-1", "fleet-orchestrator-b-2"]);
     }
 
     #[test]
@@ -448,7 +448,7 @@ mod tests {
             vec![
                 "pipe-pane".to_string(),
                 "-t".to_string(),
-                "fleet-brainstorm-b-1".to_string(),
+                "fleet-orchestrator-b-1".to_string(),
                 "-o".to_string(),
                 "cat >> '/repo/.fleet/planning/b-1/transcript.log'".to_string(),
             ],
@@ -456,7 +456,7 @@ mod tests {
         )]);
         pipe_pane_to(
             invoker.as_ref(),
-            "fleet-brainstorm-b-1",
+            "fleet-orchestrator-b-1",
             std::path::Path::new("/repo/.fleet/planning/b-1/transcript.log"),
         )
         .unwrap();

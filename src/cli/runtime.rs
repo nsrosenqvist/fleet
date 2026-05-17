@@ -262,7 +262,7 @@ pub fn render_doctor(report: &ProbeReport) -> String {
     out.push_str(&render_backend("git-bug", &report.git_bug));
     out.push_str(&render_backend("tinyproxy", &report.tinyproxy));
 
-    out.push_str("\nBrainstorm:\n");
+    out.push_str("\nOrchestrator:\n");
     out.push_str(&render_backend("tmux", &report.tmux));
 
     out.push_str("\nRecommended engine: ");

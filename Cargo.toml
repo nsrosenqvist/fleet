@@ -47,6 +47,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # on top.
 tiny_http = "0.12"
 
+# UUIDv4 for `claude --session-id <uuid>` at brainstorm spawn time
+# — we pre-assign so a later respawn can `claude --resume <uuid>`
+# deterministically instead of scraping it from the TUI.
+uuid = { version = "1", features = ["v4"] }
+
 [dev-dependencies]
 # Mocks `ProcessInvoker` and other traits so tests don't shell out.
 mockall = "0.13"

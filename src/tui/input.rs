@@ -16,7 +16,7 @@ use crate::session::store::SessionStore;
 use super::app::{Action, AppState};
 
 /// Per-tick keyboard dispatch. Returns the [`Action`] the event loop
-/// should perform (quit, suspend for a brainstorm attach, etc.) or
+/// should perform (quit, suspend to open the orchestrator, etc.) or
 /// [`Action::None`] when the keystroke was fully consumed in-place.
 pub(super) fn handle_key(state: &mut AppState, key: KeyEvent, store: &SessionStore) -> Action {
     state.handle_key(key, store)

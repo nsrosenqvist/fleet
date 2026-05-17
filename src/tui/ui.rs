@@ -11,7 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 
-use crate::brainstorm::{BrainstormSession, BrainstormState};
+use crate::orchestrator::{OrchestratorSession, OrchestratorState};
 use crate::plans::{Plan, PlanItemState, PlanState};
 use crate::session::{Session, SessionState};
 
@@ -726,17 +726,16 @@ pub(super) fn plan_failure_word(policy: crate::plans::ItemFailurePolicy) -> &'st
 }
 
 fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let title = if state.brainstorms.is_empty() {
-        format!(" sessions ({}) ", state.sessions.len())
-    } else {
-        format!(
-            " sessions ({}) · brainstorms ({}) ",
-            state.sessions.len(),
-            state.brainstorms.len(),
-        )
-    };
+    // The orchestrator pane is always shown in the sidebar — its
+    // count (0 or 1) and label live alongside the workers count in
+    // the outer frame title so the user sees both at a glance.
+    let title = format!(
+        " workers ({}) · orchestrator ({}) ",
+        state.sessions.len(),
+        state.orchestrators.len(),
+    );
     let outer = framed_block(&title);
-    if state.sessions.is_empty() && state.brainstorms.is_empty() {
+    if state.sessions.is_empty() && state.orchestrators.is_empty() {
         let muted = Style::default().fg(MUTED);
         let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
         let lines = vec![
@@ -749,8 +748,8 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
             ]),
             Line::from(vec![
                 Span::styled("  ", muted),
-                Span::styled("B", bold_key),
-                Span::styled("       start a brainstorm (Shift+B)", muted),
+                Span::styled("O", bold_key),
+                Span::styled("       open the orchestrator (Shift+O)", muted),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -766,13 +765,16 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
     f.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
-    let (workflow_area, brainstorm_area) =
-        split_sidebar_areas(inner, state.sessions.len(), state.brainstorms.len());
+    let (workflow_area, orchestrator_area) =
+        split_sidebar_areas(inner, state.sessions.len(), state.orchestrators.len());
     if let Some(area) = workflow_area {
         render_workflow_list(f, area, state);
     }
-    if let Some(area) = brainstorm_area {
-        render_brainstorm_list(f, area, state);
+    // Orchestrator pane is permanently visible — render it even
+    // when state.orchestrators is empty so the user sees the
+    // section header and knows Shift+O / Enter opens it.
+    if let Some(area) = orchestrator_area {
+        render_orchestrator_list(f, area, state);
     }
 }
 
@@ -780,25 +782,24 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn split_sidebar_areas(
     inner: Rect,
     n_workflows: usize,
-    n_brainstorms: usize,
+    n_orchestrators: usize,
 ) -> (Option<Rect>, Option<Rect>) {
-    if n_workflows == 0 && n_brainstorms == 0 {
+    // Orchestrator pane is permanently visible (per the screenshot
+    // / single-session design) — allocate ~2 rows for it even when
+    // empty so the user can see "orchestrator (0)" + Shift+O hint
+    // sit there. Worker pane gets the rest. When the orchestrator
+    // has 1 entry it gets a bit more, but never crowds the workers.
+    if inner.height == 0 {
         return (None, None);
     }
-    if n_brainstorms == 0 {
-        return (Some(inner), None);
-    }
-    if n_workflows == 0 {
-        return (None, Some(inner));
-    }
-    let workflow_share = u32::try_from(n_workflows + 1).unwrap_or(u32::MAX);
-    let brainstorm_share = u32::try_from(n_brainstorms + 1).unwrap_or(u32::MAX);
-    let total = workflow_share.saturating_add(brainstorm_share);
+    let workflow_share = u32::try_from(n_workflows + 2).unwrap_or(u32::MAX);
+    let orchestrator_share = u32::try_from(n_orchestrators + 2).unwrap_or(u32::MAX);
+    let total = workflow_share.saturating_add(orchestrator_share);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Ratio(workflow_share, total),
-            Constraint::Ratio(brainstorm_share, total),
+            Constraint::Ratio(orchestrator_share, total),
         ])
         .split(inner);
     (Some(chunks[0]), Some(chunks[1]))
@@ -834,19 +835,19 @@ fn render_workflow_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     f.render_stateful_widget(list, area, &mut shifted);
 }
 
-fn render_brainstorm_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let mut items: Vec<ListItem<'_>> = Vec::with_capacity(state.brainstorms.len() + 1);
+fn render_orchestrator_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let mut items: Vec<ListItem<'_>> = Vec::with_capacity(state.orchestrators.len() + 1);
     items.push(ListItem::new(Span::styled(
-        "── Brainstorms ──".to_string(),
+        "── Orchestrator ──".to_string(),
         Style::default().fg(MUTED),
     )));
-    for b in &state.brainstorms {
+    for b in &state.orchestrators {
         items.push(ListItem::new(Span::styled(
-            brainstorm_row_label(b),
-            brainstorm_row_style(b.state),
+            orchestrator_row_label(b),
+            orchestrator_row_style(b.state),
         )));
     }
-    let highlight = if state.sessions_focus == SessionsFocus::Brainstorms {
+    let highlight = if state.sessions_focus == SessionsFocus::Orchestrator {
         Style::default()
             .fg(SELECT_FG)
             .bg(SELECT_BG)
@@ -857,7 +858,7 @@ fn render_brainstorm_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let list = List::new(items)
         .highlight_style(highlight)
         .highlight_symbol("▸ ");
-    let mut shifted = state.brainstorms_list_state.clone();
+    let mut shifted = state.orchestrators_list_state.clone();
     if let Some(i) = shifted.selected() {
         shifted.select(Some(i + 1));
     }
@@ -865,40 +866,43 @@ fn render_brainstorm_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 #[must_use]
-pub fn brainstorm_row_label(session: &BrainstormSession) -> String {
+pub fn orchestrator_row_label(session: &OrchestratorSession) -> String {
+    // Fixed tmux name (`fl-orchestrator`) is what the screenshot
+    // shows; the agent + state suffix tells the user what's
+    // running and whether it's live.
     format!(
         "{} {}  agent={}  ({})",
-        brainstorm_state_marker(session.state),
-        session.id,
+        orchestrator_state_marker(session.state),
+        crate::orchestrator::TMUX_SESSION_NAME,
         session.agent,
-        brainstorm_state_word(session.state),
+        orchestrator_state_word(session.state),
     )
 }
 
 #[must_use]
-fn brainstorm_row_style(state: BrainstormState) -> Style {
+fn orchestrator_row_style(state: OrchestratorState) -> Style {
     match state {
-        BrainstormState::Active => Style::default().fg(ACCENT),
-        BrainstormState::Detached => Style::default().fg(WARN),
-        BrainstormState::Closed => Style::default().fg(MUTED),
+        OrchestratorState::Active => Style::default().fg(ACCENT),
+        OrchestratorState::Detached => Style::default().fg(WARN),
+        OrchestratorState::Closed => Style::default().fg(MUTED),
     }
 }
 
 #[must_use]
-fn brainstorm_state_marker(state: BrainstormState) -> &'static str {
+fn orchestrator_state_marker(state: OrchestratorState) -> &'static str {
     match state {
-        BrainstormState::Active => "◐",
-        BrainstormState::Detached => "⏸",
-        BrainstormState::Closed => "✗",
+        OrchestratorState::Active => "◐",
+        OrchestratorState::Detached => "⏸",
+        OrchestratorState::Closed => "✗",
     }
 }
 
 #[must_use]
-fn brainstorm_state_word(state: BrainstormState) -> &'static str {
+fn orchestrator_state_word(state: OrchestratorState) -> &'static str {
     match state {
-        BrainstormState::Active => "active",
-        BrainstormState::Detached => "detached",
-        BrainstormState::Closed => "closed",
+        OrchestratorState::Active => "active",
+        OrchestratorState::Detached => "detached",
+        OrchestratorState::Closed => "closed",
     }
 }
 
@@ -1143,7 +1147,7 @@ fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
                 Span::raw(" auto"),
                 sep(),
                 theme_key("B"),
-                Span::raw(" brainstorm"),
+                Span::raw(" orchestrator"),
                 sep(),
                 theme_key("r"),
                 Span::raw(" reload"),

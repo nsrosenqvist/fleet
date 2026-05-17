@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::autonomous;
-use crate::brainstorm::store::BrainstormStore;
-use crate::brainstorm::{BrainstormId, BrainstormSession};
+use crate::orchestrator::store::OrchestratorStore;
+use crate::orchestrator::OrchestratorSession;
 use crate::plans::store::PlanStore;
 use crate::plans::{Plan, PlanState};
 use crate::process::{ProcessInvoker, RealProcessInvoker};
@@ -83,9 +83,9 @@ pub(super) struct AppState {
     pub(super) plans_list_state: ListState,
     pub(super) plans_focus: PlansFocus,
     pub(super) plans_items_state: ListState,
-    pub(super) brainstorms: Vec<BrainstormSession>,
+    pub(super) orchestrators: Vec<OrchestratorSession>,
     pub(super) sessions_focus: SessionsFocus,
-    pub(super) brainstorms_list_state: ListState,
+    pub(super) orchestrators_list_state: ListState,
     /// Ticket ids currently sitting on a cycle in the deps graph.
     pub(super) cycle_nodes: std::collections::HashSet<String>,
     /// Full deps document, cached alongside `cycle_nodes`.
@@ -139,7 +139,7 @@ pub(super) enum PlansFocus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SessionsFocus {
     Workflows,
-    Brainstorms,
+    Orchestrator,
 }
 
 /// Transient overlay rendered on top of the current view.
@@ -164,8 +164,11 @@ pub(super) enum ConfirmAction {
 pub(super) enum Action {
     None,
     Quit,
-    NewBrainstorm,
-    AttachBrainstorm(BrainstormId),
+    /// Open the per-repo orchestrator: spawn it if it doesn't exist,
+    /// respawn the agent if its tmux pane has died, then attach.
+    /// Triggered by Shift+O or Enter on the orchestrator row — both
+    /// collapse to the same operation since there's only ever one.
+    OpenOrchestrator,
 }
 
 /// Resolved snapshot for the doctor pane.
@@ -230,9 +233,9 @@ impl AppState {
             plans_list_state: ListState::default(),
             plans_focus: PlansFocus::Sidebar,
             plans_items_state: ListState::default(),
-            brainstorms: Vec::new(),
+            orchestrators: Vec::new(),
             sessions_focus: SessionsFocus::Workflows,
-            brainstorms_list_state: ListState::default(),
+            orchestrators_list_state: ListState::default(),
             cycle_nodes: std::collections::HashSet::new(),
             deps_doc: crate::deps::DepsDoc::empty(),
             tickets_by_id: std::collections::HashMap::new(),
@@ -274,7 +277,7 @@ impl AppState {
             self.status_line = format!(" reconcile failed: {err:#} ");
         }
         self.refresh_plans();
-        self.refresh_brainstorms();
+        self.refresh_orchestrators();
         let deps_store = crate::deps::DepsStore::for_repo(&self.root);
         let doc = deps_store.load().unwrap_or_else(|_| crate::deps::DepsDoc::empty());
         self.cycle_nodes = crate::deps::nodes_in_cycle(&doc);
@@ -283,27 +286,25 @@ impl AppState {
         Ok(())
     }
 
-    pub(super) fn refresh_brainstorms(&mut self) {
-        let store = BrainstormStore::for_repo(&self.root);
+    pub(super) fn refresh_orchestrators(&mut self) {
+        // Single-session model: the orchestrator collection is
+        // always 0 or 1 entries. Vec is kept (rather than Option)
+        // so the rest of the TUI's list-rendering / ListState
+        // machinery doesn't need a special case.
+        let store = OrchestratorStore::for_repo(&self.root);
         let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
-        if let Err(err) = crate::brainstorm::reaper::reap(&store, invoker.as_ref(), now_ms()) {
-            self.status_line = format!(" brainstorms: reap failed: {err:#} ");
+        if let Err(err) = crate::orchestrator::reaper::reap(&store, invoker.as_ref(), now_ms()) {
+            self.status_line = format!(" orchestrator: reap failed: {err:#} ");
         }
-        let ids = match store.list() {
-            Ok(ids) => ids,
-            Err(err) => {
-                self.status_line = format!(" brainstorms: list failed: {err:#} ");
-                self.brainstorms.clear();
-                return;
-            }
-        };
-        let mut sessions = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Ok(s) = store.load(&id) {
-                sessions.push(s);
+        self.orchestrators.clear();
+        if store.exists() {
+            match store.load() {
+                Ok(s) => self.orchestrators.push(s),
+                Err(err) => {
+                    self.status_line = format!(" orchestrator: load failed: {err:#} ");
+                }
             }
         }
-        self.brainstorms = sessions;
     }
 
     pub(super) fn selected(&self) -> Option<&Session> {
@@ -365,8 +366,8 @@ impl AppState {
             self.toggle_autonomous();
             return Action::None;
         }
-        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('B')) {
-            return Action::NewBrainstorm;
+        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('O')) {
+            return Action::OpenOrchestrator;
         }
         match self.view {
             View::Sessions => self.handle_key_sessions(key, store),
@@ -441,23 +442,25 @@ impl AppState {
             KeyCode::Down | KeyCode::Char('j') => {
                 match self.sessions_focus {
                     SessionsFocus::Workflows => self.move_selection(1),
-                    SessionsFocus::Brainstorms => self.move_brainstorms_selection(1),
+                    SessionsFocus::Orchestrator => self.move_orchestrators_selection(1),
                 }
                 Action::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 match self.sessions_focus {
                     SessionsFocus::Workflows => self.move_selection(-1),
-                    SessionsFocus::Brainstorms => self.move_brainstorms_selection(-1),
+                    SessionsFocus::Orchestrator => self.move_orchestrators_selection(-1),
                 }
                 Action::None
             }
             KeyCode::Enter => {
-                if self.sessions_focus == SessionsFocus::Brainstorms {
-                    if let Some(id) = self.selected_brainstorm_id() {
-                        return Action::AttachBrainstorm(id);
-                    }
-                    self.status_line = " no brainstorm selected ".to_string();
+                if self.sessions_focus == SessionsFocus::Orchestrator {
+                    // Single-session model: there's at most one row
+                    // and "attach an existing" == "open the
+                    // orchestrator", so both branches collapse to
+                    // OpenOrchestrator. Even on an empty pane we open
+                    // (== spawn), matching what Shift+O does.
+                    return Action::OpenOrchestrator;
                 }
                 Action::None
             }
@@ -475,34 +478,27 @@ impl AppState {
 
     pub(super) fn toggle_sessions_focus(&mut self) {
         self.sessions_focus = match self.sessions_focus {
-            SessionsFocus::Workflows => SessionsFocus::Brainstorms,
-            SessionsFocus::Brainstorms => SessionsFocus::Workflows,
+            SessionsFocus::Workflows => SessionsFocus::Orchestrator,
+            SessionsFocus::Orchestrator => SessionsFocus::Workflows,
         };
-        if self.sessions_focus == SessionsFocus::Brainstorms
-            && !self.brainstorms.is_empty()
-            && self.brainstorms_list_state.selected().is_none()
+        if self.sessions_focus == SessionsFocus::Orchestrator
+            && !self.orchestrators.is_empty()
+            && self.orchestrators_list_state.selected().is_none()
         {
-            self.brainstorms_list_state.select(Some(0));
+            self.orchestrators_list_state.select(Some(0));
         }
     }
 
-    fn move_brainstorms_selection(&mut self, delta: isize) {
-        if self.brainstorms.is_empty() {
+    fn move_orchestrators_selection(&mut self, delta: isize) {
+        if self.orchestrators.is_empty() {
             return;
         }
-        let len = isize::try_from(self.brainstorms.len()).unwrap_or(isize::MAX);
+        let len = isize::try_from(self.orchestrators.len()).unwrap_or(isize::MAX);
         let current =
-            isize::try_from(self.brainstorms_list_state.selected().unwrap_or(0)).unwrap_or(0);
+            isize::try_from(self.orchestrators_list_state.selected().unwrap_or(0)).unwrap_or(0);
         let next = (current + delta).rem_euclid(len);
         let next_usize = usize::try_from(next).unwrap_or(0);
-        self.brainstorms_list_state.select(Some(next_usize));
-    }
-
-    fn selected_brainstorm_id(&self) -> Option<BrainstormId> {
-        self.brainstorms_list_state
-            .selected()
-            .and_then(|i| self.brainstorms.get(i))
-            .map(|b| b.id.clone())
+        self.orchestrators_list_state.select(Some(next_usize));
     }
 
     fn handle_key_doctor(&mut self, key: KeyEvent, store: &SessionStore) -> Action {

@@ -173,7 +173,7 @@ impl Tracker for GitBugTracker {
     fn link_parent(&self, repo_root: &Path, parent_id: &str, child_id: &str) -> Result<()> {
         // git-bug has no native parent edge; the v1 convention is a
         // `parent:<id>` label on the child. Symmetric with what other
-        // git-bug-using projects (and the brainstorm agent's epic
+        // git-bug-using projects (and the orchestrator agent's epic
         // recreation in Phase 5) expect.
         let label = format!("parent:{parent_id}");
         self.add_label(repo_root, child_id, &label)

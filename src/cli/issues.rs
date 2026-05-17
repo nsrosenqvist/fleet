@@ -15,7 +15,7 @@
 //! - `add-label <id> <label>` / `remove-label <id> <label>`.
 //!
 //! Write commands are the host-side mirror of what the per-session
-//! bridge exposes to workflow containers (and what the brainstorm
+//! bridge exposes to workflow containers (and what the orchestrator
 //! agent invokes from inside its tmux pane). Render paths are pure
 //! functions over value objects so tests assert on output text
 //! without a real `git-bug` / `gh`.
@@ -122,7 +122,7 @@ fn open_tracker(subcommand: &str) -> Result<(std::path::PathBuf, Box<dyn Tracker
 }
 
 /// Parse the CLI `<status>` argument into the typed `Status` enum.
-/// Same wording the bridge + brainstorm server use, so the surface
+/// Same wording the bridge + orchestrator server use, so the surface
 /// matches what users see in the docs.
 fn parse_status(word: &str) -> Result<Status> {
     match word {

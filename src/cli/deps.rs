@@ -1,7 +1,7 @@
 //! `fleet deps …` — CLI surface over [`crate::deps::DepsStore`].
 //!
 //! Three subcommands: `list`, `add`, `remove`. Targets the
-//! brainstorm-agent use case primarily — when filing a contracts
+//! orchestrator-agent use case primarily — when filing a contracts
 //! ticket + implementation tickets, the agent needs a clean way to
 //! record the `blocked_on` edges without hand-editing
 //! `.fleet/deps.json`. Same shape as `fleet plan` and
@@ -22,7 +22,7 @@ use crate::session::now_ms;
 
 /// `fleet deps list` — human-readable view of every edge in the
 /// current repo. Replaces `cat .fleet/deps.json` for the
-/// brainstorm agent (and any human reading the graph).
+/// orchestrator agent (and any human reading the graph).
 pub fn run_list() -> Result<i32> {
     let store = open_store()?;
     let doc = store.load().context("loading deps file")?;
@@ -76,7 +76,7 @@ pub fn run_add(
 ///
 /// Surgical: clears exactly the `(blocked, blocked_on)` edge.
 /// Idempotent — removing an edge that isn't there isn't an error,
-/// just printed as a no-op so the brainstorm agent can re-run
+/// just printed as a no-op so the orchestrator agent can re-run
 /// without worrying about state.
 pub fn run_remove(
     blocked: &str,
@@ -147,7 +147,7 @@ fn build_edge(
 }
 
 /// Pure: render the human-readable `deps list` output. Empty doc
-/// prints a one-line marker so brainstorm + scripts see something
+/// prints a one-line marker so orchestrator + scripts see something
 /// instead of nothing.
 #[must_use]
 pub fn render_list(doc: &DepsDoc) -> String {

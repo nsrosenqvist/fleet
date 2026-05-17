@@ -31,10 +31,10 @@ pub enum BackendKind {
     /// force. Not used by the Linux Podman path, which runs tinyproxy
     /// inside a sidecar container.
     Tinyproxy,
-    /// `tmux` host binary — needed for `fleet brainstorm` interactive
+    /// `tmux` host binary — needed for `fleet orchestrator` interactive
     /// planning sessions. Not used by workflow execution, so its
     /// absence is only a problem when the user reaches for the
-    /// brainstorm flow.
+    /// orchestrator flow.
     Tmux,
 }
 
@@ -111,7 +111,7 @@ pub struct ProbeReport {
     /// is the chosen egress backend — macOS Apple Container / Docker
     /// with `policy: allowlist`).
     pub tinyproxy: BackendStatus,
-    /// `tmux` binary (host-side, needed for `fleet brainstorm`).
+    /// `tmux` binary (host-side, needed for `fleet orchestrator`).
     pub tmux: BackendStatus,
     /// Recommended *engine* (not hardening or devcontainer CLI). `None`
     /// when nothing usable was found — `fleet doctor` surfaces install hints
@@ -165,7 +165,7 @@ impl ProbeReport {
             hints.push(
                 "tmux missing — `brew install tmux` (macOS) or `apt install tmux` \
                  (Debian/Ubuntu) / `dnf install tmux` (Fedora). Only needed when \
-                 you run `fleet brainstorm`; workflow sessions don't use it.",
+                 you run `fleet orchestrator`; workflow sessions don't use it.",
             );
         }
         hints
@@ -234,7 +234,7 @@ impl ProbeReport {
                     "linux" => "sudo apt install tmux    # or: sudo dnf install tmux".to_string(),
                     _ => "install tmux from your distro's repos".to_string(),
                 },
-                note: "only needed when running `fleet brainstorm` interactive sessions"
+                note: "only needed when running `fleet orchestrator` interactive sessions"
                     .to_string(),
             });
         }

@@ -18,11 +18,11 @@
 
 mod agent;
 mod autonomous;
-mod brainstorm;
 mod bridge;
 mod cli;
 mod deps;
 mod egress;
+mod orchestrator;
 mod plans;
 mod process;
 mod repo;

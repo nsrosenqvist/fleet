@@ -7,7 +7,7 @@
 use clap::{Parser, Subcommand};
 
 pub mod autonomous;
-pub mod brainstorm;
+pub mod orchestrator;
 pub mod deps;
 pub mod init;
 pub mod issues;
@@ -77,17 +77,19 @@ pub enum Command {
         sub: PlanSub,
     },
 
-    /// Brainstorm sessions: interactive host-side agent panes for
-    /// planning + ticket triage. With no subcommand, mints a new
-    /// session and attaches the caller's terminal to it.
-    Brainstorm {
+    /// Orchestrator session: the single per-repo interactive
+    /// planning + coordination agent (Claude Code by default). With
+    /// no subcommand, reuses the existing orchestrator (respawning
+    /// the agent if its tmux pane died) and attaches the caller's
+    /// terminal. With `kill`, tears it down.
+    Orchestrator {
         #[command(subcommand)]
-        sub: Option<BrainstormSub>,
+        sub: Option<OrchestratorSub>,
     },
 
     /// Cross-session dependency graph: list / add / remove edges
     /// in `.fleet/deps.json`. The supervisor consults this graph
-    /// to skip blocked tickets; the brainstorm agent records edges
+    /// to skip blocked tickets; the orchestrator agent records edges
     /// when filing contracts-first ticket trees.
     Deps {
         #[command(subcommand)]
@@ -275,15 +277,11 @@ pub enum IssuesSub {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum BrainstormSub {
-    /// List known brainstorm sessions with their state + tmux pane
-    /// name. Live tmux pane → active/detached; tmux gone → closed.
-    List,
-    /// Re-attach to an existing brainstorm session's tmux pane.
-    Attach { id: String },
-    /// Kill a brainstorm session: tear down the tmux pane and
-    /// mark the meta as Closed.
-    Kill { id: String },
+pub enum OrchestratorSub {
+    /// Kill the orchestrator: tear down the tmux pane and mark
+    /// meta as Closed. The default `fleet orchestrator` will
+    /// respawn it on next invocation.
+    Kill,
 }
 
 #[derive(Debug, Subcommand)]
@@ -462,11 +460,9 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         Command::Autonomous { sub } => match sub {
             AutonomousSub::Run { once, watch } => autonomous::run(once, watch),
         },
-        Command::Brainstorm { sub } => match sub {
-            None => brainstorm::run_default(),
-            Some(BrainstormSub::List) => brainstorm::run_list(),
-            Some(BrainstormSub::Attach { id }) => brainstorm::run_attach(&id),
-            Some(BrainstormSub::Kill { id }) => brainstorm::run_kill(&id),
+        Command::Orchestrator { sub } => match sub {
+            None => orchestrator::run_default(),
+            Some(OrchestratorSub::Kill) => orchestrator::run_kill(),
         },
         Command::Deps { sub } => match sub {
             DepsSub::List => deps::run_list(),

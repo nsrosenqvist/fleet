@@ -137,9 +137,9 @@ pub trait Tracker: Send + Sync {
         bail!("tracker `{}` does not implement remove_label", self.name())
     }
 
-    /// Create a new ticket. Supervisor / brainstorm authority only —
+    /// Create a new ticket. Supervisor / orchestrator authority only —
     /// never reachable through the bridge. The trait surface lives here
-    /// because `tracker-create` workflow nodes (Phase 2) and brainstorm
+    /// because `tracker-create` workflow nodes (Phase 2) and orchestrator
     /// tool endpoints (Phase 5) both consume it.
     #[allow(dead_code)]
     fn create(

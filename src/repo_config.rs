@@ -33,7 +33,7 @@ pub struct RepoConfig {
     pub autonomous: AutonomousConfig,
     pub cleanup: CleanupConfig,
     pub cost: CostConfig,
-    pub brainstorm: BrainstormConfig,
+    pub orchestrator: OrchestratorConfig,
 }
 
 /// `runtime:` block — which adapter to instantiate, how to harden it, where
@@ -337,21 +337,21 @@ pub struct CleanupConfig {
     pub auto_prune_completed: bool,
 }
 
-/// `brainstorm:` block — interactive planning-session config.
+/// `orchestrator:` block — interactive planning-session config.
 /// `agent` is the binary fleet exec's inside the tmux pane (e.g.
 /// `claude`, `claude-code`, `aider`, ...). Defaults to `claude`
 /// because that's what most fleet users are running today; the
-/// brainstorm prompt assumes Claude Code's tool-use semantics but
+/// orchestrator prompt assumes Claude Code's tool-use semantics but
 /// any agent that takes a system prompt + shell access works.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BrainstormConfig {
+pub struct OrchestratorConfig {
     /// Command fleet exec's. A bare program name (no spaces) so
     /// the tmux invocation stays simple. v1 doesn't support
     /// multi-word commands; embed any flags via a wrapper script.
     pub agent: String,
 }
 
-impl Default for BrainstormConfig {
+impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
             agent: String::from("claude"),
@@ -427,11 +427,11 @@ struct Raw {
     #[serde(default)]
     cost: Option<RawCost>,
     #[serde(default)]
-    brainstorm: Option<RawBrainstorm>,
+    orchestrator: Option<RawOrchestrator>,
 }
 
 #[derive(Deserialize, Default)]
-struct RawBrainstorm {
+struct RawOrchestrator {
     #[serde(default)]
     agent: Option<String>,
 }
@@ -521,7 +521,7 @@ impl From<Raw> for RepoConfig {
             autonomous: default_autonomous,
             cleanup: default_cleanup,
             cost: default_cost,
-            brainstorm: default_brainstorm,
+            orchestrator: default_orchestrator,
         } = Self::default();
 
         let runtime = match raw.runtime {
@@ -601,11 +601,11 @@ impl From<Raw> for RepoConfig {
             },
             None => default_cost,
         };
-        let brainstorm = match raw.brainstorm {
-            Some(b) => BrainstormConfig {
-                agent: b.agent.unwrap_or(default_brainstorm.agent),
+        let orchestrator = match raw.orchestrator {
+            Some(b) => OrchestratorConfig {
+                agent: b.agent.unwrap_or(default_orchestrator.agent),
             },
-            None => default_brainstorm,
+            None => default_orchestrator,
         };
         Self {
             runtime,
@@ -615,7 +615,7 @@ impl From<Raw> for RepoConfig {
             autonomous,
             cleanup,
             cost,
-            brainstorm,
+            orchestrator,
         }
     }
 }
@@ -664,23 +664,23 @@ mod tests {
     }
 
     #[test]
-    fn brainstorm_agent_defaults_to_claude() {
+    fn orchestrator_agent_defaults_to_claude() {
         let cfg = RepoConfig::default();
-        assert_eq!(cfg.brainstorm.agent, "claude");
+        assert_eq!(cfg.orchestrator.agent, "claude");
     }
 
     #[test]
-    fn brainstorm_agent_can_be_overridden_per_repo() {
-        let yaml = "brainstorm:\n  agent: aider\n";
+    fn orchestrator_agent_can_be_overridden_per_repo() {
+        let yaml = "orchestrator:\n  agent: aider\n";
         let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
-        assert_eq!(cfg.brainstorm.agent, "aider");
+        assert_eq!(cfg.orchestrator.agent, "aider");
     }
 
     #[test]
-    fn missing_brainstorm_block_keeps_the_default() {
+    fn missing_orchestrator_block_keeps_the_default() {
         let yaml = "tracker: github\n";
         let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
-        assert_eq!(cfg.brainstorm.agent, "claude");
+        assert_eq!(cfg.orchestrator.agent, "claude");
     }
 
     #[test]

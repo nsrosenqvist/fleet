@@ -8,7 +8,7 @@
 //! State transitions are user-driven through this module — the
 //! autonomous supervisor (Phase 4) only advances *item* states; plan-
 //! level moves between Active/Paused/Completed/Abandoned go through
-//! the CLI (or, in Phase 5, the brainstorm agent).
+//! the CLI (or, in Phase 5, the orchestrator agent).
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -82,7 +82,7 @@ pub fn run_complete(id: &str) -> Result<i32> {
 }
 
 /// `fleet plan abandon <id> [--reason <text>]`. The reason is
-/// recorded to stderr for now — Phase 5's brainstorm agent will be
+/// recorded to stderr for now — Phase 5's orchestrator agent will be
 /// the natural place to record it onto an epic comment.
 pub fn run_abandon(id: &str, reason: Option<&str>) -> Result<i32> {
     transition_state(id, PlanState::Abandoned)?;
@@ -138,7 +138,7 @@ pub fn run_sync(id: &str) -> Result<i32> {
         anyhow::anyhow!(
             "plan `{id}` has no epic_ref; `fleet plan sync` needs an epic \
              to reconcile against. Edit the plan (`fleet plan edit {id}`) \
-             and add an `epic_ref:` block, or let the brainstorm agent \
+             and add an `epic_ref:` block, or let the orchestrator agent \
              populate it via the supervisor."
         )
     })?;

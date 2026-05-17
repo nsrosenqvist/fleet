@@ -163,7 +163,7 @@ impl Tracker for GitHubTracker {
         // GitHub has no native parent/child edge; the v1 convention is
         // a task-list line on the parent's body so the relationship
         // surfaces in GitHub's "Tasklists" UI and trackers like the
-        // brainstorm agent can recreate it from the canonical source.
+        // orchestrator agent can recreate it from the canonical source.
         //
         // Read-modify-write via gh: read the parent's body, append a
         // `- [ ] #<child>` line if not already present, write back.

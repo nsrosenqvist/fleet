@@ -5,8 +5,8 @@
 //!   propagate, but the terminal is always restored first so a `?`
 //!   short-circuit can't strand the user in raw alt-screen mode.
 //! - `event_loop` is the per-tick draw + poll + dispatch hot path.
-//! - `run_brainstorm_suspended` is the alt-screen suspend/resume dance
-//!   for forking off `fleet brainstorm` (which itself takes over the
+//! - `run_orchestrator_suspended` is the alt-screen suspend/resume dance
+//!   for forking off `fleet orchestrator` (which itself takes over the
 //!   terminal with tmux).
 
 use anyhow::{Context, Result, bail};
@@ -104,28 +104,17 @@ fn event_loop(
                 match input::handle_key(&mut state, key, store) {
                     Action::Quit => return Ok(0),
                     Action::None => {}
-                    Action::NewBrainstorm => {
-                        if let Err(err) = run_brainstorm_suspended(terminal, &["brainstorm"]) {
-                            state.status_line = format!(" brainstorm failed: {err:#} ");
+                    Action::OpenOrchestrator => {
+                        // Single-session model: `fleet orchestrator`
+                        // is reuse-or-spawn — it will mint the
+                        // orchestrator on first invocation, respawn
+                        // the agent if the pane is dead, or just
+                        // attach if everything's alive.
+                        if let Err(err) = run_orchestrator_suspended(terminal, &["orchestrator"]) {
+                            state.status_line = format!(" orchestrator failed: {err:#} ");
                         }
-                        // After the subprocess returns, the
-                        // brainstorm session list on disk has
-                        // changed (a new one was created). Refresh
-                        // so the sidebar reflects it.
-                        if let Err(err) = state.reload(store) {
-                            state.status_line = format!(" reload failed: {err:#} ");
-                        }
-                    }
-                    Action::AttachBrainstorm(id) => {
-                        let id_str = id.as_str().to_string();
-                        if let Err(err) = run_brainstorm_suspended(
-                            terminal,
-                            &["brainstorm", "attach", id_str.as_str()],
-                        ) {
-                            state.status_line = format!(" brainstorm attach failed: {err:#} ");
-                        }
-                        // Brainstorm meta may have flipped to
-                        // Detached/Closed on detach; reload so the
+                        // Meta may have flipped to Active/Detached/
+                        // Closed on detach; reload so the sidebar
                         // marker is current.
                         if let Err(err) = state.reload(store) {
                             state.status_line = format!(" reload failed: {err:#} ");
@@ -152,7 +141,7 @@ fn event_loop(
 ///
 /// Uses [`std::env::current_exe`] to locate the binary so the
 /// behaviour works under `cargo run` as well as a release install.
-fn run_brainstorm_suspended(
+fn run_orchestrator_suspended(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     args: &[&str],
 ) -> Result<()> {

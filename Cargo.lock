@@ -482,6 +482,7 @@ dependencies = [
  "tiny_http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
