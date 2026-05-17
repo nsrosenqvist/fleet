@@ -166,8 +166,9 @@ pub(super) enum Action {
     Quit,
     /// Open the per-repo orchestrator: spawn it if it doesn't exist,
     /// respawn the agent if its tmux pane has died, then attach.
-    /// Triggered by Shift+O or Enter on the orchestrator row — both
-    /// collapse to the same operation since there's only ever one.
+    /// Triggered by Enter on the always-visible orchestrator row in
+    /// the sidebar — there's only ever one, so "new" and "attach"
+    /// collapse to the same operation.
     OpenOrchestrator,
 }
 
@@ -366,9 +367,9 @@ impl AppState {
             self.toggle_autonomous();
             return Action::None;
         }
-        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('O')) {
-            return Action::OpenOrchestrator;
-        }
+        // The orchestrator row is always visible in the sidebar, so
+        // Tab + Enter is enough to open it; no Shift+O hotkey
+        // necessary.
         match self.view {
             View::Sessions => self.handle_key_sessions(key, store),
             View::Doctor => self.handle_key_doctor(key, store),
@@ -458,8 +459,9 @@ impl AppState {
                     // Single-session model: there's at most one row
                     // and "attach an existing" == "open the
                     // orchestrator", so both branches collapse to
-                    // OpenOrchestrator. Even on an empty pane we open
-                    // (== spawn), matching what Shift+O does.
+                    // OpenOrchestrator. The synthetic "not running"
+                    // row is also Enter-able, so a brand-new repo
+                    // can spawn the orchestrator from here directly.
                     return Action::OpenOrchestrator;
                 }
                 Action::None

@@ -1920,8 +1920,8 @@ mod tests {
     // ---- sessions view orchestrator bindings ------------------------
 
     /// Seed a TempDir-rooted state with one workflow session and an
-    /// orchestrator — enough surface to exercise the Tab/j/k/
-    /// Enter/Shift+O handlers against real on-disk metadata.
+    /// orchestrator — enough surface to exercise the Tab/j/k/Enter
+    /// handlers against real on-disk metadata.
     fn sessions_state_with_one_of_each() -> (tempfile::TempDir, SessionStore, AppState) {
         let tmp = tempfile::tempdir().unwrap();
         let sessions = SessionStore::at(tmp.path().to_path_buf());
@@ -1972,20 +1972,18 @@ mod tests {
     }
 
     #[test]
-    fn shift_o_returns_open_orchestrator_from_any_view() {
+    fn shift_o_is_no_longer_a_hotkey() {
+        // The always-visible orchestrator row in the sidebar
+        // (rendered even when nothing is running) makes a global
+        // hotkey unnecessary — Tab into the pane, Enter to open.
+        // Explicitly assert Shift+O is a no-op so a future reviver
+        // of the binding has to update this test deliberately.
         let (_tmp, store, mut state) = sessions_state_with_one_of_each();
         let action = state.handle_key(
             KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
             &store,
         );
-        assert!(matches!(action, Action::OpenOrchestrator));
-        // From the Plans view, too — Shift+O is a global hotkey.
-        state.view = View::Plans;
-        let action = state.handle_key(
-            KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
-            &store,
-        );
-        assert!(matches!(action, Action::OpenOrchestrator));
+        assert!(matches!(action, Action::None));
     }
 
     // ---- orchestrator sidebar ---------------------------------------
@@ -1997,16 +1995,19 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_row_label_carries_marker_tmux_name_agent_and_state_word() {
-        // The row label always shows the fixed `fl-orchestrator`
-        // tmux name — there's no per-id variation in the
-        // single-session model.
+    fn orchestrator_row_label_is_compact_marker_plus_tmux_name() {
+        // Compact label so it fits in the narrow sidebar pane: just
+        // the state marker + fixed tmux name. The agent + state
+        // word live in the details pane when the row is selected,
+        // not in the sidebar row itself.
         let s = orchestrator("claude", OrchestratorState::Active);
         let label = orchestrator_row_label(&s);
         assert!(label.starts_with('◐'), "marker missing: {label}");
         assert!(label.contains("fl-orchestrator"));
-        assert!(label.contains("agent=claude"));
-        assert!(label.contains("(active)"));
+        // Sidebar row is intentionally minimal — no agent/state
+        // text crowding the narrow pane.
+        assert!(!label.contains("agent="), "agent leaked into sidebar: {label}");
+        assert!(!label.contains("(active)"), "state word leaked into sidebar: {label}");
     }
 
     #[test]
@@ -2017,6 +2018,73 @@ mod tests {
         );
         assert!(
             orchestrator_row_label(&orchestrator("x", OrchestratorState::Closed)).starts_with('✗')
+        );
+    }
+
+    #[test]
+    fn sidebar_orchestrator_pane_renders_when_no_orchestrator_exists_yet() {
+        // The orchestrator pane is permanently visible in the
+        // sidebar, even before the first spawn — the rendered row
+        // shows `fl-orchestrator (not running)` so the user has a
+        // visible target to Enter on.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = SessionStore::at(tmp.path().to_path_buf());
+        let state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
+        assert!(state.orchestrators.is_empty());
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        let dumped: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dumped.contains("orchestrator"),
+            "orchestrator pane title missing; got:\n{dumped}",
+        );
+        assert!(
+            dumped.contains("fl-orchestrator"),
+            "synthetic row missing; got:\n{dumped}",
+        );
+    }
+
+    #[test]
+    fn sidebar_orchestrator_pane_has_no_count_in_title() {
+        // The title should be just " orchestrator " — no "(N)"
+        // counter, since there's only ever 0 or 1.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = SessionStore::at(tmp.path().to_path_buf());
+        let ostore = OrchestratorStore::for_repo(tmp.path());
+        ostore.save(&OrchestratorSession::new("claude", 1)).unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        let dumped: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // No "(1)" / "(0)" appears next to "orchestrator" in the
+        // pane title.
+        assert!(
+            !dumped.contains("orchestrator (1)") && !dumped.contains("orchestrator (0)"),
+            "orchestrator title carries a counter; got:\n{dumped}",
         );
     }
 }

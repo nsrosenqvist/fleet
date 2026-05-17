@@ -726,97 +726,86 @@ pub(super) fn plan_failure_word(policy: crate::plans::ItemFailurePolicy) -> &'st
 }
 
 fn render_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    // The orchestrator pane is always shown in the sidebar — its
-    // count (0 or 1) and label live alongside the workers count in
-    // the outer frame title so the user sees both at a glance.
-    let title = format!(
-        " workers ({}) · orchestrator ({}) ",
-        state.sessions.len(),
-        state.orchestrators.len(),
-    );
-    let outer = framed_block(&title);
-    if state.sessions.is_empty() && state.orchestrators.is_empty() {
+    // Two distinct framed panes, stacked: orchestrator on top
+    // (one-row tall — there's only ever one) and workers below
+    // (rest of the area). Each owns its own border + title so the
+    // user reads the sidebar as two separate sections, not one
+    // section with an inline divider.
+    let (orchestrator_area, workers_area) = split_sidebar_areas(area);
+    render_orchestrator_pane(f, orchestrator_area, state);
+    render_workers_pane(f, workers_area, state);
+}
+
+/// Layout split: orchestrator pane is 3 rows (1 row of content +
+/// the border on top and bottom). Workers pane takes the rest.
+/// Returns `(orchestrator_area, workers_area)`.
+#[must_use]
+fn split_sidebar_areas(area: Rect) -> (Rect, Rect) {
+    const ORCHESTRATOR_PANE_HEIGHT: u16 = 3;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(ORCHESTRATOR_PANE_HEIGHT),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
+fn render_orchestrator_pane(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    // No counter in the title — there's only ever 0 or 1, so a
+    // count would be visual noise.
+    let block = framed_block(" orchestrator ");
+    f.render_widget(block.clone(), area);
+    let inner = block.inner(area);
+    render_orchestrator_list(f, inner, state);
+}
+
+fn render_workers_pane(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let title = format!(" workers ({}) ", state.sessions.len());
+    let block = framed_block(&title);
+    f.render_widget(block.clone(), area);
+    let inner = block.inner(area);
+    if state.sessions.is_empty() {
+        // Empty-state hint inside the pane. The orchestrator pane
+        // above this stays as-is (the synthetic "not running" row
+        // covers its own empty case), so this hint is workers-only.
         let muted = Style::default().fg(MUTED);
         let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
         let lines = vec![
-            Line::from(Span::styled("(no sessions yet)", muted)),
+            Line::from(Span::styled("(no workers yet)", muted)),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  ", muted),
                 Span::styled("n", bold_key),
-                Span::styled("       open the workflow picker", muted),
-            ]),
-            Line::from(vec![
-                Span::styled("  ", muted),
-                Span::styled("O", bold_key),
-                Span::styled("       open the orchestrator (Shift+O)", muted),
+                Span::styled("    open the workflow picker", muted),
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "  Or from a shell:  fleet workflow run <name>",
+                "  Or:  fleet workflow run <name>",
                 muted,
             )),
         ];
         let body = Paragraph::new(lines)
-            .block(outer.padding(Padding::horizontal(2)))
+            .block(Block::default().padding(Padding::horizontal(2)))
             .wrap(Wrap { trim: false });
-        f.render_widget(body, area);
-        return;
+        f.render_widget(body, inner);
+    } else {
+        render_workflow_list(f, inner, state);
     }
-    f.render_widget(outer.clone(), area);
-    let inner = outer.inner(area);
-    let (workflow_area, orchestrator_area) =
-        split_sidebar_areas(inner, state.sessions.len(), state.orchestrators.len());
-    if let Some(area) = workflow_area {
-        render_workflow_list(f, area, state);
-    }
-    // Orchestrator pane is permanently visible — render it even
-    // when state.orchestrators is empty so the user sees the
-    // section header and knows Shift+O / Enter opens it.
-    if let Some(area) = orchestrator_area {
-        render_orchestrator_list(f, area, state);
-    }
-}
-
-#[must_use]
-fn split_sidebar_areas(
-    inner: Rect,
-    n_workflows: usize,
-    n_orchestrators: usize,
-) -> (Option<Rect>, Option<Rect>) {
-    // Orchestrator pane is permanently visible (per the screenshot
-    // / single-session design) — allocate ~2 rows for it even when
-    // empty so the user can see "orchestrator (0)" + Shift+O hint
-    // sit there. Worker pane gets the rest. When the orchestrator
-    // has 1 entry it gets a bit more, but never crowds the workers.
-    if inner.height == 0 {
-        return (None, None);
-    }
-    let workflow_share = u32::try_from(n_workflows + 2).unwrap_or(u32::MAX);
-    let orchestrator_share = u32::try_from(n_orchestrators + 2).unwrap_or(u32::MAX);
-    let total = workflow_share.saturating_add(orchestrator_share);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Ratio(workflow_share, total),
-            Constraint::Ratio(orchestrator_share, total),
-        ])
-        .split(inner);
-    (Some(chunks[0]), Some(chunks[1]))
 }
 
 fn render_workflow_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let mut items: Vec<ListItem<'_>> = Vec::with_capacity(state.sessions.len() + 1);
-    items.push(ListItem::new(Span::styled(
-        "── Workflows ──".to_string(),
-        Style::default().fg(MUTED),
-    )));
-    for s in &state.sessions {
-        items.push(ListItem::new(Span::styled(
-            session_row_label(s, &state.plans, &state.cycle_nodes),
-            state_style(s.state),
-        )));
-    }
+    let items: Vec<ListItem<'_>> = state
+        .sessions
+        .iter()
+        .map(|s| {
+            ListItem::new(Span::styled(
+                session_row_label(s, &state.plans, &state.cycle_nodes),
+                state_style(s.state),
+            ))
+        })
+        .collect();
     let highlight = if state.sessions_focus == SessionsFocus::Workflows {
         Style::default()
             .fg(SELECT_FG)
@@ -828,25 +817,30 @@ fn render_workflow_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let list = List::new(items)
         .highlight_style(highlight)
         .highlight_symbol("▸ ");
-    let mut shifted = state.list_state.clone();
-    if let Some(i) = shifted.selected() {
-        shifted.select(Some(i + 1));
-    }
-    f.render_stateful_widget(list, area, &mut shifted);
+    f.render_stateful_widget(list, area, &mut state.list_state.clone());
 }
 
 fn render_orchestrator_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let mut items: Vec<ListItem<'_>> = Vec::with_capacity(state.orchestrators.len() + 1);
-    items.push(ListItem::new(Span::styled(
-        "── Orchestrator ──".to_string(),
-        Style::default().fg(MUTED),
-    )));
-    for b in &state.orchestrators {
-        items.push(ListItem::new(Span::styled(
-            orchestrator_row_label(b),
-            orchestrator_row_style(b.state),
-        )));
-    }
+    // Always one row, regardless of whether the orchestrator is
+    // running: when present we show the live state (marker + agent
+    // + state word); when absent we show just the fixed tmux name
+    // in muted style — the dimming itself signals "dormant", and
+    // keeping the row short avoids overflowing the narrow sidebar
+    // pane.
+    let item = state.orchestrators.first().map_or_else(
+        || {
+            ListItem::new(Span::styled(
+                format!("  {}", crate::orchestrator::TMUX_SESSION_NAME),
+                Style::default().fg(MUTED),
+            ))
+        },
+        |s| {
+            ListItem::new(Span::styled(
+                orchestrator_row_label(s),
+                orchestrator_row_style(s.state),
+            ))
+        },
+    );
     let highlight = if state.sessions_focus == SessionsFocus::Orchestrator {
         Style::default()
             .fg(SELECT_FG)
@@ -855,27 +849,29 @@ fn render_orchestrator_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     } else {
         Style::default()
     };
-    let list = List::new(items)
+    let list = List::new(vec![item])
         .highlight_style(highlight)
         .highlight_symbol("▸ ");
-    let mut shifted = state.orchestrators_list_state.clone();
-    if let Some(i) = shifted.selected() {
-        shifted.select(Some(i + 1));
+    // Cursor is always at row 0 (the one row). Cloning the state's
+    // ListState keeps any pre-existing selection in sync.
+    let mut cursor = state.orchestrators_list_state.clone();
+    if cursor.selected().is_some() {
+        cursor.select(Some(0));
     }
-    f.render_stateful_widget(list, area, &mut shifted);
+    f.render_stateful_widget(list, area, &mut cursor);
 }
 
 #[must_use]
 pub fn orchestrator_row_label(session: &OrchestratorSession) -> String {
-    // Fixed tmux name (`fl-orchestrator`) is what the screenshot
-    // shows; the agent + state suffix tells the user what's
-    // running and whether it's live.
+    // Compact label that fits in the narrow sidebar pane: just the
+    // state marker + fixed tmux name. The marker (◐/⏸/✗) plus the
+    // row's accent/warn/muted style convey active/detached/closed;
+    // the agent + state word are visible in the details pane when
+    // the row is selected.
     format!(
-        "{} {}  agent={}  ({})",
+        "{} {}",
         orchestrator_state_marker(session.state),
         crate::orchestrator::TMUX_SESSION_NAME,
-        session.agent,
-        orchestrator_state_word(session.state),
     )
 }
 
@@ -1145,9 +1141,6 @@ fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
                 sep(),
                 theme_key("A"),
                 Span::raw(" auto"),
-                sep(),
-                theme_key("B"),
-                Span::raw(" orchestrator"),
                 sep(),
                 theme_key("r"),
                 Span::raw(" reload"),
