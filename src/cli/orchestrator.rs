@@ -7,17 +7,24 @@
 //! - `fleet orchestrator` (no subcommand) — reuse-or-spawn. If the
 //!   orchestrator exists and its tmux pane is alive, attach. If it
 //!   exists but the pane is gone (e.g. the user Ctrl-C'd out of
-//!   the agent), respawn the agent in place — using its launcher's
-//!   resume mechanism where supported — and attach. If no
-//!   orchestrator exists yet, mint one and attach. Either way the
-//!   caller's terminal ends up inside a live agent pane.
+//!   the agent or killed it explicitly), spawn the agent fresh in
+//!   place and attach. If no orchestrator exists yet, mint one and
+//!   attach. Either way the caller's terminal ends up inside a
+//!   live agent pane.
 //! - `fleet orchestrator kill` — tear down the tmux pane and mark
-//!   meta as Closed. The next `fleet orchestrator` will respawn
-//!   it on the same `agent_session_id` when supported (claude
-//!   `--resume <uuid>`), so killing is non-destructive of the
-//!   conversation history for claude. For aider/codex the chat
-//!   history file / `resume --last` machinery survives the kill
-//!   too.
+//!   meta as Closed. The next `fleet orchestrator` will spawn a
+//!   fresh agent.
+//!
+//! The orchestrator is transient by design — a respawn after a
+//! dead pane always starts the agent fresh rather than trying to
+//! resume the prior conversation. The previous design pre-minted
+//! a `claude --session-id <uuid>` and tried to `--resume <uuid>`
+//! on respawn, but that broke whenever Claude's local session
+//! store had evicted the conversation ("No conversation found with
+//! session ID …"), leaving the user unable to re-enter the
+//! orchestrator at all. Fresh-spawn always works; the
+//! `tmux pipe-pane` transcript preserves the prior conversation
+//! for audit.
 //!
 //! The orchestrator agent has full shell access via tmux and reaches
 //! fleet via the CLI — `fleet plan …`, `fleet issues …`,
@@ -27,13 +34,7 @@
 //! launcher strategy (see `crate::orchestrator::launcher`) — the
 //! prompt body is passed as an argv flag tuned for each binary
 //! (`claude --append-system-prompt`, `aider --read`, etc.) rather
-//! than left as a file the agent might never read. For agents that
-//! support pre-assigned session ids (claude `--session-id`), fleet
-//! mints one at first spawn and persists it in `meta.json` so a
-//! respawn can `--resume <uuid>` deterministically. Aider relies on
-//! `--restore-chat-history` against a fleet-pinned history file,
-//! codex on `codex resume --last`; bare agents fall back to a
-//! fresh spawn (history lost) since fleet has no continuity hook.
+//! than left as a file the agent might never read.
 //!
 //! There's intentionally no HTTP server / token plumbing: the
 //! agent is already on the host, the bridge's security boundary
@@ -96,8 +97,7 @@ pub fn run_default() -> Result<i32> {
 
 /// `fleet orchestrator kill` — kill the tmux pane, flip meta to
 /// Closed. Idempotent. A subsequent `fleet orchestrator` will
-/// respawn the agent (resuming the conversation where the agent
-/// supports it).
+/// spawn a fresh agent.
 pub fn run_kill() -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
@@ -117,9 +117,9 @@ pub fn run_kill() -> Result<i32> {
 }
 
 /// Guarantee the orchestrator's tmux pane is alive on return.
-/// If the pane is gone, respawn the agent via its launcher's
-/// resume argv, re-pipe the transcript, and flip the meta back
-/// to Active. No-op when the pane is already alive.
+/// If the pane is gone, spawn a fresh agent in place, re-pipe the
+/// transcript, and flip the meta back to Active. No-op when the
+/// pane is already alive.
 fn ensure_alive(
     store: &OrchestratorStore,
     root: &Path,
@@ -144,12 +144,7 @@ fn ensure_alive(
     if let Some(warning) = launcher.unsupported_warning() {
         eprintln!("warning: agent `{agent}`: {warning}");
     }
-    let argv = launcher.resume_argv(
-        &agent,
-        &prompt_path,
-        &prompt_body,
-        session.agent_session_id.as_deref(),
-    );
+    let argv = launcher.argv(&agent, &prompt_path, &prompt_body);
     let env = orchestrator_env(&prompt_path);
 
     eprintln!("respawning orchestrator (agent `{agent}`) — previous tmux pane was killed");
@@ -157,7 +152,8 @@ fn ensure_alive(
         .with_context(|| format!("respawning tmux session `{TMUX_SESSION_NAME}`"))?;
 
     // pipe-pane appends to the existing transcript so the
-    // conversation log is continuous across respawns.
+    // conversation log is continuous across respawns even though
+    // the agent itself starts fresh.
     let transcript_path = store.transcript_path();
     if let Err(err) = tmux::pipe_pane_to(invoker.as_ref(), TMUX_SESSION_NAME, &transcript_path) {
         eprintln!("warning: tmux pipe-pane failed (no transcript will be captured): {err:#}");
@@ -179,7 +175,7 @@ fn spawn_fresh(
     invoker: &Arc<dyn ProcessInvoker>,
 ) -> Result<()> {
     let agent = &config.orchestrator.agent;
-    let mut session = OrchestratorSession::new(agent.as_str(), now_ms());
+    let session = OrchestratorSession::new(agent.as_str(), now_ms());
 
     let snapshot = snapshot_or_empty(root, invoker);
     let prompt_body = render_prompt_lenient(root, &snapshot);
@@ -189,16 +185,7 @@ fn spawn_fresh(
     if let Some(warning) = launcher.unsupported_warning() {
         eprintln!("warning: agent `{agent}`: {warning}");
     }
-    // If the launcher pre-mints an agent-side session id (claude
-    // does, others don't), bake it into the spawn argv and persist
-    // it so a later respawn can `--resume` the same conversation.
-    let argv = if let Some(sid) = launcher.mint_session_id() {
-        let argv = launcher.argv_with_session_id(agent, &prompt_path, &prompt_body, &sid);
-        session.agent_session_id = Some(sid);
-        argv
-    } else {
-        launcher.argv(agent, &prompt_path, &prompt_body)
-    };
+    let argv = launcher.argv(agent, &prompt_path, &prompt_body);
 
     store.save(&session)?;
     std::fs::write(&prompt_path, &prompt_body)

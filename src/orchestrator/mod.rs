@@ -62,21 +62,18 @@ pub enum OrchestratorState {
 /// Closed on next list/inspect (similar to how `Session::pid` +
 /// the reaper interact for workflow sessions).
 ///
-/// `agent_session_id` is the agent's own conversation handle, when
-/// the agent supports pre-assigning one. For claude it's the UUID
-/// passed to `--session-id` at spawn; on respawn we use it as
-/// `claude --resume <uuid>` so the conversation continues. Aider
-/// and codex don't take a pre-assigned id, so this stays None for
-/// them; they recover continuity through `--restore-chat-history`
-/// and `codex resume --last` respectively.
+/// No agent-side conversation id is tracked: the orchestrator is
+/// transient by design, and a respawn after a dead pane always
+/// starts the agent fresh rather than trying to resume the prior
+/// conversation. Old metas that include an `agent_session_id`
+/// field are still loadable (serde silently ignores unknown
+/// fields); the value is just no longer used.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorSession {
     pub agent: String,
     pub state: OrchestratorState,
     #[serde(default)]
     pub pid: Option<u32>,
-    #[serde(default)]
-    pub agent_session_id: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -91,7 +88,6 @@ impl OrchestratorSession {
             agent: agent.into(),
             state: OrchestratorState::Active,
             pid: None,
-            agent_session_id: None,
             created_at_ms,
             updated_at_ms: created_at_ms,
         }
@@ -103,14 +99,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn orchestrator_session_starts_active_with_no_pid_or_agent_session_id() {
+    fn orchestrator_session_starts_active_with_no_pid() {
         let s = OrchestratorSession::new("claude", 100);
         assert_eq!(s.state, OrchestratorState::Active);
         assert_eq!(s.agent, "claude");
         assert_eq!(s.created_at_ms, 100);
         assert_eq!(s.updated_at_ms, 100);
         assert!(s.pid.is_none());
-        assert!(s.agent_session_id.is_none());
     }
 
     #[test]
@@ -118,24 +113,18 @@ mod tests {
         let mut s = OrchestratorSession::new("claude-code", 100);
         s.state = OrchestratorState::Detached;
         s.pid = Some(12345);
-        s.agent_session_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string());
         s.updated_at_ms = 200;
         let json = serde_json::to_string(&s).unwrap();
         let round: OrchestratorSession = serde_json::from_str(&json).unwrap();
         assert_eq!(round, s);
         assert!(json.contains("\"state\":\"detached\""), "json: {json}");
-        assert!(
-            json.contains("\"agent_session_id\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\""),
-            "json: {json}",
-        );
     }
 
     #[test]
-    fn orchestrator_session_tolerates_missing_pid_and_agent_session_id_on_load() {
+    fn orchestrator_session_tolerates_missing_pid_on_load() {
         // Brand-new sessions may serialise without `pid` set yet
         // (the tmux probe runs after meta is first written).
-        // `#[serde(default)]` should yield None for both optional
-        // fields.
+        // `#[serde(default)]` should yield None.
         let json = r#"{
             "agent": "claude-code",
             "state": "active",
@@ -144,7 +133,25 @@ mod tests {
         }"#;
         let s: OrchestratorSession = serde_json::from_str(json).unwrap();
         assert!(s.pid.is_none());
-        assert!(s.agent_session_id.is_none());
+    }
+
+    #[test]
+    fn orchestrator_session_load_tolerates_legacy_agent_session_id_field() {
+        // Pre-simplification metas wrote an `agent_session_id`
+        // field. The struct no longer has it, but serde's default
+        // is to ignore unknown fields, so loading should still
+        // succeed.
+        let json = r#"{
+            "agent": "claude-code",
+            "state": "detached",
+            "pid": 999,
+            "agent_session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "created_at_ms": 1,
+            "updated_at_ms": 2
+        }"#;
+        let s: OrchestratorSession = serde_json::from_str(json).unwrap();
+        assert_eq!(s.state, OrchestratorState::Detached);
+        assert_eq!(s.pid, Some(999));
     }
 
     #[test]
