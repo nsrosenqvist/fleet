@@ -287,6 +287,11 @@ struct AppState {
     /// notices a tangle the supervisor can't resolve on its own.
     /// Empty when the deps file is missing or acyclic.
     cycle_nodes: std::collections::HashSet<String>,
+    /// Full deps document, cached alongside `cycle_nodes` from
+    /// the same `reload`. Used by the Plans ticket-detail pane
+    /// to render "Blocked on:" / "Blocks:" rows without an extra
+    /// per-render disk read. Missing file → empty document.
+    deps_doc: crate::deps::DepsDoc,
     /// Cache of tracker-fetched issue details for the Plans
     /// view's third pane, keyed by ticket id. `Err` caches the
     /// user-facing failure string so we don't re-hit the tracker
@@ -448,6 +453,7 @@ impl AppState {
             sessions_focus: SessionsFocus::Workflows,
             brainstorms_list_state: ListState::default(),
             cycle_nodes: std::collections::HashSet::new(),
+            deps_doc: crate::deps::DepsDoc::empty(),
             focused_issue_cache: std::collections::HashMap::new(),
         };
         state.reload(store)?;
@@ -503,16 +509,13 @@ impl AppState {
         // Brainstorms are similarly cheap and live in the same
         // sidebar — keep the listing fresh.
         self.refresh_brainstorms();
-        // Recompute cycle nodes from the deps file so the
-        // sidebar's ⚠ markers reflect current state. Loading a
-        // missing deps.json yields an empty doc (and thus an
-        // empty set) — the common case for repos that don't use
-        // tracker-create injection yet.
+        // Reload deps once and derive cycle membership from it —
+        // both pieces of state are downstream of `.fleet/deps.json`.
+        // Missing file → empty doc, which also yields empty cycles.
         let deps_store = crate::deps::DepsStore::for_repo(&self.root);
-        self.cycle_nodes = deps_store
-            .load()
-            .map(|doc| crate::deps::nodes_in_cycle(&doc))
-            .unwrap_or_default();
+        let doc = deps_store.load().unwrap_or_else(|_| crate::deps::DepsDoc::empty());
+        self.cycle_nodes = crate::deps::nodes_in_cycle(&doc);
+        self.deps_doc = doc;
         self.status_line = render_status_line(&self.sessions, &self.plans);
         Ok(())
     }
@@ -1018,15 +1021,17 @@ impl AppState {
         }
     }
 
-    /// Recompute `cycle_nodes` without touching the rest of the
-    /// state. Pulled out so `u` can refresh the marker after
+    /// Recompute deps-derived state (`cycle_nodes` + `deps_doc`)
+    /// without touching the rest of the world. Pulled out so `u`
+    /// can refresh the markers + ticket-pane deps rows after
     /// removing edges without re-listing every session and plan.
     fn refresh_cycle_nodes_only(&mut self) {
         let deps_store = crate::deps::DepsStore::for_repo(&self.root);
-        self.cycle_nodes = deps_store
+        let doc = deps_store
             .load()
-            .map(|doc| crate::deps::nodes_in_cycle(&doc))
-            .unwrap_or_default();
+            .unwrap_or_else(|_| crate::deps::DepsDoc::empty());
+        self.cycle_nodes = crate::deps::nodes_in_cycle(&doc);
+        self.deps_doc = doc;
     }
 
     /// Switch into the Plans view, reloading from disk so the listing
@@ -1935,7 +1940,7 @@ fn ticket_detail_lines(state: &AppState) -> Vec<Line<'static>> {
         ))];
     };
     let ticket_id = &item.ticket_id;
-    match state.focused_issue_cache.get(ticket_id) {
+    let mut lines = match state.focused_issue_cache.get(ticket_id) {
         None => vec![
             kv_line("ticket", ticket_id),
             Line::from(""),
@@ -1953,6 +1958,74 @@ fn ticket_detail_lines(state: &AppState) -> Vec<Line<'static>> {
             )),
         ],
         Some(Ok(detail)) => issue_detail_lines(detail),
+    };
+    // Append the deps section regardless of whether the tracker
+    // fetch succeeded — deps live in `.fleet/deps.json` (cached
+    // on AppState), so a tracker outage shouldn't hide them.
+    append_deps_lines(&mut lines, ticket_id, &state.deps_doc, &state.cycle_nodes);
+    lines
+}
+
+/// Append "Blocked on:" / "Blocks:" / cycle-warning rows for the
+/// given ticket, derived from the cached deps document. No-op
+/// when the ticket has no edges on either side and isn't in a
+/// cycle. The two sides are listed separately so it's clear at a
+/// glance which way the arrow points: *blocked on* X means we're
+/// waiting for X; *blocks* Y means Y is waiting for us.
+fn append_deps_lines(
+    lines: &mut Vec<Line<'static>>,
+    ticket_id: &str,
+    deps: &crate::deps::DepsDoc,
+    cycle_nodes: &std::collections::HashSet<String>,
+) {
+    let blocked_on: Vec<&crate::deps::DepEdge> = deps
+        .edges
+        .iter()
+        .filter(|e| e.blocked == ticket_id)
+        .collect();
+    let blocks: Vec<&crate::deps::DepEdge> = deps
+        .edges
+        .iter()
+        .filter(|e| e.blocked_on == ticket_id)
+        .collect();
+    let in_cycle = cycle_nodes.contains(ticket_id);
+
+    if blocked_on.is_empty() && blocks.is_empty() && !in_cycle {
+        return;
+    }
+
+    lines.push(Line::from(""));
+    if !blocked_on.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("Blocked on ({}):", blocked_on.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for edge in &blocked_on {
+            let kind = match edge.reason {
+                crate::deps::BlockedReason::Ticket => "ticket",
+                crate::deps::BlockedReason::Freeform => "freeform",
+            };
+            lines.push(Line::from(format!("  • {}  [{kind}]", edge.blocked_on)));
+        }
+    }
+    if !blocks.is_empty() {
+        if !blocked_on.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("Blocks ({}):", blocks.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for edge in &blocks {
+            lines.push(Line::from(format!("  • {}", edge.blocked)));
+        }
+    }
+    if in_cycle {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "⚠  Part of a deps cycle — supervisor can't auto-resolve.",
+            Style::default().fg(Color::Yellow),
+        )));
     }
 }
 
@@ -3821,6 +3894,141 @@ mod tests {
         let r = rendered(&ticket_detail_lines(&state));
         assert!(r.contains("simulated git-bug failure"), "got: {r}");
         assert!(r.contains("tracker read failed"));
+    }
+
+    #[test]
+    fn append_deps_lines_is_a_noop_when_no_edges_and_no_cycle() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let doc = crate::deps::DepsDoc::empty();
+        let cycles = std::collections::HashSet::new();
+        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        assert!(lines.is_empty(), "no deps + no cycle → no lines");
+    }
+
+    #[test]
+    fn append_deps_lines_renders_blocked_on_section_with_kind_marker() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let doc = crate::deps::DepsDoc {
+            version: crate::deps::DEPS_SCHEMA_VERSION,
+            edges: vec![
+                crate::deps::DepEdge {
+                    blocked: "42".into(),
+                    blocked_on: "100".into(),
+                    reason: crate::deps::BlockedReason::Ticket,
+                    created_at_ms: 1,
+                },
+                crate::deps::DepEdge {
+                    blocked: "42".into(),
+                    blocked_on: "free:apt-mirror".into(),
+                    reason: crate::deps::BlockedReason::Freeform,
+                    created_at_ms: 2,
+                },
+            ],
+        };
+        let cycles = std::collections::HashSet::new();
+        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        let r = rendered(&lines);
+        assert!(r.contains("Blocked on (2):"), "got: {r}");
+        assert!(r.contains("100  [ticket]"));
+        assert!(r.contains("free:apt-mirror  [freeform]"));
+    }
+
+    #[test]
+    fn append_deps_lines_renders_blocks_section_when_others_depend_on_this() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let doc = crate::deps::DepsDoc {
+            version: crate::deps::DEPS_SCHEMA_VERSION,
+            edges: vec![
+                crate::deps::DepEdge {
+                    blocked: "99".into(),
+                    blocked_on: "42".into(),
+                    reason: crate::deps::BlockedReason::Ticket,
+                    created_at_ms: 1,
+                },
+                crate::deps::DepEdge {
+                    blocked: "200".into(),
+                    blocked_on: "42".into(),
+                    reason: crate::deps::BlockedReason::Ticket,
+                    created_at_ms: 2,
+                },
+            ],
+        };
+        let cycles = std::collections::HashSet::new();
+        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        let r = rendered(&lines);
+        assert!(r.contains("Blocks (2):"), "got: {r}");
+        assert!(r.contains("• 99"));
+        assert!(r.contains("• 200"));
+    }
+
+    #[test]
+    fn append_deps_lines_renders_both_sections_when_ticket_is_on_both_sides() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let doc = crate::deps::DepsDoc {
+            version: crate::deps::DEPS_SCHEMA_VERSION,
+            edges: vec![
+                crate::deps::DepEdge {
+                    blocked: "42".into(),
+                    blocked_on: "100".into(),
+                    reason: crate::deps::BlockedReason::Ticket,
+                    created_at_ms: 1,
+                },
+                crate::deps::DepEdge {
+                    blocked: "99".into(),
+                    blocked_on: "42".into(),
+                    reason: crate::deps::BlockedReason::Ticket,
+                    created_at_ms: 2,
+                },
+            ],
+        };
+        let cycles = std::collections::HashSet::new();
+        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        let r = rendered(&lines);
+        assert!(r.contains("Blocked on (1):"));
+        assert!(r.contains("Blocks (1):"));
+        // Order: blocked-on (what we wait for) before blocks (who
+        // waits for us). The user is more likely to care about
+        // what's holding *us* up than who we're holding up.
+        let blocked_on_idx = r.find("Blocked on").unwrap();
+        let blocks_idx = r.find("Blocks").unwrap();
+        assert!(blocked_on_idx < blocks_idx, "ordering wrong: {r}");
+    }
+
+    #[test]
+    fn append_deps_lines_emits_cycle_warning_when_ticket_is_in_cycle_set() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let doc = crate::deps::DepsDoc::empty();
+        let mut cycles = std::collections::HashSet::new();
+        cycles.insert("42".to_string());
+        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        let r = rendered(&lines);
+        assert!(r.contains("⚠"), "warning missing: {r}");
+        assert!(r.contains("cycle"), "cycle word missing: {r}");
+    }
+
+    #[test]
+    fn ticket_detail_lines_includes_deps_section_under_cached_issue() {
+        // End-to-end: a focused item with a cached issue *and* a
+        // deps edge should show both the issue header and the
+        // deps section in the same render.
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42"]);
+        state.toggle_plans_focus();
+        state.focused_issue_cache.insert(
+            "42".to_string(),
+            Ok(issue_detail_fixture("42", "Body of 42", &[], 0)),
+        );
+        state.deps_doc = crate::deps::DepsDoc {
+            version: crate::deps::DEPS_SCHEMA_VERSION,
+            edges: vec![crate::deps::DepEdge {
+                blocked: "42".into(),
+                blocked_on: "100".into(),
+                reason: crate::deps::BlockedReason::Ticket,
+                created_at_ms: 1,
+            }],
+        };
+        let r = rendered(&ticket_detail_lines(&state));
+        assert!(r.contains("Body of 42"), "issue body missing: {r}");
+        assert!(r.contains("Blocked on (1):"), "deps section missing: {r}");
     }
 
     #[test]
