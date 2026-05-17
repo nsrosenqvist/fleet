@@ -26,6 +26,11 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # TUI
 ratatui = "0.30"
 crossterm = "0.29"
+# Parse ANSI SGR escapes from `tmux capture-pane -e` into styled
+# `ratatui::text::Text` so Claude Code's colored output reaches the
+# right-pane output preview as styled spans rather than literal
+# escape bytes.
+ansi-to-tui = "8.0"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

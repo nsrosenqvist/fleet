@@ -47,14 +47,25 @@ pub const DEFAULT_MAX_RECOMMENDED_TICKETS: u32 = 3;
 
 /// How the workflow can be started. Manual = a user invokes
 /// `fleet workflow run …`; autonomous = autonomous-mode picks it from
-/// the open-issue queue. Defaults: manual-only (autonomous off) so
-/// adding a workflow file doesn't surprise users by joining the queue.
+/// the open-issue queue; issueless = the workflow doesn't need a
+/// tracker ticket to bind to, so the TUI's spawn picker surfaces it
+/// on the Workflow tab. Defaults: manual-only (autonomous + issueless
+/// both off) so adding a workflow file doesn't surprise users by
+/// joining the autonomous queue *or* the issueless spawn list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct Trigger {
     #[serde(default = "default_true")]
     pub manual: bool,
     #[serde(default)]
     pub autonomous: bool,
+    /// Workflow runs meaningfully without a tracker ticket bound to it
+    /// — e.g. a refactor-candidate scan, a periodic codebase audit, a
+    /// "bring up the dev environment" pass. Opt-in because most
+    /// workflows reference `FLEET_ISSUE_*` env vars and would run
+    /// with empty inputs otherwise. The TUI's spawn picker Workflow
+    /// tab filters on this flag.
+    #[serde(default)]
+    pub issueless: bool,
 }
 
 impl Default for Trigger {
@@ -62,6 +73,7 @@ impl Default for Trigger {
         Self {
             manual: true,
             autonomous: false,
+            issueless: false,
         }
     }
 }
@@ -245,6 +257,20 @@ impl TryFrom<RawWorkflow> for Workflow {
             bail!("workflow `name:` must be a non-empty string");
         }
         let trigger = raw.trigger.unwrap_or_default();
+        // Autonomous mode fires workflows against open tracker issues
+        // — it has no source of "no issue here, run anyway." So an
+        // `autonomous: true && issueless: true` config is a
+        // contradiction the schema must reject up front; otherwise
+        // the supervisor would silently skip such workflows at
+        // dispatch time and the user would never know why.
+        if trigger.autonomous && trigger.issueless {
+            bail!(
+                "workflow `{}`: `trigger.autonomous: true` and \
+                 `trigger.issueless: true` are mutually exclusive — \
+                 autonomous mode only runs workflows against an open issue",
+                raw.name,
+            );
+        }
         let nodes: Vec<Node> = raw
             .nodes
             .into_iter()
@@ -755,6 +781,57 @@ nodes:
         let err = Workflow::from_path("/no/such/wf.yaml").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("/no/such/wf.yaml"), "msg = {msg}");
+    }
+
+    #[test]
+    fn trigger_defaults_issueless_to_false() {
+        let yaml = "name: x\nnodes:\n  - id: n\n    agent: claude\n";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        assert!(!wf.trigger.issueless);
+        // Sanity: the other Trigger defaults are unchanged.
+        assert!(wf.trigger.manual);
+        assert!(!wf.trigger.autonomous);
+    }
+
+    #[test]
+    fn trigger_parses_issueless_true_from_yaml() {
+        let yaml = "\
+name: audit
+trigger:
+  issueless: true
+nodes:
+  - id: scan
+    agent: claude
+";
+        let wf = Workflow::from_str_at(yaml, "/audit.yaml").unwrap();
+        assert!(wf.trigger.issueless);
+    }
+
+    #[test]
+    fn trigger_rejects_autonomous_and_issueless_together() {
+        // Autonomous mode only fires against open issues; a workflow
+        // can't be "issueless" *and* autonomous-eligible at once. The
+        // parser must reject the combo so the conflict surfaces at
+        // workflow-load time rather than silently never-firing.
+        let yaml = "\
+name: nonsense
+trigger:
+  autonomous: true
+  issueless: true
+nodes:
+  - id: n
+    agent: claude
+";
+        let err = Workflow::from_str_at(yaml, "/x.yaml").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mutually exclusive"),
+            "expected conflict message; got: {msg}",
+        );
+        assert!(
+            msg.contains("nonsense"),
+            "should name the workflow; got: {msg}"
+        );
     }
 
     #[test]

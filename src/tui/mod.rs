@@ -22,6 +22,7 @@
 
 mod app;
 mod input;
+mod refresh;
 mod terminal;
 mod theme;
 mod ui;
@@ -907,9 +908,24 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
             &store,
         );
+        // Default tab is Issue when the tracker is buildable
+        // (`git-bug` is the default in test configs). Workflows are
+        // still populated for the Workflow tab / override cycle.
         assert_eq!(state.view, View::Spawn);
-        assert_eq!(state.spawn_workflows, vec!["hotfix", "standard"]);
-        assert_eq!(state.spawn_list_state.selected(), Some(0));
+        assert_eq!(state.spawn.tab, SpawnTab::Issue);
+        let names: Vec<&str> = state
+            .spawn
+            .workflows
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["hotfix", "standard"]);
+        // Neither default workflow opts into issueless mode.
+        assert!(state.spawn.workflows.iter().all(|w| !w.issueless));
+        assert_eq!(state.spawn.workflow_idx, 0);
+        assert!(state.spawn.filter.is_empty());
+        assert!(!state.spawn.show_closed);
+        assert!(state.spawn.workflow_override.is_empty());
     }
 
     #[test]
@@ -921,11 +937,10 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
             &store,
         );
-        // View transitions even when empty; the renderer shows a hint.
-        // Selection stays None.
+        // View transitions even when empty; the renderer shows a hint
+        // on whichever tab is active.
         assert_eq!(state.view, View::Spawn);
-        assert!(state.spawn_workflows.is_empty());
-        assert_eq!(state.spawn_list_state.selected(), None);
+        assert!(state.spawn.workflows.is_empty());
     }
 
     #[test]
@@ -972,18 +987,23 @@ mod tests {
     fn spawn_view_renders_overlay_atop_sessions() {
         // The overlay must coexist with the sessions content: the
         // sidebar's session count appears underneath, while the
-        // picker's title appears on top of it. Use a test backend
-        // to capture the rendered buffer.
+        // picker's title and tab strip appear on top of it.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
         let tmp = tempfile::tempdir().unwrap();
+        // Mark these as issueless so the Workflow tab actually shows
+        // them — the tab filters to opt-ins now.
         write(
             tmp.path(),
             ".fleet/workflows/standard.yaml",
-            "name: standard\n",
+            "name: standard\ntrigger:\n  issueless: true\n",
         );
-        write(tmp.path(), ".fleet/workflows/hotfix.yaml", "name: hotfix\n");
+        write(
+            tmp.path(),
+            ".fleet/workflows/hotfix.yaml",
+            "name: hotfix\ntrigger:\n  issueless: true\n",
+        );
         let store = SessionStore::at(tmp.path().join("sessions"));
         store
             .create(&session("s-bg", "wf", SessionState::Running, 1))
@@ -994,8 +1014,11 @@ mod tests {
             &store,
         );
         assert_eq!(state.view, View::Spawn);
+        // Drive to the Workflow tab so the rendered body contains a
+        // workflow row regardless of the async tracker fetch state.
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
 
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
         let buf = terminal.backend().buffer();
@@ -1012,14 +1035,18 @@ mod tests {
             dumped.contains("workers"),
             "background sidebar missing; got:\n{dumped}"
         );
-        // Overlay's title and entries on top.
+        // Overlay's title, tab labels, and entries on top.
         assert!(
-            dumped.contains("spawn workflow"),
+            dumped.contains("spawn session"),
             "overlay title missing; got:\n{dumped}"
         );
         assert!(
-            dumped.contains("standard"),
-            "overlay entry missing; got:\n{dumped}"
+            dumped.contains("Issue") && dumped.contains("Workflow"),
+            "tab labels missing; got:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("standard") && dumped.contains("hotfix"),
+            "workflow rows missing; got:\n{dumped}"
         );
     }
 
@@ -1047,7 +1074,106 @@ mod tests {
     }
 
     #[test]
-    fn jk_in_spawn_view_wraps_through_workflow_list() {
+    fn jk_in_workflow_tab_wraps_through_workflow_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Workflow tab only shows `trigger.issueless: true` workflows
+        // now, so test fixtures need to opt in.
+        write(
+            tmp.path(),
+            ".fleet/workflows/a.yaml",
+            "name: a\ntrigger:\n  issueless: true\n",
+        );
+        write(
+            tmp.path(),
+            ".fleet/workflows/b.yaml",
+            "name: b\ntrigger:\n  issueless: true\n",
+        );
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        // Tab to the Workflow list — `j`/`k` operate on the active
+        // tab's cursor.
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
+        assert_eq!(state.spawn.tab, SpawnTab::Workflow);
+        assert_eq!(state.spawn.workflow_idx, 0);
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn.workflow_idx, 1);
+        // Wrap: j past the end returns to 0.
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn.workflow_idx, 0);
+        // k before 0 wraps to the end.
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn.workflow_idx, 1);
+    }
+
+    #[test]
+    fn typing_in_spawn_picker_appends_to_filter_not_navigation() {
+        // Plain-letter shortcuts (`j`/`k`/`o`/`w`) only fire when the
+        // filter buffer is empty. Once the user has typed anything,
+        // those keys become filter input — otherwise filtering for
+        // `worker` would silently toggle the workflow override.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/a.yaml", "name: a\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        // Tab to Workflow tab so `j`/`k` would otherwise move the
+        // workflow cursor (Issue tab has no rows to move into).
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
+        // Type "bug".
+        for c in "bug".chars() {
+            state.handle_key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+                &store,
+            );
+        }
+        assert_eq!(state.spawn.filter, "bug");
+        // Workflow cursor unchanged — the chars went into the filter.
+        assert_eq!(state.spawn.workflow_idx, 0);
+        // Backspace shrinks the filter.
+        state.handle_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn.filter, "bu");
+    }
+
+    #[test]
+    fn tab_in_spawn_picker_switches_between_issue_and_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/a.yaml", "name: a\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn.tab, SpawnTab::Issue);
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
+        assert_eq!(state.spawn.tab, SpawnTab::Workflow);
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
+        assert_eq!(state.spawn.tab, SpawnTab::Issue);
+    }
+
+    #[test]
+    fn w_key_cycles_workflow_override_on_focused_issue() {
+        // Seed two issues and two workflows; verify `w` cycles the
+        // focused row's override: None → a → b → None.
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), ".fleet/workflows/a.yaml", "name: a\n");
         write(tmp.path(), ".fleet/workflows/b.yaml", "name: b\n");
@@ -1057,24 +1183,261 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
             &store,
         );
-        assert_eq!(state.spawn_list_state.selected(), Some(0));
+        // Force-load a deterministic issue set, bypassing the async
+        // tracker fetch the picker would otherwise wait for.
+        state.spawn.issues = IssuesState::Loaded(vec![crate::tracker::Issue {
+            id: "1".into(),
+            human_id: "B-1".into(),
+            title: "fix overflow".into(),
+            status: "open".into(),
+            labels: vec!["bug".into()],
+        }]);
+        // `w` only fires when the filter buffer is empty + Issue tab is active.
+        assert_eq!(state.spawn.tab, SpawnTab::Issue);
+        // First press: override → workflows[0] (= "a").
         state.handle_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::empty()),
             &store,
         );
-        assert_eq!(state.spawn_list_state.selected(), Some(1));
-        // Wrap: j past the end returns to 0.
+        assert_eq!(
+            state.spawn.workflow_override.get("B-1").map(String::as_str),
+            Some("a")
+        );
+        // Second press: override → workflows[1] (= "b").
         state.handle_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::empty()),
             &store,
         );
-        assert_eq!(state.spawn_list_state.selected(), Some(0));
-        // k before 0 wraps to the end.
+        assert_eq!(
+            state.spawn.workflow_override.get("B-1").map(String::as_str),
+            Some("b")
+        );
+        // Third press: past the end → override cleared, back to label-routed default.
         state.handle_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::empty()),
             &store,
         );
-        assert_eq!(state.spawn_list_state.selected(), Some(1));
+        assert!(!state.spawn.workflow_override.contains_key("B-1"));
+    }
+
+    #[test]
+    fn o_toggles_show_closed_on_issue_tab() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/a.yaml", "name: a\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert!(!state.spawn.show_closed);
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()),
+            &store,
+        );
+        assert!(state.spawn.show_closed);
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()),
+            &store,
+        );
+        assert!(!state.spawn.show_closed);
+    }
+
+    #[test]
+    fn filter_hides_non_matching_issues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        state.spawn.issues = IssuesState::Loaded(vec![
+            crate::tracker::Issue {
+                id: "1".into(),
+                human_id: "B-1".into(),
+                title: "fix login race".into(),
+                status: "open".into(),
+                labels: vec![],
+            },
+            crate::tracker::Issue {
+                id: "2".into(),
+                human_id: "B-2".into(),
+                title: "pagination flicker".into(),
+                status: "open".into(),
+                labels: vec![],
+            },
+        ]);
+        assert_eq!(state.spawn.filtered_issues().len(), 2);
+        for c in "login".chars() {
+            state.handle_key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+                &store,
+            );
+        }
+        let filtered = state.spawn.filtered_issues();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].human_id, "B-1");
+    }
+
+    #[test]
+    fn global_shortcuts_are_blocked_while_spawn_modal_is_open() {
+        // Modal-style behaviour: Shift+A / Shift+T / Shift+K must
+        // not fire while the picker is open, otherwise a user
+        // typing a capital letter into the filter would trip a
+        // tracker-TUI launch / autonomous toggle / kill dialog.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/workflows/a.yaml", "name: a\n");
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        let auto_before = state.autonomous.enabled();
+        // Shift+A would normally toggle autonomous; here it goes to
+        // the filter buffer instead.
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert!(matches!(action, Action::None));
+        assert_eq!(
+            state.autonomous.enabled(),
+            auto_before,
+            "Shift+A must not toggle autonomous from inside the modal",
+        );
+        assert_eq!(state.spawn.filter, "A");
+        // Shift+T would normally fire OpenTrackerTui; same story.
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.spawn.filter, "AT");
+    }
+
+    #[test]
+    fn snaps_to_workflow_tab_when_tracker_plugin_is_unsupported() {
+        // Linear/Jira have no tracker plugin yet — opening the picker
+        // on the Issue tab would dump the user into an "Unsupported"
+        // placeholder. The picker snaps to the Workflow tab instead so
+        // there's a useful default action — but only if at least one
+        // workflow has opted into `trigger.issueless: true`, otherwise
+        // the Workflow tab is empty too and Issue-tab's manual-id
+        // fallback is the better default.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            ".fleet/workflows/audit.yaml",
+            "name: audit\ntrigger:\n  issueless: true\n",
+        );
+        write(
+            tmp.path(),
+            ".fleet/config.yaml",
+            "tracker: linear\nruntime:\n  adapter: local\n",
+        );
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn.tab, SpawnTab::Workflow);
+        assert!(matches!(
+            state.spawn.issues,
+            IssuesState::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn stays_on_issue_tab_when_unsupported_and_no_issueless_workflows() {
+        // Same Unsupported-tracker setup, but the workflow doesn't
+        // opt in — the Workflow tab would render an empty
+        // "no issueless workflows defined" placeholder. The Issue
+        // tab's manual-id fallback ("type an id manually") is the
+        // better default; honour it instead of snapping away.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            ".fleet/workflows/standard.yaml",
+            "name: standard\n",
+        );
+        write(
+            tmp.path(),
+            ".fleet/config.yaml",
+            "tracker: linear\nruntime:\n  adapter: local\n",
+        );
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.spawn.tab, SpawnTab::Issue);
+    }
+
+    #[test]
+    fn workflow_tab_filters_to_issueless_workflows_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            ".fleet/workflows/audit.yaml",
+            "name: audit\ntrigger:\n  issueless: true\n",
+        );
+        write(
+            tmp.path(),
+            ".fleet/workflows/standard.yaml",
+            "name: standard\n",
+        );
+        let store = SessionStore::at(tmp.path().join("sessions"));
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &store,
+        );
+        // All workflows are loaded — both are valid override targets
+        // for the Issue tab's `w` cycle.
+        assert_eq!(state.spawn.workflows.len(), 2);
+        // But only `audit` shows up on the Workflow tab.
+        let visible: Vec<&str> = state
+            .spawn
+            .filtered_workflows()
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(visible, vec!["audit"]);
+    }
+
+    #[test]
+    fn list_workflow_entries_marks_issueless_flag_per_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            ".fleet/workflows/audit.yaml",
+            "name: audit\ntrigger:\n  issueless: true\n",
+        );
+        write(
+            tmp.path(),
+            ".fleet/workflows/standard.yaml",
+            "name: standard\n",
+        );
+        // Malformed YAML must not nuke the picker — it surfaces with
+        // `issueless: false` so the user still sees the file's
+        // existence and the override cycle still includes it.
+        write(
+            tmp.path(),
+            ".fleet/workflows/broken.yaml",
+            "name:\n  not-a-string\n",
+        );
+        let entries = list_workflow_entries(tmp.path());
+        let by_name: std::collections::HashMap<&str, bool> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.issueless))
+            .collect();
+        assert_eq!(by_name.get("audit"), Some(&true));
+        assert_eq!(by_name.get("standard"), Some(&false));
+        assert_eq!(by_name.get("broken"), Some(&false));
     }
 
     #[test]

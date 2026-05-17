@@ -17,7 +17,7 @@ use crate::orchestrator::{OrchestratorSession, OrchestratorState};
 use crate::plans::{Plan, PlanItemState, PlanState};
 use crate::session::{Session, SessionState};
 
-use super::app::{AppState, Overlay, PlansFocus, SessionsFocus, View};
+use super::app::{AppState, IssuesState, Overlay, PlansFocus, SessionsFocus, SpawnTab, View};
 use super::theme::{
     ACCENT, ERR, IDENT, MUTED, OK, SELECT_BG, SELECT_FG, WARN, badge, chip, framed_block,
     framed_block_accent, framed_block_accent_titled, framed_block_titled, key as theme_key,
@@ -64,7 +64,11 @@ pub(super) fn render(f: &mut Frame<'_>, state: &AppState) {
         }
     }
     if state.view == View::Spawn {
-        let modal = centered_rect(body_area, 60, 60);
+        // Taller + wider than the old workflow-only picker — needs
+        // room for the filter line, tab strip, scrollable list, and
+        // help footer without the issue title getting truncated to a
+        // useless prefix.
+        let modal = centered_rect(body_area, 78, 75);
         f.render_widget(Clear, modal);
         render_spawn(f, modal, state);
     }
@@ -305,38 +309,157 @@ fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     // The spawn picker is the active navigation target while open —
     // accent border to match the Plans-view focus convention.
-    let block = framed_block_accent(" spawn workflow ").padding(Padding::horizontal(2));
-    if state.spawn_workflows.is_empty() {
-        let muted = Style::default().fg(MUTED);
-        let lines = vec![
-            Line::from(Span::styled(
-                "(no workflows found under .fleet/workflows/)",
-                muted,
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Run `fleet init` to scaffold the default standard / hotfix /",
-                muted,
-            )),
-            Line::from(Span::styled(
-                "review-only workflows, or drop a `<name>.yaml` into",
-                muted,
-            )),
-            Line::from(Span::styled("`.fleet/workflows/` by hand.", muted)),
-        ];
-        let body = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false });
-        f.render_widget(body, area);
+    let outer = framed_block_accent(" spawn session ").padding(Padding::horizontal(2));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    // Three horizontal bands inside the modal:
+    //   - top:    filter + tab strip (3 rows)
+    //   - middle: scrollable list (rest)
+    //   - footer: count + help line (2 rows)
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    render_spawn_header(f, rows[0], state);
+    render_spawn_body(f, rows[1], state);
+    render_spawn_footer(f, rows[2], state);
+}
+
+/// Filter input on row 0, tab strip on row 2 (blank row between for
+/// breathing room). The block-style caret on the filter mirrors the
+/// old AO-era spawn modal so the cursor location is unambiguous.
+fn render_spawn_header(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let muted = Style::default().fg(MUTED);
+    let bold_accent = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+
+    let filter_line = Line::from(vec![
+        Span::styled("filter   ", muted),
+        Span::styled(state.spawn.filter.clone(), bold_accent),
+        Span::styled("█", Style::default().fg(ACCENT)),
+    ]);
+
+    let active = state.spawn.tab;
+    let tab = |label: &str, this_tab: SpawnTab| -> Span<'static> {
+        if active == this_tab {
+            Span::styled(
+                format!("[ {label} ]"),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!("  {label}  "), muted)
+        }
+    };
+    let tab_line = Line::from(vec![
+        tab("Issue", SpawnTab::Issue),
+        Span::raw("  "),
+        tab("Workflow", SpawnTab::Workflow),
+        Span::raw("        "),
+        Span::styled("(Tab to switch)", muted.add_modifier(Modifier::ITALIC)),
+    ]);
+
+    let lines = vec![filter_line, Line::from(""), tab_line];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_spawn_body(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    match state.spawn.tab {
+        SpawnTab::Issue => render_spawn_issues(f, area, state),
+        SpawnTab::Workflow => render_spawn_workflows(f, area, state),
+    }
+}
+
+fn render_spawn_issues(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let muted = Style::default().fg(MUTED);
+    // Placeholders for the non-Loaded states. `Loaded` falls through
+    // to the list-widget render below.
+    match &state.spawn.issues {
+        IssuesState::Loading => {
+            let line = Line::from(Span::styled(
+                "loading issues from tracker…",
+                muted.add_modifier(Modifier::ITALIC),
+            ));
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
+        IssuesState::Unsupported { plugin } => {
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("tracker `", muted),
+                    Span::styled(plugin.clone(), Style::default().fg(WARN)),
+                    Span::styled("` — listing not implemented.", muted),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Type the issue id manually and press Enter, or Tab to the",
+                    muted,
+                )),
+                Line::from(Span::styled(
+                    "Workflow tab to fire a workflow without binding an issue.",
+                    muted,
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+            return;
+        }
+        IssuesState::Error(msg) => {
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("tracker error: ", Style::default().fg(ERR)),
+                    Span::styled(
+                        truncate(msg, 80).into_owned(),
+                        Style::default().fg(ERR).add_modifier(Modifier::ITALIC),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Type the issue id manually below and press Enter,",
+                    muted,
+                )),
+                Line::from(Span::styled("or Tab to the Workflow tab.", muted)),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+            return;
+        }
+        IssuesState::Loaded(_) => {}
+    }
+    let filtered = state.spawn.filtered_issues();
+    if filtered.is_empty() {
+        let total_loaded = match &state.spawn.issues {
+            IssuesState::Loaded(all) => all.len(),
+            _ => 0,
+        };
+        let placeholder = if total_loaded == 0 {
+            "(no issues in this repo — type an id manually and press Enter)".to_string()
+        } else if state.spawn.filter.is_empty() {
+            "(no open issues — press `o` to show closed)".to_string()
+        } else {
+            format!(
+                "no issues match `{}` — press Enter to submit it as a manual id",
+                state.spawn.filter
+            )
+        };
+        let line = Line::from(Span::styled(
+            placeholder,
+            muted.add_modifier(Modifier::ITALIC),
+        ));
+        f.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), area);
         return;
     }
-    let items: Vec<ListItem<'_>> = state
-        .spawn_workflows
+    let items: Vec<ListItem<'_>> = filtered
         .iter()
-        .map(|name| ListItem::new(Line::from(name.clone())))
+        .map(|issue| {
+            let resolved = state.resolved_workflow_for(issue);
+            let overridden = state.spawn.workflow_override.contains_key(&issue.human_id);
+            ListItem::new(spawn_issue_rows(issue, &resolved, overridden))
+        })
         .collect();
     let list = List::new(items)
-        .block(block)
         .highlight_style(
             Style::default()
                 .fg(SELECT_FG)
@@ -344,11 +467,196 @@ fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ")
-        // Reserve the cursor column on every row so the list doesn't
-        // shift right when the user Tabs in and the symbol appears.
         .highlight_spacing(HighlightSpacing::Always);
-    let mut list_state = state.spawn_list_state;
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(state.spawn.issue_idx.min(filtered.len() - 1)));
     f.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Two-row issue card: id+title+status on row 0, dim resolved-workflow
+/// hint + labels on row 1. Two rows is busier than the old one-row UX
+/// but the routing hint is the new affordance that earns its keep.
+fn spawn_issue_rows(
+    issue: &crate::tracker::Issue,
+    resolved_workflow: &str,
+    overridden: bool,
+) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(MUTED);
+    let id_style = Style::default().fg(IDENT).add_modifier(Modifier::BOLD);
+    let status_color = match issue.status.as_str() {
+        "open" => OK,
+        "closed" => MUTED,
+        _ => WARN,
+    };
+    let primary = Line::from(vec![
+        Span::styled(format!("{:<10}", issue.human_id), id_style),
+        Span::raw(truncate(&issue.title, 60).into_owned()),
+        Span::raw("  "),
+        Span::styled(
+            format!("[{}]", issue.status),
+            Style::default().fg(status_color),
+        ),
+    ]);
+    let mut secondary_spans: Vec<Span<'static>> = Vec::with_capacity(4);
+    let arrow_style = if overridden {
+        // Highlight the override so the user knows they've moved off
+        // the auto-routed default.
+        Style::default().fg(WARN)
+    } else {
+        muted
+    };
+    secondary_spans.push(Span::styled("            → ", arrow_style));
+    secondary_spans.push(Span::styled(resolved_workflow.to_string(), arrow_style));
+    if overridden {
+        secondary_spans.push(Span::styled(" (override)", arrow_style));
+    }
+    if !issue.labels.is_empty() {
+        secondary_spans.push(Span::styled("   ", muted));
+        for (i, l) in issue.labels.iter().enumerate() {
+            if i > 0 {
+                secondary_spans.push(Span::raw(" "));
+            }
+            secondary_spans.push(label_chip(l));
+        }
+    }
+    vec![primary, Line::from(secondary_spans)]
+}
+
+fn render_spawn_workflows(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let muted = Style::default().fg(MUTED);
+    // Two empty-state shapes:
+    //   - no workflows on disk → tell the user to `fleet init`.
+    //   - workflows exist but none opt in via `trigger.issueless:
+    //     true` → explain the opt-in so the user knows where the
+    //     filtering is coming from.
+    if state.spawn.workflows.is_empty() {
+        let lines = vec![
+            Line::from(Span::styled(
+                "(no workflows under .fleet/workflows/)",
+                muted,
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Run `fleet init` to scaffold the defaults, or drop a",
+                muted,
+            )),
+            Line::from(Span::styled(
+                "`<name>.yaml` into `.fleet/workflows/` by hand.",
+                muted,
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        return;
+    }
+    let filtered = state.spawn.filtered_workflows();
+    if filtered.is_empty() {
+        let any_issueless = state.spawn.workflows.iter().any(|w| w.issueless);
+        let lines = if any_issueless {
+            vec![Line::from(Span::styled(
+                format!("no workflows match `{}`", state.spawn.filter),
+                muted.add_modifier(Modifier::ITALIC),
+            ))]
+        } else {
+            vec![
+                Line::from(Span::styled("(no issueless workflows defined)", muted)),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "The Workflow tab only shows workflows that opt in via",
+                    muted,
+                )),
+                Line::from(Span::styled(
+                    "`trigger.issueless: true` in their YAML — e.g. a",
+                    muted,
+                )),
+                Line::from(Span::styled(
+                    "refactor-candidate scan or a codebase audit.",
+                    muted,
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Workflows that need a ticket live on the Issue tab.",
+                    muted,
+                )),
+            ]
+        };
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        return;
+    }
+    let items: Vec<ListItem<'_>> = filtered
+        .iter()
+        .map(|entry| ListItem::new(Line::from(entry.name.clone())))
+        .collect();
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .fg(SELECT_FG)
+                .bg(SELECT_BG)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ")
+        .highlight_spacing(HighlightSpacing::Always);
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(state.spawn.workflow_idx.min(filtered.len() - 1)));
+    f.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn render_spawn_footer(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let muted = Style::default().fg(MUTED);
+    let count_line = match state.spawn.tab {
+        SpawnTab::Issue => match &state.spawn.issues {
+            IssuesState::Loaded(all) => {
+                let shown = state.spawn.filtered_issues().len();
+                let mut chunks: Vec<Span<'static>> = vec![Span::styled(
+                    format!("{shown} of {} issues", all.len()),
+                    muted,
+                )];
+                if state.spawn.show_closed {
+                    chunks.push(Span::styled(
+                        "  ·  showing closed".to_string(),
+                        muted.add_modifier(Modifier::ITALIC),
+                    ));
+                }
+                Line::from(chunks)
+            }
+            _ => Line::from(""),
+        },
+        SpawnTab::Workflow => {
+            let shown = state.spawn.filtered_workflows().len();
+            let total_issueless = state.spawn.workflows.iter().filter(|w| w.issueless).count();
+            Line::from(Span::styled(
+                format!("{shown} of {total_issueless} issueless workflows"),
+                muted,
+            ))
+        }
+    };
+    let mut help: Vec<Span<'static>> = vec![
+        modal_key("↑↓"),
+        Span::styled(" pick  ", muted),
+        modal_key("Tab"),
+        Span::styled(" switch  ", muted),
+    ];
+    if state.spawn.tab == SpawnTab::Issue {
+        help.push(modal_key("o"));
+        help.push(Span::styled(" closed  ", muted));
+        help.push(modal_key("w"));
+        help.push(Span::styled(" workflow  ", muted));
+    }
+    help.push(modal_key("Enter"));
+    help.push(Span::styled(" spawn  ", muted));
+    help.push(modal_key("Esc"));
+    help.push(Span::styled(" cancel", muted));
+    f.render_widget(Paragraph::new(vec![count_line, Line::from(help)]), area);
+}
+
+/// Borrowed/owned-friendly truncation: returns the original string by
+/// reference when it already fits, owned otherwise. Saves an
+/// allocation on the common case (most issue titles are short).
+fn truncate(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.chars().count() <= max {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+    std::borrow::Cow::Owned(format!("{truncated}…"))
 }
 
 fn render_plans_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -1209,41 +1517,102 @@ fn plan_annotation_for(session: &Session, plans: &[Plan]) -> Option<String> {
     ))
 }
 
+/// What the right-hand pane is showing. Drives both the details
+/// section (top) and the output preview (bottom) so the two stay in
+/// sync: an orchestrator-focused right pane shows orchestrator kv +
+/// tmux-pane capture; a worker-focused pane shows session kv + log
+/// tail; the help-hint fallback only ever appears when there's nothing
+/// to show.
+enum DetailTarget<'a> {
+    Worker(&'a Session),
+    Orchestrator(&'a OrchestratorSession),
+    OrchestratorAbsent,
+    Empty,
+}
+
+fn detail_target(state: &AppState) -> DetailTarget<'_> {
+    match state.sessions_focus {
+        SessionsFocus::Orchestrator => state
+            .orchestrators
+            .first()
+            .map_or(DetailTarget::OrchestratorAbsent, DetailTarget::Orchestrator),
+        SessionsFocus::Workflows => state
+            .selected()
+            .map_or(DetailTarget::Empty, DetailTarget::Worker),
+    }
+}
+
 fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let target = detail_target(state);
+    // Empty case is the only one without an output preview — show the
+    // help hint in a single full-height pane.
+    if matches!(target, DetailTarget::Empty) {
+        render_detail_empty(f, area);
+        return;
+    }
+
+    // Stack details on top (kv pairs — small, fixed-ish height per
+    // case) and the output preview below (grows to fill). Mirrors the
+    // pre-AO/Lima layout: two distinct framed blocks rather than one
+    // big paragraph, so the eye reads details / output as separate
+    // sections.
+    let detail_lines = detail_lines_for(&target);
+    // +2 for the block's top/bottom border rows; clamp so a wildly
+    // long details section can't starve the output preview.
+    let details_height = u16::try_from(detail_lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .clamp(3, 18);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(details_height), Constraint::Min(0)])
+        .split(area);
+    render_details_section(f, chunks[0], &target, detail_lines);
+    render_output_section(f, chunks[1], &target, state);
+}
+
+fn render_detail_empty(f: &mut Frame<'_>, area: Rect) {
     let muted = Style::default().fg(MUTED);
     let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-    let Some(session) = state.selected() else {
-        let lines = vec![
-            Line::from(Span::styled("Select a session, or use one of:", muted)),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  ", muted),
-                Span::styled("j/k", bold_key),
-                Span::styled("     navigate", muted),
-            ]),
-            Line::from(vec![
-                Span::styled("  ", muted),
-                Span::styled("r", bold_key),
-                Span::styled("       reload from disk", muted),
-            ]),
-            Line::from(vec![
-                Span::styled("  ", muted),
-                Span::styled("Shift+K", bold_key),
-                Span::styled(" mark selected session failed", muted),
-            ]),
-            Line::from(vec![
-                Span::styled("  ", muted),
-                Span::styled("q", bold_key),
-                Span::styled("       quit", muted),
-            ]),
-        ];
-        let body = Paragraph::new(lines)
-            .block(framed_block(" detail ").padding(Padding::horizontal(2)))
-            .wrap(Wrap { trim: false });
-        f.render_widget(body, area);
-        return;
-    };
+    let lines = vec![
+        Line::from(Span::styled("Select a session, or use one of:", muted)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", muted),
+            Span::styled("j/k", bold_key),
+            Span::styled("     navigate", muted),
+        ]),
+        Line::from(vec![
+            Span::styled("  ", muted),
+            Span::styled("r", bold_key),
+            Span::styled("       reload from disk", muted),
+        ]),
+        Line::from(vec![
+            Span::styled("  ", muted),
+            Span::styled("Shift+K", bold_key),
+            Span::styled(" mark selected session failed", muted),
+        ]),
+        Line::from(vec![
+            Span::styled("  ", muted),
+            Span::styled("q", bold_key),
+            Span::styled("       quit", muted),
+        ]),
+    ];
+    let body = Paragraph::new(lines)
+        .block(framed_block(" detail ").padding(Padding::horizontal(2)))
+        .wrap(Wrap { trim: false });
+    f.render_widget(body, area);
+}
 
+fn detail_lines_for(target: &DetailTarget<'_>) -> Vec<Line<'static>> {
+    match target {
+        DetailTarget::Worker(session) => worker_detail_lines(session),
+        DetailTarget::Orchestrator(orch) => orchestrator_detail_lines(orch),
+        DetailTarget::OrchestratorAbsent => orchestrator_absent_lines(),
+        DetailTarget::Empty => Vec::new(),
+    }
+}
+
+fn worker_detail_lines(session: &Session) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = detail_kv_pairs(session)
         .into_iter()
         .map(|(k, v)| kv_line(k, &v))
@@ -1258,36 +1627,192 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
             lines.push(Line::from(format!("  {node:<16} ${usd:.4}")));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "log tail:",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )));
-    if state.log_tail.is_empty() {
-        lines.push(Line::from(Span::styled("  (no logs yet)", muted)));
-    } else {
-        for log_line in &state.log_tail {
-            lines.push(Line::from(format!("  {log_line}")));
-        }
-    }
-    // Mirror keel's info-panel header: bold-accent id + italic-dim state.
-    let title = Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            session.id.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            state_word(session.state),
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-        ),
-        Span::raw(" "),
-    ]);
+    lines
+}
+
+fn orchestrator_detail_lines(orch: &OrchestratorSession) -> Vec<Line<'static>> {
+    vec![
+        kv_line("agent", &orch.agent),
+        Line::from(vec![
+            Span::styled(format!("{:<14}", "state"), Style::default().fg(MUTED)),
+            Span::styled(
+                orchestrator_state_word(orch.state).to_string(),
+                orchestrator_state_value_style(orch.state),
+            ),
+        ]),
+        kv_line("tmux", crate::orchestrator::TMUX_SESSION_NAME),
+    ]
+}
+
+fn orchestrator_absent_lines() -> Vec<Line<'static>> {
+    let muted = Style::default().fg(MUTED);
+    let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    vec![
+        Line::from(Span::styled("(orchestrator not running)", muted)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Press ", muted),
+            Span::styled("enter", bold_key),
+            Span::styled(" to spawn and attach.", muted),
+        ]),
+    ]
+}
+
+fn render_details_section(
+    f: &mut Frame<'_>,
+    area: Rect,
+    target: &DetailTarget<'_>,
+    lines: Vec<Line<'static>>,
+) {
+    let title = details_title(target);
     let body = Paragraph::new(lines)
         .block(framed_block_titled(title).padding(Padding::horizontal(2)))
         .wrap(Wrap { trim: false });
     f.render_widget(body, area);
+}
+
+fn details_title(target: &DetailTarget<'_>) -> Line<'static> {
+    let pad = Span::raw(" ");
+    match target {
+        DetailTarget::Worker(s) => Line::from(vec![
+            pad.clone(),
+            Span::styled(
+                s.id.to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                state_word(s.state),
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            ),
+            pad,
+        ]),
+        DetailTarget::Orchestrator(o) => Line::from(vec![
+            pad.clone(),
+            Span::styled(
+                crate::orchestrator::TMUX_SESSION_NAME.to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                orchestrator_state_word(o.state),
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            ),
+            pad,
+        ]),
+        DetailTarget::OrchestratorAbsent => Line::from(vec![
+            pad.clone(),
+            Span::styled(
+                crate::orchestrator::TMUX_SESSION_NAME.to_string(),
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "not running",
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            ),
+            pad,
+        ]),
+        DetailTarget::Empty => Line::from(Span::raw(" detail ")),
+    }
+}
+
+fn render_output_section(
+    f: &mut Frame<'_>,
+    area: Rect,
+    target: &DetailTarget<'_>,
+    state: &AppState,
+) {
+    let block = framed_block(" output ").padding(Padding::horizontal(2));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Publish the inner dims so the refresh thread can pin the
+    // orchestrator's tmux window to the panel width. Packed as
+    // `(w << 16) | h`. Zero stays zero until we actually have a non-
+    // empty area — keeps the first capture from running before we
+    // know how wide the panel is.
+    let packed = (u32::from(inner.width) << 16) | u32::from(inner.height);
+    state
+        .pane_size
+        .store(packed, std::sync::atomic::Ordering::Relaxed);
+
+    match target {
+        DetailTarget::Worker(_) => render_worker_output(f, inner, state),
+        DetailTarget::Orchestrator(_) => render_orchestrator_output(f, inner, state),
+        DetailTarget::OrchestratorAbsent => render_output_placeholder(
+            f,
+            inner,
+            "(no output — orchestrator not spawned yet; press enter on the row)",
+        ),
+        DetailTarget::Empty => {}
+    }
+}
+
+fn render_worker_output(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    if state.log_tail.is_empty() {
+        render_output_placeholder(f, area, "(no logs yet)");
+        return;
+    }
+    let lines: Vec<Line<'_>> = state
+        .log_tail
+        .iter()
+        .map(|l| Line::from(l.clone()))
+        .collect();
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_orchestrator_output(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let Some(body) = state.orchestrator_pane.as_deref().filter(|s| !s.is_empty()) else {
+        render_output_placeholder(
+            f,
+            area,
+            "(no output captured yet — first refresh after spawn takes ~1.5s)",
+        );
+        return;
+    };
+    // Parse `tmux capture-pane -e` ANSI escapes into styled spans so
+    // Claude Code's colors come through. On parse failure, fall back
+    // to plain text — a malformed capture should never blank the
+    // pane.
+    let text: ratatui::text::Text<'_> = ansi_to_tui::IntoText::into_text(&body)
+        .unwrap_or_else(|_| ratatui::text::Text::raw(body.to_string()));
+    let line_count = text.lines.len();
+    let take = area.height as usize;
+    let tail: Vec<Line<'_>> = text
+        .lines
+        .into_iter()
+        .skip(line_count.saturating_sub(take))
+        .collect();
+    f.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), area);
+}
+
+fn render_output_placeholder(f: &mut Frame<'_>, area: Rect, text: &str) {
+    let muted = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(text.to_string(), muted)))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+#[must_use]
+fn orchestrator_state_word(state: OrchestratorState) -> &'static str {
+    match state {
+        OrchestratorState::Active => "active",
+        OrchestratorState::Detached => "detached",
+        OrchestratorState::Closed => "closed",
+    }
+}
+
+#[must_use]
+fn orchestrator_state_value_style(state: OrchestratorState) -> Style {
+    let base = match state {
+        OrchestratorState::Active => Style::default().fg(OK),
+        OrchestratorState::Detached => Style::default().fg(WARN),
+        OrchestratorState::Closed => Style::default().fg(MUTED),
+    };
+    base.add_modifier(Modifier::BOLD)
 }
 
 fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -1420,7 +1945,10 @@ fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
         View::Spawn => {
             spans.extend([
                 theme_key("↑/↓"),
-                Span::raw(" nav"),
+                Span::raw(" pick"),
+                sep(),
+                theme_key("tab"),
+                Span::raw(" switch"),
                 sep(),
                 theme_key("enter"),
                 Span::raw(" spawn"),

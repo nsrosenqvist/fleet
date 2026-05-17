@@ -179,18 +179,17 @@ impl Tracker for GitBugTracker {
         self.add_label(repo_root, child_id, &label)
     }
 
-    fn link_blocks(
-        &self,
-        repo_root: &Path,
-        blocked_id: &str,
-        blocked_on_id: &str,
-    ) -> Result<()> {
+    fn link_blocks(&self, repo_root: &Path, blocked_id: &str, blocked_on_id: &str) -> Result<()> {
         // git-bug has no native blocks/blocked-by edge; mirror
         // `link_parent`'s label convention with a symmetric pair so
         // either side of the relationship is queryable via
         // `git-bug ls --label`. `add_label` is idempotent on git-bug,
         // so this call is safe to re-run.
-        self.add_label(repo_root, blocked_id, &format!("blocked-by:{blocked_on_id}"))?;
+        self.add_label(
+            repo_root,
+            blocked_id,
+            &format!("blocked-by:{blocked_on_id}"),
+        )?;
         self.add_label(repo_root, blocked_on_id, &format!("blocks:{blocked_id}"))?;
         Ok(())
     }

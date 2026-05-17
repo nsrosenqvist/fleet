@@ -97,11 +97,30 @@ fn event_loop(
             );
         }
     }
+    // Background thread polls the orchestrator pane and the panel-size
+    // atomic. Started after the initial reload + reaper sweep so the
+    // first capture has a real session to look at; joined on Quit /
+    // ?-propagation through `loop_result` (see end of function).
+    state.spawn_refresh_thread();
+    let loop_result = drive(terminal, &mut state, store);
+    state.shutdown_refresh_thread();
+    loop_result
+}
+
+fn drive(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut AppState,
+    store: &SessionStore,
+) -> Result<i32> {
     loop {
-        terminal.draw(|f| ui::render(f, &state))?;
+        // Pull anything the refresh thread emitted since the last
+        // draw (orchestrator pane snapshots), so the next render
+        // shows the freshest output.
+        state.drain_refresh_updates();
+        terminal.draw(|f| ui::render(f, state))?;
         if event::poll(POLL_TIMEOUT)? {
             if let Event::Key(key) = event::read()? {
-                match input::handle_key(&mut state, key, store) {
+                match input::handle_key(state, key, store) {
                     Action::Quit => return Ok(0),
                     Action::None => {}
                     Action::OpenOrchestrator => {
@@ -115,6 +134,12 @@ fn event_loop(
                         if let Err(err) = run_suspended(terminal, &exe, &["orchestrator"]) {
                             state.status_line = format!(" orchestrator failed: {err:#} ");
                         }
+                        // Detach left the tmux session at `window-size
+                        // latest` (host terminal width). Ask the
+                        // refresh thread to re-pin to the output
+                        // sub-pane's dims on its next tick so the
+                        // preview doesn't show wrap-broken lines.
+                        state.request_orchestrator_repin();
                         // Meta may have flipped to Active/Detached/
                         // Closed on detach; reload so the sidebar
                         // marker is current.
@@ -143,6 +168,11 @@ fn event_loop(
         // Reap any workflow-run subprocess we kicked off — surfaces
         // non-zero exits as an error overlay before the next draw.
         state.poll_pending_spawn();
+        // Promote the spawn-picker's tracker fetch from `Loading` to
+        // `Loaded` / `Error` as soon as the background thread sends.
+        // No-op when the picker is closed or the channel already
+        // drained — cheap to call every iteration.
+        state.drain_spawn_fetch();
     }
 }
 

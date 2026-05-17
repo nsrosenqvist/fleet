@@ -224,9 +224,7 @@ pub fn render_add_outcome(o: &AddOutcome) -> String {
             o.blocked, o.blocked_on
         );
     }
-    let suffix: String = if !o.tracker_available {
-        " (no tracker configured for this repo — cross-link comments and native tracker link skipped)".to_string()
-    } else {
+    let suffix: String = if o.tracker_available {
         let mut parts: Vec<String> = Vec::new();
         match o.comments_posted {
             0 => {}
@@ -241,6 +239,8 @@ pub fn render_add_outcome(o: &AddOutcome) -> String {
         } else {
             format!("; {}", parts.join(", "))
         }
+    } else {
+        " (no tracker configured for this repo — cross-link comments and native tracker link skipped)".to_string()
     };
     format!("added edge: {} → {}{}\n", o.blocked, o.blocked_on, suffix)
 }

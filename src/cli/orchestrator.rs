@@ -206,11 +206,23 @@ fn spawn_fresh(
 /// `tmux attach`, blocking until the user detaches or the agent
 /// exits, then flip the meta to Detached (pane still alive) or
 /// Closed (pane gone) so the next reuse pass knows what to do.
+///
+/// Before the attach we inject a fleet-flavoured status bar (purple
+/// session name + `ctrl+b d to detach` hint) so the user always
+/// knows how to get back to the management TUI. Options are
+/// `set-option -t <session>` so they only affect this orchestrator's
+/// session — we don't leak into any other tmux state the user keeps.
+/// We also flip the window to `window-size latest` so the attach
+/// reaches the user's full host terminal rather than the narrower
+/// dims the TUI pinned for its capture-pane preview. (Re-pinning to
+/// panel dims after detach is the TUI's job — see
+/// `AppState::request_orchestrator_repin`.)
 fn attach_and_finalize(store: &OrchestratorStore, invoker: &dyn ProcessInvoker) -> Result<i32> {
-    let status = std::process::Command::new("tmux")
-        .args(["attach-session", "-t", TMUX_SESSION_NAME])
+    let script = build_attach_script(TMUX_SESSION_NAME);
+    let status = std::process::Command::new("bash")
+        .args(["-c", &script])
         .status()
-        .with_context(|| format!("running `tmux attach -t {TMUX_SESSION_NAME}`"))?;
+        .with_context(|| format!("running attach script for `{TMUX_SESSION_NAME}`"))?;
     if !status.success() {
         eprintln!("warning: tmux attach exited non-zero ({status})");
     }
@@ -224,6 +236,57 @@ fn attach_and_finalize(store: &OrchestratorStore, invoker: &dyn ProcessInvoker) 
     updated.updated_at_ms = now_ms();
     store.save(&updated)?;
     Ok(0)
+}
+
+/// Bash one-liner that customises the target session's status bar
+/// and then attaches. `set-option -t <session>` is per-session so
+/// other tmux sessions in the user's environment keep whatever they
+/// had configured. We tolerate set-option errors with `|| true` — if
+/// tmux is older / the session has gone away between selection and
+/// attach, the attach itself will fail with a useful error rather
+/// than the status-option setup masking it.
+///
+/// Status bar:
+///   - Left:   ` <session-name>  │  ctrl+b d to detach `
+///   - Window list rides to the right of `status-left` via tmux's
+///     built-in `status-window-format`.
+///   - Colour: fleet purple (`colour141`) for the session name +
+///     active-window marker; muted gray for everything else.
+fn build_attach_script(session: &str) -> String {
+    let s = shell_single_quote(session);
+    let status_left =
+        " #[fg=colour141,bold]#S#[default] #[fg=brightblack]│#[default] ctrl+b d to detach ";
+    let q_status_left = shell_single_quote(status_left);
+    format!(
+        "set -e
+tmux set-option -t {s} status on >/dev/null 2>&1 || true
+tmux set-option -t {s} status-style 'bg=default,fg=colour250' >/dev/null 2>&1 || true
+tmux set-option -t {s} status-left {q_status_left} >/dev/null 2>&1 || true
+tmux set-option -t {s} status-left-length 60 >/dev/null 2>&1 || true
+tmux set-option -t {s} window-status-current-style 'fg=colour141,bold' >/dev/null 2>&1 || true
+tmux set-option -t {s} window-status-style 'fg=colour250' >/dev/null 2>&1 || true
+tmux set-option -t {s} window-size latest >/dev/null 2>&1 || true
+exec tmux attach -t {s}
+"
+    )
+}
+
+/// POSIX single-quote escape (a→'a', a'b → 'a'\''b'). Mirrors the
+/// helper in `orchestrator/tmux.rs` but inlined here so the attach
+/// script doesn't reach across module boundaries for a 5-line utility.
+#[must_use]
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Environment passed into the tmux session — just the prompt path
@@ -303,6 +366,77 @@ mod tests {
                 "FLEET_ORCHESTRATOR_PROMPT".to_string(),
                 "/repo/.fleet/orchestrator/prompt.md".to_string(),
             )]
+        );
+    }
+
+    #[test]
+    fn attach_script_ends_with_exec_attach_against_the_target_session() {
+        // `exec tmux attach` so tmux replaces the bash wrapper —
+        // keeps the process tree clean and lets tmux own the TTY
+        // for the duration of the attach.
+        let script = build_attach_script(TMUX_SESSION_NAME);
+        assert!(
+            script.contains(&format!("exec tmux attach -t '{TMUX_SESSION_NAME}'")),
+            "script: {script}"
+        );
+    }
+
+    #[test]
+    fn attach_script_sets_styled_status_left_with_detach_hint() {
+        // The bottom-bar instruction (`ctrl+b d to detach`) is the
+        // user's only built-in hint for how to get back to the
+        // management TUI — verify the wording stays in the script.
+        let script = build_attach_script(TMUX_SESSION_NAME);
+        assert!(script.contains("ctrl+b d to detach"), "script: {script}");
+    }
+
+    #[test]
+    fn attach_script_turns_status_bar_on() {
+        // Some agents (and some user-level tmux configs) ship with
+        // `status off`; without an explicit `status on` the styled
+        // status-left would never render.
+        let script = build_attach_script(TMUX_SESSION_NAME);
+        assert!(
+            script.contains(&format!("set-option -t '{TMUX_SESSION_NAME}' status on")),
+            "script: {script}"
+        );
+    }
+
+    #[test]
+    fn attach_script_switches_window_size_to_latest_before_attach() {
+        // The session is normally pinned to `window-size manual` by
+        // the TUI's refresh thread so capture-pane returns lines at
+        // the panel width. Without flipping back to `latest`, the
+        // attaching client would see the agent at the panel's narrow
+        // width instead of their full host terminal.
+        let script = build_attach_script(TMUX_SESSION_NAME);
+        let ws_idx = script
+            .find("window-size latest")
+            .expect("attach script should switch window-size to latest");
+        let attach_idx = script
+            .find("exec tmux attach")
+            .expect("attach script should exec tmux attach");
+        assert!(
+            ws_idx < attach_idx,
+            "window-size latest must be set before the attach (script: {script})"
+        );
+    }
+
+    #[test]
+    fn attach_script_single_quotes_pathological_session_names() {
+        // The session name is a constant today, but the helper has
+        // to stay defensive against future renames — anything with
+        // shell metachars must be single-quoted so it can't escape
+        // the surrounding bash.
+        let script = build_attach_script("fl-4; rm -rf /");
+        assert!(
+            script.contains("'fl-4; rm -rf /'"),
+            "name should be wrapped in single quotes; script: {script}"
+        );
+        // And the dangerous tail must never appear as a bare token.
+        assert!(
+            !script.contains(" fl-4; rm -rf / "),
+            "name must not appear unquoted; script: {script}"
         );
     }
 }

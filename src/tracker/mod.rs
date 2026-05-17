@@ -165,7 +165,7 @@ pub trait Tracker: Send + Sync {
     /// Mapping varies per tracker — GitHub uses the native Issue
     /// Dependencies REST API; git-bug encodes the relationship as a
     /// symmetric pair of labels (`blocked-by:<id>` on the blocked
-    /// side, `blocks:<id>` on the blocked_on side). Idempotent across
+    /// side, `blocks:<id>` on the `blocked_on` side). Idempotent across
     /// both backends: re-linking the same pair is a no-op.
     ///
     /// Invoked by `fleet deps add` so the dep edge stored in

@@ -190,10 +190,7 @@ impl Tracker for GitHubTracker {
                 })?;
             parse_issue_number_list(&stdout)
         };
-        if existing_numbers
-            .iter()
-            .any(|n| n.to_string() == child_id)
-        {
+        if existing_numbers.iter().any(|n| n.to_string() == child_id) {
             return Ok(());
         }
 
@@ -226,12 +223,7 @@ impl Tracker for GitHubTracker {
         Ok(())
     }
 
-    fn link_blocks(
-        &self,
-        repo_root: &Path,
-        blocked_id: &str,
-        blocked_on_id: &str,
-    ) -> Result<()> {
+    fn link_blocks(&self, repo_root: &Path, blocked_id: &str, blocked_on_id: &str) -> Result<()> {
         // GitHub's native Issue Dependencies REST API. Same three-step
         // pattern as `link_parent`'s sub-issues flow because the POST
         // endpoint isn't idempotent (duplicate links return 422):
@@ -291,9 +283,7 @@ impl Tracker for GitHubTracker {
         );
         self.invoker
             .run("sh", Self::shell_cmd(repo_root, &post_cmd))
-            .with_context(|| {
-                format!("linking #{blocked_id} as blocked by #{blocked_on_id}")
-            })?;
+            .with_context(|| format!("linking #{blocked_id} as blocked by #{blocked_on_id}"))?;
         Ok(())
     }
 }
