@@ -1449,7 +1449,12 @@ mod tests {
         assert!(r.contains("42"));
         assert!(r.contains("Ticket 42 title"));
         assert!(r.contains("open"));
-        assert!(r.contains("[bug, urgent]"));
+        // Labels render as individual chips (no longer wrapped in
+        // `[…]`), so assert each label appears in the rendered surface
+        // independently. Visual styling (muted background) doesn't
+        // round-trip through the rendered() helper.
+        assert!(r.contains("bug"));
+        assert!(r.contains("urgent"));
         assert!(r.contains("comments"));
         assert!(r.contains('3'));
         assert!(r.contains("Body text"));
@@ -1498,7 +1503,8 @@ mod tests {
         );
         let r = rendered(&ticket_detail_lines(&state));
         assert!(r.contains("Body of 42"), "got: {r}");
-        assert!(r.contains("[bug]"));
+        // Label now renders as a chip span — text only, no `[…]`.
+        assert!(r.contains("bug"));
     }
 
     #[test]
@@ -2232,3 +2238,4 @@ mod tests {
         );
     }
 }
+

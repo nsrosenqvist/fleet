@@ -29,6 +29,19 @@ pub const OK: Color = Color::Green;
 pub const ERR: Color = Color::Red;
 pub const WARN: Color = Color::Yellow;
 
+/// Identifier-like strings (ticket ids, session ids, hashes). Cyan is
+/// distinct from the violet accent and from every status colour, so a
+/// row that includes a status word + a ticket id reads as two clearly
+/// separated tokens at a glance.
+pub const IDENT: Color = Color::Cyan;
+
+/// Background for muted "chip" spans used to wrap individual tracker
+/// labels in the ticket-detail pane. One indexed dark-grey step above
+/// the terminal default so the chips read as discrete pills without
+/// fighting the violet accent or any status colour. Pairs with the
+/// terminal's default foreground for readable text on the chip.
+pub const CHIP_BG: Color = Color::Indexed(237);
+
 /// Indexed background for the selected sidebar row — a dark grey one step
 /// brighter than the terminal default so the selection reads against
 /// black/near-black backgrounds without competing with the accent border.
@@ -61,6 +74,47 @@ pub fn framed_block_titled(title: Line<'_>) -> Block<'_> {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(MUTED))
         .title(title)
+}
+
+/// Focus-highlighted variant of [`framed_block`] — the border colour
+/// flips from MUTED to ACCENT so the user can tell at a glance which
+/// pane is the active navigation target. Used by the Plans view to
+/// distinguish sidebar-vs-items focus, and by the Sessions sidebar
+/// (which is always the navigation target while that view is active).
+pub fn framed_block_accent(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+}
+
+/// [`framed_block_accent`] paired with a composed-title variant, for
+/// panels whose title is `bold-accent id + italic-muted kind` rather
+/// than a single string.
+pub fn framed_block_accent_titled(title: Line<'_>) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(title)
+}
+
+/// Tracker-label pill: text with a muted background on the terminal's
+/// default foreground, with one space of padding either side so it
+/// reads as a discrete chip rather than a coloured word. Caller is
+/// responsible for separating multiple chips with a plain space.
+/// Returns `'static` because the rendered text is owned (`format!`
+/// allocates), which means call sites can embed the chip in a
+/// `Line<'static>` without lifetime gymnastics.
+pub fn label_chip(text: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {text} "),
+        Style::default().bg(CHIP_BG).add_modifier(Modifier::BOLD),
+    )
 }
 
 /// One key/value row for the details panel. 14-col left-aligned muted

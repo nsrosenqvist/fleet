@@ -17,9 +17,9 @@ use crate::session::{Session, SessionState};
 
 use super::app::{AppState, Overlay, PlansFocus, SessionsFocus, View};
 use super::theme::{
-    ACCENT, ERR, MUTED, OK, SELECT_BG, SELECT_FG, WARN, badge, chip, framed_block,
+    ACCENT, ERR, IDENT, MUTED, OK, SELECT_BG, SELECT_FG, WARN, badge, chip, framed_block,
     framed_block_accent, framed_block_accent_titled, framed_block_titled, key as theme_key,
-    kv_line, modal_key, sep,
+    kv_line, label_chip, modal_key, sep,
 };
 
 /// Full-frame render entry point. Called once per event-loop tick from
@@ -293,7 +293,9 @@ fn render_doctor(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let block = framed_block(" spawn workflow ").padding(Padding::horizontal(2));
+    // The spawn picker is the active navigation target while open —
+    // accent border to match the Plans-view focus convention.
+    let block = framed_block_accent(" spawn workflow ").padding(Padding::horizontal(2));
     if state.spawn_workflows.is_empty() {
         let muted = Style::default().fg(MUTED);
         let lines = vec![
@@ -570,29 +572,57 @@ fn format_title_suffix(
 
 #[must_use]
 pub(super) fn issue_detail_lines(detail: &crate::tracker::IssueDetail) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        kv_line("id", &detail.issue.human_id),
+    let muted = Style::default().fg(MUTED);
+    let label = |s: &str| Span::styled(format!("{s:<14}"), muted);
+    let mut lines: Vec<Line<'static>> = vec![
+        // id: cyan + bold so it matches the plan-items column where
+        // the user just navigated from.
+        Line::from(vec![
+            label("id"),
+            Span::styled(
+                detail.issue.human_id.clone(),
+                Style::default().fg(IDENT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
         kv_line("title", &detail.issue.title),
-        kv_line("status", &detail.issue.status),
+        // status word coloured by tracker convention: open = OK,
+        // closed = MUTED, anything else = WARN. Bold so it lifts off
+        // the row.
+        Line::from(vec![
+            label("status"),
+            Span::styled(
+                detail.issue.status.clone(),
+                issue_status_value_style(&detail.issue.status),
+            ),
+        ]),
     ];
     if !detail.issue.labels.is_empty() {
-        lines.push(kv_line(
-            "labels",
-            &format!("[{}]", detail.issue.labels.join(", ")),
-        ));
+        let mut row: Vec<Span<'static>> = vec![label("labels")];
+        for (i, l) in detail.issue.labels.iter().enumerate() {
+            if i > 0 {
+                row.push(Span::raw(" "));
+            }
+            row.push(label_chip(l));
+        }
+        lines.push(Line::from(row));
     }
     let comment_count = detail.comments.len();
-    lines.push(kv_line("comments", &comment_count.to_string()));
+    let comment_style = if comment_count > 0 {
+        Style::default().fg(OK).add_modifier(Modifier::BOLD)
+    } else {
+        muted
+    };
+    lines.push(Line::from(vec![
+        label("comments"),
+        Span::styled(comment_count.to_string(), comment_style),
+    ]));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Body:",
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
     if detail.body.trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no body)",
-            Style::default().fg(MUTED),
-        )));
+        lines.push(Line::from(Span::styled("  (no body)", muted)));
     } else {
         for line in detail.body.lines() {
             lines.push(Line::from(line.to_string()));
@@ -642,12 +672,33 @@ pub(super) fn plan_detail_lines(
     selected_item: Option<usize>,
     titles: &std::collections::HashMap<String, crate::tracker::Issue>,
 ) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(MUTED);
     let (done, total) = plan.progress();
-    let mut out = vec![
+    let mut out: Vec<Line<'static>> = vec![
         kv_line("name", &plan.name),
-        kv_line("state", plan_state_word(plan.state)),
-        kv_line("progress", &format!("{done}/{total}")),
-        kv_line("policy", plan_failure_word(plan.on_item_failure)),
+        // state value coloured by the same palette as `plan_row_style`
+        // so the header echoes the sidebar.
+        Line::from(vec![
+            Span::styled(format!("{:<14}", "state"), muted),
+            Span::styled(
+                plan_state_word(plan.state).to_string(),
+                plan_state_value_style(plan.state),
+            ),
+        ]),
+        // progress fraction: done count in OK once > 0 (full-OK when
+        // it equals total), slash + total in muted so the eye lands
+        // on the active number.
+        progress_kv_line(done, total),
+        // policy: stop = ERR, retry-once = WARN, continue = OK. Same
+        // semantics as the runtime palette — failure modes are warm,
+        // recovery is cool.
+        Line::from(vec![
+            Span::styled(format!("{:<14}", "policy"), muted),
+            Span::styled(
+                plan_failure_word(plan.on_item_failure).to_string(),
+                plan_policy_value_style(plan.on_item_failure),
+            ),
+        ]),
     ];
     if let Some(epic) = &plan.epic_ref {
         out.push(kv_line("epic", &format!("{}:{}", epic.tracker, epic.id)));
@@ -655,33 +706,125 @@ pub(super) fn plan_detail_lines(
     out.push(Line::from(""));
     out.push(Line::from(Span::styled(
         format!("Items ({total})"),
-        Style::default().fg(MUTED),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
-    use std::fmt::Write as _;
     for (idx, item) in plan.items.iter().enumerate() {
-        let cursor = if selected_item == Some(idx) {
-            "▸ "
-        } else {
-            "  "
-        };
-        let mut row = format!(
-            "{cursor}{idx:>3}. {marker} {state:<11} {ticket}",
-            marker = plan_item_marker(item.state),
-            state = plan_item_word(item.state),
-            ticket = item.ticket_id,
-        );
-        if let Some(title) = titles.get(&item.ticket_id).map(|i| i.title.as_str()) {
-            let _ = write!(row, " — {title}");
-        }
-        if item.injected {
-            row.push_str("  (injected)");
-        }
-        if let Some(session) = &item.session_id {
-            let _ = write!(row, "  · session {session}");
-        }
-        out.push(Line::from(Span::styled(row, plan_item_style(item.state))));
+        out.push(plan_item_line(idx, item, selected_item == Some(idx), titles));
     }
     out
+}
+
+/// One row in the plan-items list. Composed of multiple spans so the
+/// ticket id and status word can stand out against the muted index and
+/// optional title. For completed/skipped items we tone the title +
+/// ticket id down to MUTED so the line of sight stays on what's still
+/// in flight.
+fn plan_item_line(
+    idx: usize,
+    item: &crate::plans::PlanItem,
+    is_selected: bool,
+    titles: &std::collections::HashMap<String, crate::tracker::Issue>,
+) -> Line<'static> {
+    let muted = Style::default().fg(MUTED);
+    let item_state = item.state;
+    let recede = matches!(
+        item_state,
+        PlanItemState::Completed | PlanItemState::Skipped
+    );
+    let state_style = plan_item_style(item_state).add_modifier(Modifier::BOLD);
+    let ident_style = if recede {
+        muted.add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(IDENT).add_modifier(Modifier::BOLD)
+    };
+
+    let cursor = if is_selected { "▸ " } else { "  " };
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(format!("{cursor}{idx:>3}. "), muted),
+        // Marker glyph + state word both get the state colour, so the
+        // pair reads as one tightly-coupled "status indicator" segment.
+        Span::styled(format!("{} ", plan_item_marker(item_state)), state_style),
+        Span::styled(format!("{:<11} ", plan_item_word(item_state)), state_style),
+        // Ticket id: cyan + bold. Distinct from the violet accent so an
+        // id never reads as a "selected" or "active" cue.
+        Span::styled(item.ticket_id.clone(), ident_style),
+    ];
+
+    if let Some(title) = titles.get(&item.ticket_id).map(|i| i.title.as_str()) {
+        spans.push(Span::styled(" — ", muted));
+        let title_style = if recede { muted } else { Style::default() };
+        spans.push(Span::styled(title.to_string(), title_style));
+    }
+    if item.injected {
+        spans.push(Span::styled(
+            "  (injected)",
+            Style::default().fg(WARN).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    if let Some(session) = &item.session_id {
+        spans.push(Span::styled("  · session ", muted));
+        spans.push(Span::styled(
+            session.to_string(),
+            Style::default().fg(IDENT),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Build the "progress" row of the plan header. The done count adopts
+/// OK once it's > 0; the slash and total stay muted so the eye lands
+/// on the active number. When done equals total, the whole fraction
+/// goes OK — a "fully done" tell at a glance.
+fn progress_kv_line(done: usize, total: usize) -> Line<'static> {
+    let muted = Style::default().fg(MUTED);
+    let ok = Style::default().fg(OK).add_modifier(Modifier::BOLD);
+    let label = Span::styled(format!("{:<14}", "progress"), muted);
+    if total > 0 && done == total {
+        return Line::from(vec![
+            label,
+            Span::styled(format!("{done}/{total}"), ok),
+        ]);
+    }
+    let done_style = if done == 0 { muted } else { ok };
+    Line::from(vec![
+        label,
+        Span::styled(done.to_string(), done_style),
+        Span::styled(format!("/{total}"), muted),
+    ])
+}
+
+/// Tracker-issue status word style. `open` reads OK, `closed` recedes
+/// to MUTED, anything else (state machines vary — Linear/Jira may add
+/// custom states) gets WARN so the user notices a non-standard value.
+#[must_use]
+fn issue_status_value_style(status: &str) -> Style {
+    let base = match status {
+        "open" => Style::default().fg(OK),
+        "closed" => Style::default().fg(MUTED),
+        _ => Style::default().fg(WARN),
+    };
+    base.add_modifier(Modifier::BOLD)
+}
+
+#[must_use]
+fn plan_state_value_style(state: PlanState) -> Style {
+    let base = match state {
+        PlanState::Active => Style::default().fg(OK),
+        PlanState::Paused => Style::default().fg(WARN),
+        PlanState::Completed => Style::default().fg(MUTED),
+        PlanState::Abandoned => Style::default().fg(ERR),
+    };
+    base.add_modifier(Modifier::BOLD)
+}
+
+#[must_use]
+fn plan_policy_value_style(policy: crate::plans::ItemFailurePolicy) -> Style {
+    let base = match policy {
+        crate::plans::ItemFailurePolicy::Stop => Style::default().fg(ERR),
+        crate::plans::ItemFailurePolicy::RetryOnce => Style::default().fg(WARN),
+        crate::plans::ItemFailurePolicy::Continue => Style::default().fg(OK),
+    };
+    base.add_modifier(Modifier::BOLD)
 }
 
 #[must_use]
@@ -764,8 +907,14 @@ fn split_sidebar_areas(area: Rect) -> (Rect, Rect) {
 
 fn render_orchestrator_pane(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     // No counter in the title — there's only ever 0 or 1, so a
-    // count would be visual noise.
-    let block = framed_block(" orchestrator ");
+    // count would be visual noise. Border switches to ACCENT when
+    // the orchestrator sub-list owns the focus, so the user can see
+    // at a glance which `j/k` target is active.
+    let block = if state.sessions_focus == SessionsFocus::Orchestrator {
+        framed_block_accent(" orchestrator ")
+    } else {
+        framed_block(" orchestrator ")
+    };
     f.render_widget(block.clone(), area);
     let inner = block.inner(area);
     render_orchestrator_list(f, inner, state);
@@ -773,7 +922,11 @@ fn render_orchestrator_pane(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn render_workers_pane(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let title = format!(" workers ({}) ", state.sessions.len());
-    let block = framed_block(&title);
+    let block = if state.sessions_focus == SessionsFocus::Workflows {
+        framed_block_accent(&title)
+    } else {
+        framed_block(&title)
+    };
     f.render_widget(block.clone(), area);
     let inner = block.inner(area);
     if state.sessions.is_empty() {
