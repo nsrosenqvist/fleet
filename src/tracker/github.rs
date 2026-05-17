@@ -160,34 +160,78 @@ impl Tracker for GitHubTracker {
     }
 
     fn link_parent(&self, repo_root: &Path, parent_id: &str, child_id: &str) -> Result<()> {
-        // GitHub has no native parent/child edge; the v1 convention is
-        // a task-list line on the parent's body so the relationship
-        // surfaces in GitHub's "Tasklists" UI and trackers like the
-        // orchestrator agent can recreate it from the canonical source.
+        // GitHub's native sub-issues feature (REST API surface added
+        // in api version `2026-03-10`, exposed in the UI as the
+        // "Sub-issues" panel on the parent). Three `gh api` shellouts:
         //
-        // Read-modify-write via gh: read the parent's body, append a
-        // `- [ ] #<child>` line if not already present, write back.
-        // Two shellouts because gh has no "append-to-body" verb.
-        let view_cmd = format!("gh issue view {} --json body", shell_quote_str(parent_id));
-        let body_json = self
-            .invoker
-            .run("sh", Self::shell_cmd(repo_root, &view_cmd))
-            .with_context(|| format!("invoking `gh issue view {parent_id} --json body`"))?;
-        let current = parse_gh_body_field(&body_json).with_context(|| {
-            format!("parsing body field from `gh issue view {parent_id}` output")
-        })?;
-        let new_body = append_task_list_line(&current, child_id);
-        let edit_cmd = format!(
-            "gh issue edit {} --body {}",
+        //   1. list existing sub-issues so re-linking is a no-op
+        //      (the POST endpoint isn't idempotent — it would return
+        //      422 on a duplicate, and we want `link_parent` to stay
+        //      cheap to re-run);
+        //   2. resolve the child issue's database id, because the POST
+        //      body takes the numeric `id`, not the user-facing issue
+        //      `number`;
+        //   3. POST the link.
+        //
+        // `{owner}/{repo}` are placeholders that `gh api` substitutes
+        // from the current git remote, same as fleet's other `gh`
+        // shellouts (which all `cd` into the repo first).
+        let existing_numbers = {
+            let cmd = format!(
+                "gh api {API_VERSION_HEADER} \
+                 repos/{{owner}}/{{repo}}/issues/{}/sub_issues",
+                shell_quote_str(parent_id),
+            );
+            let stdout = self
+                .invoker
+                .run("sh", Self::shell_cmd(repo_root, &cmd))
+                .with_context(|| {
+                    format!("listing sub-issues of #{parent_id} for idempotence check")
+                })?;
+            parse_sub_issue_numbers(&stdout)
+        };
+        if existing_numbers
+            .iter()
+            .any(|n| n.to_string() == child_id)
+        {
+            return Ok(());
+        }
+
+        let child_db_id = {
+            let cmd = format!(
+                "gh api {API_VERSION_HEADER} \
+                 repos/{{owner}}/{{repo}}/issues/{} --jq .id",
+                shell_quote_str(child_id),
+            );
+            let stdout = self
+                .invoker
+                .run("sh", Self::shell_cmd(repo_root, &cmd))
+                .with_context(|| format!("resolving database id of #{child_id}"))?;
+            stdout.trim().parse::<u64>().with_context(|| {
+                format!(
+                    "parsing database id for #{child_id}: expected an integer, got {:?}",
+                    stdout.trim()
+                )
+            })?
+        };
+
+        let post_cmd = format!(
+            "gh api {API_VERSION_HEADER} -X POST -F sub_issue_id={child_db_id} \
+             repos/{{owner}}/{{repo}}/issues/{}/sub_issues",
             shell_quote_str(parent_id),
-            shell_quote_str(&new_body),
         );
         self.invoker
-            .run("sh", Self::shell_cmd(repo_root, &edit_cmd))
-            .with_context(|| format!("invoking `gh issue edit {parent_id} --body`"))?;
+            .run("sh", Self::shell_cmd(repo_root, &post_cmd))
+            .with_context(|| format!("linking #{child_id} as a sub-issue of #{parent_id}"))?;
         Ok(())
     }
 }
+
+/// API version header passed to every sub-issues `gh api` call.
+/// Sub-issues entered general availability under this version; pinning
+/// it keeps fleet's behaviour stable when GitHub bumps the default
+/// version for unrelated reasons.
+const API_VERSION_HEADER: &str = "-H 'X-GitHub-Api-Version: 2026-03-10'";
 
 /// Parse `gh issue list --json …` output into normalised `Issue`s.
 /// Pure; exposed for tests.
@@ -253,50 +297,30 @@ pub fn parse_gh_create_output(stdout: &str) -> Option<u64> {
     last_segment.parse::<u64>().ok()
 }
 
-/// Parse the `body` field out of a `gh issue view --json body` payload.
-/// Returns the body as a String, or an error when the payload doesn't
-/// shape-match (missing field, malformed JSON, …).
-#[allow(dead_code)] // Caller is `link_parent`, dead until Phase 2's tracker-create.
-fn parse_gh_body_field(stdout: &str) -> Result<String> {
+/// Parse the `[{number, ...}, ...]` JSON returned by the sub-issues
+/// list endpoint into a flat list of issue numbers. Pure; exposed for
+/// the [`Tracker::link_parent`] idempotence check and unit tests.
+///
+/// Tolerant on shape mismatch (returns an empty list) for the same
+/// reason [`parse_gh_output`] is: a parse failure on the read side
+/// shouldn't block the POST that follows — the POST itself will
+/// surface any real auth/repo error with a clearer message than a
+/// JSON parse failure on a list response would.
+#[must_use]
+fn parse_sub_issue_numbers(stdout: &str) -> Vec<u64> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
-        return Err(anyhow!("`gh issue view --json body` returned no output"));
+        return Vec::new();
     }
     #[derive(Deserialize)]
-    struct BodyOnly {
-        #[serde(default)]
-        body: String,
+    struct Ref {
+        number: u64,
     }
-    let raw: BodyOnly = serde_json::from_str(trimmed)
-        .with_context(|| format!("parsing body-only payload: {trimmed:?}"))?;
-    Ok(raw.body)
-}
-
-/// Append `- [ ] #<child_id>` to `current` if it isn't already
-/// referenced. Idempotent: re-linking the same child is a no-op. A
-/// trailing newline is normalised so the appended line always lives
-/// on its own row even if the parent's body didn't end in `\n`.
-#[must_use]
-#[allow(dead_code)] // Caller is `link_parent`, dead until Phase 2's tracker-create.
-fn append_task_list_line(current: &str, child_id: &str) -> String {
-    let needle = format!("#{child_id}");
-    // Whole-token match — a body that mentions `#43` shouldn't be
-    // treated as already linking `#4`. lines() splits on `\n`/`\r\n`;
-    // for each line, split_whitespace gives us tokens we can compare.
-    let already_linked = current
-        .lines()
-        .any(|line| line.split_whitespace().any(|tok| tok == needle));
-    if already_linked {
-        return current.to_string();
-    }
-    let mut out = current.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str("- [ ] ");
-    out.push_str(&needle);
-    out.push('\n');
-    out
+    let raw: Vec<Ref> = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    raw.into_iter().map(|r| r.number).collect()
 }
 
 /// POSIX-shell single-quote escape for an arbitrary string. Matches
@@ -643,18 +667,32 @@ mod tests {
     }
 
     #[test]
-    fn link_parent_reads_then_appends_task_list_line_and_writes_back() {
+    fn link_parent_lists_sub_issues_then_resolves_database_id_then_posts() {
+        // Three shellouts, in order: list (returns empty array so the
+        // child is not yet linked), GET the child to resolve its
+        // database id, POST the link. Each `expect_shell_cmd` matches
+        // exactly one invocation; the `MockProcessInvoker` framework
+        // fails the test if any extra calls fire.
         let mut mock = MockProcessInvoker::new();
         expect_shell_cmd(
             &mut mock,
             "/r",
-            "gh issue view '100' --json body",
-            r#"{"body": "Parent description"}"#,
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'100'/sub_issues",
+            "[]",
         );
         expect_shell_cmd(
             &mut mock,
             "/r",
-            "gh issue edit '100' --body 'Parent description\n- [ ] #57\n'",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'57' --jq .id",
+            "9876543210\n",
+        );
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' -X POST -F sub_issue_id=9876543210 \
+             repos/{owner}/{repo}/issues/'100'/sub_issues",
             "",
         );
         let t = GitHubTracker::new(Arc::new(mock));
@@ -662,25 +700,78 @@ mod tests {
     }
 
     #[test]
-    fn link_parent_is_idempotent_when_child_already_referenced() {
-        // No second shellout should fire because the body already
-        // contains `#57`. MockProcessInvoker would fail the test if a
-        // second call appeared without an expect_shell_cmd for it.
+    fn link_parent_is_idempotent_when_child_already_linked() {
+        // The list call returns the child already on the parent — no
+        // database-id lookup or POST should fire. Only one
+        // `expect_shell_cmd` is set up; if `link_parent` does a second
+        // invocation the mock framework fails the test.
         let mut mock = MockProcessInvoker::new();
         expect_shell_cmd(
             &mut mock,
             "/r",
-            "gh issue view '100' --json body",
-            r#"{"body": "Existing: - [x] #57 done"}"#,
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'100'/sub_issues",
+            r#"[{"number": 57, "id": 9876543210}]"#,
+        );
+        let t = GitHubTracker::new(Arc::new(mock));
+        t.link_parent(Path::new("/r"), "100", "57").unwrap();
+    }
+
+    #[test]
+    fn link_parent_idempotence_is_whole_number_match_not_substring() {
+        // Parent already has #43 as a sub-issue; linking #4 must
+        // proceed (resolve id + POST), not short-circuit. The mock
+        // framework fails the test if the resolve / post calls
+        // don't fire — proving the substring trap is avoided.
+        let mut mock = MockProcessInvoker::new();
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'100'/sub_issues",
+            r#"[{"number": 43}]"#,
         );
         expect_shell_cmd(
             &mut mock,
             "/r",
-            "gh issue edit '100' --body 'Existing: - [x] #57 done'",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'4' --jq .id",
+            "1111111\n",
+        );
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' -X POST -F sub_issue_id=1111111 \
+             repos/{owner}/{repo}/issues/'100'/sub_issues",
             "",
         );
         let t = GitHubTracker::new(Arc::new(mock));
-        t.link_parent(Path::new("/r"), "100", "57").unwrap();
+        t.link_parent(Path::new("/r"), "100", "4").unwrap();
+    }
+
+    #[test]
+    fn link_parent_surfaces_a_non_integer_database_id_as_a_typed_error() {
+        let mut mock = MockProcessInvoker::new();
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'100'/sub_issues",
+            "[]",
+        );
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'57' --jq .id",
+            "not-a-number\n",
+        );
+        let t = GitHubTracker::new(Arc::new(mock));
+        let err = t.link_parent(Path::new("/r"), "100", "57").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("expected an integer"),
+            "got: {err:#}"
+        );
     }
 
     // ---- pure helpers ----
@@ -707,36 +798,22 @@ mod tests {
     }
 
     #[test]
-    fn append_task_list_line_appends_when_absent() {
-        assert_eq!(
-            append_task_list_line("Old body", "42"),
-            "Old body\n- [ ] #42\n"
-        );
-        // Trailing newline preserved.
-        assert_eq!(
-            append_task_list_line("Old body\n", "42"),
-            "Old body\n- [ ] #42\n"
-        );
+    fn parse_sub_issue_numbers_extracts_issue_numbers_from_list_response() {
+        let json = r#"[
+            {"number": 57, "id": 9876, "title": "child A"},
+            {"number": 91, "id": 1234, "title": "child B"}
+        ]"#;
+        assert_eq!(parse_sub_issue_numbers(json), vec![57, 91]);
     }
 
     #[test]
-    fn append_task_list_line_is_idempotent_when_present() {
-        assert_eq!(
-            append_task_list_line("- [ ] #42\nother stuff", "42"),
-            "- [ ] #42\nother stuff"
-        );
+    fn parse_sub_issue_numbers_returns_empty_for_empty_array() {
+        assert_eq!(parse_sub_issue_numbers("[]"), Vec::<u64>::new());
     }
 
     #[test]
-    fn append_task_list_line_does_not_match_partial_number() {
-        // A body that mentions `#43` shouldn't be considered to
-        // already link `#4`.
-        let body = append_task_list_line("references #43", "4");
-        assert!(body.ends_with("- [ ] #4\n"), "{body}");
-    }
-
-    #[test]
-    fn append_task_list_line_handles_empty_body() {
-        assert_eq!(append_task_list_line("", "42"), "- [ ] #42\n");
+    fn parse_sub_issue_numbers_returns_empty_on_blank_or_unparseable_output() {
+        assert_eq!(parse_sub_issue_numbers(""), Vec::<u64>::new());
+        assert_eq!(parse_sub_issue_numbers("not json"), Vec::<u64>::new());
     }
 }
