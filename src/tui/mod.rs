@@ -292,6 +292,13 @@ struct AppState {
     /// to render "Blocked on:" / "Blocks:" rows without an extra
     /// per-render disk read. Missing file → empty document.
     deps_doc: crate::deps::DepsDoc,
+    /// Tracker-issue-by-human-id cache. One bulk
+    /// `tracker.list_issues` call populates this whenever the
+    /// Plans view is entered or reloaded, so the plan items list
+    /// and the deps section can show titles next to each id
+    /// without N per-render `tracker.read` calls. Empty when no
+    /// tracker is configured or the list call has failed.
+    tickets_by_id: std::collections::HashMap<String, crate::tracker::Issue>,
     /// Cache of tracker-fetched issue details for the Plans
     /// view's third pane, keyed by ticket id. `Err` caches the
     /// user-facing failure string so we don't re-hit the tracker
@@ -454,6 +461,7 @@ impl AppState {
             brainstorms_list_state: ListState::default(),
             cycle_nodes: std::collections::HashSet::new(),
             deps_doc: crate::deps::DepsDoc::empty(),
+            tickets_by_id: std::collections::HashMap::new(),
             focused_issue_cache: std::collections::HashMap::new(),
         };
         state.reload(store)?;
@@ -858,11 +866,13 @@ impl AppState {
                 Action::None
             }
             KeyCode::Char('r') => {
-                // Reload also drops the ticket-detail cache so a
-                // user editing the tracker out-of-band has an
-                // explicit way to force a refetch on the next nav.
+                // Reload also drops the ticket-detail cache + re-
+                // fetches the bulk title map so a user editing
+                // the tracker out-of-band has an explicit way to
+                // force a re-read.
                 self.focused_issue_cache.clear();
                 self.refresh_plans();
+                self.refresh_ticket_titles();
                 self.refresh_focused_issue();
                 Action::None
             }
@@ -1037,9 +1047,42 @@ impl AppState {
     /// Switch into the Plans view, reloading from disk so the listing
     /// matches the latest `.fleet/plans/<id>.yaml` state. Empty list
     /// is fine — the renderer shows a hint instead.
+    ///
+    /// Also bulk-fetches tracker issues so plan items + deps rows
+    /// can render with titles next to each id. One tracker call
+    /// per Plans-view entry — cheaper than fanning out
+    /// `tracker.read` per item.
     fn open_plans_view(&mut self) {
         self.refresh_plans();
+        self.refresh_ticket_titles();
         self.view = View::Plans;
+    }
+
+    /// Bulk-fetch every tracker issue into `tickets_by_id`. Called
+    /// when entering Plans view or on `r` reload. Failure surfaces
+    /// in the status line but doesn't clear the existing map —
+    /// stale titles beat empty titles when the tracker is briefly
+    /// unreachable.
+    fn refresh_ticket_titles(&mut self) {
+        let Some(tracker) = self.ensure_tracker() else {
+            // No tracker plugin → clear so we don't keep stale
+            // data from a previous tracker config.
+            self.tickets_by_id.clear();
+            return;
+        };
+        let root = self.root.clone();
+        match tracker.list_issues(&root) {
+            Ok(issues) => {
+                self.tickets_by_id.clear();
+                for issue in issues {
+                    self.tickets_by_id.insert(issue.human_id.clone(), issue);
+                }
+            }
+            Err(err) => {
+                self.status_line = format!(" tracker list failed: {err:#} ");
+                // Leave stale map alone — better than blanking.
+            }
+        }
     }
 
     /// Reload plans from disk and restore the previous selection by
@@ -1879,7 +1922,7 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         format!(" {} ", plan.id)
     };
     let block = Block::default().title(title).borders(Borders::ALL);
-    let body = Paragraph::new(plan_detail_lines(plan, selected_item))
+    let body = Paragraph::new(plan_detail_lines(plan, selected_item, &state.tickets_by_id))
         .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(body, area);
@@ -1962,7 +2005,13 @@ fn ticket_detail_lines(state: &AppState) -> Vec<Line<'static>> {
     // Append the deps section regardless of whether the tracker
     // fetch succeeded — deps live in `.fleet/deps.json` (cached
     // on AppState), so a tracker outage shouldn't hide them.
-    append_deps_lines(&mut lines, ticket_id, &state.deps_doc, &state.cycle_nodes);
+    append_deps_lines(
+        &mut lines,
+        ticket_id,
+        &state.deps_doc,
+        &state.cycle_nodes,
+        &state.tickets_by_id,
+    );
     lines
 }
 
@@ -1972,11 +2021,17 @@ fn ticket_detail_lines(state: &AppState) -> Vec<Line<'static>> {
 /// cycle. The two sides are listed separately so it's clear at a
 /// glance which way the arrow points: *blocked on* X means we're
 /// waiting for X; *blocks* Y means Y is waiting for us.
+///
+/// `titles` is consulted to suffix each ticket-id row with the
+/// issue's title (skipped for `free:<slug>` freeform tags, which
+/// aren't ticket ids). Pass an empty map to suppress suffixes
+/// (tests).
 fn append_deps_lines(
     lines: &mut Vec<Line<'static>>,
     ticket_id: &str,
     deps: &crate::deps::DepsDoc,
     cycle_nodes: &std::collections::HashSet<String>,
+    titles: &std::collections::HashMap<String, crate::tracker::Issue>,
 ) {
     let blocked_on: Vec<&crate::deps::DepEdge> = deps
         .edges
@@ -2005,7 +2060,11 @@ fn append_deps_lines(
                 crate::deps::BlockedReason::Ticket => "ticket",
                 crate::deps::BlockedReason::Freeform => "freeform",
             };
-            lines.push(Line::from(format!("  • {}  [{kind}]", edge.blocked_on)));
+            let title_suffix = format_title_suffix(&edge.blocked_on, edge.reason, titles);
+            lines.push(Line::from(format!(
+                "  • {}{title_suffix}  [{kind}]",
+                edge.blocked_on
+            )));
         }
     }
     if !blocks.is_empty() {
@@ -2017,7 +2076,11 @@ fn append_deps_lines(
             Style::default().add_modifier(Modifier::BOLD),
         )));
         for edge in &blocks {
-            lines.push(Line::from(format!("  • {}", edge.blocked)));
+            // Left-hand side is always a ticket id (only the
+            // right side carries the `free:` prefix for freeform
+            // edges), so look up the title unconditionally.
+            let title_suffix = format_title_suffix(&edge.blocked, crate::deps::BlockedReason::Ticket, titles);
+            lines.push(Line::from(format!("  • {}{title_suffix}", edge.blocked)));
         }
     }
     if in_cycle {
@@ -2027,6 +2090,25 @@ fn append_deps_lines(
             Style::default().fg(Color::Yellow),
         )));
     }
+}
+
+/// `" — <title>"` when `id` is a ticket reference present in
+/// `titles`, empty string otherwise. Skips lookups for freeform
+/// tags (`free:<slug>`) — those aren't ticket ids and have no
+/// title to fetch.
+#[must_use]
+fn format_title_suffix(
+    id: &str,
+    reason: crate::deps::BlockedReason,
+    titles: &std::collections::HashMap<String, crate::tracker::Issue>,
+) -> String {
+    if matches!(reason, crate::deps::BlockedReason::Freeform) {
+        return String::new();
+    }
+    titles
+        .get(id)
+        .map(|i| format!(" — {}", i.title))
+        .unwrap_or_default()
 }
 
 /// Pure: turn an `IssueDetail` into render lines. Pulled out
@@ -2126,8 +2208,18 @@ fn plan_state_marker(state: PlanState) -> &'static str {
 /// `selected_item` highlights one item row with a `▸` prefix —
 /// pass `None` from the sidebar-focus rendering (or from tests
 /// that don't care about the cursor).
+///
+/// `titles` is the bulk-fetched ticket-id → issue map (see
+/// `refresh_ticket_titles`). When an item's `ticket_id` is in
+/// the map, the row is suffixed with `— <title>` so the user
+/// doesn't have to memorise tracker ids. Pass an empty map to
+/// skip the suffix (tests).
 #[must_use]
-fn plan_detail_lines(plan: &Plan, selected_item: Option<usize>) -> Vec<Line<'static>> {
+fn plan_detail_lines(
+    plan: &Plan,
+    selected_item: Option<usize>,
+    titles: &std::collections::HashMap<String, crate::tracker::Issue>,
+) -> Vec<Line<'static>> {
     let (done, total) = plan.progress();
     let mut out = vec![
         kv_line("name", &plan.name),
@@ -2156,6 +2248,9 @@ fn plan_detail_lines(plan: &Plan, selected_item: Option<usize>) -> Vec<Line<'sta
             state = plan_item_word(item.state),
             ticket = item.ticket_id,
         );
+        if let Some(title) = titles.get(&item.ticket_id).map(|i| i.title.as_str()) {
+            let _ = write!(row, " — {title}");
+        }
         if item.injected {
             row.push_str("  (injected)");
         }
@@ -2609,6 +2704,12 @@ mod tests {
     /// `HashSet::new()` at every call site.
     fn no_cycles() -> std::collections::HashSet<String> {
         std::collections::HashSet::new()
+    }
+
+    /// Sibling of `no_cycles`: empty title map for tests that
+    /// don't care about title suffixes in plan / deps rendering.
+    fn no_titles() -> std::collections::HashMap<String, crate::tracker::Issue> {
+        std::collections::HashMap::new()
     }
 
     fn session(id: &str, workflow: &str, state: SessionState, ts: u64) -> Session {
@@ -3570,7 +3671,7 @@ mod tests {
     #[test]
     fn plan_detail_lines_includes_progress_and_item_rows() {
         let p = sample_plan();
-        let lines = plan_detail_lines(&p, None);
+        let lines = plan_detail_lines(&p, None, &no_titles());
         let rendered: Vec<String> = lines
             .iter()
             .map(|l| {
@@ -3599,7 +3700,7 @@ mod tests {
     fn plan_detail_lines_marks_injected_items() {
         let mut p = sample_plan();
         p.items.insert(1, PlanItem::pending_injected("99"));
-        let lines = plan_detail_lines(&p, None);
+        let lines = plan_detail_lines(&p, None, &no_titles());
         let joined: String = lines
             .iter()
             .map(|l| {
@@ -3618,7 +3719,7 @@ mod tests {
     #[test]
     fn plan_detail_lines_emits_epic_ref_only_when_set() {
         let p = sample_plan();
-        let lines = plan_detail_lines(&p, None);
+        let lines = plan_detail_lines(&p, None, &no_titles());
         let joined: String = lines
             .iter()
             .map(|l| {
@@ -3637,7 +3738,7 @@ mod tests {
             tracker: "github".into(),
             id: "200".into(),
         });
-        let lines2 = plan_detail_lines(&p_with, None);
+        let lines2 = plan_detail_lines(&p_with, None, &no_titles());
         let joined2: String = lines2
             .iter()
             .map(|l| {
@@ -3901,7 +4002,7 @@ mod tests {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let doc = crate::deps::DepsDoc::empty();
         let cycles = std::collections::HashSet::new();
-        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        append_deps_lines(&mut lines, "42", &doc, &cycles, &no_titles());
         assert!(lines.is_empty(), "no deps + no cycle → no lines");
     }
 
@@ -3926,7 +4027,7 @@ mod tests {
             ],
         };
         let cycles = std::collections::HashSet::new();
-        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        append_deps_lines(&mut lines, "42", &doc, &cycles, &no_titles());
         let r = rendered(&lines);
         assert!(r.contains("Blocked on (2):"), "got: {r}");
         assert!(r.contains("100  [ticket]"));
@@ -3954,7 +4055,7 @@ mod tests {
             ],
         };
         let cycles = std::collections::HashSet::new();
-        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        append_deps_lines(&mut lines, "42", &doc, &cycles, &no_titles());
         let r = rendered(&lines);
         assert!(r.contains("Blocks (2):"), "got: {r}");
         assert!(r.contains("• 99"));
@@ -3982,7 +4083,7 @@ mod tests {
             ],
         };
         let cycles = std::collections::HashSet::new();
-        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        append_deps_lines(&mut lines, "42", &doc, &cycles, &no_titles());
         let r = rendered(&lines);
         assert!(r.contains("Blocked on (1):"));
         assert!(r.contains("Blocks (1):"));
@@ -4000,10 +4101,99 @@ mod tests {
         let doc = crate::deps::DepsDoc::empty();
         let mut cycles = std::collections::HashSet::new();
         cycles.insert("42".to_string());
-        append_deps_lines(&mut lines, "42", &doc, &cycles);
+        append_deps_lines(&mut lines, "42", &doc, &cycles, &no_titles());
         let r = rendered(&lines);
         assert!(r.contains("⚠"), "warning missing: {r}");
         assert!(r.contains("cycle"), "cycle word missing: {r}");
+    }
+
+    /// Tracker issue fixture for tests that want a title in the
+    /// `tickets_by_id` map without dragging the full
+    /// `issue_detail_fixture` helper around.
+    fn ticket(human: &str, title: &str) -> crate::tracker::Issue {
+        crate::tracker::Issue {
+            id: format!("gh:{human}"),
+            human_id: human.into(),
+            title: title.into(),
+            status: "open".into(),
+            labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn plan_detail_lines_appends_title_when_known() {
+        let p = sample_plan();
+        let mut titles = std::collections::HashMap::new();
+        titles.insert("42".to_string(), ticket("42", "Parser refactor"));
+        titles.insert("43".to_string(), ticket("43", "Token tweaks"));
+        // 44 left without a title — the row should still render
+        // without a suffix.
+        let r = rendered(&plan_detail_lines(&p, None, &titles));
+        assert!(r.contains("42 — Parser refactor"), "got: {r}");
+        assert!(r.contains("43 — Token tweaks"));
+        // 44 should appear (it's an item) but without a title
+        // suffix.
+        let line_44 = r.lines().find(|l| l.contains("44")).unwrap();
+        assert!(!line_44.contains("—"), "unexpected title suffix: {line_44}");
+    }
+
+    #[test]
+    fn append_deps_lines_appends_title_for_ticket_edges_only() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let doc = crate::deps::DepsDoc {
+            version: crate::deps::DEPS_SCHEMA_VERSION,
+            edges: vec![
+                // Ticket edge — should get a title suffix.
+                crate::deps::DepEdge {
+                    blocked: "42".into(),
+                    blocked_on: "100".into(),
+                    reason: crate::deps::BlockedReason::Ticket,
+                    created_at_ms: 1,
+                },
+                // Freeform edge — no title lookup, no suffix.
+                crate::deps::DepEdge {
+                    blocked: "42".into(),
+                    blocked_on: "free:apt-mirror".into(),
+                    reason: crate::deps::BlockedReason::Freeform,
+                    created_at_ms: 2,
+                },
+            ],
+        };
+        let cycles = std::collections::HashSet::new();
+        let mut titles = std::collections::HashMap::new();
+        titles.insert("100".to_string(), ticket("100", "Define OpenAPI schema"));
+        append_deps_lines(&mut lines, "42", &doc, &cycles, &titles);
+        let r = rendered(&lines);
+        assert!(
+            r.contains("100 — Define OpenAPI schema  [ticket]"),
+            "got: {r}"
+        );
+        // Freeform row stays bare — `free:` prefix isn't a ticket id.
+        let line_apt = r.lines().find(|l| l.contains("apt-mirror")).unwrap();
+        assert!(
+            !line_apt.contains("—"),
+            "freeform row gained a phantom title: {line_apt}"
+        );
+    }
+
+    #[test]
+    fn append_deps_lines_appends_title_on_blocks_side_too() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let doc = crate::deps::DepsDoc {
+            version: crate::deps::DEPS_SCHEMA_VERSION,
+            edges: vec![crate::deps::DepEdge {
+                blocked: "99".into(),
+                blocked_on: "42".into(),
+                reason: crate::deps::BlockedReason::Ticket,
+                created_at_ms: 1,
+            }],
+        };
+        let cycles = std::collections::HashSet::new();
+        let mut titles = std::collections::HashMap::new();
+        titles.insert("99".to_string(), ticket("99", "Frontend client"));
+        append_deps_lines(&mut lines, "42", &doc, &cycles, &titles);
+        let r = rendered(&lines);
+        assert!(r.contains("99 — Frontend client"), "got: {r}");
     }
 
     #[test]
