@@ -178,6 +178,22 @@ impl Tracker for GitBugTracker {
         let label = format!("parent:{parent_id}");
         self.add_label(repo_root, child_id, &label)
     }
+
+    fn link_blocks(
+        &self,
+        repo_root: &Path,
+        blocked_id: &str,
+        blocked_on_id: &str,
+    ) -> Result<()> {
+        // git-bug has no native blocks/blocked-by edge; mirror
+        // `link_parent`'s label convention with a symmetric pair so
+        // either side of the relationship is queryable via
+        // `git-bug ls --label`. `add_label` is idempotent on git-bug,
+        // so this call is safe to re-run.
+        self.add_label(repo_root, blocked_id, &format!("blocked-by:{blocked_on_id}"))?;
+        self.add_label(repo_root, blocked_on_id, &format!("blocks:{blocked_id}"))?;
+        Ok(())
+    }
 }
 
 /// Parse `git-bug ls --format json` output into normalised `Issue`s.
@@ -551,6 +567,24 @@ mod tests {
         let t = GitBugTracker::new(Arc::new(mock));
         t.link_parent(Path::new("/repo"), "parent456", "child123")
             .unwrap();
+    }
+
+    #[test]
+    fn link_blocks_attaches_a_symmetric_label_pair() {
+        // `blocked-by:<blocked_on>` on the blocked side and
+        // `blocks:<blocked>` on the blocked_on side — two label-add
+        // shellouts in that order. The mock framework fails the test
+        // if either is missing or out of order.
+        let mut mock = MockProcessInvoker::new();
+        expect_shell_cmd(
+            &mut mock,
+            "/repo",
+            "git-bug label add 'a' 'blocked-by:b'",
+            "",
+        );
+        expect_shell_cmd(&mut mock, "/repo", "git-bug label add 'b' 'blocks:a'", "");
+        let t = GitBugTracker::new(Arc::new(mock));
+        t.link_blocks(Path::new("/repo"), "a", "b").unwrap();
     }
 
     #[test]

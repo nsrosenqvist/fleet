@@ -188,7 +188,7 @@ impl Tracker for GitHubTracker {
                 .with_context(|| {
                     format!("listing sub-issues of #{parent_id} for idempotence check")
                 })?;
-            parse_sub_issue_numbers(&stdout)
+            parse_issue_number_list(&stdout)
         };
         if existing_numbers
             .iter()
@@ -225,12 +225,83 @@ impl Tracker for GitHubTracker {
             .with_context(|| format!("linking #{child_id} as a sub-issue of #{parent_id}"))?;
         Ok(())
     }
+
+    fn link_blocks(
+        &self,
+        repo_root: &Path,
+        blocked_id: &str,
+        blocked_on_id: &str,
+    ) -> Result<()> {
+        // GitHub's native Issue Dependencies REST API. Same three-step
+        // pattern as `link_parent`'s sub-issues flow because the POST
+        // endpoint isn't idempotent (duplicate links return 422):
+        //
+        //   1. list `blocked_by` deps on the blocked issue;
+        //   2. resolve the blocked_on issue's database id (the POST
+        //      body takes `issue_id`, not the user-facing number);
+        //   3. POST the dep.
+        //
+        // POSTing to `…/issues/<blocked>/dependencies/blocked_by` with
+        // `issue_id: <blocked_on>` is symmetric: GitHub records the
+        // inverse "blocking" relationship on the blocked_on issue
+        // automatically, so we don't have to make the call twice.
+        let existing_numbers = {
+            let cmd = format!(
+                "gh api {API_VERSION_HEADER} \
+                 repos/{{owner}}/{{repo}}/issues/{}/dependencies/blocked_by",
+                shell_quote_str(blocked_id),
+            );
+            let stdout = self
+                .invoker
+                .run("sh", Self::shell_cmd(repo_root, &cmd))
+                .with_context(|| {
+                    format!("listing blocked-by deps of #{blocked_id} for idempotence check")
+                })?;
+            parse_issue_number_list(&stdout)
+        };
+        if existing_numbers
+            .iter()
+            .any(|n| n.to_string() == blocked_on_id)
+        {
+            return Ok(());
+        }
+
+        let blocked_on_db_id = {
+            let cmd = format!(
+                "gh api {API_VERSION_HEADER} \
+                 repos/{{owner}}/{{repo}}/issues/{} --jq .id",
+                shell_quote_str(blocked_on_id),
+            );
+            let stdout = self
+                .invoker
+                .run("sh", Self::shell_cmd(repo_root, &cmd))
+                .with_context(|| format!("resolving database id of #{blocked_on_id}"))?;
+            stdout.trim().parse::<u64>().with_context(|| {
+                format!(
+                    "parsing database id for #{blocked_on_id}: expected an integer, got {:?}",
+                    stdout.trim()
+                )
+            })?
+        };
+
+        let post_cmd = format!(
+            "gh api {API_VERSION_HEADER} -X POST -F issue_id={blocked_on_db_id} \
+             repos/{{owner}}/{{repo}}/issues/{}/dependencies/blocked_by",
+            shell_quote_str(blocked_id),
+        );
+        self.invoker
+            .run("sh", Self::shell_cmd(repo_root, &post_cmd))
+            .with_context(|| {
+                format!("linking #{blocked_id} as blocked by #{blocked_on_id}")
+            })?;
+        Ok(())
+    }
 }
 
-/// API version header passed to every sub-issues `gh api` call.
-/// Sub-issues entered general availability under this version; pinning
-/// it keeps fleet's behaviour stable when GitHub bumps the default
-/// version for unrelated reasons.
+/// API version header passed to every sub-issues / dependencies
+/// `gh api` call. Both endpoints entered general availability under
+/// this version; pinning it keeps fleet's behaviour stable when
+/// GitHub bumps the default version for unrelated reasons.
 const API_VERSION_HEADER: &str = "-H 'X-GitHub-Api-Version: 2026-03-10'";
 
 /// Parse `gh issue list --json …` output into normalised `Issue`s.
@@ -297,9 +368,10 @@ pub fn parse_gh_create_output(stdout: &str) -> Option<u64> {
     last_segment.parse::<u64>().ok()
 }
 
-/// Parse the `[{number, ...}, ...]` JSON returned by the sub-issues
-/// list endpoint into a flat list of issue numbers. Pure; exposed for
-/// the [`Tracker::link_parent`] idempotence check and unit tests.
+/// Parse the `[{number, ...}, ...]` JSON returned by GitHub's
+/// sub-issues and dependencies list endpoints into a flat list of
+/// issue numbers. Pure; used by both [`Tracker::link_parent`] and
+/// [`Tracker::link_blocks`] for their idempotence checks.
 ///
 /// Tolerant on shape mismatch (returns an empty list) for the same
 /// reason [`parse_gh_output`] is: a parse failure on the read side
@@ -307,7 +379,7 @@ pub fn parse_gh_create_output(stdout: &str) -> Option<u64> {
 /// surface any real auth/repo error with a clearer message than a
 /// JSON parse failure on a list response would.
 #[must_use]
-fn parse_sub_issue_numbers(stdout: &str) -> Vec<u64> {
+fn parse_issue_number_list(stdout: &str) -> Vec<u64> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -774,6 +846,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn link_blocks_lists_dependencies_then_resolves_id_then_posts() {
+        // Same three-shellout pattern as `link_parent` but against the
+        // `/dependencies/blocked_by` endpoints. POST body uses
+        // `issue_id` (not `sub_issue_id`).
+        let mut mock = MockProcessInvoker::new();
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'42'/dependencies/blocked_by",
+            "[]",
+        );
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'43' --jq .id",
+            "5550000\n",
+        );
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' -X POST -F issue_id=5550000 \
+             repos/{owner}/{repo}/issues/'42'/dependencies/blocked_by",
+            "",
+        );
+        let t = GitHubTracker::new(Arc::new(mock));
+        t.link_blocks(Path::new("/r"), "42", "43").unwrap();
+    }
+
+    #[test]
+    fn link_blocks_is_idempotent_when_dependency_already_recorded() {
+        // The list response already contains the proposed blocked_on
+        // ticket; no resolve / POST should fire.
+        let mut mock = MockProcessInvoker::new();
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'42'/dependencies/blocked_by",
+            r#"[{"number": 43, "id": 5550000}]"#,
+        );
+        let t = GitHubTracker::new(Arc::new(mock));
+        t.link_blocks(Path::new("/r"), "42", "43").unwrap();
+    }
+
+    #[test]
+    fn link_blocks_surfaces_a_non_integer_database_id_as_a_typed_error() {
+        let mut mock = MockProcessInvoker::new();
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'42'/dependencies/blocked_by",
+            "[]",
+        );
+        expect_shell_cmd(
+            &mut mock,
+            "/r",
+            "gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+             repos/{owner}/{repo}/issues/'43' --jq .id",
+            "not-a-number\n",
+        );
+        let t = GitHubTracker::new(Arc::new(mock));
+        let err = t.link_blocks(Path::new("/r"), "42", "43").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("expected an integer"),
+            "got: {err:#}"
+        );
+    }
+
     // ---- pure helpers ----
 
     #[test]
@@ -798,22 +942,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_sub_issue_numbers_extracts_issue_numbers_from_list_response() {
+    fn parse_issue_number_list_extracts_issue_numbers_from_list_response() {
         let json = r#"[
             {"number": 57, "id": 9876, "title": "child A"},
             {"number": 91, "id": 1234, "title": "child B"}
         ]"#;
-        assert_eq!(parse_sub_issue_numbers(json), vec![57, 91]);
+        assert_eq!(parse_issue_number_list(json), vec![57, 91]);
     }
 
     #[test]
-    fn parse_sub_issue_numbers_returns_empty_for_empty_array() {
-        assert_eq!(parse_sub_issue_numbers("[]"), Vec::<u64>::new());
+    fn parse_issue_number_list_returns_empty_for_empty_array() {
+        assert_eq!(parse_issue_number_list("[]"), Vec::<u64>::new());
     }
 
     #[test]
-    fn parse_sub_issue_numbers_returns_empty_on_blank_or_unparseable_output() {
-        assert_eq!(parse_sub_issue_numbers(""), Vec::<u64>::new());
-        assert_eq!(parse_sub_issue_numbers("not json"), Vec::<u64>::new());
+    fn parse_issue_number_list_returns_empty_on_blank_or_unparseable_output() {
+        assert_eq!(parse_issue_number_list(""), Vec::<u64>::new());
+        assert_eq!(parse_issue_number_list("not json"), Vec::<u64>::new());
     }
 }

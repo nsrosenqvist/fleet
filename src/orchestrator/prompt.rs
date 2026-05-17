@@ -200,8 +200,11 @@ edge will be recorded.
 `fleet deps add` also posts cross-link comments on both tickets
 (or just the `blocked` side for a freeform-tag edge) so a human
 browsing either ticket in the tracker sees the relationship
-without consulting fleet. Re-adding the same edge is a quiet
-no-op — no duplicate comments on retry.
+without consulting fleet, and — for ticket→ticket edges — records
+a native blocks/blocked-by link in the host tracker (GitHub's
+Issue Dependencies, or a `blocked-by:<id>` / `blocks:<id>` label
+pair on git-bug). Re-adding the same edge is a quiet no-op — no
+duplicate comments and no extra tracker calls on retry.
 
 ## Behaviour expectations
 

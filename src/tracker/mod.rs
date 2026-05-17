@@ -90,11 +90,11 @@ impl Issue {
 /// listener holds an `Arc<dyn Tracker>` shared across thread bounds).
 ///
 /// Write methods (`comment`, `set_status`, `add_label`, `remove_label`,
-/// `create`, `link_parent`) and the rich-read method (`read`) carry
-/// default impls that bail with a clear error. Trackers without
-/// concrete support (e.g. a stub used in a test) get the bail-by-name
-/// behaviour for free; the two production impls (`GitBugTracker` and
-/// `GitHubTracker`) override every method.
+/// `create`, `link_parent`, `link_blocks`) and the rich-read method
+/// (`read`) carry default impls that bail with a clear error. Trackers
+/// without concrete support (e.g. a stub used in a test) get the
+/// bail-by-name behaviour for free; the two production impls
+/// (`GitBugTracker` and `GitHubTracker`) override every method.
 pub trait Tracker: Send + Sync {
     fn name(&self) -> &'static str;
     /// Issues for the project rooted at `repo_root`. Sorted with open
@@ -158,6 +158,30 @@ pub trait Tracker: Send + Sync {
     #[allow(dead_code)]
     fn link_parent(&self, _repo_root: &Path, _parent_id: &str, _child_id: &str) -> Result<()> {
         bail!("tracker `{}` does not implement link_parent", self.name())
+    }
+
+    /// Record a blocks/blocked-by edge between two existing tickets:
+    /// `blocked_id` cannot proceed until `blocked_on_id` resolves.
+    /// Mapping varies per tracker — GitHub uses the native Issue
+    /// Dependencies REST API; git-bug encodes the relationship as a
+    /// symmetric pair of labels (`blocked-by:<id>` on the blocked
+    /// side, `blocks:<id>` on the blocked_on side). Idempotent across
+    /// both backends: re-linking the same pair is a no-op.
+    ///
+    /// Invoked by `fleet deps add` so the dep edge stored in
+    /// `.fleet/deps.json` is also surfaced in the host tracker's
+    /// native UI alongside the narrative cross-link comments. Distinct
+    /// from [`Self::link_parent`]: that one encodes a sub-issue
+    /// hierarchy (the child is *part of* the parent), this one a
+    /// temporal blocks-relationship between independently-scoped
+    /// tickets.
+    fn link_blocks(
+        &self,
+        _repo_root: &Path,
+        _blocked_id: &str,
+        _blocked_on_id: &str,
+    ) -> Result<()> {
+        bail!("tracker `{}` does not implement link_blocks", self.name())
     }
 }
 
@@ -263,6 +287,7 @@ mod tests {
             ("remove_label", t.remove_label(repo, "1", "x").err()),
             ("create", t.create(repo, "t", "b", &[]).err()),
             ("link_parent", t.link_parent(repo, "p", "c").err()),
+            ("link_blocks", t.link_blocks(repo, "b", "o").err()),
         ] {
             let msg = format!(
                 "{:#}",
