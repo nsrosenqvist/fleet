@@ -305,10 +305,19 @@ workflows:
 
 /// Default `.devcontainer/devcontainer.json`. Minimal so it always
 /// builds; the user is expected to edit it for their project.
+///
+/// `workspaceMount` is set explicitly because the devcontainer CLI's
+/// default mount target is `/workspaces/${localWorkspaceFolderBasename}`
+/// — for fleet's per-session worktrees that becomes `/workspaces/worktree`,
+/// which doesn't match the `workspaceFolder: /workspace` cwd users
+/// (and our agent prompts) expect. Pinning the mount keeps them
+/// aligned: the bind mounts at /workspace, the agent's cwd is
+/// /workspace, agent prompts can reference /workspace and find files.
 const DEFAULT_DEVCONTAINER_JSON: &str = "\
 {
   \"name\": \"fleet workspace\",
   \"image\": \"mcr.microsoft.com/devcontainers/base:ubuntu\",
+  \"workspaceMount\": \"source=${localWorkspaceFolder},target=/workspace,type=bind\",
   \"workspaceFolder\": \"/workspace\"
 }
 ";
