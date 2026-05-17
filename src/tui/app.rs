@@ -244,6 +244,14 @@ impl AppState {
             pending_spawn: None,
         };
         state.reload(store)?;
+        // Default sidebar focus: if there are no workers, land the
+        // cursor on the always-visible orchestrator row instead of
+        // an empty workers list. That way a brand-new repo can
+        // spawn the orchestrator without first hitting Tab.
+        if state.sessions.is_empty() {
+            state.sessions_focus = SessionsFocus::Orchestrator;
+            state.orchestrators_list_state.select(Some(0));
+        }
         Ok(state)
     }
 
@@ -312,18 +320,6 @@ impl AppState {
         self.list_state
             .selected()
             .and_then(|i| self.sessions.get(i))
-    }
-
-    pub(super) fn move_selection(&mut self, delta: isize) {
-        if self.sessions.is_empty() {
-            return;
-        }
-        let len = isize::try_from(self.sessions.len()).unwrap_or(isize::MAX);
-        let current = isize::try_from(self.list_state.selected().unwrap_or(0)).unwrap_or(0);
-        let next = (current + delta).rem_euclid(len);
-        let next_usize = usize::try_from(next).unwrap_or(0);
-        self.list_state.select(Some(next_usize));
-        self.refresh_log_tail();
     }
 
     fn refresh_log_tail(&mut self) {
@@ -441,17 +437,11 @@ impl AppState {
                 Action::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                match self.sessions_focus {
-                    SessionsFocus::Workflows => self.move_selection(1),
-                    SessionsFocus::Orchestrator => self.move_orchestrators_selection(1),
-                }
+                self.sidebar_move(1);
                 Action::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                match self.sessions_focus {
-                    SessionsFocus::Workflows => self.move_selection(-1),
-                    SessionsFocus::Orchestrator => self.move_orchestrators_selection(-1),
-                }
+                self.sidebar_move(-1);
                 Action::None
             }
             KeyCode::Enter => {
@@ -494,16 +484,63 @@ impl AppState {
         }
     }
 
-    fn move_orchestrators_selection(&mut self, delta: isize) {
-        if self.orchestrators.is_empty() {
+    /// Unified up/down navigation across the two stacked sidebar
+    /// panes. The orchestrator pane sits on top and always has one
+    /// row (live or synthetic); the workers pane is below with 0..n
+    /// rows. Moving Up from the top of workers hops focus to
+    /// orchestrator; Down from orchestrator hops focus to workers
+    /// row 0 (or stays if there are none). Neither edge wraps —
+    /// Up at the top and Down at the bottom of the whole sidebar
+    /// are no-ops.
+    fn sidebar_move(&mut self, delta: isize) {
+        match (self.sessions_focus, delta) {
+            (SessionsFocus::Orchestrator, 1) => {
+                // Down from orchestrator → workers row 0 if any,
+                // otherwise stay (nothing to move to).
+                if !self.sessions.is_empty() {
+                    self.sessions_focus = SessionsFocus::Workflows;
+                    self.list_state.select(Some(0));
+                    self.refresh_log_tail();
+                }
+            }
+            (SessionsFocus::Orchestrator, _) => {
+                // Up from orchestrator is the top of everything;
+                // no row to move to.
+            }
+            (SessionsFocus::Workflows, -1) => {
+                // Up: from row 0 → orchestrator (always has its
+                // synthetic row). From any other row, move within
+                // the workers list.
+                let at_top = self.list_state.selected().is_none_or(|i| i == 0);
+                if at_top {
+                    self.sessions_focus = SessionsFocus::Orchestrator;
+                    self.orchestrators_list_state.select(Some(0));
+                } else {
+                    self.move_workflow_selection(-1);
+                }
+            }
+            (SessionsFocus::Workflows, _) => {
+                // Down within workers. Clamped (no wrap) so a long
+                // hold-down doesn't surprise the user by jumping
+                // back to row 0.
+                self.move_workflow_selection(1);
+            }
+        }
+    }
+
+    /// Move the workers cursor within its own pane, clamped to
+    /// `[0, len-1]`. No wraparound — cross-pane navigation is the
+    /// caller's job (see [`Self::sidebar_move`]).
+    pub(super) fn move_workflow_selection(&mut self, delta: isize) {
+        if self.sessions.is_empty() {
             return;
         }
-        let len = isize::try_from(self.orchestrators.len()).unwrap_or(isize::MAX);
-        let current =
-            isize::try_from(self.orchestrators_list_state.selected().unwrap_or(0)).unwrap_or(0);
-        let next = (current + delta).rem_euclid(len);
+        let len = isize::try_from(self.sessions.len()).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.list_state.selected().unwrap_or(0)).unwrap_or(0);
+        let next = (current + delta).clamp(0, len - 1);
         let next_usize = usize::try_from(next).unwrap_or(0);
-        self.orchestrators_list_state.select(Some(next_usize));
+        self.list_state.select(Some(next_usize));
+        self.refresh_log_tail();
     }
 
     fn handle_key_doctor(&mut self, key: KeyEvent, store: &SessionStore) -> Action {

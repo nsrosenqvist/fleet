@@ -18,7 +18,8 @@ use crate::session::{Session, SessionState};
 use super::app::{AppState, Overlay, PlansFocus, SessionsFocus, View};
 use super::theme::{
     ACCENT, ERR, MUTED, OK, SELECT_BG, SELECT_FG, WARN, badge, chip, framed_block,
-    framed_block_titled, key as theme_key, kv_line, modal_key, sep,
+    framed_block_accent, framed_block_accent_titled, framed_block_titled, key as theme_key,
+    kv_line, modal_key, sep,
 };
 
 /// Full-frame render entry point. Called once per event-loop tick from
@@ -335,7 +336,11 @@ fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn render_plans_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let title = format!(" plans ({}) ", state.plans.len());
-    let block = framed_block(&title);
+    let block = if state.plans_focus == PlansFocus::Sidebar {
+        framed_block_accent(&title)
+    } else {
+        framed_block(&title)
+    };
     if state.plans.is_empty() {
         let muted = Style::default().fg(MUTED);
         let lines = vec![
@@ -412,7 +417,12 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         ),
         Span::raw(" "),
     ]);
-    let block = framed_block_titled(title).padding(Padding::horizontal(2));
+    let block = if state.plans_focus == PlansFocus::Items {
+        framed_block_accent_titled(title)
+    } else {
+        framed_block_titled(title)
+    }
+    .padding(Padding::horizontal(2));
     let body = Paragraph::new(plan_detail_lines(plan, selected_item, &state.tickets_by_id))
         .block(block)
         .wrap(Wrap { trim: false });
@@ -890,15 +900,6 @@ fn orchestrator_state_marker(state: OrchestratorState) -> &'static str {
         OrchestratorState::Active => "◐",
         OrchestratorState::Detached => "⏸",
         OrchestratorState::Closed => "✗",
-    }
-}
-
-#[must_use]
-fn orchestrator_state_word(state: OrchestratorState) -> &'static str {
-    match state {
-        OrchestratorState::Active => "active",
-        OrchestratorState::Detached => "detached",
-        OrchestratorState::Closed => "closed",
     }
 }
 

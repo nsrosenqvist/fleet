@@ -308,7 +308,7 @@ mod tests {
         // After load: sorted newest-first, so s-b at index 0.
         assert_eq!(state.selected().unwrap().id.as_str(), "s-b");
         // Move to the older one (s-a, index 1).
-        state.move_selection(1);
+        state.move_workflow_selection(1);
         assert_eq!(state.selected().unwrap().id.as_str(), "s-a");
         // Reload should keep selection on s-a.
         state.reload(&store).unwrap();
@@ -335,7 +335,10 @@ mod tests {
     }
 
     #[test]
-    fn app_state_move_selection_wraps_around() {
+    fn move_workflow_selection_clamps_at_edges() {
+        // No wraparound: Up from row 0 stays put, Down from the
+        // last row stays put. Cross-pane navigation (Up from row 0
+        // → orchestrator) is handled by `sidebar_move`, not here.
         let tmp = tempfile::tempdir().unwrap();
         let store = SessionStore::at(tmp.path().to_path_buf());
         store
@@ -345,8 +348,14 @@ mod tests {
             .create(&session("s-2", "wf", SessionState::Running, 200))
             .unwrap();
         let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
-        // start at index 0 (newest); going up should wrap to last.
-        state.move_selection(-1);
+        // start at index 0 (s-2, newest); going up stays.
+        state.move_workflow_selection(-1);
+        assert_eq!(state.selected().unwrap().id.as_str(), "s-2");
+        // Down to s-1 (older).
+        state.move_workflow_selection(1);
+        assert_eq!(state.selected().unwrap().id.as_str(), "s-1");
+        // Past the bottom stays at s-1.
+        state.move_workflow_selection(1);
         assert_eq!(state.selected().unwrap().id.as_str(), "s-1");
     }
 
@@ -1972,28 +1981,26 @@ mod tests {
     }
 
     #[test]
-    fn tab_then_enter_opens_orchestrator_even_when_none_running_yet() {
-        // Brand-new repo state: no orchestrator on disk, vec is
-        // empty. Tab into the orchestrator pane (the synthetic
-        // not-running row is always visible), Enter should still
-        // trigger OpenOrchestrator so the user can spawn it from
-        // the TUI without first dropping to the shell.
+    fn fresh_repo_defaults_focus_to_orchestrator_and_enter_spawns() {
+        // Brand-new repo: no workers, no orchestrator. The TUI
+        // should default focus to the orchestrator pane (the only
+        // actionable row), pre-select the synthetic row, and let
+        // a single Enter spawn the orchestrator without any Tab
+        // dance first.
         let tmp = tempfile::tempdir().unwrap();
         let sessions = SessionStore::at(tmp.path().to_path_buf());
         let mut state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
-        assert!(state.orchestrators.is_empty(), "test premise: empty");
-        let _ = state.handle_key(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
-            &sessions,
+        assert!(state.sessions.is_empty(), "test premise: no workers");
+        assert!(state.orchestrators.is_empty(), "test premise: no orchestrator");
+        assert_eq!(
+            state.sessions_focus,
+            SessionsFocus::Orchestrator,
+            "empty workers → default focus on orchestrator",
         );
-        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
-        // The cursor needs to land on the synthetic row so the
-        // highlight is visible — without an explicit selection the
-        // ▸ highlight symbol stays hidden.
         assert_eq!(
             state.orchestrators_list_state.selected(),
             Some(0),
-            "synthetic row should auto-select on Tab",
+            "synthetic row should be pre-selected so ▸ shows",
         );
         let action = state.handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
@@ -2003,6 +2010,109 @@ mod tests {
             matches!(action, Action::OpenOrchestrator),
             "Enter on the synthetic row should spawn-and-attach",
         );
+    }
+
+    #[test]
+    fn up_at_top_of_workers_jumps_to_orchestrator_pane() {
+        // Cross-pane navigation: Up from row 0 of the workers list
+        // hops focus to the Orchestrator pane (which sits visually
+        // above the workers pane). The two panes act as one logical
+        // top-to-bottom navigation surface, mirroring how the
+        // sidebar is laid out.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-1", "wf", SessionState::Running, 100))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        assert_eq!(state.sessions_focus, SessionsFocus::Workflows);
+        assert_eq!(state.list_state.selected(), Some(0));
+        // Up from workers row 0 → Orchestrator focus, row 0 selected.
+        let _ = state.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
+        assert_eq!(state.orchestrators_list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn down_from_orchestrator_jumps_to_workers_pane() {
+        // Symmetric to the Up test: Down from the orchestrator row
+        // hops focus into the workers pane at row 0.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-1", "wf", SessionState::Running, 100))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        // Tab into the orchestrator pane (workers is the default).
+        let _ = state.handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
+        // Down → Workflows.
+        let _ = state.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.sessions_focus, SessionsFocus::Workflows);
+        assert_eq!(state.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn up_at_orchestrator_is_a_noop_no_wraparound() {
+        // The orchestrator sits at the top of the stack — Up at
+        // that row stays put, no wrap-around to the bottom of
+        // workers. That would be surprising in a vertical layout.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-1", "wf", SessionState::Running, 100))
+            .unwrap();
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        let _ = state.handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
+        let _ = state.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
+    }
+
+    #[test]
+    fn down_at_orchestrator_with_no_workers_stays_put() {
+        // Down from orchestrator on an empty repo has nowhere to
+        // go — workers pane is empty. Focus stays on orchestrator.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        // Default focus is Orchestrator already (empty workers).
+        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
+        let _ = state.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            &store,
+        );
+        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
+    }
+
+    #[test]
+    fn fresh_repo_with_workers_defaults_focus_to_workflows() {
+        // When workers exist on first load, the default focus
+        // stays on the Workflows pane (the more dynamic content),
+        // not Orchestrator. The smart-default only kicks in for
+        // an empty workers list.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        store
+            .create(&session("s-1", "wf", SessionState::Running, 100))
+            .unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        assert_eq!(state.sessions_focus, SessionsFocus::Workflows);
     }
 
     #[test]
