@@ -287,6 +287,14 @@ struct AppState {
     /// notices a tangle the supervisor can't resolve on its own.
     /// Empty when the deps file is missing or acyclic.
     cycle_nodes: std::collections::HashSet<String>,
+    /// Cache of tracker-fetched issue details for the Plans
+    /// view's third pane, keyed by ticket id. `Err` caches the
+    /// user-facing failure string so we don't re-hit the tracker
+    /// on every `j`/`k` keystroke when a ticket is missing /
+    /// unreadable. Cleared on `r` reload so the user has a way
+    /// to force a refetch after editing the tracker out-of-band.
+    focused_issue_cache:
+        std::collections::HashMap<String, Result<crate::tracker::IssueDetail, String>>,
 }
 
 /// Lifecycle of the lazily-built tracker. Three states because the
@@ -440,6 +448,7 @@ impl AppState {
             sessions_focus: SessionsFocus::Workflows,
             brainstorms_list_state: ListState::default(),
             cycle_nodes: std::collections::HashSet::new(),
+            focused_issue_cache: std::collections::HashMap::new(),
         };
         state.reload(store)?;
         Ok(state)
@@ -846,7 +855,12 @@ impl AppState {
                 Action::None
             }
             KeyCode::Char('r') => {
+                // Reload also drops the ticket-detail cache so a
+                // user editing the tracker out-of-band has an
+                // explicit way to force a refetch on the next nav.
+                self.focused_issue_cache.clear();
                 self.refresh_plans();
+                self.refresh_focused_issue();
                 Action::None
             }
             _ => Action::None,
@@ -868,6 +882,9 @@ impl AppState {
             if n_items > 0 && self.plans_items_state.selected().is_none() {
                 self.plans_items_state.select(Some(0));
             }
+            // Pre-fetch the newly-focused item's ticket so the
+            // ticket-detail pane has content on the next draw.
+            self.refresh_focused_issue();
         }
     }
 
@@ -886,6 +903,9 @@ impl AppState {
         let next = (current + delta).rem_euclid(len);
         let next_usize = usize::try_from(next).unwrap_or(0);
         self.plans_items_state.select(Some(next_usize));
+        // Cache check is O(1); a tracker.read only fires the first
+        // time a given ticket id is navigated to in this session.
+        self.refresh_focused_issue();
     }
 
     /// Shift+P on the Plans view: flip Active↔Paused, leave anything
@@ -1173,23 +1193,76 @@ impl AppState {
     /// engine OFF with a status line explaining why; re-pressing
     /// `Shift+A` after an Unsupported result does not retry.
     fn toggle_autonomous(&mut self) {
-        if !self.autonomous.enabled() {
-            if matches!(self.tracker, TrackerState::Pending) {
-                let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
-                self.tracker = crate::tracker::build(self.config.tracker, invoker)
-                    .map_or(TrackerState::Unsupported, |boxed| {
-                        TrackerState::Built(Arc::from(boxed))
-                    });
-            }
-            if matches!(self.tracker, TrackerState::Unsupported) {
-                self.autonomous.set_status(format!(
-                    "autonomous: cannot enable — tracker `{}` is not implemented yet",
-                    self.config.tracker.as_str(),
-                ));
-                return;
-            }
+        if !self.autonomous.enabled() && self.ensure_tracker().is_none() {
+            self.autonomous.set_status(format!(
+                "autonomous: cannot enable — tracker `{}` is not implemented yet",
+                self.config.tracker.as_str(),
+            ));
+            return;
         }
         self.autonomous.toggle();
+    }
+
+    /// Build the configured tracker on first use and cache it.
+    /// Returns `None` when the tracker plugin isn't implemented
+    /// (Linear / Jira) — callers surface a user-facing message.
+    ///
+    /// Lazy so users who never enter the Plans view or toggle
+    /// autonomous mode aren't blocked by tracker setup at TUI
+    /// startup (a `gh auth` failure on every launch would be
+    /// hostile).
+    fn ensure_tracker(&mut self) -> Option<Arc<dyn crate::tracker::Tracker>> {
+        if matches!(self.tracker, TrackerState::Pending) {
+            let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+            self.tracker = crate::tracker::build(self.config.tracker, invoker)
+                .map_or(TrackerState::Unsupported, |boxed| {
+                    TrackerState::Built(Arc::from(boxed))
+                });
+        }
+        match &self.tracker {
+            TrackerState::Built(t) => Some(Arc::clone(t)),
+            TrackerState::Unsupported | TrackerState::Pending => None,
+        }
+    }
+
+    /// Fetch the focused plan item's tracker issue (if any) into
+    /// `focused_issue_cache`. Skips if no item is focused, if the
+    /// ticket is already cached (success or failure), or if the
+    /// tracker plugin isn't implemented. Cache failures use the
+    /// formatted error string so the render path can show the
+    /// reason without re-hitting the tracker.
+    fn refresh_focused_issue(&mut self) {
+        let Some(plan_idx) = self.plans_list_state.selected() else {
+            return;
+        };
+        let Some(plan) = self.plans.get(plan_idx) else {
+            return;
+        };
+        let Some(item_idx) = self.plans_items_state.selected() else {
+            return;
+        };
+        let Some(item) = plan.items.get(item_idx) else {
+            return;
+        };
+        let ticket_id = item.ticket_id.clone();
+        if self.focused_issue_cache.contains_key(&ticket_id) {
+            return;
+        }
+        let Some(tracker) = self.ensure_tracker() else {
+            self.focused_issue_cache.insert(
+                ticket_id,
+                Err(format!(
+                    "no tracker configured (`tracker: {}` in .fleet/config.yaml is not implemented yet)",
+                    self.config.tracker.as_str(),
+                )),
+            );
+            return;
+        };
+        let root = self.root.clone();
+        let result = tracker
+            .read(&root, &ticket_id)
+            .map_err(|err| format!("{err:#}"));
+        self.focused_issue_cache.insert(ticket_id, result);
     }
 
     /// One autonomous supervisor tick. The engine debounces, so this
@@ -1538,10 +1611,15 @@ fn render(f: &mut Frame<'_>, state: &AppState) {
         View::Plans => {
             let body = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .constraints([
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(40),
+                    Constraint::Percentage(35),
+                ])
                 .split(outer[0]);
             render_plans_sidebar(f, body[0], state);
             render_plans_detail(f, body[1], state);
+            render_plans_ticket(f, body[2], state);
         }
     }
     if state.view == View::Spawn {
@@ -1800,6 +1878,123 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(body, area);
+}
+
+/// Render the third Plans-view pane: the focused item's tracker
+/// issue. When the items pane has no cursor (sidebar focus, no
+/// plan selected, or the plan is empty) the pane shows a hint
+/// instead of fetched data — the focus model is the user's signal
+/// that they want detail.
+fn render_plans_ticket(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let block = Block::default().title(" Ticket ").borders(Borders::ALL);
+    let lines = ticket_detail_lines(state);
+    let body = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(body, area);
+}
+
+/// Pure: build the lines for the ticket-detail pane against the
+/// current `state`. Factored out so tests can assert on the
+/// rendered surface without a ratatui Frame.
+///
+/// Five cases the pane covers:
+/// - Sidebar focus → "Tab to navigate items" hint.
+/// - Items focus + plan empty → "(plan has no items)".
+/// - Items focus + no cache entry → "(fetching…)" (cache fills
+///   on the *next* navigation; this happens for one render cycle
+///   between a fresh switch and the post-toggle fetch).
+/// - Items focus + cached error → the error message verbatim.
+/// - Items focus + cached `IssueDetail` → title, status, labels,
+///   comment count, then the body verbatim. Body is rendered with
+///   wrap; ratatui handles overflow.
+#[must_use]
+fn ticket_detail_lines(state: &AppState) -> Vec<Line<'static>> {
+    if state.plans_focus == PlansFocus::Sidebar {
+        return vec![Line::from(Span::styled(
+            "Tab to focus items, then j/k to navigate. Selected item's tracker issue will appear here.",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    }
+    let Some(plan) = state.selected_plan() else {
+        return vec![Line::from(Span::styled(
+            "(no plan selected)",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    };
+    let Some(item_idx) = state.plans_items_state.selected() else {
+        return vec![Line::from(Span::styled(
+            "(plan has no items)",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    };
+    let Some(item) = plan.items.get(item_idx) else {
+        return vec![Line::from(Span::styled(
+            "(item index out of range)",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    };
+    let ticket_id = &item.ticket_id;
+    match state.focused_issue_cache.get(ticket_id) {
+        None => vec![
+            kv_line("ticket", ticket_id),
+            Line::from(""),
+            Line::from(Span::styled(
+                "(fetching…)",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
+        Some(Err(msg)) => vec![
+            kv_line("ticket", ticket_id),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("tracker read failed: {msg}"),
+                Style::default().fg(Color::Red),
+            )),
+        ],
+        Some(Ok(detail)) => issue_detail_lines(detail),
+    }
+}
+
+/// Pure: turn an `IssueDetail` into render lines. Pulled out
+/// from `ticket_detail_lines` so tests can drive it directly
+/// against fixture data without seeding `AppState`.
+#[must_use]
+fn issue_detail_lines(detail: &crate::tracker::IssueDetail) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        kv_line("id", &detail.issue.human_id),
+        kv_line("title", &detail.issue.title),
+        kv_line("status", &detail.issue.status),
+    ];
+    if !detail.issue.labels.is_empty() {
+        lines.push(kv_line(
+            "labels",
+            &format!("[{}]", detail.issue.labels.join(", ")),
+        ));
+    }
+    let comment_count = detail.comments.len();
+    lines.push(kv_line(
+        "comments",
+        &comment_count.to_string(),
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Body:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    if detail.body.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no body)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // Preserve the body's own line breaks; ratatui Wrap will
+        // handle horizontal overflow per line.
+        for line in detail.body.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+    }
+    lines
 }
 
 /// One-line label for the plans sidebar list. Pure: pulled out for
@@ -3518,6 +3713,128 @@ mod tests {
         cycles.insert("999".to_string()); // not in the plan
         let label = plan_row_label(&p, &cycles);
         assert!(!label.starts_with("⚠ "), "got: {label}");
+    }
+
+    // ---- ticket-detail pane (Plans view 3rd column) -----------------
+
+    fn issue_detail_fixture(human: &str, body: &str, labels: &[&str], comments: usize) -> crate::tracker::IssueDetail {
+        crate::tracker::IssueDetail {
+            issue: crate::tracker::Issue {
+                id: format!("gh:{human}"),
+                human_id: human.into(),
+                title: format!("Ticket {human} title"),
+                status: "open".into(),
+                labels: labels.iter().map(|s| (*s).to_string()).collect(),
+            },
+            body: body.into(),
+            comments: (0..comments)
+                .map(|i| crate::tracker::Comment {
+                    author: format!("user{i}"),
+                    body: format!("comment {i}"),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn rendered(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn issue_detail_lines_includes_id_title_status_and_comment_count() {
+        let d = issue_detail_fixture("42", "Body text", &["bug", "urgent"], 3);
+        let r = rendered(&issue_detail_lines(&d));
+        assert!(r.contains("42"));
+        assert!(r.contains("Ticket 42 title"));
+        assert!(r.contains("open"));
+        assert!(r.contains("[bug, urgent]"));
+        assert!(r.contains("comments"));
+        assert!(r.contains('3'));
+        assert!(r.contains("Body text"));
+    }
+
+    #[test]
+    fn issue_detail_lines_omits_labels_row_when_none() {
+        let d = issue_detail_fixture("42", "Body", &[], 0);
+        let r = rendered(&issue_detail_lines(&d));
+        assert!(!r.contains("labels"), "labels row should be hidden: {r}");
+    }
+
+    #[test]
+    fn issue_detail_lines_shows_no_body_placeholder_when_empty() {
+        let d = issue_detail_fixture("42", "   ", &[], 0);
+        let r = rendered(&issue_detail_lines(&d));
+        assert!(r.contains("(no body)"));
+    }
+
+    #[test]
+    fn ticket_detail_lines_says_tab_when_sidebar_has_focus() {
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42", "43"]);
+        // Default focus is Sidebar.
+        assert_eq!(state.plans_focus, PlansFocus::Sidebar);
+        let r = rendered(&ticket_detail_lines(&state));
+        assert!(r.contains("Tab"), "got: {r}");
+        // Even with an item-cache entry seeded the sidebar-focus
+        // hint wins — the user told us they're not navigating
+        // items right now.
+        state.focused_issue_cache.insert(
+            "42".to_string(),
+            Ok(issue_detail_fixture("42", "Body", &[], 0)),
+        );
+        let r = rendered(&ticket_detail_lines(&state));
+        assert!(r.contains("Tab"));
+    }
+
+    #[test]
+    fn ticket_detail_lines_renders_cached_issue_when_items_focused() {
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42", "43"]);
+        state.toggle_plans_focus(); // Items, cursor at 0 (ticket 42)
+        // Seed the cache as if a tracker.read succeeded.
+        state.focused_issue_cache.insert(
+            "42".to_string(),
+            Ok(issue_detail_fixture("42", "Body of 42", &["bug"], 1)),
+        );
+        let r = rendered(&ticket_detail_lines(&state));
+        assert!(r.contains("Body of 42"), "got: {r}");
+        assert!(r.contains("[bug]"));
+    }
+
+    #[test]
+    fn ticket_detail_lines_surfaces_cached_error_verbatim() {
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42"]);
+        state.toggle_plans_focus();
+        state.focused_issue_cache.insert(
+            "42".to_string(),
+            Err("simulated git-bug failure".to_string()),
+        );
+        let r = rendered(&ticket_detail_lines(&state));
+        assert!(r.contains("simulated git-bug failure"), "got: {r}");
+        assert!(r.contains("tracker read failed"));
+    }
+
+    #[test]
+    fn ticket_detail_lines_shows_fetching_when_cache_is_empty_under_items_focus() {
+        let (_tmp, _store, mut state) = plans_state_with_one_active_plan(&["42"]);
+        state.toggle_plans_focus();
+        // The toggle calls refresh_focused_issue, which builds the
+        // tracker; in a test with no git-bug available it'll
+        // populate the cache with an Unsupported placeholder.
+        // Drop the cache so we can exercise the "(fetching…)"
+        // path explicitly.
+        state.focused_issue_cache.clear();
+        let r = rendered(&ticket_detail_lines(&state));
+        assert!(r.contains("(fetching"), "got: {r}");
     }
 
     // ---- plans view interactivity -----------------------------------
