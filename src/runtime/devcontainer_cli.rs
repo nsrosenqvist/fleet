@@ -521,10 +521,12 @@ mod tests {
             "--mount".to_string(),
             "type=bind,source=/art,target=/artifacts".to_string(),
             // Extra mounts follow the artifacts mount in input order so
-            // tests assert against a stable argv. Read-only first to
-            // pin both flag-variants in one test.
+            // tests assert against a stable argv. `read_only` on the
+            // struct is intentionally not surfaced in the rendered
+            // arg — see `MountSpec::to_mount_arg` for the devcontainer
+            // CLI input-format limitation.
             "--mount".to_string(),
-            "type=bind,source=/host/bin/fleet-tracker,target=/usr/local/bin/fleet-tracker,readonly"
+            "type=bind,source=/host/bin/fleet-tracker,target=/usr/local/bin/fleet-tracker"
                 .to_string(),
             "--mount".to_string(),
             "type=bind,source=/host/work,target=/extra".to_string(),

@@ -248,6 +248,8 @@ sessions/
 crashed/
 plans/
 planning/
+orchestrator/
+spawn-logs/
 deps.json
 *.tmp
 ";

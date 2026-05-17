@@ -905,7 +905,7 @@ impl WorkflowExecutor {
             image,
             workspace: req.workspace.to_path_buf(),
             artifacts: artifacts_dir,
-            env,
+            env: env.clone(),
             command: None,
             network: egress.network_name.clone(),
             dns: egress.dns_ip.clone(),
@@ -944,8 +944,20 @@ impl WorkflowExecutor {
         // cost parsing the headless / CI flow has relied on.
         let log_path = self.node_log_path(req, session, &node.id);
         let in_tmux = std::env::var_os(crate::session::SESSION_TMUX_ENV).is_some();
+        // Per-exec env: the same env we built for ContainerSpec.env
+        // *also* has to flow through the adapter's exec / attach_pty
+        // call — `devcontainer up --remote-env` (the path
+        // start_container uses) only sets env for lifecycle commands
+        // (postCreateCommand etc), not for arbitrary later exec. So
+        // without re-passing it here, the agent's env arrives empty.
         let run_outcome: Result<NodeOutcome> = if in_tmux {
-            let attach_result = req.adapter.attach_pty(&container_id, &agent.command);
+            let attach_opts = ExecOpts {
+                workdir: None,
+                env: env.clone(),
+            };
+            let attach_result = req
+                .adapter
+                .attach_pty(&container_id, &agent.command, attach_opts);
             let log_text = match &attach_result {
                 Ok(h) => format!(
                     "--- agent {agent_name} ran interactively in tmux ---\n\
@@ -969,9 +981,11 @@ impl WorkflowExecutor {
                 Err(err) => Err(err),
             }
         } else {
-            let exec_result = req
-                .adapter
-                .exec(&container_id, &agent.command, ExecOpts::default());
+            let exec_opts = ExecOpts {
+                workdir: None,
+                env,
+            };
+            let exec_result = req.adapter.exec(&container_id, &agent.command, exec_opts);
             let log_text = match &exec_result {
                 Ok(h) => format!(
                     "--- agent {agent_name} ---\n--- stdout ---\n{}\n--- stderr ---\n{}\n--- exit {} ---\n",
@@ -6565,6 +6579,7 @@ nodes:
             &self,
             _container: &crate::runtime::ContainerId,
             _argv: &[String],
+            _opts: crate::runtime::ExecOpts,
         ) -> Result<crate::runtime::PtyHandle> {
             unimplemented!("arch-only adapter is for fleet_tracker_mount tests")
         }

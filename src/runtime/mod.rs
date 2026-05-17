@@ -138,20 +138,24 @@ pub struct MountSpec {
 
 impl MountSpec {
     /// Render as a single `--mount` argument for the devcontainer CLI's
-    /// `--mount` flag (which the CLI forwards verbatim to `docker run`
-    /// / `podman run`). Path values are embedded literally; callers are
-    /// expected to feed in absolute paths the engine can resolve.
+    /// `--mount` flag. The CLI's input validator only accepts
+    /// `type=<bind|volume>,source=<src>,target=<tgt>[,external=<true|false>]`
+    /// — `readonly`, `bind-propagation=…`, and other engine-level
+    /// modifiers are rejected at parse time even though the
+    /// underlying engine would accept them. So we render only the
+    /// three load-bearing fields here; `read_only` lives on the
+    /// struct for adapters that bypass the devcontainer CLI (none
+    /// today), and as a documentation signal for future readers.
+    /// Defence-in-depth loss is thin: the agent already runs as root
+    /// in its own container and can chmod / replace any bind-mounted
+    /// binary regardless.
     #[must_use]
     pub fn to_mount_arg(&self) -> String {
-        let mut out = format!(
+        format!(
             "type=bind,source={},target={}",
             self.host_path.display(),
             self.container_path.display()
-        );
-        if self.read_only {
-            out.push_str(",readonly");
-        }
-        out
+        )
     }
 }
 
@@ -241,9 +245,22 @@ pub trait RuntimeAdapter: Send + Sync {
     /// in full; interactive use cases go through [`Self::attach_pty`].
     fn exec(&self, container: &ContainerId, argv: &[String], opts: ExecOpts) -> Result<ExecHandle>;
 
-    /// Attach a PTY for an interactive session. The returned handle is
-    /// owned by the caller; the adapter does not retain it.
-    fn attach_pty(&self, container: &ContainerId, argv: &[String]) -> Result<PtyHandle>;
+    /// Attach a PTY for an interactive session. `opts.env` is
+    /// surfaced into the agent's process env so credentials /
+    /// per-node context flow into the container the same way `exec`
+    /// does — historically attach_pty had no opts, which silently
+    /// broke env passthrough for tmux-mode (`--detached`) workflow
+    /// runs because the engine's `up --remote-env` only sets env for
+    /// lifecycle commands, not subsequent exec calls.
+    ///
+    /// The returned handle is owned by the caller; the adapter does
+    /// not retain it.
+    fn attach_pty(
+        &self,
+        container: &ContainerId,
+        argv: &[String],
+        opts: ExecOpts,
+    ) -> Result<PtyHandle>;
 
     /// Stop and remove the container. Idempotent — stopping an already-stopped
     /// container is not an error.
@@ -369,7 +386,12 @@ mod tests {
     }
 
     #[test]
-    fn mount_spec_renders_read_only_flag_when_set() {
+    fn mount_spec_renders_only_the_three_devcontainer_cli_compatible_fields() {
+        // The devcontainer CLI's --mount parser rejects modifiers
+        // beyond `external=<true|false>`. So `read_only: true` is
+        // intentionally NOT emitted into the argument string;
+        // adapters that bypass the CLI can read the field directly
+        // for engine-native rendering.
         let m = MountSpec {
             host_path: PathBuf::from("/host/bin/fleet-tracker"),
             container_path: PathBuf::from("/usr/local/bin/fleet-tracker"),
@@ -377,12 +399,12 @@ mod tests {
         };
         assert_eq!(
             m.to_mount_arg(),
-            "type=bind,source=/host/bin/fleet-tracker,target=/usr/local/bin/fleet-tracker,readonly"
+            "type=bind,source=/host/bin/fleet-tracker,target=/usr/local/bin/fleet-tracker"
         );
     }
 
     #[test]
-    fn mount_spec_omits_read_only_flag_when_unset() {
+    fn mount_spec_render_does_not_change_with_read_only_false() {
         let m = MountSpec {
             host_path: PathBuf::from("/h"),
             container_path: PathBuf::from("/c"),
@@ -437,7 +459,12 @@ mod tests {
         ) -> Result<ExecHandle> {
             unimplemented!("not exercised by is_running tests")
         }
-        fn attach_pty(&self, _container: &ContainerId, _argv: &[String]) -> Result<PtyHandle> {
+        fn attach_pty(
+            &self,
+            _container: &ContainerId,
+            _argv: &[String],
+            _opts: ExecOpts,
+        ) -> Result<PtyHandle> {
             unimplemented!("not exercised by is_running tests")
         }
         fn stop(&self, _container: &ContainerId) -> Result<()> {

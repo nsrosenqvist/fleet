@@ -124,7 +124,9 @@ pub fn run_attach(id: &str, argv: &[String]) -> Result<i32> {
     } else {
         argv.to_vec()
     };
-    let handle = ctx.adapter.attach_pty(&ContainerId::new(id), &resolved)?;
+    let handle = ctx
+        .adapter
+        .attach_pty(&ContainerId::new(id), &resolved, ExecOpts::default())?;
     Ok(handle.exit_code)
 }
 

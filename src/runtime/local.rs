@@ -190,19 +190,25 @@ impl RuntimeAdapter for LocalAdapter {
         }
     }
 
-    fn attach_pty(&self, container: &ContainerId, argv: &[String]) -> Result<PtyHandle> {
+    fn attach_pty(
+        &self,
+        container: &ContainerId,
+        argv: &[String],
+        opts: ExecOpts,
+    ) -> Result<PtyHandle> {
         // "PTY attach" for Local has no container to enter — we run
         // the agent directly with the caller's stdio inherited so it
         // can render its TUI in the current terminal (the tmux pane,
         // when invoked under `fleet workflow run --detached`).
         // Differs from `exec` only in stdio handling: exec captures
-        // output; attach_pty streams it. Workspace cwd + container-
-        // level env are still threaded through so the agent sees the
-        // same FLEET_* / HTTP_PROXY env it would under exec.
+        // output; attach_pty streams it. The per-call `opts.env`
+        // overlays the container-level env so callers (e.g. the
+        // workflow executor) can pass freshly-resolved secrets at
+        // attach time without baking them into the container record.
         if argv.is_empty() {
             bail!("attach_pty argv must contain at least the program name");
         }
-        let (workspace, env) = self.with_container(container, |c| {
+        let (workspace, container_env) = self.with_container(container, |c| {
             if c.state == ContainerState::Running {
                 Ok((c.workspace.clone(), c.env.clone()))
             } else {
@@ -212,7 +218,8 @@ impl RuntimeAdapter for LocalAdapter {
         let status = std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .current_dir(&workspace)
-            .envs(env)
+            .envs(container_env)
+            .envs(opts.env)
             .status()
             .with_context(|| format!("running `{}` with inherited stdio", argv[0]))?;
         Ok(PtyHandle {
@@ -457,7 +464,9 @@ mod tests {
         // The contract for both `local` and the container adapters
         // is the same: empty argv is a usage error.
         let a = LocalAdapter::new(invoker_returning(""));
-        let err = a.attach_pty(&ContainerId::new("any"), &[]).unwrap_err();
+        let err = a
+            .attach_pty(&ContainerId::new("any"), &[], ExecOpts::default())
+            .unwrap_err();
         assert!(format!("{err}").contains("attach_pty argv"));
     }
 
@@ -467,7 +476,11 @@ mod tests {
         // is a clear caller bug, not a fall-through.
         let a = LocalAdapter::new(invoker_returning(""));
         let err = a
-            .attach_pty(&ContainerId::new("ghost"), &["bash".to_string()])
+            .attach_pty(
+                &ContainerId::new("ghost"),
+                &["bash".to_string()],
+                ExecOpts::default(),
+            )
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(

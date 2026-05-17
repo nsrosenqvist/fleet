@@ -122,17 +122,22 @@ impl RuntimeAdapter for AppleContainerAdapter {
         self.cli.exec(&workspace, argv, opts)
     }
 
-    fn attach_pty(&self, container: &ContainerId, user_argv: &[String]) -> Result<PtyHandle> {
+    fn attach_pty(
+        &self,
+        container: &ContainerId,
+        user_argv: &[String],
+        opts: ExecOpts,
+    ) -> Result<PtyHandle> {
         // Per the plan's open questions: `container exec -it` is still
         // maturing in early Apple Containerization releases; the v1
         // macOS-26 acceptance smoke must exercise this path before we
         // declare PTY attach done. Behaviour-wise it mirrors the
-        // podman/docker impls: shell `container exec -it <id> <argv>`
-        // with the caller's stdio inherited.
+        // podman/docker impls: shell `container exec -it [-e KEY=VAL]…
+        // <id> <argv>` with the caller's stdio inherited.
         if user_argv.is_empty() {
             bail!("attach_pty argv must contain at least the program name");
         }
-        let cli_args = attach_argv(container, user_argv);
+        let cli_args = attach_argv(container, user_argv, &opts.env);
         let exit_code = crate::process::run_interactive("container", &cli_args, &[], &[])?;
         Ok(PtyHandle {
             container: container.clone(),
@@ -181,13 +186,23 @@ impl RuntimeAdapter for AppleContainerAdapter {
     }
 }
 
-/// Build the argv for `container exec -it <id> <cmd…>`. Pure so the
-/// shape can be locked in by tests without spawning the real CLI
-/// (which doesn't exist on Linux at all).
-fn attach_argv(container: &ContainerId, user_argv: &[String]) -> Vec<String> {
-    let mut cli_args = Vec::with_capacity(3 + user_argv.len());
+/// Build the argv for `container exec -it [-e KEY=VAL]… <id>
+/// <cmd…>`. Pure so the shape can be locked in by tests without
+/// spawning the real CLI (which doesn't exist on Linux at all).
+/// Env vars surface as `-e KEY=VAL` pairs before the container id;
+/// callers that don't need env pass an empty slice.
+fn attach_argv(
+    container: &ContainerId,
+    user_argv: &[String],
+    env: &[(String, String)],
+) -> Vec<String> {
+    let mut cli_args = Vec::with_capacity(3 + env.len() * 2 + user_argv.len());
     cli_args.push("exec".to_string());
     cli_args.push("-it".to_string());
+    for (k, v) in env {
+        cli_args.push("-e".to_string());
+        cli_args.push(format!("{k}={v}"));
+    }
     cli_args.push(container.as_str().to_string());
     cli_args.extend(user_argv.iter().cloned());
     cli_args
@@ -451,13 +466,15 @@ mod tests {
     #[test]
     fn attach_pty_rejects_empty_argv() {
         let a = AppleContainerAdapter::new(Arc::new(MockProcessInvoker::new()));
-        let err = a.attach_pty(&ContainerId::new("c"), &[]).unwrap_err();
+        let err = a
+            .attach_pty(&ContainerId::new("c"), &[], ExecOpts::default())
+            .unwrap_err();
         assert!(format!("{err}").contains("at least the program name"));
     }
 
     #[test]
     fn attach_argv_wraps_exec_dash_it_with_container_id() {
-        let argv = attach_argv(&ContainerId::new("c-mac"), &["bash".to_string()]);
+        let argv = attach_argv(&ContainerId::new("c-mac"), &["bash".to_string()], &[]);
         assert_eq!(argv, vec!["exec", "-it", "c-mac", "bash"]);
     }
 
@@ -466,6 +483,7 @@ mod tests {
         let argv = attach_argv(
             &ContainerId::new("c-1"),
             &["sh".to_string(), "-c".to_string(), "uname -a".to_string()],
+            &[],
         );
         assert_eq!(argv, vec!["exec", "-it", "c-1", "sh", "-c", "uname -a"]);
     }
