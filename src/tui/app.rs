@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::autonomous;
-use crate::orchestrator::store::OrchestratorStore;
 use crate::orchestrator::OrchestratorSession;
+use crate::orchestrator::store::OrchestratorStore;
 use crate::plans::store::PlanStore;
 use crate::plans::{Plan, PlanState};
 use crate::process::{ProcessInvoker, RealProcessInvoker};
@@ -161,6 +161,7 @@ pub(super) enum ConfirmAction {
 }
 
 /// Closed enum so the event loop's dispatch stays exhaustive.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Action {
     None,
     Quit,
@@ -170,6 +171,15 @@ pub(super) enum Action {
     /// the sidebar — there's only ever one, so "new" and "attach"
     /// collapse to the same operation.
     OpenOrchestrator,
+    /// Suspend the TUI and open the configured tracker's terminal UI:
+    /// `git-bug termui` when `tracker: git-bug`, `gh dash` when
+    /// `tracker: github`. Triggered by Shift+T. The action carries
+    /// the resolved binary/args so the event loop doesn't have to
+    /// re-read repo config.
+    OpenTrackerTui {
+        exe: &'static str,
+        args: &'static [&'static str],
+    },
 }
 
 /// Resolved snapshot for the doctor pane.
@@ -288,7 +298,9 @@ impl AppState {
         self.refresh_plans();
         self.refresh_orchestrators();
         let deps_store = crate::deps::DepsStore::for_repo(&self.root);
-        let doc = deps_store.load().unwrap_or_else(|_| crate::deps::DepsDoc::empty());
+        let doc = deps_store
+            .load()
+            .unwrap_or_else(|_| crate::deps::DepsDoc::empty());
         self.cycle_nodes = crate::deps::nodes_in_cycle(&doc);
         self.deps_doc = doc;
         self.status_line = super::ui::render_status_line(&self.sessions, &self.plans);
@@ -363,6 +375,9 @@ impl AppState {
             self.toggle_autonomous();
             return Action::None;
         }
+        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('T')) {
+            return self.tracker_tui_action();
+        }
         // The orchestrator row is always visible in the sidebar, so
         // Tab + Enter is enough to open it; no Shift+O hotkey
         // necessary.
@@ -390,6 +405,32 @@ impl AppState {
             Overlay::None => unreachable!("handle_key_overlay called with Overlay::None"),
         }
         Action::None
+    }
+
+    /// Resolve Shift+T to a tracker-TUI launch. Returns
+    /// [`Action::OpenTrackerTui`] for trackers that ship a terminal
+    /// UI (`git-bug`, `github`), or sets a status-line hint and
+    /// returns [`Action::None`] for the placeholder trackers
+    /// (`linear`, `jira`) so the keypress isn't silently dropped.
+    fn tracker_tui_action(&mut self) -> Action {
+        use crate::repo_config::Tracker;
+        match self.config.tracker {
+            Tracker::GitBug => Action::OpenTrackerTui {
+                exe: "git-bug",
+                args: &["termui"],
+            },
+            Tracker::Github => Action::OpenTrackerTui {
+                exe: "gh",
+                args: &["dash"],
+            },
+            Tracker::Linear | Tracker::Jira => {
+                self.status_line = format!(
+                    " tracker {} has no local TUI ",
+                    self.config.tracker.as_str()
+                );
+                Action::None
+            }
+        }
     }
 
     fn prompt_kill_selected(&mut self) {
@@ -664,8 +705,11 @@ impl AppState {
         let store = PlanStore::for_repo(&self.root);
         match store.save(plan) {
             Ok(()) => {
-                self.status_line =
-                    format!(" plan `{}` → {} ", plan.id, super::ui::plan_state_word(target));
+                self.status_line = format!(
+                    " plan `{}` → {} ",
+                    plan.id,
+                    super::ui::plan_state_word(target)
+                );
             }
             Err(err) => {
                 plan.state = previous;
@@ -939,15 +983,15 @@ impl AppState {
                         message: format!(
                             "spawn `{}` exited {} — see log:\n{}\n\n{}",
                             pending.name,
-                            status
-                                .code()
-                                .map_or_else(|| "(signal)".to_string(), |c| format!("with code {c}")),
+                            status.code().map_or_else(
+                                || "(signal)".to_string(),
+                                |c| format!("with code {c}")
+                            ),
                             pending.log_path.display(),
                             tail.trim_end(),
                         ),
                     };
-                    self.status_line =
-                        format!(" spawn `{}` failed — press any key ", pending.name);
+                    self.status_line = format!(" spawn `{}` failed — press any key ", pending.name);
                 }
                 let _ = pending.started_at_ms;
             }
@@ -1063,11 +1107,7 @@ impl AppState {
         }
     }
 
-    fn dispatch_autonomous_spawn(
-        &mut self,
-        cmd: &autonomous::SpawnCommand,
-        store: &SessionStore,
-    ) {
+    fn dispatch_autonomous_spawn(&mut self, cmd: &autonomous::SpawnCommand, store: &SessionStore) {
         let Ok(binary) = std::env::current_exe() else {
             self.autonomous.set_status(
                 "autonomous: ON · spawn failed: cannot resolve fleet binary (current_exe)",
@@ -1198,9 +1238,8 @@ fn sanitize_log_segment(s: &str) -> String {
 /// for write-from-empty.
 pub(super) fn open_spawn_log(log_path: &Path) -> Result<std::fs::File> {
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating spawn-log directory at {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating spawn-log directory at {}", parent.display()))?;
     }
     std::fs::File::create(log_path)
         .with_context(|| format!("creating spawn-log file at {}", log_path.display()))

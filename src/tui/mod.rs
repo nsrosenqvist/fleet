@@ -4,11 +4,11 @@
 //!
 //! - [`app`]      — state + behaviour, no rendering, no I/O setup
 //! - [`ui`]       — pure `(&AppState, &mut Frame) -> ()` renderers
-//!                  plus the display-side helpers they need
+//!   plus the display-side helpers they need
 //! - [`theme`]    — colour tokens + small inline-span helpers shared
-//!                  across every panel; ported from the pre-AO/Lima TUI
+//!   across every panel; ported from the pre-AO/Lima TUI
 //! - [`input`]    — keyboard dispatch seam between the event loop
-//!                  and `AppState`'s mutation methods
+//!   and `AppState`'s mutation methods
 //! - [`terminal`] — crossterm lifecycle, event loop, subprocess-suspend
 //!
 //! Aesthetic inspiration: keel — dark background, rounded borders,
@@ -42,8 +42,8 @@ mod tests {
     use crate::orchestrator::{OrchestratorSession, OrchestratorState};
     use crate::plans::store::PlanStore;
     use crate::plans::{ItemFailurePolicy, Plan, PlanId, PlanItem, PlanItemState, PlanState};
-    use crate::session::store::SessionStore;
     use crate::session::SessionId;
+    use crate::session::store::SessionStore;
     use crate::session::{IssueContext, Session, SessionState};
 
     /// Convenience: an empty cycle-node set for tests that don't
@@ -578,6 +578,70 @@ mod tests {
     }
 
     #[test]
+    fn handle_key_shift_t_resolves_git_bug_tracker_to_termui() {
+        // Default tracker in a fresh repo is `git-bug` (see
+        // `Tracker::default`). Shift+T must surface the tracker
+        // launch as an Action the terminal-side dispatch can suspend
+        // around — exercising both that the resolver picks the right
+        // binary AND that the top-level handler routes Shift+T
+        // through it.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert_eq!(
+            action,
+            Action::OpenTrackerTui {
+                exe: "git-bug",
+                args: &["termui"],
+            }
+        );
+    }
+
+    #[test]
+    fn handle_key_shift_t_resolves_github_tracker_to_gh_dash() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/config.yaml", "tracker: github\n");
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert_eq!(
+            action,
+            Action::OpenTrackerTui {
+                exe: "gh",
+                args: &["dash"],
+            }
+        );
+    }
+
+    #[test]
+    fn handle_key_shift_t_for_placeholder_tracker_flashes_status() {
+        // Linear / Jira plugins don't ship a local TUI yet —
+        // Shift+T shouldn't silently no-op; the status line
+        // explains why nothing happened.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".fleet/config.yaml", "tracker: linear\n");
+        let store = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &store,
+        );
+        assert_eq!(action, Action::None);
+        assert!(
+            state.status_line.contains("linear") && state.status_line.contains("no local TUI"),
+            "expected status line to explain the no-op, got {:?}",
+            state.status_line
+        );
+    }
+
+    #[test]
     fn handle_key_r_reloads_from_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let store = SessionStore::at(tmp.path().to_path_buf());
@@ -688,10 +752,7 @@ mod tests {
         // with mid-byte-window UTF-8 (lossy decode).
         assert_eq!(read_tail_string(&p, 4).as_deref(), Some("tail"));
         // Large cap → whole file is returned.
-        assert_eq!(
-            read_tail_string(&p, 1024).as_deref(),
-            Some("AAAAAAAA-tail")
-        );
+        assert_eq!(read_tail_string(&p, 1024).as_deref(), Some("AAAAAAAA-tail"));
     }
 
     #[test]
@@ -1408,7 +1469,12 @@ mod tests {
 
     // ---- ticket-detail pane (Plans view 3rd column) -----------------
 
-    fn issue_detail_fixture(human: &str, body: &str, labels: &[&str], comments: usize) -> crate::tracker::IssueDetail {
+    fn issue_detail_fixture(
+        human: &str,
+        body: &str,
+        labels: &[&str],
+        comments: usize,
+    ) -> crate::tracker::IssueDetail {
         crate::tracker::IssueDetail {
             issue: crate::tracker::Issue {
                 id: format!("gh:{human}"),
@@ -1944,7 +2010,9 @@ mod tests {
             .create(&session("s-1", "standard", SessionState::Running, 100))
             .unwrap();
         let ostore = OrchestratorStore::for_repo(tmp.path());
-        ostore.save(&OrchestratorSession::new("claude", 200)).unwrap();
+        ostore
+            .save(&OrchestratorSession::new("claude", 200))
+            .unwrap();
         let state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
         (tmp, sessions, state)
     }
@@ -1969,20 +2037,14 @@ mod tests {
         // command does the right thing regardless of current state).
         let (_tmp, store, mut state) = sessions_state_with_one_of_each();
         state.toggle_sessions_focus();
-        let action = state.handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &store,
-        );
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &store);
         assert!(matches!(action, Action::OpenOrchestrator));
     }
 
     #[test]
     fn enter_with_workflows_focus_is_a_noop_for_now() {
         let (_tmp, store, mut state) = sessions_state_with_one_of_each();
-        let action = state.handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &store,
-        );
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &store);
         assert!(matches!(action, Action::None));
     }
 
@@ -1997,7 +2059,10 @@ mod tests {
         let sessions = SessionStore::at(tmp.path().to_path_buf());
         let mut state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
         assert!(state.sessions.is_empty(), "test premise: no workers");
-        assert!(state.orchestrators.is_empty(), "test premise: no orchestrator");
+        assert!(
+            state.orchestrators.is_empty(),
+            "test premise: no orchestrator"
+        );
         assert_eq!(
             state.sessions_focus,
             SessionsFocus::Orchestrator,
@@ -2053,10 +2118,7 @@ mod tests {
             .unwrap();
         let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
         // Tab into the orchestrator pane (workers is the default).
-        let _ = state.handle_key(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
-            &store,
-        );
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
         assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
         // Down → Workflows.
         let _ = state.handle_key(
@@ -2078,10 +2140,7 @@ mod tests {
             .create(&session("s-1", "wf", SessionState::Running, 100))
             .unwrap();
         let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
-        let _ = state.handle_key(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
-            &store,
-        );
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
         assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
         let _ = state.handle_key(
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
@@ -2144,10 +2203,7 @@ mod tests {
         );
 
         // Tab → focus moves to orchestrator; border colours invert.
-        let _ = state.handle_key(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
-            &store,
-        );
+        let _ = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), &store);
         assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
         terminal.draw(|f| render(f, &state)).unwrap();
         let buf = terminal.backend().buffer();
@@ -2213,8 +2269,14 @@ mod tests {
         assert!(label.contains("fl-orchestrator"));
         // Sidebar row is intentionally minimal — no agent/state
         // text crowding the narrow pane.
-        assert!(!label.contains("agent="), "agent leaked into sidebar: {label}");
-        assert!(!label.contains("(active)"), "state word leaked into sidebar: {label}");
+        assert!(
+            !label.contains("agent="),
+            "agent leaked into sidebar: {label}"
+        );
+        assert!(
+            !label.contains("(active)"),
+            "state word leaked into sidebar: {label}"
+        );
     }
 
     #[test]
@@ -2295,5 +2357,3 @@ mod tests {
         );
     }
 }
-
-

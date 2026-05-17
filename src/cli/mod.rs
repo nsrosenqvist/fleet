@@ -7,10 +7,10 @@
 use clap::{Parser, Subcommand};
 
 pub mod autonomous;
-pub mod orchestrator;
 pub mod deps;
 pub mod init;
 pub mod issues;
+pub mod orchestrator;
 pub mod plan;
 pub mod runtime;
 pub mod sessions;

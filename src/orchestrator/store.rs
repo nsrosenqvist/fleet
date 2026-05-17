@@ -123,7 +123,10 @@ mod tests {
         // No per-id subdir — the single orchestrator gets its files
         // directly in `.fleet/orchestrator/`.
         let store = OrchestratorStore::for_repo("/repo");
-        assert_eq!(store.meta_path(), Path::new("/repo/.fleet/orchestrator/meta.json"));
+        assert_eq!(
+            store.meta_path(),
+            Path::new("/repo/.fleet/orchestrator/meta.json")
+        );
         assert_eq!(
             store.transcript_path(),
             Path::new("/repo/.fleet/orchestrator/transcript.log")

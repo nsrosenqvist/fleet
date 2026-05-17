@@ -108,16 +108,13 @@ fn open_store() -> Result<DepsStore> {
 /// the on-disk `blocked_on` string. The freeform tag form gets a
 /// `free:` prefix so the supervisor can distinguish tag edges from
 /// ticket edges at scan time.
-fn resolve_blocked_on(
-    blocked_on: Option<&str>,
-    blocked_on_tag: Option<&str>,
-) -> Result<String> {
+fn resolve_blocked_on(blocked_on: Option<&str>, blocked_on_tag: Option<&str>) -> Result<String> {
     match (blocked_on, blocked_on_tag) {
         (Some(id), None) if !id.is_empty() => Ok(id.to_string()),
         (None, Some(tag)) if !tag.is_empty() => Ok(format!("free:{tag}")),
-        (Some(_), Some(_)) => bail!(
-            "pass either --blocked-on <ticket-id> or --blocked-on-tag <slug>, not both"
-        ),
+        (Some(_), Some(_)) => {
+            bail!("pass either --blocked-on <ticket-id> or --blocked-on-tag <slug>, not both")
+        }
         _ => bail!("pass --blocked-on <ticket-id> or --blocked-on-tag <slug>"),
     }
 }
@@ -133,9 +130,9 @@ fn build_edge(
     let (right_hand, reason) = match (blocked_on, blocked_on_tag) {
         (Some(id), None) if !id.is_empty() => (id.to_string(), BlockedReason::Ticket),
         (None, Some(tag)) if !tag.is_empty() => (format!("free:{tag}"), BlockedReason::Freeform),
-        (Some(_), Some(_)) => bail!(
-            "pass either --blocked-on <ticket-id> or --blocked-on-tag <slug>, not both"
-        ),
+        (Some(_), Some(_)) => {
+            bail!("pass either --blocked-on <ticket-id> or --blocked-on-tag <slug>, not both")
+        }
         _ => bail!("pass --blocked-on <ticket-id> or --blocked-on-tag <slug>"),
     };
     Ok(DepEdge {
@@ -162,11 +159,7 @@ pub fn render_list(doc: &DepsDoc) -> String {
             BlockedReason::Ticket => "ticket",
             BlockedReason::Freeform => "freeform",
         };
-        let _ = writeln!(
-            out,
-            "  {} → {}  [{kind}]",
-            edge.blocked, edge.blocked_on
-        );
+        let _ = writeln!(out, "  {} → {}  [{kind}]", edge.blocked, edge.blocked_on);
     }
     out
 }
@@ -208,7 +201,10 @@ mod tests {
         let out = render_list(&doc);
         assert!(out.contains("2 edges:"), "got: {out}");
         assert!(out.contains("42 → 43  [ticket]"), "got: {out}");
-        assert!(out.contains("44 → free:apt-mirror  [freeform]"), "got: {out}");
+        assert!(
+            out.contains("44 → free:apt-mirror  [freeform]"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -239,28 +235,19 @@ mod tests {
     #[test]
     fn build_edge_refuses_both_flags_passed() {
         let err = build_edge("42", Some("43"), Some("apt-mirror")).unwrap_err();
-        assert!(
-            err.to_string().contains("not both"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("not both"), "got: {err}");
     }
 
     #[test]
     fn build_edge_refuses_neither_flag_passed() {
         let err = build_edge("42", None, None).unwrap_err();
-        assert!(
-            err.to_string().contains("--blocked-on"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("--blocked-on"), "got: {err}");
     }
 
     #[test]
     fn build_edge_refuses_empty_blocked_id() {
         let err = build_edge("", Some("43"), None).unwrap_err();
-        assert!(
-            err.to_string().contains("must not be empty"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("must not be empty"), "got: {err}");
     }
 
     #[test]

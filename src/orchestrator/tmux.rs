@@ -413,7 +413,10 @@ mod tests {
             "fleet-orchestrator-b-1\nfleet-orchestrator-b-2\n\n".to_string(),
         )]);
         let names = list_session_names(invoker.as_ref()).unwrap();
-        assert_eq!(names, vec!["fleet-orchestrator-b-1", "fleet-orchestrator-b-2"]);
+        assert_eq!(
+            names,
+            vec!["fleet-orchestrator-b-1", "fleet-orchestrator-b-2"]
+        );
     }
 
     #[test]

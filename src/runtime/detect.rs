@@ -511,5 +511,4 @@ mod tests {
         assert_eq!(BackendKind::GitBug.program(), "git-bug");
         assert_eq!(BackendKind::Tinyproxy.program(), "tinyproxy");
     }
-
 }

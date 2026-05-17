@@ -5,9 +5,9 @@
 //!   propagate, but the terminal is always restored first so a `?`
 //!   short-circuit can't strand the user in raw alt-screen mode.
 //! - `event_loop` is the per-tick draw + poll + dispatch hot path.
-//! - `run_orchestrator_suspended` is the alt-screen suspend/resume dance
-//!   for forking off `fleet orchestrator` (which itself takes over the
-//!   terminal with tmux).
+//! - `run_suspended` is the alt-screen suspend/resume dance for forking
+//!   off an interactive subprocess: `fleet orchestrator` (tmux takeover)
+//!   and the tracker TUIs (`git-bug termui`, `gh dash`).
 
 use anyhow::{Context, Result, bail};
 use crossterm::{
@@ -22,10 +22,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::repo;
+use crate::runtime::factory::build_stopper;
+use crate::session::now_ms;
 use crate::session::reaper::{self, RealPidProbe};
 use crate::session::store::SessionStore;
-use crate::session::{now_ms};
-use crate::runtime::factory::build_stopper;
 
 use super::app::{Action, AppState, DoctorSnapshot};
 use super::input;
@@ -110,7 +110,9 @@ fn event_loop(
                         // orchestrator on first invocation, respawn
                         // the agent if the pane is dead, or just
                         // attach if everything's alive.
-                        if let Err(err) = run_orchestrator_suspended(terminal, &["orchestrator"]) {
+                        let exe =
+                            std::env::current_exe().context("locating current fleet binary")?;
+                        if let Err(err) = run_suspended(terminal, &exe, &["orchestrator"]) {
                             state.status_line = format!(" orchestrator failed: {err:#} ");
                         }
                         // Meta may have flipped to Active/Detached/
@@ -118,6 +120,16 @@ fn event_loop(
                         // marker is current.
                         if let Err(err) = state.reload(store) {
                             state.status_line = format!(" reload failed: {err:#} ");
+                        }
+                    }
+                    Action::OpenTrackerTui { exe, args } => {
+                        // Suspend into the tracker's terminal UI
+                        // (`git-bug termui`, `gh dash`). The binary
+                        // lives on PATH on the host — no Lima shell
+                        // dance any more — so we can launch it
+                        // directly.
+                        if let Err(err) = run_suspended(terminal, std::path::Path::new(exe), args) {
+                            state.status_line = format!(" {exe} failed: {err:#} ");
                         }
                     }
                 }
@@ -134,18 +146,20 @@ fn event_loop(
     }
 }
 
-/// Suspend the alternate-screen + raw-mode dance, run the current
-/// fleet binary with `args` inheriting stdio, then re-enter the
-/// alternate screen. The terminal is left in a usable raw-mode
-/// alternate-screen state whether or not the subprocess succeeds.
+/// Suspend the alternate-screen + raw-mode dance, run `exe` with
+/// `args` inheriting stdio, then re-enter the alternate screen. The
+/// terminal is left in a usable raw-mode alternate-screen state
+/// whether or not the subprocess succeeds.
 ///
-/// Uses [`std::env::current_exe`] to locate the binary so the
-/// behaviour works under `cargo run` as well as a release install.
-fn run_orchestrator_suspended(
+/// Used both for `fleet orchestrator` (caller passes
+/// [`std::env::current_exe`] so cargo-run and release installs both
+/// work) and for the tracker TUIs (`git-bug termui`, `gh dash`,
+/// resolved from PATH).
+fn run_suspended(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    exe: &Path,
     args: &[&str],
 ) -> Result<()> {
-    let exe = std::env::current_exe().context("locating current fleet binary")?;
     // Tear down — order mirrors the setup in `run` (reverse).
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
@@ -153,7 +167,7 @@ fn run_orchestrator_suspended(
 
     let exe_display = exe.display().to_string();
     let args_joined = args.join(" ");
-    let result = std::process::Command::new(&exe)
+    let result = std::process::Command::new(exe)
         .args(args)
         .status()
         .with_context(|| format!("running {exe_display} {args_joined}"));

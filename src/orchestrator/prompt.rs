@@ -366,10 +366,7 @@ mod tests {
         );
         // ADR vs schema choice is documented.
         assert!(p.contains("ADR"), "ADR option missing");
-        assert!(
-            p.contains("docs/decisions/"),
-            "ADR file location missing"
-        );
+        assert!(p.contains("docs/decisions/"), "ADR file location missing");
     }
 
     #[test]

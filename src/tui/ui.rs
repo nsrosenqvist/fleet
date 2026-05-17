@@ -127,7 +127,11 @@ fn render_breadcrumb(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         Some(_) => ERR,
         None => MUTED,
     };
-    let auto_color = if state.autonomous.enabled() { OK } else { MUTED };
+    let auto_color = if state.autonomous.enabled() {
+        OK
+    } else {
+        MUTED
+    };
     let right = Line::from(vec![
         Span::styled("runtime", muted),
         Span::raw(":"),
@@ -169,7 +173,9 @@ fn render_confirm(f: &mut Frame<'_>, area: Rect, prompt: &str) {
         .border_style(Style::default().fg(WARN))
         .title(title)
         .padding(Padding::horizontal(2));
-    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let body = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
 
@@ -189,7 +195,9 @@ fn render_error(f: &mut Frame<'_>, area: Rect, message: &str) {
         .border_style(Style::default().fg(ERR))
         .title(title)
         .padding(Padding::horizontal(2));
-    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let body = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
 
@@ -316,7 +324,9 @@ fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
             )),
             Line::from(Span::styled("`.fleet/workflows/` by hand.", muted)),
         ];
-        let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        let body = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         f.render_widget(body, area);
         return;
     }
@@ -337,7 +347,7 @@ fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         // Reserve the cursor column on every row so the list doesn't
         // shift right when the user Tabs in and the symbol appears.
         .highlight_spacing(HighlightSpacing::Always);
-    let mut list_state = state.spawn_list_state.clone();
+    let mut list_state = state.spawn_list_state;
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
@@ -387,7 +397,7 @@ fn render_plans_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         // Reserve the cursor column on every row so the list doesn't
         // shift right when the user Tabs in and the symbol appears.
         .highlight_spacing(HighlightSpacing::Always);
-    let mut list_state = state.plans_list_state.clone();
+    let mut list_state = state.plans_list_state;
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
@@ -452,10 +462,7 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .constraints([Constraint::Length(header_height), Constraint::Min(0)])
         .split(inner);
 
-    f.render_widget(
-        Paragraph::new(header).wrap(Wrap { trim: false }),
-        rows[0],
-    );
+    f.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), rows[0]);
 
     let item_lines: Vec<ListItem<'_>> = plan
         .items
@@ -473,7 +480,7 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         // Reserve the cursor column on every row so the list doesn't
         // shift right when the user Tabs in and the symbol appears.
         .highlight_spacing(HighlightSpacing::Always);
-    let mut item_cursor = state.plans_items_state.clone();
+    let mut item_cursor = state.plans_items_state;
     if state.plans_focus != PlansFocus::Items {
         // Show no highlight when the user has Tab'd back to the
         // sidebar — the visual "this row is selected" cue belongs to
@@ -487,7 +494,9 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn render_plans_ticket(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let block = framed_block(" ticket ").padding(Padding::horizontal(2));
     let lines = ticket_detail_lines(state);
-    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let body = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
 
@@ -698,7 +707,10 @@ pub(super) fn issue_detail_lines(detail: &crate::tracker::IssueDetail) -> Vec<Li
 }
 
 #[must_use]
-pub(super) fn plan_row_label(plan: &Plan, cycle_nodes: &std::collections::HashSet<String>) -> String {
+pub(super) fn plan_row_label(
+    plan: &Plan,
+    cycle_nodes: &std::collections::HashSet<String>,
+) -> String {
     let (done, total) = plan.progress();
     let warning_prefix = if plan_in_cycle(plan, cycle_nodes) {
         "⚠ "
@@ -779,6 +791,7 @@ fn plan_header_lines(
 /// path (see `render_plans_detail`) so the items can use a List widget
 /// with a full-row selection highlight, but the assertion surface
 /// here stays stable.
+#[cfg(test)]
 #[must_use]
 pub(super) fn plan_detail_lines(
     plan: &Plan,
@@ -787,7 +800,12 @@ pub(super) fn plan_detail_lines(
 ) -> Vec<Line<'static>> {
     let mut out = plan_header_lines(plan, titles);
     for (idx, item) in plan.items.iter().enumerate() {
-        out.push(plan_item_line(idx, item, selected_item == Some(idx), titles));
+        out.push(plan_item_line(
+            idx,
+            item,
+            selected_item == Some(idx),
+            titles,
+        ));
     }
     out
 }
@@ -858,10 +876,7 @@ fn progress_kv_line(done: usize, total: usize) -> Line<'static> {
     let ok = Style::default().fg(OK).add_modifier(Modifier::BOLD);
     let label = Span::styled(format!("{:<14}", "progress"), muted);
     if total > 0 && done == total {
-        return Line::from(vec![
-            label,
-            Span::styled(format!("{done}/{total}"), ok),
-        ]);
+        return Line::from(vec![label, Span::styled(format!("{done}/{total}"), ok)]);
     }
     let done_style = if done == 0 { muted } else { ok };
     Line::from(vec![
@@ -1022,10 +1037,7 @@ fn render_workers_pane(f: &mut Frame<'_>, area: Rect, state: &AppState) {
                 Span::styled("    open the workflow picker", muted),
             ]),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Or:  fleet workflow run <name>",
-                muted,
-            )),
+            Line::from(Span::styled("  Or:  fleet workflow run <name>", muted)),
         ];
         let body = Paragraph::new(lines)
             .block(Block::default().padding(Padding::horizontal(2)))
@@ -1099,9 +1111,9 @@ fn render_orchestrator_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         // Reserve the cursor column on every row so the list doesn't
         // shift right when the user Tabs in and the symbol appears.
         .highlight_spacing(HighlightSpacing::Always);
-    // Cursor is always at row 0 (the one row). Cloning the state's
+    // Cursor is always at row 0 (the one row). Copying the state's
     // ListState keeps any pre-existing selection in sync.
-    let mut cursor = state.orchestrators_list_state.clone();
+    let mut cursor = state.orchestrators_list_state;
     if cursor.selected().is_some() {
         cursor.select(Some(0));
     }
@@ -1202,10 +1214,7 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     let bold_key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     let Some(session) = state.selected() else {
         let lines = vec![
-            Line::from(Span::styled(
-                "Select a session, or use one of:",
-                muted,
-            )),
+            Line::from(Span::styled("Select a session, or use one of:", muted)),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  ", muted),
@@ -1290,7 +1299,10 @@ fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         let line = Line::from(vec![
             badge(" auto ", ACCENT),
             Span::raw(" "),
-            Span::styled(state.autonomous.status().to_string(), Style::default().fg(ACCENT)),
+            Span::styled(
+                state.autonomous.status().to_string(),
+                Style::default().fg(ACCENT),
+            ),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
@@ -1304,7 +1316,11 @@ fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         // its status line.
         let is_error =
             trimmed.contains("failed") || trimmed.contains("rejected") || trimmed.contains("error");
-        let (glyph, color) = if is_error { (" ! ", ERR) } else { (" ✓ ", OK) };
+        let (glyph, color) = if is_error {
+            (" ! ", ERR)
+        } else {
+            (" ✓ ", OK)
+        };
         let line = Line::from(vec![
             badge(glyph, color),
             Span::raw(" "),
@@ -1376,6 +1392,9 @@ fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
                 sep(),
                 theme_key("A"),
                 Span::raw(" auto"),
+                sep(),
+                theme_key("T"),
+                Span::raw(" tracker"),
                 sep(),
                 theme_key("r"),
                 Span::raw(" reload"),

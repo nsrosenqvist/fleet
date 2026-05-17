@@ -154,13 +154,7 @@ impl AgentLauncher for ClaudeLauncher {
         // predates the `--session-id` capture.)
         prior_session_id.map_or_else(
             || vec![agent.to_string(), "--continue".to_string()],
-            |id| {
-                vec![
-                    agent.to_string(),
-                    "--resume".to_string(),
-                    id.to_string(),
-                ]
-            },
+            |id| vec![agent.to_string(), "--resume".to_string(), id.to_string()],
         )
     }
 }
@@ -526,7 +520,10 @@ mod tests {
         // wire — the safest default is "spawn again, same way" and
         // let the user re-type whatever they had in flight.
         let argv = BareLauncher.resume_argv("custom-agent", &prompt_path(), "BODY", None);
-        assert_eq!(argv, BareLauncher.argv("custom-agent", &prompt_path(), "BODY"));
+        assert_eq!(
+            argv,
+            BareLauncher.argv("custom-agent", &prompt_path(), "BODY")
+        );
     }
 
     #[test]
@@ -535,6 +532,9 @@ mod tests {
         // so callers don't have to thread a separate session-dir
         // argument through the trait.
         let p = aider_history_path(Path::new("/repo/.fleet/planning/b-9/prompt.md"));
-        assert_eq!(p, PathBuf::from("/repo/.fleet/planning/b-9/aider-chat-history.md"));
+        assert_eq!(
+            p,
+            PathBuf::from("/repo/.fleet/planning/b-9/aider-chat-history.md")
+        );
     }
 }

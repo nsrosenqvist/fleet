@@ -86,7 +86,10 @@ pub fn run_default() -> Result<i32> {
     }
 
     let session = store.load()?;
-    println!("orchestrator: {TMUX_SESSION_NAME} (agent: {})", session.agent);
+    println!(
+        "orchestrator: {TMUX_SESSION_NAME} (agent: {})",
+        session.agent
+    );
 
     attach_and_finalize(&store, invoker.as_ref())
 }
