@@ -1972,6 +1972,40 @@ mod tests {
     }
 
     #[test]
+    fn tab_then_enter_opens_orchestrator_even_when_none_running_yet() {
+        // Brand-new repo state: no orchestrator on disk, vec is
+        // empty. Tab into the orchestrator pane (the synthetic
+        // not-running row is always visible), Enter should still
+        // trigger OpenOrchestrator so the user can spawn it from
+        // the TUI without first dropping to the shell.
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = SessionStore::at(tmp.path().to_path_buf());
+        let mut state = AppState::new(tmp.path().to_path_buf(), &sessions).unwrap();
+        assert!(state.orchestrators.is_empty(), "test premise: empty");
+        let _ = state.handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &sessions,
+        );
+        assert_eq!(state.sessions_focus, SessionsFocus::Orchestrator);
+        // The cursor needs to land on the synthetic row so the
+        // highlight is visible — without an explicit selection the
+        // ▸ highlight symbol stays hidden.
+        assert_eq!(
+            state.orchestrators_list_state.selected(),
+            Some(0),
+            "synthetic row should auto-select on Tab",
+        );
+        let action = state.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &sessions,
+        );
+        assert!(
+            matches!(action, Action::OpenOrchestrator),
+            "Enter on the synthetic row should spawn-and-attach",
+        );
+    }
+
+    #[test]
     fn shift_o_is_no_longer_a_hotkey() {
         // The always-visible orchestrator row in the sidebar
         // (rendered even when nothing is running) makes a global

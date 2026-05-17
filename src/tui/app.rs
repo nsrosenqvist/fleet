@@ -483,8 +483,11 @@ impl AppState {
             SessionsFocus::Workflows => SessionsFocus::Orchestrator,
             SessionsFocus::Orchestrator => SessionsFocus::Workflows,
         };
+        // Always auto-select row 0 when focus moves to the
+        // Orchestrator pane — the sidebar renders a synthetic
+        // not-running row when no orchestrator exists yet, so there
+        // is always something to highlight (and Enter to spawn).
         if self.sessions_focus == SessionsFocus::Orchestrator
-            && !self.orchestrators.is_empty()
             && self.orchestrators_list_state.selected().is_none()
         {
             self.orchestrators_list_state.select(Some(0));
