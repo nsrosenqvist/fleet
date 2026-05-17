@@ -49,22 +49,28 @@ use crate::tracker::Tracker;
 /// `&mut Session` — can apply the outcome without the inner functions
 /// needing mutable access. The pattern matters most for fanout, whose
 /// siblings run in `std::thread::scope` with shared access to Session
-/// only.
-#[derive(Debug, Default, Clone)]
-struct NodeOutcome {
+/// only, or — under `FLEET_TMUX_SESSION` — in per-sibling subprocesses
+/// that serialise this value through a file on disk.
+///
+/// `Serialize` + `Deserialize` are load-bearing for the tmux-windows
+/// fanout path: each sibling subprocess writes a `FanoutOutcome::Ok`
+/// JSON file the driver picks up.
+#[allow(clippy::redundant_pub_crate)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NodeOutcome {
     /// `(node_id, usd)` pairs. Usually 0 or 1 entry; a fanout returns
     /// one per agent sibling that produced a parseable cost line.
-    node_costs: Vec<(String, f64)>,
+    pub(crate) node_costs: Vec<(String, f64)>,
     /// `((node_id, output_name), value)` tuples the executor itself
     /// produced (not from an artifact file). Distinct from
     /// `extract_outputs` — that path is for agent-produced
     /// `<node>.outputs.json` files; this is for engine-driven nodes
     /// like `tracker-create` that compute outputs in Rust.
-    extra_outputs: Vec<((String, String), String)>,
+    pub(crate) extra_outputs: Vec<((String, String), String)>,
 }
 
 impl NodeOutcome {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self::default()
     }
 
@@ -74,6 +80,19 @@ impl NodeOutcome {
             extra_outputs: Vec::new(),
         }
     }
+}
+
+/// Wire format the per-sibling subprocess writes to
+/// `.fleet/sessions/<id>/fanout/<node-id>.outcome` so the driver
+/// can collect results from sibling tmux windows. Untagged-style
+/// enum (the file's either a successful outcome JSON or a failure
+/// record) keeps the format human-readable for debugging.
+#[allow(clippy::redundant_pub_crate)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub(crate) enum FanoutOutcome {
+    Ok(NodeOutcome),
+    Failed { message: String },
 }
 
 /// Trait-bound closure type for the clock. Boxed so a single executor can
@@ -729,7 +748,7 @@ impl WorkflowExecutor {
         Ok(())
     }
 
-    fn run_node(
+    pub(crate) fn run_node(
         &self,
         req: &ExecuteRequest<'_>,
         node: &Node,
@@ -901,6 +920,17 @@ impl WorkflowExecutor {
         } else {
             Vec::new()
         };
+        // When running as a fanout sibling subprocess, the per-
+        // sibling tmux dispatcher sets `FLEET_FANOUT_SIBLING` so we
+        // can disambiguate the devcontainer CLI container identity
+        // via `--id-label`. Without this, sibling A's `devcontainer
+        // up --remove-existing-container` would evict sibling B's
+        // container (they share the workspace-derived default
+        // identity). Non-fanout calls leave it `None` so behaviour
+        // for ordinary `fleet workflow run` is unchanged.
+        let id_label = std::env::var("FLEET_FANOUT_SIBLING")
+            .ok()
+            .map(|sib| format!("fleet-sibling={sib}"));
         let spec = ContainerSpec {
             image,
             workspace: req.workspace.to_path_buf(),
@@ -910,6 +940,7 @@ impl WorkflowExecutor {
             network: egress.network_name.clone(),
             dns: egress.dns_ip.clone(),
             extra_mounts,
+            id_label,
         };
         let container_id = req
             .adapter
@@ -981,10 +1012,7 @@ impl WorkflowExecutor {
                 Err(err) => Err(err),
             }
         } else {
-            let exec_opts = ExecOpts {
-                workdir: None,
-                env,
-            };
+            let exec_opts = ExecOpts { workdir: None, env };
             let exec_result = req.adapter.exec(&container_id, &agent.command, exec_opts);
             let log_text = match &exec_result {
                 Ok(h) => format!(
@@ -1452,24 +1480,37 @@ impl WorkflowExecutor {
 
         let log_path = self.node_log_path(req, session, &node.id);
 
-        let results: Vec<Result<NodeOutcome>> = std::thread::scope(|scope| {
-            // The `collect()` between spawn and join is deliberate, not
-            // wasteful: fusing the iterators would join each thread
-            // before spawning the next, serialising the slate. Suppress
-            // the needless-collect lint locally.
-            #[allow(clippy::needless_collect)]
-            let handles: Vec<_> = sibling_nodes
-                .iter()
-                .map(|sib| scope.spawn(|| self.run_node(req, sib, session, outputs, egress)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| match h.join() {
-                    Ok(r) => r,
-                    Err(panic) => Err(anyhow!("sibling thread panicked: {panic:?}")),
+        // Branch on tmux mode. Inside a `fleet workflow run
+        // --detached` pane, each sibling gets its own tmux window
+        // (and therefore its own PTY) — necessary because multiple
+        // interactive agents can't share one stdio. Outside tmux
+        // (CI / autonomous when not detached), the threadpool path
+        // is what we always had: lightweight, no extra processes.
+        let results: Vec<Result<NodeOutcome>> =
+            if std::env::var_os(crate::session::SESSION_TMUX_ENV).is_some() {
+                self.run_fanout_via_tmux_windows(req, &sibling_nodes, session)?
+            } else {
+                std::thread::scope(|scope| {
+                    // The `collect()` between spawn and join is deliberate, not
+                    // wasteful: fusing the iterators would join each thread
+                    // before spawning the next, serialising the slate. Suppress
+                    // the needless-collect lint locally.
+                    #[allow(clippy::needless_collect)]
+                    let handles: Vec<_> = sibling_nodes
+                        .iter()
+                        .map(|sib| {
+                            scope.spawn(|| self.run_node(req, sib, session, outputs, egress))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| match h.join() {
+                            Ok(r) => r,
+                            Err(panic) => Err(anyhow!("sibling thread panicked: {panic:?}")),
+                        })
+                        .collect()
                 })
-                .collect()
-        });
+            };
 
         let mut failed: Vec<(String, String)> = Vec::new();
         let mut aggregate = NodeOutcome::empty();
@@ -1517,6 +1558,168 @@ impl WorkflowExecutor {
                 log_path.display(),
             );
         }
+    }
+
+    /// Tmux-mode fanout dispatch. Each sibling gets its own tmux
+    /// window inside the worker session; the window's command is
+    /// `fleet workflow run-sibling --session-id <id> <node>`,
+    /// wrapped in a tiny bash so a non-zero exit code keeps the
+    /// window alive (via `sleep 600`) for forensic attach. The
+    /// driver polls each sibling's `.outcome` file and folds the
+    /// parsed `FanoutOutcome` back into the `Result<NodeOutcome>`
+    /// shape the surrounding aggregator expects.
+    fn run_fanout_via_tmux_windows(
+        &self,
+        req: &ExecuteRequest<'_>,
+        sibling_nodes: &[&Node],
+        session: &Session,
+    ) -> Result<Vec<Result<NodeOutcome>>> {
+        let tmux_session = std::env::var(crate::session::SESSION_TMUX_ENV)
+            .context("FLEET_TMUX_SESSION must be set in tmux-mode fanout dispatch")?;
+        let fleet_bin = std::env::current_exe()
+            .context("locating current fleet binary for sibling subprocesses")?;
+        let session_id_str = session.id.as_str().to_string();
+        let fanout_dir = req.store.session_dir(&session.id).join("fanout");
+        // Clear any prior `.outcome` files for this slate of
+        // siblings — re-running a fanout (replay) must not see
+        // stale outcomes.
+        std::fs::create_dir_all(&fanout_dir)
+            .with_context(|| format!("creating fanout dir at {}", fanout_dir.display()))?;
+        for sib in sibling_nodes {
+            let _ = std::fs::remove_file(fanout_dir.join(format!("{}.outcome", sib.id)));
+        }
+
+        // Pre-warm the devcontainer image once before fanning out.
+        // Without this, every sibling subprocess invokes
+        // `devcontainer up` in parallel — and the underlying
+        // `docker buildx --load` races on the final image export,
+        // with all but one sibling getting `ERROR: image "…":
+        // already exists`. Building serially in the driver ensures
+        // subsequent siblings hit the cached layers + tag.
+        // Non-fatal: a build failure here surfaces from the first
+        // sibling that runs anyway; we don't want a flaky probe to
+        // block the run, but we do want the happy path warmed.
+        if sibling_nodes
+            .iter()
+            .any(|n| matches!(n.kind, NodeKind::Agent { .. }))
+        {
+            if let Err(err) = req.adapter.ensure_image(req.devcontainer) {
+                tracing::warn!(
+                    error = %err,
+                    "pre-warming devcontainer image before fanout dispatch failed; \
+                     siblings will retry individually"
+                );
+            }
+        }
+
+        // Spawn one tmux window per sibling. Each window's command
+        // is a small bash wrapper:
+        //   fleet workflow run-sibling … ; rc=$?; if [ $rc -ne 0 ]; then sleep 600; fi
+        // Successful siblings exit quickly and their windows close
+        // by default; failed siblings hang on the sleep so the
+        // user can attach (`Ctrl+B <window-num>`) and inspect.
+        //
+        // Spawns are staggered slightly for agent siblings because
+        // multiple concurrent `devcontainer up` invocations race on
+        // `docker buildx --load`'s image export ("ERROR: image
+        // already exists"). A small inter-sibling delay lets each
+        // build finish its export before the next one starts; the
+        // node bodies still overlap (parallelism is preserved for
+        // the actual agent run, only the spawn ramp is serialised).
+        // Bash siblings skip the stagger — they don't touch the
+        // adapter / image at all.
+        let needs_stagger = sibling_nodes
+            .iter()
+            .any(|n| matches!(n.kind, NodeKind::Agent { .. }));
+        let stagger = if needs_stagger {
+            std::time::Duration::from_secs(4)
+        } else {
+            std::time::Duration::ZERO
+        };
+        for (idx, sib) in sibling_nodes.iter().enumerate() {
+            if idx > 0 && !stagger.is_zero() {
+                std::thread::sleep(stagger);
+            }
+            let sib = *sib;
+            let cmd_str = format!(
+                "{exe} workflow run-sibling --session-id {sid} {node}; \
+                 rc=$?; \
+                 if [ $rc -ne 0 ]; then echo; echo \"--- sibling exited $rc; keeping window alive for inspection (Ctrl+B & to close) ---\"; sleep 600; fi",
+                exe = shell_quote_value(&fleet_bin.display().to_string()),
+                sid = shell_quote_value(&session_id_str),
+                node = shell_quote_value(&sib.id),
+            );
+            let argv = vec!["bash".to_string(), "-c".to_string(), cmd_str];
+            // Same env_passthrough discipline as start_container —
+            // the sibling subprocess inherits the parent fleet
+            // process's env (so things like ANTHROPIC_API_KEY,
+            // PATH, HOME are present). Per-sibling tmux env
+            // (`-e FLEET_TMUX_SESSION=…`) keeps the run-sibling
+            // process aware of its own tmux context for breadcrumbs.
+            let env = vec![(
+                crate::session::SESSION_TMUX_ENV.to_string(),
+                tmux_session.clone(),
+            )];
+            crate::orchestrator::tmux::new_window(
+                self.invoker.as_ref(),
+                &tmux_session,
+                &sib.id,
+                &argv,
+                &env,
+            )
+            .with_context(|| format!("spawning tmux window for sibling `{}`", sib.id))?;
+        }
+
+        // Poll the outcome files. Sleep between checks at a cadence
+        // that's snappy when siblings finish quickly but not so
+        // tight it wastes CPU on long-running agents. No timeout —
+        // a hung sibling is a workflow-level problem the user
+        // resolves via attach + kill.
+        let mut results: Vec<Option<Result<NodeOutcome>>> =
+            (0..sibling_nodes.len()).map(|_| None).collect();
+        let mut pending: usize = sibling_nodes.len();
+        while pending > 0 {
+            // Honour interrupt requests so a parent Ctrl+C between
+            // nodes doesn't strand the driver in the poll loop.
+            if check_interrupt(req.interrupt_flag.as_ref()) {
+                bail!("user interrupted during fanout dispatch");
+            }
+            for (idx, sib) in sibling_nodes.iter().enumerate() {
+                if results[idx].is_some() {
+                    continue;
+                }
+                let path = fanout_dir.join(format!("{}.outcome", sib.id));
+                if !path.exists() {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let outcome: FanoutOutcome = serde_json::from_str(&body)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                let result = match outcome {
+                    FanoutOutcome::Ok(o) => Ok(o),
+                    FanoutOutcome::Failed { message } => Err(anyhow!(message)),
+                };
+                let succeeded = result.is_ok();
+                results[idx] = Some(result);
+                pending -= 1;
+                // Close the window for a clean exit. Failed
+                // windows are left alive — the trailing `sleep
+                // 600` in the wrapper keeps them open even though
+                // run-sibling itself has exited.
+                if succeeded {
+                    let _ = crate::orchestrator::tmux::kill_window(
+                        self.invoker.as_ref(),
+                        &tmux_session,
+                        &sib.id,
+                    );
+                }
+            }
+            if pending > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+        Ok(results.into_iter().map(Option::unwrap).collect())
     }
 
     fn node_log_path(&self, req: &ExecuteRequest<'_>, session: &Session, node_id: &str) -> PathBuf {
@@ -2109,7 +2312,10 @@ fn node_kind_word(kind: &NodeKind) -> &'static str {
 /// Flatten the session's persisted nested outputs map into the
 /// in-memory [`OutputMap`] the executor's expression engine consumes.
 /// Pure; tests assert the round-trip with [`outputs_to_persisted`].
-fn outputs_from_persisted(persisted: &BTreeMap<String, BTreeMap<String, String>>) -> OutputMap {
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn outputs_from_persisted(
+    persisted: &BTreeMap<String, BTreeMap<String, String>>,
+) -> OutputMap {
     let mut out = HashMap::new();
     for (node_id, names) in persisted {
         for (name, value) in names {
@@ -2341,6 +2547,50 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("gh_token"), "msg: {msg}");
         assert!(msg.contains("env"), "msg: {msg}");
+    }
+
+    #[test]
+    fn fanout_outcome_round_trips_ok_variant_through_json() {
+        // Pins the wire format the `run-sibling` subprocess writes
+        // and the parent driver reads. Drift here would silently
+        // break stage-3 fanout dispatch.
+        let outcome = NodeOutcome {
+            node_costs: vec![("sib_a".to_string(), 0.12)],
+            extra_outputs: vec![(
+                ("sib_a".to_string(), "created_id".to_string()),
+                "42".to_string(),
+            )],
+        };
+        let wire = FanoutOutcome::Ok(outcome.clone());
+        let json = serde_json::to_string(&wire).unwrap();
+        // Tag is on the outer object.
+        assert!(json.contains("\"kind\":\"ok\""), "json: {json}");
+        // Round-trip.
+        let parsed: FanoutOutcome = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FanoutOutcome::Ok(p) => {
+                assert_eq!(p.node_costs, outcome.node_costs);
+                assert_eq!(p.extra_outputs, outcome.extra_outputs);
+            }
+            FanoutOutcome::Failed { .. } => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn fanout_outcome_round_trips_failed_variant_through_json() {
+        let wire = FanoutOutcome::Failed {
+            message: "agent exited with code 1".to_string(),
+        };
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains("\"kind\":\"failed\""), "json: {json}");
+        assert!(json.contains("agent exited with code 1"), "json: {json}");
+        let parsed: FanoutOutcome = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FanoutOutcome::Failed { message } => {
+                assert_eq!(message, "agent exited with code 1");
+            }
+            FanoutOutcome::Ok(_) => panic!("expected Failed"),
+        }
     }
 
     fn sample_devcontainer() -> Devcontainer {

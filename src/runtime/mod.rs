@@ -122,6 +122,16 @@ pub struct ContainerSpec {
     /// adapters that go through the devcontainer CLI; adapters without
     /// container isolation (Local) ignore the field.
     pub extra_mounts: Vec<MountSpec>,
+    /// Optional `--id-label name=value` for the devcontainer CLI's
+    /// container identity. Without it, the CLI derives identity
+    /// from the workspace path — which makes `--remove-existing-
+    /// container` kill any sibling whose workspace matches, even
+    /// when the siblings *want* parallel containers (fanout-of-
+    /// agents). Setting a per-sibling id-label disambiguates so
+    /// each sibling owns its own container. `None` = use the
+    /// CLI's default (workspace-derived) identity, which is what
+    /// every non-fanout caller wants.
+    pub id_label: Option<String>,
 }
 
 /// A single host-to-container bind mount. Read-only is opt-in because

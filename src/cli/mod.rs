@@ -194,6 +194,26 @@ pub enum WorkflowSub {
     /// the gate.
     Resume { session: String },
 
+    /// Internal subcommand used by the tmux-windows fanout
+    /// dispatcher to run a single node in its own tmux window.
+    /// Loads the session + workflow, runs the named node via the
+    /// executor's `run_node`, writes a `FanoutOutcome` JSON file
+    /// to `.fleet/sessions/<id>/fanout/<node>.outcome`, exits.
+    /// Hidden from `--help` since it's never invoked directly by
+    /// users — the executor spawns it as the command for each
+    /// fanout sibling's tmux window.
+    #[command(hide = true)]
+    RunSibling {
+        /// Session id (the parent fanout's owning session). The
+        /// session must already exist on disk; this subcommand
+        /// doesn't mint one.
+        #[arg(long)]
+        session_id: String,
+        /// Node id to run. Must be one of the sibling nodes of a
+        /// fanout in the session's workflow.
+        node: String,
+    },
+
     /// Replay a prior session from a chosen node. Mints a new session,
     /// copies the source session's artifacts/ into it, and runs the
     /// workflow starting at `--rerun-from` (continues to the end) or
@@ -509,6 +529,9 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 detached,
             } => workflow::run_run(&name, issue.as_deref(), session_id.as_deref(), detached),
             WorkflowSub::Resume { session } => workflow::run_resume(&session),
+            WorkflowSub::RunSibling { session_id, node } => {
+                workflow::run_sibling(&session_id, &node)
+            }
             WorkflowSub::Replay {
                 session,
                 rerun_from,

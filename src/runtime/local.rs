@@ -317,6 +317,7 @@ mod tests {
             network: None,
             dns: None,
             extra_mounts: vec![],
+            id_label: None,
         }
     }
 

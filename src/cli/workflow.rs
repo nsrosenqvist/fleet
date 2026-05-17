@@ -355,6 +355,134 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
     Ok(i32::from(resumed.state != SessionState::Completed))
 }
 
+/// Internal CLI entry: `fleet workflow run-sibling --session-id
+/// <id> <node>`. Spawned by [`crate::workflow::executor::WorkflowExecutor::run_fanout_node`]
+/// as the command for each per-sibling tmux window. Runs a single
+/// node body in this subprocess, then writes a `FanoutOutcome`
+/// JSON record to `.fleet/sessions/<id>/fanout/<node>.outcome` so
+/// the driver process can pick up the result.
+///
+/// Exit code: 0 when the node body returned `Ok`, 1 otherwise.
+/// The driver doesn't actually read the exit code — it polls the
+/// outcome file — but the code is still meaningful for users who
+/// invoke `run-sibling` manually for forensics.
+pub fn run_sibling(session_id: &str, node_id: &str) -> Result<i32> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let config =
+        RepoConfig::load(root.join(".fleet/config.yaml")).context("loading .fleet/config.yaml")?;
+
+    let store = SessionStore::for_repo(&root);
+    let sid = SessionId::new(session_id);
+    let session = store
+        .load(&sid)
+        .with_context(|| format!("loading session `{session_id}`"))?;
+
+    let wf_path = workflow_path(&root, &session.workflow);
+    let wf = Workflow::from_path(&wf_path).with_context(|| {
+        format!(
+            "loading workflow `{}` for sibling `{node_id}`",
+            session.workflow
+        )
+    })?;
+    let node = wf
+        .node(node_id)
+        .ok_or_else(|| anyhow!("workflow `{}` has no node `{node_id}`", session.workflow))?;
+
+    let dc_path = if config.runtime.devcontainer.is_absolute() {
+        config.runtime.devcontainer.clone()
+    } else {
+        root.join(&config.runtime.devcontainer)
+    };
+    let devcontainer = Devcontainer::from_path(&dc_path)
+        .with_context(|| format!("loading devcontainer at {}", dc_path.display()))?;
+
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+    let report = probe(invoker.as_ref());
+    let adapter = build_adapter(&config.runtime, &report, Arc::clone(&invoker))?;
+
+    // Workspace: same as the driver — the per-session worktree if
+    // it exists, the repo root otherwise. Matches `resume`'s
+    // fallback policy.
+    let workspace_path: PathBuf = match session.worktree_path.as_deref() {
+        Some(p) if p.is_dir() => p.to_path_buf(),
+        _ => root.clone(),
+    };
+
+    let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
+    let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
+    let executor = crate::workflow::executor::WorkflowExecutor::new(Arc::clone(&invoker))
+        .with_tracker(tracker);
+    let req = ExecuteRequest {
+        workflow: &wf,
+        adapter: adapter.as_ref(),
+        agents: &config.agents.registry,
+        store: &store,
+        devcontainer: &devcontainer,
+        workspace: &workspace_path,
+        session_id: sid,
+        // Inherit the parent run's issue context so `FLEET_ISSUE_*`
+        // is consistent across sibling subprocesses.
+        issue: session.issue.clone(),
+        // Worktree was provisioned by the parent run; siblings
+        // don't re-stamp.
+        worktree: None,
+        cost: &config.cost,
+        egress: enforcer.as_ref(),
+        // Siblings don't install their own SIGINT handler — a
+        // Ctrl+C in the parent driver's pane propagates through
+        // the tmux session and reaches every window.
+        interrupt_flag: None,
+        secrets: &config.secrets,
+    };
+
+    // Hydrate the parent's outputs map so `when:` predicates and
+    // `extract_outputs` references against upstream nodes resolve.
+    let outputs = crate::workflow::executor::outputs_from_persisted(&session.outputs);
+    // Signal to the executor that this run is a fanout sibling —
+    // the agent-node path reads this env var to add an `--id-label`
+    // to `devcontainer up` so concurrent siblings get distinct
+    // container identities (avoids `--remove-existing-container`
+    // sibling-eviction races).
+    // SAFETY: env mutation is process-global, but this is a fresh
+    // subprocess (the `run-sibling` invocation) so nothing else in
+    // the address space is concurrent with the set_var call.
+    unsafe { std::env::set_var("FLEET_FANOUT_SIBLING", node_id) };
+    let egress_setup = req.egress.setup(req.session_id.as_str())?;
+    let outcome_result = executor.run_node(&req, node, &session, &outputs, &egress_setup);
+    if let Err(err) = req.egress.teardown(&egress_setup) {
+        tracing::warn!(error = %err, "egress teardown after run-sibling failed");
+    }
+
+    let outcome_path = root
+        .join(".fleet")
+        .join("sessions")
+        .join(session_id)
+        .join("fanout")
+        .join(format!("{node_id}.outcome"));
+    if let Some(parent) = outcome_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating fanout outcome dir at {}", parent.display()))?;
+    }
+    let (wire, exit_code) = match &outcome_result {
+        Ok(outcome) => (
+            crate::workflow::executor::FanoutOutcome::Ok(outcome.clone()),
+            0,
+        ),
+        Err(err) => (
+            crate::workflow::executor::FanoutOutcome::Failed {
+                message: format!("{err:#}"),
+            },
+            1,
+        ),
+    };
+    let body =
+        serde_json::to_string_pretty(&wire).with_context(|| "serialising sibling outcome")?;
+    std::fs::write(&outcome_path, body)
+        .with_context(|| format!("writing {}", outcome_path.display()))?;
+    Ok(exit_code)
+}
+
 /// CLI entry point for
 /// `fleet workflow replay <session> --rerun-from <node> | --rerun-only <node>`.
 /// Mints a new session whose workflow is read off the source session's

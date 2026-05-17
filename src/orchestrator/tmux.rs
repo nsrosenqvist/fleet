@@ -224,6 +224,111 @@ pub fn list_session_names(invoker: &dyn ProcessInvoker) -> Result<Vec<String>> {
     }
 }
 
+/// `tmux new-window -t <session> -n <window> [-e KEY=VAL]… --
+/// <command…>`. Adds a window to an *existing* session; used by
+/// the workflow executor's fanout dispatcher to give each sibling
+/// its own pty so parallel interactive agents don't collide on
+/// stdio.
+///
+/// `command` is the argv tmux will exec inside the new window;
+/// `env` is per-window env (the `-e` flags). Returns `Ok(())` once
+/// tmux acknowledges window creation — the inner process may still
+/// be initialising.
+pub fn new_window(
+    invoker: &dyn ProcessInvoker,
+    session_name: &str,
+    window_name: &str,
+    command: &[String],
+    env: &[(String, String)],
+) -> Result<()> {
+    if command.is_empty() {
+        bail!("tmux new_window needs at least the program name in `command`");
+    }
+    let mut argv = vec![
+        "new-window".to_string(),
+        "-t".to_string(),
+        session_name.to_string(),
+        "-n".to_string(),
+        window_name.to_string(),
+    ];
+    for (k, v) in env {
+        argv.push("-e".to_string());
+        argv.push(format!("{k}={v}"));
+    }
+    argv.push("--".to_string());
+    argv.extend(command.iter().cloned());
+    invoker
+        .run("tmux", argv)
+        .with_context(|| format!("`tmux new-window -t {session_name} -n {window_name}` failed"))?;
+    Ok(())
+}
+
+/// `tmux kill-window -t <session>:<window>`. Idempotent — a missing
+/// window is not an error. Used after a fanout sibling completes
+/// successfully so the user's session collapses back to the
+/// driver's window for downstream nodes.
+pub fn kill_window(
+    invoker: &dyn ProcessInvoker,
+    session_name: &str,
+    window_name: &str,
+) -> Result<()> {
+    let target = format!("{session_name}:{window_name}");
+    let result = invoker.run(
+        "tmux",
+        vec!["kill-window".to_string(), "-t".to_string(), target.clone()],
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let msg = format!("{err:#}");
+            if is_missing_window_error(&msg) {
+                Ok(())
+            } else {
+                Err(err.context(format!("`tmux kill-window -t {target}` failed")))
+            }
+        }
+    }
+}
+
+/// Tmux's "no such window" wording. Matches both per-name and
+/// per-id variants; lowercased before substring-match for
+/// resilience against locale tweaks.
+#[must_use]
+fn is_missing_window_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("can't find window") || lower.contains("window not found")
+}
+
+/// `tmux set-option -t <session> remain-on-exit on`. Default tmux
+/// behaviour kills a window when its first-pane command exits;
+/// turning this on at session creation keeps failed-sibling
+/// windows visible for inspection. The fanout dispatcher kills
+/// successful sibling windows itself, so the live remainder is
+/// always intentional.
+#[allow(dead_code)] // reserved for a future "keep all sibling windows alive" mode
+pub fn set_remain_on_exit(
+    invoker: &dyn ProcessInvoker,
+    session_name: &str,
+    enabled: bool,
+) -> Result<()> {
+    let value = if enabled { "on" } else { "off" };
+    invoker
+        .run(
+            "tmux",
+            vec![
+                "set-option".to_string(),
+                "-t".to_string(),
+                session_name.to_string(),
+                "remain-on-exit".to_string(),
+                value.to_string(),
+            ],
+        )
+        .with_context(|| {
+            format!("`tmux set-option -t {session_name} remain-on-exit {value}` failed")
+        })?;
+    Ok(())
+}
+
 /// `tmux display-message -p -t <name> '#{pid}'` → the tmux server
 /// pid. Reserved for the orchestrator reaper (detect a dead tmux
 /// server and mark the session Closed without leaving stale meta
@@ -510,5 +615,105 @@ mod tests {
         )]);
         let err = server_pid_for(invoker.as_ref(), "s").unwrap_err();
         assert!(format!("{err:#}").contains("not-a-number"));
+    }
+
+    #[test]
+    fn new_window_argv_includes_session_and_window_name() {
+        let invoker = invoker_with(vec![(
+            "tmux",
+            vec![
+                "new-window".to_string(),
+                "-t".to_string(),
+                "fleet-s-1".to_string(),
+                "-n".to_string(),
+                "sib-a".to_string(),
+                "--".to_string(),
+                "bash".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string(),
+            ],
+            String::new(),
+        )]);
+        new_window(
+            invoker.as_ref(),
+            "fleet-s-1",
+            "sib-a",
+            &["bash".to_string(), "-c".to_string(), "echo hi".to_string()],
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn new_window_argv_threads_env_pairs_as_dash_e_flags() {
+        let invoker = invoker_with(vec![(
+            "tmux",
+            vec![
+                "new-window".to_string(),
+                "-t".to_string(),
+                "fleet-s-2".to_string(),
+                "-n".to_string(),
+                "sib-b".to_string(),
+                "-e".to_string(),
+                "FLEET_SIBLING=sib-b".to_string(),
+                "--".to_string(),
+                "sleep".to_string(),
+                "0".to_string(),
+            ],
+            String::new(),
+        )]);
+        new_window(
+            invoker.as_ref(),
+            "fleet-s-2",
+            "sib-b",
+            &["sleep".to_string(), "0".to_string()],
+            &[("FLEET_SIBLING".to_string(), "sib-b".to_string())],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn new_window_rejects_empty_command() {
+        let invoker = invoker_with(vec![]);
+        let err = new_window(invoker.as_ref(), "s", "w", &[], &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("program name"));
+    }
+
+    #[test]
+    fn kill_window_is_idempotent_for_missing_window() {
+        // Tmux's "can't find window" wording must collapse to an Ok
+        // for the dispatcher's clean-up pass — re-killing an
+        // already-gone sibling window is a routine occurrence.
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run()
+            .returning(|_, _| Err(anyhow!("can't find window: sib-a")));
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(mock);
+        kill_window(invoker.as_ref(), "fleet-s-1", "sib-a").unwrap();
+    }
+
+    #[test]
+    fn kill_window_propagates_unexpected_errors() {
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run()
+            .returning(|_, _| Err(anyhow!("disk full")));
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(mock);
+        let err = kill_window(invoker.as_ref(), "fleet-s-1", "sib-a").unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"));
+    }
+
+    #[test]
+    fn set_remain_on_exit_emits_set_option_argv() {
+        let invoker = invoker_with(vec![(
+            "tmux",
+            vec![
+                "set-option".to_string(),
+                "-t".to_string(),
+                "fleet-s-1".to_string(),
+                "remain-on-exit".to_string(),
+                "on".to_string(),
+            ],
+            String::new(),
+        )]);
+        set_remain_on_exit(invoker.as_ref(), "fleet-s-1", true).unwrap();
     }
 }

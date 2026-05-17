@@ -80,6 +80,11 @@ pub struct UpRequest<'a> {
     /// [`MountSpec::to_mount_arg`]. Adapters thread this through from
     /// `ContainerSpec.extra_mounts`.
     pub extra_mounts: &'a [MountSpec],
+    /// Optional `--id-label name=value` for container identity.
+    /// See [`crate::runtime::ContainerSpec::id_label`] for the
+    /// fanout-siblings use case. `None` lets the CLI derive
+    /// identity from the workspace path (the historical default).
+    pub id_label: Option<&'a str>,
 }
 
 /// Typed wrapper around `devcontainer build/up/exec`. Stateless: every call
@@ -174,6 +179,16 @@ impl DevcontainerCli {
             "--docker-path".to_string(),
             self.engine.binary().to_string(),
         ];
+        // Per-sibling container identity for fanout. The CLI uses
+        // `--id-label` for both "create a container with this
+        // label" and "remove any prior container with this label
+        // (under --remove-existing-container)". Without it,
+        // siblings share the workspace-derived identity and
+        // accidentally evict each other.
+        if let Some(label) = req.id_label {
+            args.push("--id-label".to_string());
+            args.push(label.to_string());
+        }
         if let Some(cfg) = req.config {
             args.push("--config".to_string());
             args.push(cfg.display().to_string());
@@ -492,6 +507,7 @@ mod tests {
             env: &env,
             extra_run_args: &extra,
             extra_mounts: &[],
+            id_label: None,
         };
         let id = cli.up(&req).unwrap();
         assert_eq!(id.as_str(), "abc123");
@@ -540,6 +556,7 @@ mod tests {
             env: &[],
             extra_run_args: &[],
             extra_mounts: &extra_mounts,
+            id_label: None,
         };
         cli.up(&req).unwrap();
     }
@@ -567,6 +584,7 @@ mod tests {
             env: &[],
             extra_run_args: &[],
             extra_mounts: &[],
+            id_label: None,
         };
         cli.up(&req).unwrap();
     }
@@ -584,6 +602,7 @@ mod tests {
             env: &[],
             extra_run_args: &[],
             extra_mounts: &[],
+            id_label: None,
         };
         let err = cli.up(&req).unwrap_err();
         assert!(format!("{err}").contains("non-success outcome"));

@@ -149,6 +149,7 @@ impl RuntimeAdapter for PodmanAdapter {
             env: &spec.env,
             extra_run_args: &extra,
             extra_mounts: &spec.extra_mounts,
+            id_label: spec.id_label.as_deref(),
         };
         let id = self.cli.up(&req)?;
         let mut guard = self
@@ -341,6 +342,7 @@ mod tests {
             network: None,
             dns: None,
             extra_mounts: vec![],
+            id_label: None,
         }
     }
 
