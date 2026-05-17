@@ -9,7 +9,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap,
+};
 
 use crate::orchestrator::{OrchestratorSession, OrchestratorState};
 use crate::plans::{Plan, PlanItemState, PlanState};
@@ -331,7 +333,10 @@ fn render_spawn(f: &mut Frame<'_>, area: Rect, state: &AppState) {
                 .bg(SELECT_BG)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▸ ")
+        // Reserve the cursor column on every row so the list doesn't
+        // shift right when the user Tabs in and the symbol appears.
+        .highlight_spacing(HighlightSpacing::Always);
     let mut list_state = state.spawn_list_state.clone();
     f.render_stateful_widget(list, area, &mut list_state);
 }
@@ -378,7 +383,10 @@ fn render_plans_sidebar(f: &mut Frame<'_>, area: Rect, state: &AppState) {
                 .bg(SELECT_BG)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▸ ")
+        // Reserve the cursor column on every row so the list doesn't
+        // shift right when the user Tabs in and the symbol appears.
+        .highlight_spacing(HighlightSpacing::Always);
     let mut list_state = state.plans_list_state.clone();
     f.render_stateful_widget(list, area, &mut list_state);
 }
@@ -461,7 +469,10 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .add_modifier(Modifier::BOLD);
     let list = List::new(item_lines)
         .highlight_style(highlight)
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▸ ")
+        // Reserve the cursor column on every row so the list doesn't
+        // shift right when the user Tabs in and the symbol appears.
+        .highlight_spacing(HighlightSpacing::Always);
     let mut item_cursor = state.plans_items_state.clone();
     if state.plans_focus != PlansFocus::Items {
         // Show no highlight when the user has Tab'd back to the
@@ -1046,7 +1057,10 @@ fn render_workflow_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
     let list = List::new(items)
         .highlight_style(highlight)
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▸ ")
+        // Reserve the cursor column on every row so the list doesn't
+        // shift right when the user Tabs in and the symbol appears.
+        .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, area, &mut state.list_state.clone());
 }
 
@@ -1081,7 +1095,10 @@ fn render_orchestrator_list(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
     let list = List::new(vec![item])
         .highlight_style(highlight)
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▸ ")
+        // Reserve the cursor column on every row so the list doesn't
+        // shift right when the user Tabs in and the symbol appears.
+        .highlight_spacing(HighlightSpacing::Always);
     // Cursor is always at row 0 (the one row). Cloning the state's
     // ListState keeps any pre-existing selection in sync.
     let mut cursor = state.orchestrators_list_state.clone();
