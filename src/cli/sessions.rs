@@ -106,6 +106,42 @@ pub fn run_logs(id: &str, node: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
+/// CLI entry point for `fleet sessions attach <id>`. Resolves the
+/// session's tmux pane (`fleet-<id>`), runs the shared bash attach
+/// script — same styled status bar with `ctrl+b d to detach` the
+/// orchestrator uses — and `exec tmux attach`s into it. Errors
+/// clearly when the pane is gone (workflow exited or was never
+/// detached). Doesn't require a TUI to be running — scripted users
+/// can `fleet workflow run --detached … | xargs fleet sessions
+/// attach`.
+pub fn run_attach(id: &str) -> Result<i32> {
+    let store = open_store()?;
+    let session_id = SessionId::new(id);
+    // Load the session record up-front to give a clearer error than
+    // "tmux pane gone" when the user typo's an id. We don't need
+    // anything from the record beyond confirming it exists.
+    let _ = store
+        .load(&session_id)
+        .with_context(|| format!("loading session `{id}`"))?;
+
+    let tmux_name = crate::session::worker_tmux_name(&session_id);
+    let invoker = RealProcessInvoker;
+    crate::orchestrator::tmux::probe(&invoker)?;
+    if !crate::orchestrator::tmux::has_session(&invoker, &tmux_name) {
+        bail!(
+            "session `{id}` has no live tmux pane `{tmux_name}` — was it spawned with \
+             `fleet workflow run --detached`? Foreground / pre-stage-2 runs can't be attached to."
+        );
+    }
+
+    let script = crate::cli::orchestrator::build_attach_script(&tmux_name);
+    let status = std::process::Command::new("bash")
+        .args(["-c", &script])
+        .status()
+        .with_context(|| format!("running attach script for `{tmux_name}`"))?;
+    Ok(status.code().unwrap_or(0))
+}
+
 /// CLI entry point for `fleet sessions reap`. Returns 0 regardless of
 /// how many sessions were reaped — reaping is recovery, not a failure
 /// signal. Exit non-zero only when the sweep itself errors (e.g. the
@@ -623,8 +659,16 @@ pub fn render_session_show(session: &Session, store: &SessionStore, logs: &[Path
         "  current node: {}",
         session.current_node.as_deref().unwrap_or("-")
     );
-    let _ = writeln!(out, "  created (ms): {}", session.created_at_ms);
-    let _ = writeln!(out, "  updated (ms): {}", session.updated_at_ms);
+    let _ = writeln!(
+        out,
+        "  created:      {}",
+        crate::tui::format_epoch_ms(session.created_at_ms)
+    );
+    let _ = writeln!(
+        out,
+        "  updated:      {}",
+        crate::tui::format_epoch_ms(session.updated_at_ms)
+    );
     let _ = writeln!(
         out,
         "  directory:    {}",

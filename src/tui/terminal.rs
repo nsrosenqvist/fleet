@@ -139,7 +139,7 @@ fn drive(
                         // refresh thread to re-pin to the output
                         // sub-pane's dims on its next tick so the
                         // preview doesn't show wrap-broken lines.
-                        state.request_orchestrator_repin();
+                        state.request_focused_repin();
                         // Meta may have flipped to Active/Detached/
                         // Closed on detach; reload so the sidebar
                         // marker is current.
@@ -155,6 +155,20 @@ fn drive(
                         // directly.
                         if let Err(err) = run_suspended(terminal, std::path::Path::new(exe), args) {
                             state.status_line = format!(" {exe} failed: {err:#} ");
+                        }
+                    }
+                    Action::AttachWorker { tmux_name } => {
+                        // Suspend → run the same styled-status-bar
+                        // attach script the orchestrator uses → on
+                        // detach, repin the focused window. Same
+                        // shape as `OpenOrchestrator`; only the tmux
+                        // target name differs.
+                        if let Err(err) = run_attach_script(terminal, &tmux_name) {
+                            state.status_line = format!(" attach failed: {err:#} ");
+                        }
+                        state.request_focused_repin();
+                        if let Err(err) = state.reload(store) {
+                            state.status_line = format!(" reload failed: {err:#} ");
                         }
                     }
                 }
@@ -185,6 +199,36 @@ fn drive(
 /// [`std::env::current_exe`] so cargo-run and release installs both
 /// work) and for the tracker TUIs (`git-bug termui`, `gh dash`,
 /// resolved from PATH).
+/// Suspend the TUI and run the orchestrator's bash attach script
+/// against `tmux_name`. The script sets the styled status bar with
+/// the detach hint, then `exec tmux attach` — same dance as `fleet
+/// orchestrator` uses, just parametrised over the tmux session name
+/// so workers can reuse it.
+fn run_attach_script(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    tmux_name: &str,
+) -> Result<()> {
+    let script = crate::cli::orchestrator::build_attach_script(tmux_name);
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+
+    let result = std::process::Command::new("bash")
+        .args(["-c", &script])
+        .status()
+        .with_context(|| format!("running attach script for `{tmux_name}`"));
+
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = enable_raw_mode();
+    let _ = terminal.clear();
+
+    let status = result?;
+    if !status.success() {
+        bail!("tmux attach -t {tmux_name} exited with {status}");
+    }
+    Ok(())
+}
+
 fn run_suspended(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     exe: &Path,

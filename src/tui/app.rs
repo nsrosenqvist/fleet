@@ -16,11 +16,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-use super::refresh::{self, RefreshCommand, RefreshUpdate};
+use super::refresh::{self, FocusedTarget, RefreshCommand, RefreshInputs, RefreshUpdate};
 use crate::autonomous;
 use crate::orchestrator::OrchestratorSession;
 use crate::orchestrator::store::OrchestratorStore;
@@ -33,7 +32,7 @@ use crate::runtime::Capabilities;
 use crate::runtime::detect::probe;
 use crate::runtime::factory::build_adapter;
 use crate::session::store::SessionStore;
-use crate::session::{Session, SessionState, now_ms};
+use crate::session::{Session, SessionId, SessionState, now_ms};
 
 /// How many lines of the most-recently-modified log file to show in the
 /// detail pane.
@@ -106,18 +105,22 @@ pub(super) struct AppState {
     /// session, refreshed by the background thread in
     /// [`super::refresh`]. `None` while the session doesn't exist or
     /// the first tick hasn't completed yet — the renderer falls back
-    /// to a muted placeholder. Stays None for non-orchestrator
-    /// selections (workers don't run in tmux; their preview source is
-    /// `log_tail`).
+    /// to a muted placeholder.
     pub(super) orchestrator_pane: Option<String>,
 
-    /// Inner dimensions of the output sub-pane from the last render,
-    /// packed as `(w << 16) | h`. The renderer writes this on every
-    /// draw; the refresh thread reads it to pin the orchestrator's
-    /// tmux window so its output lays out at the panel width. Atomic
-    /// (rather than `Cell`) because the read happens from a separate
-    /// thread.
-    pub(super) pane_size: Arc<AtomicU32>,
+    /// Per-worker `tmux capture-pane` snapshots, keyed by session id.
+    /// Populated by the refresh thread for sessions launched with
+    /// `--detached` (i.e. wrapped in a `fleet-<id>` tmux session); the
+    /// worker-output renderer prefers this over the static log-tail
+    /// when present. Evicted (set to `None` or removed) when the
+    /// tmux session goes away — capture-pane errors flow back as
+    /// `WorkerPane { output: None }`.
+    pub(super) worker_panes: std::collections::HashMap<SessionId, String>,
+
+    /// Shared refresh-thread inputs (panel size, worker target list,
+    /// focused target). Cloned into the thread on spawn; the UI
+    /// writes through this same handle to publish state.
+    pub(super) refresh_inputs: RefreshInputs,
 
     /// Refresh-thread plumbing. `Option` so we can take ownership at
     /// shutdown without unsafe. None outside an active event loop —
@@ -348,6 +351,14 @@ pub(super) enum Action {
         exe: &'static str,
         args: &'static [&'static str],
     },
+    /// Attach to a worker session's tmux pane. Triggered by Enter on
+    /// a worker row whose tmux session is live (i.e. it was launched
+    /// with `--detached`). Payload is the tmux session name
+    /// (`fleet-<id>`) so the event loop can run the attach script
+    /// without re-deriving it.
+    AttachWorker {
+        tmux_name: String,
+    },
 }
 
 /// Resolved snapshot for the doctor pane.
@@ -420,7 +431,8 @@ impl AppState {
             focused_issue_cache: std::collections::HashMap::new(),
             pending_spawn: None,
             orchestrator_pane: None,
-            pane_size: Arc::new(AtomicU32::new(0)),
+            worker_panes: std::collections::HashMap::new(),
+            refresh_inputs: RefreshInputs::default(),
             refresh_cmd_tx: None,
             refresh_update_rx: None,
             refresh_handle: None,
@@ -476,18 +488,26 @@ impl AppState {
         self.cycle_nodes = crate::deps::nodes_in_cycle(&doc);
         self.deps_doc = doc;
         self.status_line = super::ui::render_status_line(&self.sessions, &self.plans);
+        // Sessions may have appeared / disappeared on reload, so the
+        // worker target list the refresh thread polls needs to track.
+        self.publish_refresh_inputs();
         Ok(())
     }
 
     /// Start the background refresh thread that polls `tmux
-    /// capture-pane` against the orchestrator session. Called once
-    /// from [`super::terminal::run`] after `AppState::new`; tests
-    /// skip this so they don't shell out to tmux.
+    /// capture-pane` against the orchestrator + every active worker.
+    /// Called once from [`super::terminal::run`] after
+    /// `AppState::new`; tests skip this so they don't shell out to
+    /// tmux.
     pub(super) fn spawn_refresh_thread(&mut self) {
-        let (cmd_tx, update_rx, handle) = refresh::spawn(Arc::clone(&self.pane_size));
+        let (cmd_tx, update_rx, handle) = refresh::spawn(self.refresh_inputs.clone());
         self.refresh_cmd_tx = Some(cmd_tx);
         self.refresh_update_rx = Some(update_rx);
         self.refresh_handle = Some(handle);
+        // Publish the initial worker target list + focused target so
+        // the first tick lines up with the current sidebar state
+        // (workers loaded by `reload`, focus set by the constructor).
+        self.publish_refresh_inputs();
     }
 
     /// Tell the refresh thread to exit and join it. Called from the
@@ -505,20 +525,57 @@ impl AppState {
     }
 
     /// Bump the "re-pin window size" flag on the refresh thread.
-    /// Called by the event loop after the user detaches from the
-    /// orchestrator: the attach script flipped tmux to
-    /// `window-size latest`, so the window now matches the host
-    /// terminal — not our narrower output sub-pane. The next refresh
-    /// tick re-pins to panel dims before capturing.
-    pub(super) fn request_orchestrator_repin(&self) {
+    /// Called by the event loop after the user detaches from a tmux
+    /// session: the attach script flipped tmux to `window-size latest`,
+    /// so the window now matches the host terminal — not our
+    /// narrower output sub-pane. The next refresh tick re-pins to
+    /// panel dims before capturing.
+    pub(super) fn request_focused_repin(&self) {
         if let Some(tx) = self.refresh_cmd_tx.as_ref() {
             let _ = tx.send(RefreshCommand::Repin);
         }
     }
 
+    /// Push the current worker session list + focused target down to
+    /// the refresh thread. Called by `reload` (when the sidebar
+    /// changes) and by focus-change handlers (Tab, j/k that swap
+    /// panes).
+    pub(super) fn publish_refresh_inputs(&self) {
+        // Worker targets: every session whose tmux pane is alive (i.e.
+        // it was launched with `--detached`). We can't `tmux
+        // has-session` from the UI thread every reload without a
+        // visible stall, so the refresh thread itself treats
+        // capture-pane errors as "pane gone" and emits a None body.
+        // Here we just publish every non-terminal session — the
+        // thread filters in flight.
+        let workers: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|s| !s.state.is_terminal())
+            .map(|s| s.id.clone())
+            .collect();
+        if let Ok(mut g) = self.refresh_inputs.worker_targets.lock() {
+            *g = workers;
+        }
+        if let Ok(mut g) = self.refresh_inputs.focused.write() {
+            *g = self.focused_target();
+        }
+    }
+
+    /// What the right-pane preview is currently showing. Drives the
+    /// refresh thread's "which window do I resize?" decision.
+    pub(super) fn focused_target(&self) -> FocusedTarget {
+        match self.sessions_focus {
+            SessionsFocus::Orchestrator => FocusedTarget::Orchestrator,
+            SessionsFocus::Workflows => self
+                .selected()
+                .map_or(FocusedTarget::None, |s| FocusedTarget::Worker(s.id.clone())),
+        }
+    }
+
     /// Drain any refresh-thread updates that have arrived since the
-    /// last tick. Mutates the orchestrator pane snapshot in place;
-    /// the renderer reads it on the next draw.
+    /// last tick. Mutates the per-target pane snapshots in place;
+    /// the renderer reads them on the next draw.
     pub(super) fn drain_refresh_updates(&mut self) {
         let Some(rx) = self.refresh_update_rx.as_ref() else {
             return;
@@ -528,6 +585,14 @@ impl AppState {
                 RefreshUpdate::OrchestratorPane(snapshot) => {
                     self.orchestrator_pane = snapshot;
                 }
+                RefreshUpdate::WorkerPane { session_id, output } => match output {
+                    Some(body) => {
+                        self.worker_panes.insert(session_id, body);
+                    }
+                    None => {
+                        self.worker_panes.remove(&session_id);
+                    }
+                },
             }
         }
     }
@@ -728,7 +793,7 @@ impl AppState {
                     // can spawn the orchestrator from here directly.
                     return Action::OpenOrchestrator;
                 }
-                Action::None
+                self.enter_worker_attach()
             }
             KeyCode::Char('p') => {
                 self.open_plans_view();
@@ -739,6 +804,39 @@ impl AppState {
                 Action::None
             }
             _ => Action::None,
+        }
+    }
+
+    /// Enter on a worker row: attach if the worker has a live tmux
+    /// pane (refresh thread is publishing captures for it), otherwise
+    /// flash a status-line hint so the keypress isn't silently
+    /// dropped. Foreground/CI-spawned workers don't have a tmux
+    /// pane and can't be attached to.
+    fn enter_worker_attach(&mut self) -> Action {
+        let Some(session) = self.selected() else {
+            return Action::None;
+        };
+        if session.state.is_terminal() {
+            self.status_line = format!(
+                " {} is {} — attach is only for live sessions ",
+                session.id,
+                super::ui::state_word(session.state)
+            );
+            return Action::None;
+        }
+        // `worker_panes` is populated by the refresh thread when
+        // capture-pane succeeds; "is there an entry?" is our proxy
+        // for "is the tmux pane alive?". This avoids a synchronous
+        // `tmux has-session` round-trip on the input thread.
+        if !self.worker_panes.contains_key(&session.id) {
+            self.status_line = format!(
+                " {} has no live tmux pane — was it spawned with --detached? ",
+                session.id
+            );
+            return Action::None;
+        }
+        Action::AttachWorker {
+            tmux_name: crate::session::worker_tmux_name(&session.id),
         }
     }
 
@@ -756,6 +854,9 @@ impl AppState {
         {
             self.orchestrators_list_state.select(Some(0));
         }
+        // Focus changed → tell the refresh thread which tmux window
+        // to pin to the panel dims on its next tick.
+        self.publish_refresh_inputs();
     }
 
     /// Unified up/down navigation across the two stacked sidebar
@@ -800,6 +901,9 @@ impl AppState {
                 self.move_workflow_selection(1);
             }
         }
+        // The focused session may have changed — re-publish so the
+        // refresh thread retargets its resize call.
+        self.publish_refresh_inputs();
     }
 
     /// Move the workers cursor within its own pane, clamped to
@@ -1475,7 +1579,10 @@ impl AppState {
             }
         };
 
-        let mut cmd = build_workflow_run_command(&binary, workflow, issue);
+        // Detached: wrap the run in `tmux new-session -d -s
+        // fleet-<id>` so the TUI's refresh thread can capture-pane it
+        // and Enter can attach for a live view.
+        let mut cmd = build_workflow_run_command(&binary, workflow, issue, true);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null());
         match log_file.as_ref().and_then(|f| f.try_clone().ok()) {
@@ -1656,8 +1763,11 @@ impl AppState {
             );
             return;
         };
+        // Detached: TUI-driven autonomous spawns get the same tmux
+        // wrapping as a manual spawn so users can attach to watch
+        // what the engine picked.
         let mut child =
-            build_workflow_run_command(&binary, &cmd.workflow, Some(&cmd.issue.human_id));
+            build_workflow_run_command(&binary, &cmd.workflow, Some(&cmd.issue.human_id), true);
         child
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -1772,19 +1882,30 @@ pub fn list_workflows_dir(root: &Path) -> Vec<String> {
     names
 }
 
-/// Build the `fleet workflow run <name> [--issue <human_id>]` command.
-/// `fleet_binary` is the path to the fleet executable (typically
-/// `std::env::current_exe()`).
+/// Build the `fleet workflow run <name> [--issue <human_id>]
+/// [--detached]` command. `fleet_binary` is the path to the fleet
+/// executable (typically `std::env::current_exe()`).
+///
+/// `detached = true` switches the spawn to the tmux wrapper path
+/// (one tmux session per worker, attachable for live view). Used by
+/// the TUI spawn picker and autonomous mode so workers get the same
+/// preview / attach machinery as the orchestrator. CI-style callers
+/// (`fleet workflow run` from a shell) pass `false` and keep the
+/// inline blocking semantics they've always had.
 #[must_use]
 pub fn build_workflow_run_command(
     fleet_binary: &Path,
     workflow_name: &str,
     issue_human_id: Option<&str>,
+    detached: bool,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(fleet_binary);
     cmd.args(["workflow", "run", workflow_name]);
     if let Some(id) = issue_human_id {
         cmd.args(["--issue", id]);
+    }
+    if detached {
+        cmd.arg("--detached");
     }
     cmd
 }

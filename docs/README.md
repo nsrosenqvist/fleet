@@ -19,10 +19,12 @@ The per-boundary deep-dives:
   mounts that cross the boundary (`/workspace` per-session worktree,
   `/artifacts`), per-adapter hardening (Podman+rootless+optional gVisor,
   Apple Container microVM, Docker, Local), and what stays on the host.
-- [`auth.md`](./auth.md) — identity brokering. How `env_passthrough`
-  in `.fleet/config.yaml` gets a secret from fleet's process env into
-  the agent container without ever touching the image or the
-  container filesystem.
+- [`auth.md`](./auth.md) — identity brokering. The `secrets:` block
+  + `fleet secrets {register, list, test, remove}` CLI, the three
+  backends (OS keyring / 1Password CLI / host env var), the
+  per-agent resolver chain, and how the resolved value reaches the
+  agent container without touching the image or the container
+  filesystem.
 - [`network.md`](./network.md) — egress allowlist. The two enforcer
   backends (Podman `--internal` network + tinyproxy sidecar on Linux,
   host-side tinyproxy on macOS / Docker), the default allowlist

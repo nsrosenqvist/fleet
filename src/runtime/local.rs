@@ -13,7 +13,7 @@
 //! the adapter; lock scopes are intentionally small (one `HashMap` operation
 //! per scope) to keep contention non-existent in practice.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -190,8 +190,35 @@ impl RuntimeAdapter for LocalAdapter {
         }
     }
 
-    fn attach_pty(&self, _container: &ContainerId, _argv: &[String]) -> Result<PtyHandle> {
-        bail!("`local` adapter does not support PTY attach; use `exec` instead")
+    fn attach_pty(&self, container: &ContainerId, argv: &[String]) -> Result<PtyHandle> {
+        // "PTY attach" for Local has no container to enter — we run
+        // the agent directly with the caller's stdio inherited so it
+        // can render its TUI in the current terminal (the tmux pane,
+        // when invoked under `fleet workflow run --detached`).
+        // Differs from `exec` only in stdio handling: exec captures
+        // output; attach_pty streams it. Workspace cwd + container-
+        // level env are still threaded through so the agent sees the
+        // same FLEET_* / HTTP_PROXY env it would under exec.
+        if argv.is_empty() {
+            bail!("attach_pty argv must contain at least the program name");
+        }
+        let (workspace, env) = self.with_container(container, |c| {
+            if c.state == ContainerState::Running {
+                Ok((c.workspace.clone(), c.env.clone()))
+            } else {
+                Err(anyhow!("container {container} is not running"))
+            }
+        })??;
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(&workspace)
+            .envs(env)
+            .status()
+            .with_context(|| format!("running `{}` with inherited stdio", argv[0]))?;
+        Ok(PtyHandle {
+            container: container.clone(),
+            exit_code: status.code().unwrap_or(-1),
+        })
     }
 
     fn stop(&self, container: &ContainerId) -> Result<()> {
@@ -426,12 +453,27 @@ mod tests {
     }
 
     #[test]
-    fn attach_pty_errors_for_local_adapter() {
+    fn attach_pty_rejects_empty_argv() {
+        // The contract for both `local` and the container adapters
+        // is the same: empty argv is a usage error.
+        let a = LocalAdapter::new(invoker_returning(""));
+        let err = a.attach_pty(&ContainerId::new("any"), &[]).unwrap_err();
+        assert!(format!("{err}").contains("attach_pty argv"));
+    }
+
+    #[test]
+    fn attach_pty_rejects_unknown_container() {
+        // Mirrors `exec` — addressing a container we never started
+        // is a clear caller bug, not a fall-through.
         let a = LocalAdapter::new(invoker_returning(""));
         let err = a
-            .attach_pty(&ContainerId::new("any"), &["bash".to_string()])
+            .attach_pty(&ContainerId::new("ghost"), &["bash".to_string()])
             .unwrap_err();
-        assert!(format!("{err}").contains("does not support PTY"));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not found") || msg.contains("ghost"),
+            "got: {msg}"
+        );
     }
 
     #[test]

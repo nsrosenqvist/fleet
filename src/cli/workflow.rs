@@ -63,7 +63,27 @@ pub fn run_validate(name: &str) -> Result<i32> {
 /// on stderr. Exit code: 0 on Completed, 1 on Failed. When `issue_id` is
 /// `Some`, resolves the human id through the configured tracker and
 /// surfaces it to nodes via `FLEET_ISSUE_*` env vars.
-pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
+///
+/// With `detached = true`, this is the **wrapper**: it mints the session
+/// id, prints it, spawns `tmux new-session -d -s fleet-<id>` running
+/// the inner (same binary, re-invoked with `--session-id <id>` so the
+/// pre-minted id flows through), and returns immediately. Without
+/// `--detached`, the run is inline and blocking — the contract CI /
+/// autonomous mode have always relied on.
+///
+/// `preassigned_session_id` carries the wrapper-minted id into the
+/// inner invocation. When `None` (the inline path or a first-class
+/// CLI call), a fresh id is minted as before.
+pub fn run_run(
+    name: &str,
+    issue_id: Option<&str>,
+    preassigned_session_id: Option<&str>,
+    detached: bool,
+) -> Result<i32> {
+    if detached {
+        return run_run_detached(name, issue_id);
+    }
+
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
     let config =
@@ -89,7 +109,10 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
     let adapter = build_adapter(&config.runtime, &report, Arc::clone(&invoker))?;
 
     let store = SessionStore::for_repo(&root);
-    let session_id = ClockIdSource.mint();
+    // Re-use the wrapper's pre-minted id when present (so the tmux
+    // session name `fleet-<id>` and the wrapper's stdout `<id>` line
+    // address the same on-disk session). Otherwise mint as before.
+    let session_id = preassigned_session_id.map_or_else(|| ClockIdSource.mint(), SessionId::new);
 
     let issue = match issue_id {
         Some(id) => Some(resolve_issue(&config, &root, Arc::clone(&invoker), id)?),
@@ -114,6 +137,19 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
     let executor = WorkflowExecutor::new(Arc::clone(&invoker)).with_tracker(tracker);
+    // SIGINT handler shared with the executor: between nodes, the
+    // executor checks this flag and aborts cleanly (marking the
+    // session `Failed` with a "user interrupted" reason) rather than
+    // dying mid-loop. During an agent step the agent absorbs the
+    // signal directly through its PTY — claude code's `cancel current
+    // message` UX kicks in there. `try_set_handler` swallows the
+    // harmless "already set" case for any future caller that nests
+    // runs in the same process.
+    let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handler_flag = Arc::clone(&interrupt);
+    let _ = ctrlc::try_set_handler(move || {
+        handler_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -126,6 +162,8 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
         worktree: worktree_meta,
         cost: &config.cost,
         egress: enforcer.as_ref(),
+        interrupt_flag: Some(Arc::clone(&interrupt)),
+        secrets: &config.secrets,
     };
 
     println!("{session_id}");
@@ -140,8 +178,86 @@ pub fn run_run(name: &str, issue_id: Option<&str>) -> Result<i32> {
             auto_prune_completed_session(&config, invoker.as_ref(), &root, &store, &session);
             Ok(i32::from(session.state != SessionState::Completed))
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            // 130 is the conventional SIGINT exit code. Distinguish
+            // it from other failures so shells / cron / CI can tell
+            // "user cancelled" apart from "agent failed".
+            if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("fleet workflow run: `{name}` aborted (user interrupted)");
+                return Ok(130);
+            }
+            Err(err)
+        }
     }
+}
+
+/// Wrapper path for `fleet workflow run --detached`. Pre-mints the
+/// session id (so the tmux session can be named and the id can be
+/// printed *before* the inner starts) and shells out to a fresh
+/// `fleet workflow run … --session-id <id>` inside
+/// `tmux new-session -d -s fleet-<id>`. Returns as soon as the tmux
+/// session is alive; the actual workflow keeps running inside the
+/// pane and the user can attach via the TUI or `fleet sessions
+/// attach <id>`.
+///
+/// Probes for tmux up-front so a missing binary fails loudly rather
+/// than after we've half-set things up. `pipe-pane` mirrors the pane
+/// to `.fleet/sessions/<id>/transcript.log` for post-hoc forensics
+/// — same shape as the orchestrator.
+fn run_run_detached(name: &str, issue_id: Option<&str>) -> Result<i32> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+
+    crate::orchestrator::tmux::probe(invoker.as_ref())?;
+
+    let session_id = ClockIdSource.mint();
+    let tmux_name = crate::session::worker_tmux_name(&session_id);
+
+    // Materialise the session dir so the transcript pipe has a place
+    // to write; the inner will populate meta.json on its first save.
+    let store = SessionStore::for_repo(&root);
+    let session_dir = store.session_dir(&session_id);
+    std::fs::create_dir_all(&session_dir)
+        .with_context(|| format!("creating session dir at {}", session_dir.display()))?;
+
+    let exe = std::env::current_exe().context("locating current fleet binary")?;
+    let mut argv: Vec<String> = vec![
+        exe.display().to_string(),
+        "workflow".to_string(),
+        "run".to_string(),
+        name.to_string(),
+        "--session-id".to_string(),
+        session_id.as_str().to_string(),
+    ];
+    if let Some(id) = issue_id {
+        argv.push("--issue".to_string());
+        argv.push(id.to_string());
+    }
+    let env = vec![(
+        crate::session::SESSION_TMUX_ENV.to_string(),
+        tmux_name.clone(),
+    )];
+
+    crate::orchestrator::tmux::new_session(invoker.as_ref(), &tmux_name, &argv, &env)
+        .with_context(|| format!("spawning tmux session `{tmux_name}`"))?;
+
+    // Best-effort transcript pipe — same as the orchestrator. A
+    // missing/old tmux that doesn't support `pipe-pane` is a
+    // diagnostic loss, not a run failure.
+    let transcript_path = session_dir.join("transcript.log");
+    if let Err(err) =
+        crate::orchestrator::tmux::pipe_pane_to(invoker.as_ref(), &tmux_name, &transcript_path)
+    {
+        eprintln!("warning: tmux pipe-pane failed (no transcript will be captured): {err:#}");
+    }
+
+    println!("{session_id}");
+    eprintln!(
+        "fleet workflow run: `{name}` spawned detached in tmux `{tmux_name}` — \
+         attach with `fleet sessions attach {session_id}` or via the TUI"
+    );
+    Ok(0)
 }
 
 /// CLI entry point for `fleet workflow resume <session-id>`. Loads the
@@ -225,6 +341,8 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         worktree: None,
         cost: &config.cost,
         egress: enforcer.as_ref(),
+        interrupt_flag: None,
+        secrets: &config.secrets,
     };
     println!("{session_id}");
     let resumed = executor.resume(&req)?;
@@ -349,6 +467,8 @@ pub fn run_replay(
         worktree: worktree_meta,
         cost: &config.cost,
         egress: enforcer.as_ref(),
+        interrupt_flag: None,
+        secrets: &config.secrets,
     };
 
     println!("{new_id}");

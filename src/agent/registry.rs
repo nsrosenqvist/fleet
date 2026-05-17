@@ -95,14 +95,53 @@ impl AgentRegistry {
 }
 
 fn claude_code_default() -> AgentSpec {
+    // Wrap claude in a tiny bash trampoline that materialises the
+    // OAuth token (forwarded as `CLAUDE_CODE_OAUTH_TOKEN` env via the
+    // secrets resolver / host-file auto-pickup) into the credentials
+    // file claude reads, then `exec`s claude in print mode against
+    // the rendered `FLEET_PROMPT`. The `exec` keeps the process tree
+    // a single hop deep and lets claude own the TTY when invoked
+    // through `attach_pty`. Falls through silently when no token is
+    // available — claude itself surfaces a clear auth error in that
+    // case, which is more discoverable than a bash error here.
+    //
+    // The fallback to `ANTHROPIC_API_KEY` keeps API-only users
+    // working: claude reads it directly when present, no credentials
+    // file required.
     AgentSpec {
-        command: vec!["claude".to_string(), "code".to_string()],
+        command: vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            CLAUDE_CODE_ENTRY_SCRIPT.to_string(),
+        ],
         env_passthrough: vec![
             "ANTHROPIC_API_KEY".to_string(),
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            // Legacy spelling kept for users whose configs still
+            // reference it. The is_claude_oauth_var helper in
+            // `workflow::executor` accepts both.
             "CLAUDE_OAUTH_TOKEN".to_string(),
         ],
     }
 }
+
+/// Bash entrypoint for the default `claude-code` agent. Writes the
+/// credentials file from whichever OAuth env var the secrets layer
+/// resolved (canonical first, then legacy alias), then exec's
+/// claude with the rendered prompt in print mode. Kept as a single
+/// `const &str` so the registry stays a value object — no shell
+/// templating, no string concatenation at registration time.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) const CLAUDE_CODE_ENTRY_SCRIPT: &str = "\
+set -e
+TOKEN=\"${CLAUDE_CODE_OAUTH_TOKEN:-${CLAUDE_OAUTH_TOKEN:-}}\"
+if [ -n \"$TOKEN\" ]; then
+  mkdir -p \"$HOME/.claude\"
+  printf '{\"claudeAiOauth\":{\"accessToken\":\"%s\",\"scopes\":[\"user:inference\"],\"subscriptionType\":\"subscription\"}}\\n' \"$TOKEN\" > \"$HOME/.claude/.credentials.json\"
+  chmod 600 \"$HOME/.claude/.credentials.json\"
+fi
+exec claude -p \"${FLEET_PROMPT:-No prompt provided. Please summarise what claude code is in two sentences.}\"
+";
 
 #[cfg(test)]
 mod tests {
@@ -112,12 +151,46 @@ mod tests {
     fn default_registry_includes_claude_code() {
         let r = AgentRegistry::default();
         let spec = r.get("claude-code").expect("claude-code must be present");
-        assert_eq!(spec.command, vec!["claude".to_string(), "code".to_string()]);
+        // The default is now a `bash -c <script>` trampoline that
+        // materialises the OAuth credentials file before exec'ing
+        // claude in print mode.
+        assert_eq!(spec.command[0], "bash");
+        assert_eq!(spec.command[1], "-c");
+        assert!(
+            spec.command[2].contains("exec claude"),
+            "command[2] should invoke claude: {}",
+            spec.command[2]
+        );
+        // Both the canonical and legacy OAuth env var names ride
+        // through so the secrets resolver and the host-file
+        // auto-pickup can both feed the trampoline.
         assert!(
             spec.env_passthrough
                 .iter()
                 .any(|e| e == "ANTHROPIC_API_KEY")
         );
+        assert!(
+            spec.env_passthrough
+                .iter()
+                .any(|e| e == "CLAUDE_CODE_OAUTH_TOKEN")
+        );
+    }
+
+    #[test]
+    fn default_claude_code_writes_credentials_from_token_env() {
+        // The trampoline must wire the resolved env var into
+        // `~/.claude/.credentials.json` so claude reads the OAuth
+        // material it expects on disk. Pin the file path + JSON
+        // shape so a future "let's use a different format" change
+        // can't silently break the auth pipeline.
+        let script = &claude_code_default().command[2];
+        assert!(script.contains("$HOME/.claude/.credentials.json"));
+        assert!(script.contains("claudeAiOauth"));
+        assert!(script.contains("accessToken"));
+        assert!(script.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+        // Legacy spelling still accepted in the trampoline for
+        // configs that haven't been updated yet.
+        assert!(script.contains("CLAUDE_OAUTH_TOKEN"));
     }
 
     #[test]

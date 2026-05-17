@@ -29,6 +29,7 @@ mod ui;
 
 pub use app::build_workflow_run_command;
 pub use terminal::run;
+pub use ui::format_epoch_ms;
 
 #[cfg(test)]
 mod tests {
@@ -126,6 +127,29 @@ mod tests {
     #[test]
     fn format_cost_none_is_dash() {
         assert_eq!(format_cost(None), "-");
+    }
+
+    #[test]
+    fn format_epoch_ms_renders_yyyy_mm_dd_hh_mm_ss_utc() {
+        // 2021-09-09T05:46:40.000Z — Unix epoch ms = 1_631_166_400_000.
+        let s = format_epoch_ms(1_631_166_400_000);
+        assert_eq!(s, "2021-09-09 05:46:40 UTC");
+    }
+
+    #[test]
+    fn format_epoch_ms_zero_is_unix_epoch() {
+        // Sanity: the zero we get from `Default::default()` renders as
+        // the Unix epoch, not an empty string.
+        assert_eq!(format_epoch_ms(0), "1970-01-01 00:00:00 UTC");
+    }
+
+    #[test]
+    fn format_epoch_ms_falls_back_for_unrepresentable_values() {
+        // Effectively-infinite ms — past `OffsetDateTime`'s i64-year
+        // range. The helper must still produce a string rather than
+        // panic; the raw ms is the documented fallback.
+        let s = format_epoch_ms(u64::MAX);
+        assert!(s.contains("ms (epoch)") || s.contains("UTC"), "got: {s}");
     }
 
     #[test]
@@ -875,22 +899,38 @@ mod tests {
 
     #[test]
     fn build_workflow_run_command_without_issue() {
-        let cmd = build_workflow_run_command(Path::new("/usr/local/bin/fleet"), "standard", None);
+        let cmd =
+            build_workflow_run_command(Path::new("/usr/local/bin/fleet"), "standard", None, false);
         let dbg = format!("{cmd:?}");
         assert!(dbg.contains("/usr/local/bin/fleet"), "got: {dbg}");
         assert!(dbg.contains("workflow"), "got: {dbg}");
         assert!(dbg.contains("run"), "got: {dbg}");
         assert!(dbg.contains("standard"), "got: {dbg}");
         assert!(!dbg.contains("--issue"), "got: {dbg}");
+        assert!(!dbg.contains("--detached"), "got: {dbg}");
     }
 
     #[test]
     fn build_workflow_run_command_with_issue_appends_flag() {
-        let cmd =
-            build_workflow_run_command(Path::new("/usr/local/bin/fleet"), "standard", Some("42"));
+        let cmd = build_workflow_run_command(
+            Path::new("/usr/local/bin/fleet"),
+            "standard",
+            Some("42"),
+            false,
+        );
         let dbg = format!("{cmd:?}");
         assert!(dbg.contains("--issue"), "got: {dbg}");
         assert!(dbg.contains("42"), "got: {dbg}");
+    }
+
+    #[test]
+    fn build_workflow_run_command_with_detached_appends_flag() {
+        // The TUI spawn picker passes `detached=true` so the worker
+        // gets tmux-wrapped; the flag must surface on the argv.
+        let cmd =
+            build_workflow_run_command(Path::new("/usr/local/bin/fleet"), "standard", None, true);
+        let dbg = format!("{cmd:?}");
+        assert!(dbg.contains("--detached"), "got: {dbg}");
     }
 
     #[test]

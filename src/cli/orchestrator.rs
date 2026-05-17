@@ -252,7 +252,12 @@ fn attach_and_finalize(store: &OrchestratorStore, invoker: &dyn ProcessInvoker) 
 ///     built-in `status-window-format`.
 ///   - Colour: fleet purple (`colour141`) for the session name +
 ///     active-window marker; muted gray for everything else.
-fn build_attach_script(session: &str) -> String {
+// `cli` modules are reached only through `crate::cli::dispatch` so
+// they're effectively private; the `pub(crate)` here lets the TUI
+// and `fleet sessions attach` reuse the script without copying the
+// styling.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn build_attach_script(session: &str) -> String {
     let s = shell_single_quote(session);
     let status_left =
         " #[fg=colour141,bold]#S#[default] #[fg=brightblack]│#[default] ctrl+b d to detach ";

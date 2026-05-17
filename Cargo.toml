@@ -57,6 +57,33 @@ tiny_http = "0.12"
 # deterministically instead of scraping it from the TUI.
 uuid = { version = "1", features = ["v4"] }
 
+# SIGINT handler in `fleet workflow run`'s inner so an accidental
+# Ctrl+C between nodes inside a tmux pane records a clean "user
+# interrupted" failure rather than leaving the session stuck in
+# `Running` until the reaper sweeps it.
+ctrlc = "3.4"
+
+# Format `updated_at_ms` etc as `YYYY-MM-DD HH:MM:SS UTC` for the
+# TUI details pane / sessions show output. Already in the transitive
+# tree via signal-hook; promoting to a direct dep for the formatting
+# API.
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+# Secret material (claude OAuth token, future tracker creds) lives
+# in `SecretString` so it never accidentally lands in a Debug print
+# or tracing log. The `secrets` module's backends all return one.
+secrecy = "0.8"
+
+# Cross-platform OS keyring access for the `keychain` secrets backend:
+# macOS Security framework, Linux DBus Secret Service (GNOME
+# Keyring / KWallet / KeePassXC), Windows Credential Manager.
+keyring = { version = "3", default-features = false, features = [
+    "apple-native",
+    "linux-native-sync-persistent",
+    "sync-secret-service",
+    "windows-native",
+] }
+
 [dev-dependencies]
 # Mocks `ProcessInvoker` and other traits so tests don't shell out.
 mockall = "0.13"

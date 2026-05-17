@@ -13,6 +13,7 @@ pub mod issues;
 pub mod orchestrator;
 pub mod plan;
 pub mod runtime;
+pub mod secrets;
 pub mod sessions;
 pub mod workflow;
 
@@ -53,6 +54,15 @@ pub enum Command {
     Sessions {
         #[command(subcommand)]
         sub: SessionsSub,
+    },
+
+    /// Secrets management: register / list / test the secrets fleet
+    /// resolves into the agent container's env at run time. Backed
+    /// by the OS keychain by default (macOS Security framework /
+    /// Linux DBus Secret Service / Windows Credential Manager).
+    Secrets {
+        #[command(subcommand)]
+        sub: SecretsSub,
     },
 
     /// Issue tracker browser via the configured tracker (git-bug / gh).
@@ -153,11 +163,30 @@ pub enum WorkflowSub {
     /// 1 on Failed. With `--issue <id>`, resolves the issue through
     /// the configured tracker and exposes it to nodes via
     /// `FLEET_ISSUE_ID` / `FLEET_ISSUE_HUMAN_ID` / `FLEET_ISSUE_TITLE`.
+    ///
+    /// `--detached` wraps the run in a `tmux new-session -d -s
+    /// fleet-<session-id>` so the user can later attach for a live
+    /// view of the agent inside its pane (via the TUI or
+    /// `fleet sessions attach <id>`). Returns immediately after the
+    /// tmux session is alive; exit code reflects the spawn, not the
+    /// workflow outcome — poll `fleet sessions show <id>` for that.
+    /// Without the flag, the run is inline and blocking as before
+    /// (the contract CI / autonomous mode relies on).
     Run {
         name: String,
         /// Issue id to act on (matches the tracker's `human_id`).
         #[arg(long)]
         issue: Option<String>,
+        /// Pre-minted session id (set by the `--detached` wrapper so
+        /// the inner inherits the same id the wrapper printed). When
+        /// absent, a fresh id is minted as before. Internal: not
+        /// surfaced in `--help` output.
+        #[arg(long, hide = true)]
+        session_id: Option<String>,
+        /// Wrap the run in a tmux session for live attach. See the
+        /// command-level docs above for the full lifecycle.
+        #[arg(long)]
+        detached: bool,
     },
 
     /// Resume a workflow paused at a gate. Loads the persisted session,
@@ -217,6 +246,14 @@ pub enum SessionsSub {
         reason: Option<String>,
     },
 
+    /// Attach to a session's live tmux pane for a live view of the
+    /// agent. The session must have been launched with
+    /// `fleet workflow run --detached` (or via the TUI spawn
+    /// picker / autonomous mode, which both pass `--detached`).
+    /// Errors clearly when the tmux pane is gone (workflow already
+    /// finished) or never existed (foreground run).
+    Attach { id: String },
+
     /// Remove a session's per-session git worktree, freeing the
     /// checked-out source code from disk. The branch and the
     /// session's logs/artifacts/meta.json are kept — `git checkout
@@ -242,6 +279,47 @@ pub enum SessionsSub {
         /// failed/abandoned sessions.
         #[arg(long = "with-branch")]
         with_branch: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretsSub {
+    /// List every `secrets.<name>` entry in `.fleet/config.yaml`
+    /// along with the backend kind it's resolved through and a
+    /// status indicator (ok / unreachable / missing). Doesn't print
+    /// the secret values themselves.
+    List,
+
+    /// Register a secret. For the well-known `claude_code_oauth_token`
+    /// name, walks the user through `claude setup-token`, stores the
+    /// resulting token in the OS keychain, and appends a `[secrets.…]`
+    /// entry to `.fleet/config.yaml`. For arbitrary names, prompts
+    /// for a value and stores it under the same backend.
+    Register {
+        /// Secret name (e.g. `claude_code_oauth_token`). Matched
+        /// case-insensitively against agent `env_passthrough`
+        /// declarations at resolve time, so `claude_code_oauth_token`
+        /// here resolves `CLAUDE_CODE_OAUTH_TOKEN` in env_passthrough.
+        name: String,
+    },
+
+    /// Resolve a registered secret through its configured backend
+    /// and print "ok (NN chars)" — confirms the backend is wired
+    /// up without revealing the value. Use after `register` to
+    /// catch misconfigured keychain / 1Password references.
+    Test {
+        /// Secret name from the `secrets:` block.
+        name: String,
+    },
+
+    /// Remove a secret. Drops the `secrets.<name>` entry from
+    /// `.fleet/config.yaml`. The OS keychain entry itself is left
+    /// in place — delete it via `secret-tool delete` / `security
+    /// delete-generic-password` if you also want to purge the
+    /// stored value.
+    Remove {
+        /// Secret name from the `secrets:` block.
+        name: String,
     },
 }
 
@@ -424,7 +502,12 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         Command::Workflow { sub } => match sub {
             WorkflowSub::List => workflow::run_list(),
             WorkflowSub::Validate { name } => workflow::run_validate(&name),
-            WorkflowSub::Run { name, issue } => workflow::run_run(&name, issue.as_deref()),
+            WorkflowSub::Run {
+                name,
+                issue,
+                session_id,
+                detached,
+            } => workflow::run_run(&name, issue.as_deref(), session_id.as_deref(), detached),
             WorkflowSub::Resume { session } => workflow::run_resume(&session),
             WorkflowSub::Replay {
                 session,
@@ -438,12 +521,19 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             SessionsSub::Logs { id, node } => sessions::run_logs(&id, node.as_deref()),
             SessionsSub::Reap => sessions::run_reap(),
             SessionsSub::Unblock { id, reason } => sessions::run_unblock(&id, reason.as_deref()),
+            SessionsSub::Attach { id } => sessions::run_attach(&id),
             SessionsSub::Prune {
                 id,
                 completed,
                 all,
                 with_branch,
             } => sessions::run_prune(id.as_deref(), completed, all, with_branch),
+        },
+        Command::Secrets { sub } => match sub {
+            SecretsSub::List => secrets::run_list(),
+            SecretsSub::Register { name } => secrets::run_register(&name),
+            SecretsSub::Test { name } => secrets::run_test(&name),
+            SecretsSub::Remove { name } => secrets::run_remove(&name),
         },
         Command::Issues { sub } => match sub {
             IssuesSub::List => issues::run_list(),

@@ -32,9 +32,11 @@ pub mod containers;
 pub mod reaper;
 pub mod state;
 pub mod store;
+pub mod tmux;
 
 pub use aggregate::Session;
 pub use state::SessionState;
+pub use tmux::{SESSION_TMUX_ENV, worker_tmux_name};
 
 /// Issue the workflow is acting on, when one was supplied via the
 /// tracker. Persisted on the session so that a `fleet workflow resume`

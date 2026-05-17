@@ -138,6 +138,23 @@ pub struct ExecuteRequest<'a> {
     /// `Failed`. `CostConfig::default()` (`None`/`None`) opts every
     /// session out — historical behaviour.
     pub cost: &'a crate::repo_config::CostConfig,
+    /// User-interrupt flag. The CLI's SIGINT handler flips this when
+    /// the user hits Ctrl+C; the executor checks it between nodes
+    /// and aborts cleanly (marking the session `Failed` with a
+    /// "user interrupted" reason) rather than dying mid-loop and
+    /// leaving meta stuck in `Running`. `None` for tests and any
+    /// callers that don't want interrupt handling — the executor
+    /// behaves exactly as before in that case.
+    #[allow(clippy::struct_field_names)]
+    pub interrupt_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Per-name secret backend declarations resolved from the repo
+    /// config's `secrets:` block. Threaded through so
+    /// [`run_agent_node`] can resolve `env_passthrough` entries that
+    /// have a backend configured (keychain / env / op). Empty when
+    /// no `secrets:` block is set, in which case the resolver is a
+    /// no-op and the host-env / host-file fallbacks in
+    /// [`build_agent_env`] apply.
+    pub secrets: &'a std::collections::BTreeMap<String, crate::secrets::SecretBackendConfig>,
 }
 
 /// Per-session worktree bookkeeping, threaded into [`ExecuteRequest`]
@@ -449,6 +466,7 @@ impl WorkflowExecutor {
     /// in `Running` (caller transitions to `Completed`) or in
     /// `AwaitingGate` (caller leaves it alone). Errors propagate
     /// after marking the session `Failed`.
+    #[allow(clippy::too_many_lines)]
     fn run_loop(
         &self,
         req: &ExecuteRequest<'_>,
@@ -467,6 +485,19 @@ impl WorkflowExecutor {
         let mut outputs: OutputMap = outputs_from_persisted(&session.outputs);
         let mut i = start_idx;
         while i < order.len() {
+            // Check for a user interrupt *before* starting each node.
+            // The check window is the brief between-nodes interval
+            // (a few ms) when the fleet driver is foreground in the
+            // tmux pane; during an agent step the agent absorbs the
+            // signal directly via its PTY. Without this, an accidental
+            // Ctrl+C between nodes would kill the driver process and
+            // leave the session stuck in `Running` until the reaper
+            // sweeps it.
+            if check_interrupt(req.interrupt_flag.as_ref()) {
+                let err = anyhow!("user interrupted (Ctrl+C between nodes)");
+                self.mark_failed(req, session, &err);
+                return Err(err);
+            }
             let node_id = order[i].clone();
             let node = req
                 .workflow
@@ -499,6 +530,21 @@ impl WorkflowExecutor {
             session.set_current_node(Some(node_id.clone()), (self.clock)());
             req.store.save(session)?;
 
+            // Print a one-line breadcrumb to fleet's stdout so the
+            // tmux pane shows workflow structure as it runs. Silent
+            // when not in tmux (headless / CI keeps its clean
+            // single-line stdout contract). The node kind helps the
+            // user understand *what* is happening — agent steps will
+            // then take over the pane via attach_pty; bash steps
+            // stream their own output via the inherit-stdio branch
+            // in run_bash_node.
+            if std::env::var_os(crate::session::SESSION_TMUX_ENV).is_some() {
+                println!(
+                    "\nfleet: ▸ node `{node_id}` ({}) starting",
+                    node_kind_word(&node.kind)
+                );
+            }
+
             // Gate: pause the workflow and let the user resume later.
             // We persist the gate's summary as the node's "log" so the
             // TUI / `fleet sessions logs` surfaces it.
@@ -521,10 +567,16 @@ impl WorkflowExecutor {
             let outcome = match run_result {
                 Ok(o) => o,
                 Err(err) => {
+                    if std::env::var_os(crate::session::SESSION_TMUX_ENV).is_some() {
+                        println!("fleet: ✗ node `{node_id}` failed: {err}");
+                    }
                     self.mark_failed(req, session, &err);
                     return Err(err);
                 }
             };
+            if std::env::var_os(crate::session::SESSION_TMUX_ENV).is_some() {
+                println!("fleet: ✓ node `{node_id}` done");
+            }
 
             // Fold any cost figures the node produced into the
             // session and flush. The extra save is one disk write per
@@ -807,6 +859,14 @@ impl WorkflowExecutor {
             issue: session.issue.as_ref(),
         };
         let mut env = build_agent_env(agent, &agent_ctx);
+        // Overlay any `secrets:`-configured values on top of the
+        // base env. Resolves keychain / op / env-var backends per
+        // entry; missing host-env names that have *no* backend
+        // config fall through to whatever `build_agent_env`
+        // already filled in (host env var, claude-OAuth host-file
+        // fallback).
+        resolve_secrets_in_env(&mut env, req.secrets, &self.invoker)
+            .with_context(|| format!("resolving secrets for node `{}`", node.id))?;
         // Egress enforcement: append the proxy env so every HTTP/HTTPS
         // client the agent uses respects HTTP_PROXY / HTTPS_PROXY.
         // Order matters — putting these after the agent's own env
@@ -869,24 +929,85 @@ impl WorkflowExecutor {
             tracing::warn!(?err, container = %container_id, "writing container marker failed");
         }
 
-        let exec_result = req
-            .adapter
-            .exec(&container_id, &agent.command, ExecOpts::default());
-        // Log capture first — happens even on adapter-level error so the
-        // user can read what happened after a failure.
+        // Branch on whether we're running inside a per-session tmux
+        // pane (set by `fleet workflow run --detached`'s wrapper).
+        //
+        // Inside tmux: PTY-attach so the agent's interactive UI
+        // (Claude Code, aider, codex) renders live in the pane —
+        // exactly what the user sees when they `tmux attach`.
+        // Stdout/stderr aren't captured as Strings here, so we skip
+        // the agent-cost parse (the transcript.log piped by tmux
+        // preserves the cost line for post-hoc forensics; the
+        // sidebar's cost summary is informational only).
+        //
+        // Outside tmux: stick with `exec` for the captured stdio +
+        // cost parsing the headless / CI flow has relied on.
         let log_path = self.node_log_path(req, session, &node.id);
-        let log_text = match &exec_result {
-            Ok(h) => format!(
-                "--- agent {agent_name} ---\n--- stdout ---\n{}\n--- stderr ---\n{}\n--- exit {} ---\n",
-                h.stdout, h.stderr, h.exit_code
-            ),
-            Err(err) => format!("--- agent {agent_name} failed: {err:#} ---\n"),
+        let in_tmux = std::env::var_os(crate::session::SESSION_TMUX_ENV).is_some();
+        let run_outcome: Result<NodeOutcome> = if in_tmux {
+            let attach_result = req.adapter.attach_pty(&container_id, &agent.command);
+            let log_text = match &attach_result {
+                Ok(h) => format!(
+                    "--- agent {agent_name} ran interactively in tmux ---\n\
+                     stdio streamed to the session's tmux pane;\n\
+                     see transcript.log alongside this file for the full output.\n\
+                     --- exit {} ---\n",
+                    h.exit_code
+                ),
+                Err(err) => format!("--- agent {agent_name} pty-attach failed: {err:#} ---\n"),
+            };
+            if let Err(err) = std::fs::write(&log_path, log_text) {
+                tracing::warn!(?err, log = %log_path.display(), "writing agent log failed");
+            }
+            match attach_result {
+                Ok(handle) if handle.exit_code == 0 => Ok(NodeOutcome::empty()),
+                Ok(handle) => Err(anyhow!(
+                    "agent `{agent_name}` in node `{}` exited with code {} (see transcript)",
+                    node.id,
+                    handle.exit_code
+                )),
+                Err(err) => Err(err),
+            }
+        } else {
+            let exec_result = req
+                .adapter
+                .exec(&container_id, &agent.command, ExecOpts::default());
+            let log_text = match &exec_result {
+                Ok(h) => format!(
+                    "--- agent {agent_name} ---\n--- stdout ---\n{}\n--- stderr ---\n{}\n--- exit {} ---\n",
+                    h.stdout, h.stderr, h.exit_code
+                ),
+                Err(err) => format!("--- agent {agent_name} failed: {err:#} ---\n"),
+            };
+            if let Err(err) = std::fs::write(&log_path, log_text) {
+                tracing::warn!(?err, log = %log_path.display(), "writing agent log failed");
+            }
+            match exec_result {
+                Ok(handle) if handle.exit_code == 0 => {
+                    Ok(
+                        parse_agent_cost_usd(agent_name, &handle.stdout, &handle.stderr)
+                            .map_or_else(
+                                || {
+                                    tracing::debug!(
+                                        agent = agent_name,
+                                        node = %node.id,
+                                        "agent cost parser found no match in output"
+                                    );
+                                    NodeOutcome::empty()
+                                },
+                                |usd| NodeOutcome::with_cost(&node.id, usd),
+                            ),
+                    )
+                }
+                Ok(handle) => Err(anyhow!(
+                    "agent `{agent_name}` in node `{}` exited with code {} (log at {})",
+                    node.id,
+                    handle.exit_code,
+                    log_path.display()
+                )),
+                Err(err) => Err(err),
+            }
         };
-        // Log write failures don't mask the more interesting agent failure;
-        // surface them through tracing but continue with the agent result.
-        if let Err(err) = std::fs::write(&log_path, log_text) {
-            tracing::warn!(?err, log = %log_path.display(), "writing agent log failed");
-        }
 
         // Stop is best-effort: an agent that succeeded shouldn't get its
         // success overridden by a stale-container stop error. The
@@ -905,33 +1026,7 @@ impl WorkflowExecutor {
             tracing::warn!(?err, container = %container_id, "clearing container marker failed");
         }
 
-        let handle = exec_result?;
-        if handle.exit_code != 0 {
-            bail!(
-                "agent `{agent_name}` in node `{}` exited with code {} (log at {})",
-                node.id,
-                handle.exit_code,
-                log_path.display()
-            );
-        }
-
-        // Parse the agent's reported cost from captured stdio. A
-        // `None` here is informational, not an error: the agent might
-        // not have printed a cost line at all, or its format may have
-        // changed since the parser was last updated. We surface the
-        // signal in the UI; nothing else acts on it.
-        let outcome = parse_agent_cost_usd(agent_name, &handle.stdout, &handle.stderr).map_or_else(
-            || {
-                tracing::debug!(
-                    agent = agent_name,
-                    node = %node.id,
-                    "agent cost parser found no match in output"
-                );
-                NodeOutcome::empty()
-            },
-            |usd| NodeOutcome::with_cost(&node.id, usd),
-        );
-        Ok(outcome)
+        run_outcome
     }
 
     fn run_bash_node(
@@ -954,8 +1049,41 @@ impl WorkflowExecutor {
             "cd {} && {env_prefix}{script}",
             shell_quote_path(req.workspace)
         );
-        let result = self.invoker.run("sh", vec!["-c".to_string(), cmd]);
         let log_path = self.node_log_path(req, session, &node.id);
+
+        // Branch on tmux mode (set by `fleet workflow run --detached`).
+        // In tmux: inherit stdio so the bash output streams into the
+        // pane — the user attaching sees activity instead of a silent
+        // pane until the workflow completes. The pane's full output
+        // is preserved in `transcript.log` via the wrapper's
+        // `pipe-pane`, so we can write a small pointer to the per-node
+        // log file rather than losing the content entirely. Outside
+        // tmux: capture (the historical headless / CI behaviour).
+        if std::env::var_os(crate::session::SESSION_TMUX_ENV).is_some() {
+            let status = std::process::Command::new("sh")
+                .args(["-c", &cmd])
+                .status()
+                .with_context(|| format!("running bash node `{}`", node.id))?;
+            let exit_code = status.code().unwrap_or(-1);
+            let log_text = format!(
+                "--- bash node {} ran in tmux pane (exit {exit_code}) ---\n\
+                 stdio streamed to the session's tmux pane; the captured\n\
+                 transcript lives at `transcript.log` alongside this file.\n",
+                node.id
+            );
+            if let Err(err) = std::fs::write(&log_path, log_text) {
+                tracing::warn!(?err, log = %log_path.display(), "writing bash log failed");
+            }
+            if !status.success() {
+                bail!(
+                    "bash node `{}` exited with {exit_code} (see transcript)",
+                    node.id
+                );
+            }
+            return Ok(());
+        }
+
+        let result = self.invoker.run("sh", vec!["-c".to_string(), cmd]);
         match result {
             Ok(stdout) => {
                 if let Err(err) = std::fs::write(&log_path, &stdout) {
@@ -1602,12 +1730,30 @@ pub struct PromptArtifact {
 /// `env_passthrough` whitelist (resolved against the host's environment)
 /// plus any persona / prompt / issue context. Pure; the testable seam
 /// for `run_agent_node`.
+///
+/// `CLAUDE_CODE_OAUTH_TOKEN` gets a special path: when the agent's
+/// `env_passthrough` includes it (or its legacy alias
+/// `CLAUDE_OAUTH_TOKEN`) **and** the host's env doesn't supply one,
+/// we fall back to reading `~/.claude/.credentials.json` and
+/// extracting `claudeAiOauth.accessToken` — the same file that
+/// `claude setup-token` (and the interactive OAuth flow) write. This
+/// restores the pre-AO/Lima behaviour where fleet picked up the
+/// host's claude credentials automatically, without re-introducing a
+/// keychain / secrets module.
 #[must_use]
 pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = agent
         .env_passthrough
         .iter()
-        .map(|k| (k.clone(), std::env::var(k).unwrap_or_default()))
+        .map(|k| {
+            let value = std::env::var(k).unwrap_or_default();
+            let resolved = if value.is_empty() && is_claude_oauth_var(k) {
+                host_claude_oauth_token().unwrap_or_default()
+            } else {
+                value
+            };
+            (k.clone(), resolved)
+        })
         .collect();
     if let Some(persona) = ctx.persona {
         env.push(("FLEET_PERSONA".to_string(), persona.to_string()));
@@ -1622,6 +1768,72 @@ pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String
         env.push(("FLEET_ISSUE_TITLE".to_string(), issue.title.clone()));
     }
     env
+}
+
+/// `true` if `name` is one of the two env var names users may put in
+/// `env_passthrough` to flow the claude OAuth token through. The
+/// canonical name is `CLAUDE_CODE_OAUTH_TOKEN` (what claude itself
+/// reads); `CLAUDE_OAUTH_TOKEN` is the legacy spelling fleet's
+/// default registry used pre-refactor.
+fn is_claude_oauth_var(name: &str) -> bool {
+    name == "CLAUDE_CODE_OAUTH_TOKEN" || name == "CLAUDE_OAUTH_TOKEN"
+}
+
+/// Walk an env Vec and replace any value whose key has a
+/// configured `secrets:` backend with the value the backend
+/// returns. Names match case-insensitively so the env-var-style
+/// `CLAUDE_CODE_OAUTH_TOKEN` resolves the snake-case
+/// `claude_code_oauth_token` secret entry.
+///
+/// Errors propagate from configured backends — a typo in a
+/// 1Password reference or a missing keychain entry should fail
+/// the agent node loudly rather than silently fall through to a
+/// half-resolved env. Names without a backend config are left
+/// untouched; their existing host-env / host-file fallback applies.
+///
+/// Pure-ish: the only side effect is whatever the backend does
+/// (subprocess to `op`, keychain RPC). `invoker` is the seam for
+/// tests.
+pub fn resolve_secrets_in_env(
+    env: &mut [(String, String)],
+    secrets: &std::collections::BTreeMap<String, crate::secrets::SecretBackendConfig>,
+    invoker: &Arc<dyn ProcessInvoker>,
+) -> Result<()> {
+    use secrecy::ExposeSecret;
+    for (key, value) in env.iter_mut() {
+        let lookup = key.to_ascii_lowercase();
+        let Some(cfg) = secrets.get(&lookup) else {
+            continue;
+        };
+        let backend = crate::secrets::build(cfg, Arc::clone(invoker));
+        let resolved = backend.fetch().with_context(|| {
+            format!(
+                "resolving secret `{lookup}` via `{}` backend for env var `{key}`",
+                backend.kind()
+            )
+        })?;
+        resolved.expose_secret().clone_into(value);
+    }
+    Ok(())
+}
+
+/// Best-effort read of the host's claude OAuth token from the file
+/// `claude setup-token` writes. Returns `None` on any failure —
+/// missing file, unparseable JSON, missing key — so the env-var
+/// fallback degrades silently to "no credentials" and the agent's
+/// own failure path surfaces a clear error if it really needs auth.
+fn host_claude_oauth_token() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::Path::new(&home)
+        .join(".claude")
+        .join(".credentials.json");
+    let body = std::fs::read_to_string(&path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;
+    parsed
+        .get("claudeAiOauth")?
+        .get("accessToken")?
+        .as_str()
+        .map(String::from)
 }
 
 /// Locate the sibling `fleet-tracker` binary and render it as a
@@ -1857,6 +2069,29 @@ fn topological_order(wf: &Workflow) -> Result<Vec<String>> {
     Ok(order)
 }
 
+/// `true` when the caller-supplied interrupt flag is `Some(flag)` and
+/// `flag` is currently set. Used by the run loop to abort cleanly on
+/// user Ctrl+C. Pure helper so the call site reads `if check_interrupt(...)`
+/// without unwrapping the Option inline.
+fn check_interrupt(flag: Option<&Arc<std::sync::atomic::AtomicBool>>) -> bool {
+    flag.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Short word describing a node's kind, for the per-node breadcrumb
+/// the run loop prints when fleet is running inside a tmux pane. Pure
+/// so it's trivially testable.
+#[must_use]
+fn node_kind_word(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Agent { .. } => "agent",
+        NodeKind::Bash { .. } => "bash",
+        NodeKind::Gate { .. } => "gate",
+        NodeKind::Assert { .. } => "assert",
+        NodeKind::Fanout { .. } => "fanout",
+        NodeKind::TrackerCreate { .. } => "tracker-create",
+    }
+}
+
 /// Flatten the session's persisted nested outputs map into the
 /// in-memory [`OutputMap`] the executor's expression engine consumes.
 /// Pure; tests assert the round-trip with [`outputs_to_persisted`].
@@ -2011,7 +2246,88 @@ mod tests {
     use crate::process::MockProcessInvoker;
     use crate::runtime::local::LocalAdapter;
     use mockall::predicate::{always, eq};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    #[test]
+    fn check_interrupt_returns_false_when_flag_absent() {
+        // No SIGINT handler installed (tests, CI runs without --detached)
+        // → executor always sees `false` and never short-circuits.
+        assert!(!check_interrupt(None));
+    }
+
+    #[test]
+    fn check_interrupt_returns_false_when_flag_present_but_clear() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!check_interrupt(Some(&flag)));
+    }
+
+    #[test]
+    fn check_interrupt_returns_true_when_flag_set() {
+        // The SIGINT handler flips the bool to true; the next run-loop
+        // iteration sees it via `check_interrupt` and aborts.
+        let flag = Arc::new(AtomicBool::new(true));
+        assert!(check_interrupt(Some(&flag)));
+    }
+
+    #[test]
+    fn resolve_secrets_in_env_overlays_env_backend_value() {
+        // Secret named `gh_token`, env passthrough on `GH_TOKEN` —
+        // case-insensitive match resolves the snake-case secret to
+        // the uppercase env var.
+        let mut secrets = std::collections::BTreeMap::new();
+        secrets.insert(
+            "gh_token".to_string(),
+            crate::secrets::SecretBackendConfig::Env {
+                var: "FLEET_TEST_RESOLVE_SECRETS_OVERLAYS".to_string(),
+            },
+        );
+        // SAFETY: env mutation is process-global; the name is unique
+        // to this test so concurrent tests can't race.
+        unsafe { std::env::set_var("FLEET_TEST_RESOLVE_SECRETS_OVERLAYS", "ghp_via_secret") };
+        let mut env = vec![
+            ("GH_TOKEN".to_string(), String::new()),
+            ("OTHER".to_string(), "untouched".to_string()),
+        ];
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(crate::process::RealProcessInvoker);
+        resolve_secrets_in_env(&mut env, &secrets, &invoker).unwrap();
+        unsafe { std::env::remove_var("FLEET_TEST_RESOLVE_SECRETS_OVERLAYS") };
+        assert_eq!(env[0].1, "ghp_via_secret");
+        assert_eq!(env[1].1, "untouched");
+    }
+
+    #[test]
+    fn resolve_secrets_in_env_is_a_noop_when_no_backend_matches() {
+        // Empty config → every env entry passes through unchanged.
+        let secrets = std::collections::BTreeMap::new();
+        let mut env = vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "kept".to_string())];
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(crate::process::RealProcessInvoker);
+        resolve_secrets_in_env(&mut env, &secrets, &invoker).unwrap();
+        assert_eq!(env[0].1, "kept");
+    }
+
+    #[test]
+    fn resolve_secrets_in_env_propagates_backend_failure() {
+        // A configured backend that fails (e.g. env var missing)
+        // must surface the error rather than silently leaving the
+        // env empty — otherwise the agent runs with no auth and the
+        // user sees a confusing claude-side error instead of fleet's
+        // clear "could not resolve secret X" message.
+        let mut secrets = std::collections::BTreeMap::new();
+        secrets.insert(
+            "gh_token".to_string(),
+            crate::secrets::SecretBackendConfig::Env {
+                var: "FLEET_TEST_RESOLVE_SECRETS_MISSING".to_string(),
+            },
+        );
+        // SAFETY: env mutation is process-global; the name is unique.
+        unsafe { std::env::remove_var("FLEET_TEST_RESOLVE_SECRETS_MISSING") };
+        let mut env = vec![("GH_TOKEN".to_string(), String::new())];
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(crate::process::RealProcessInvoker);
+        let err = resolve_secrets_in_env(&mut env, &secrets, &invoker).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("gh_token"), "msg: {msg}");
+        assert!(msg.contains("env"), "msg: {msg}");
+    }
 
     fn sample_devcontainer() -> Devcontainer {
         Devcontainer::from_str_at(
@@ -2019,6 +2335,18 @@ mod tests {
             "/repo/.devcontainer/devcontainer.json",
         )
         .unwrap()
+    }
+
+    /// Empty static secrets map for `ExecuteRequest` literals in
+    /// tests. Lives in a `OnceLock` so the reference is `'static`
+    /// without each test having to declare its own owning binding.
+    fn empty_secrets_static()
+    -> &'static std::collections::BTreeMap<String, crate::secrets::SecretBackendConfig> {
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<
+            std::collections::BTreeMap<String, crate::secrets::SecretBackendConfig>,
+        > = OnceLock::new();
+        EMPTY.get_or_init(std::collections::BTreeMap::new)
     }
 
     /// Deterministic clock: returns 1, 2, 3, … on successive calls.
@@ -2321,6 +2649,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -2357,6 +2687,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -2402,6 +2734,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -2656,6 +2990,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -2690,6 +3026,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -2735,6 +3073,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.worktree_path.as_deref(), Some(wt_path.as_path()));
@@ -2781,6 +3121,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert!(session.worktree_path.is_none());
@@ -2886,6 +3228,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &enforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -2948,6 +3292,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &enforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         executor.execute(&req).unwrap();
         assert_eq!(*enforcer.setup_calls.lock().unwrap(), 1);
@@ -2986,6 +3332,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3028,6 +3376,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         let active =
@@ -3070,6 +3420,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3110,6 +3462,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -3148,6 +3502,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("unknown agent `ghost`"));
@@ -3199,6 +3555,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3240,6 +3598,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("bash node `bad` failed"));
@@ -3287,6 +3647,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::AwaitingGate);
@@ -3351,6 +3713,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let final_session = executor.execute(&req).unwrap();
 
@@ -3410,6 +3774,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::AwaitingGate);
@@ -3449,6 +3815,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let _ = executor.execute(&req).unwrap_err();
         let loaded = store.load(&SessionId::new("s-fail-pid")).unwrap();
@@ -3494,6 +3862,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         // First execute pauses at the gate.
         let paused = executor.execute(&req).unwrap();
@@ -3555,6 +3925,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let paused = executor.execute(&req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -3606,6 +3978,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         // First run completes (no gate).
         let done = executor.execute(&req).unwrap();
@@ -3648,6 +4022,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.resume(&req).unwrap_err();
         assert!(
@@ -3734,6 +4110,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
 
         let replayed = executor.replay(&req, &src_id, "review").unwrap();
@@ -3812,6 +4190,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
 
         let replayed = executor.replay_only(&req, &src_id, "mid").unwrap();
@@ -3883,6 +4263,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
 
         let replayed = executor.replay_only(&req, &src_id, "revise").unwrap();
@@ -3941,6 +4323,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor
             .replay_only(&req, &src_id, "nonexistent")
@@ -3994,6 +4378,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
 
         let replayed = executor.replay(&req, &src_id, "review").unwrap();
@@ -4039,6 +4425,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
 
         let err = executor.replay(&req, &src_id, "nope").unwrap_err();
@@ -4082,6 +4470,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor
             .replay(&req, &SessionId::new("s-does-not-exist"), "only")
@@ -4152,6 +4542,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
 
         let replayed = executor.replay(&req, &src_id, "a").unwrap();
@@ -4203,6 +4595,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let replayed = executor.replay(&req, &src_id, "only").unwrap();
         assert_eq!(replayed.state, SessionState::Completed);
@@ -4285,6 +4679,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
 
         // The `decide` bash node "produces" its declared outputs as a
@@ -4383,6 +4779,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let replayed = executor.replay(&req, &src_id, "act").unwrap();
         assert_eq!(replayed.state, SessionState::Completed);
@@ -4511,6 +4909,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -4595,6 +4995,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -4645,6 +5047,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(
@@ -4692,6 +5096,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         (session, script_log)
@@ -5001,6 +5407,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -5236,6 +5644,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -5317,6 +5727,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -5371,6 +5783,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -5443,6 +5857,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -5523,6 +5939,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -5586,6 +6004,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -5645,6 +6065,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -5696,6 +6118,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -5814,6 +6238,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let paused = executor.execute(&req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -5890,6 +6316,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let paused = executor.execute(&exec_req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -5917,6 +6345,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let resumed = executor.resume(&resume_req).unwrap();
         assert_eq!(resumed.state, SessionState::Completed);
@@ -5978,6 +6408,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         executor.execute(&exec_req).unwrap();
 
@@ -6002,6 +6434,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let resumed = executor.resume(&resume_req).unwrap();
         assert_eq!(resumed.issue, Some(replacement));
@@ -6062,6 +6496,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         // when:-false skipped the assert; workflow Completes despite
@@ -6379,6 +6815,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
 
@@ -6470,6 +6908,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         executor.execute(&req).unwrap();
         let calls = tracker.calls();
@@ -6558,6 +6998,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         executor.execute(&req).unwrap();
 
@@ -6644,6 +7086,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         executor.execute(&req).unwrap();
 
@@ -6731,6 +7175,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         executor.execute(&req).unwrap();
 
@@ -6802,6 +7248,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         executor.execute(&req).unwrap();
         // Plans directory may not even exist; tracker-create
@@ -6876,6 +7324,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         executor.execute(&req).unwrap();
         let deps_path = deps_path_for(&store);
@@ -6941,6 +7391,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         executor.execute(&req).unwrap();
         let calls = tracker.calls();
@@ -7003,6 +7455,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("requires a tracker"));
@@ -7066,6 +7520,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -7132,6 +7588,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("title"));
@@ -7195,6 +7653,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("forced tracker create failure"));
@@ -7267,6 +7727,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -7353,6 +7815,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -7462,6 +7926,8 @@ nodes:
                 lifetime_budget_usd: None,
             },
             egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("forced link_parent failure"));

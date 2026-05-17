@@ -34,6 +34,13 @@ pub struct RepoConfig {
     pub cleanup: CleanupConfig,
     pub cost: CostConfig,
     pub orchestrator: OrchestratorConfig,
+    /// Per-name secret-backend declarations. Each entry maps an env
+    /// var name (e.g. `claude_code_oauth_token`, `gh_token`) to the
+    /// backend that resolves it. Used by [`crate::workflow::executor::build_agent_env`]
+    /// — when an agent's `env_passthrough` lists a name with a
+    /// matching entry here, the resolved secret is injected as the
+    /// container env value. Empty by default.
+    pub secrets: std::collections::BTreeMap<String, crate::secrets::SecretBackendConfig>,
 }
 
 /// `runtime:` block — which adapter to instantiate, how to harden it, where
@@ -428,6 +435,8 @@ struct Raw {
     cost: Option<RawCost>,
     #[serde(default)]
     orchestrator: Option<RawOrchestrator>,
+    #[serde(default)]
+    secrets: Option<std::collections::BTreeMap<String, crate::secrets::SecretBackendConfig>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -509,6 +518,7 @@ struct RawWorkflows {
 }
 
 impl From<Raw> for RepoConfig {
+    #[allow(clippy::too_many_lines)]
     fn from(raw: Raw) -> Self {
         // Destructure defaults up front so each field can be moved into the
         // matching `unwrap_or(...)` slot without aliasing the same struct
@@ -522,6 +532,7 @@ impl From<Raw> for RepoConfig {
             cleanup: default_cleanup,
             cost: default_cost,
             orchestrator: default_orchestrator,
+            secrets: default_secrets,
         } = Self::default();
 
         let runtime = match raw.runtime {
@@ -607,6 +618,7 @@ impl From<Raw> for RepoConfig {
             },
             None => default_orchestrator,
         };
+        let secrets = raw.secrets.unwrap_or(default_secrets);
         Self {
             runtime,
             tracker,
@@ -616,6 +628,7 @@ impl From<Raw> for RepoConfig {
             cleanup,
             cost,
             orchestrator,
+            secrets,
         }
     }
 }
@@ -1059,6 +1072,53 @@ agents:
         // ...without dropping `claude-code` from the defaults.
         assert!(cfg.agents.registry.get("claude-code").is_some());
         assert_eq!(cfg.agents.default, "aider");
+    }
+
+    #[test]
+    fn secrets_block_round_trips_three_backends() {
+        let yaml = "\
+secrets:
+  claude_code_oauth_token:
+    backend: keychain
+    service: claude-code-oauth-token
+  gh_token:
+    backend: env
+    var: GH_TOKEN
+  sentry_dsn:
+    backend: op
+    ref: op://Eng/Sentry/dsn
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        // All three entries land, keyed by their declared names.
+        assert_eq!(cfg.secrets.len(), 3);
+        assert_eq!(
+            cfg.secrets
+                .get("claude_code_oauth_token")
+                .map(crate::secrets::SecretBackendConfig::kind),
+            Some("keychain"),
+        );
+        assert_eq!(
+            cfg.secrets
+                .get("gh_token")
+                .map(crate::secrets::SecretBackendConfig::kind),
+            Some("env"),
+        );
+        assert_eq!(
+            cfg.secrets
+                .get("sentry_dsn")
+                .map(crate::secrets::SecretBackendConfig::kind),
+            Some("op"),
+        );
+    }
+
+    #[test]
+    fn secrets_block_defaults_to_empty_when_absent() {
+        // A config without a `secrets:` block parses fine and lands
+        // with an empty map — the resolver then falls through to the
+        // host file / env passthrough fallbacks.
+        let yaml = "tracker: github\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert!(cfg.secrets.is_empty());
     }
 
     #[test]

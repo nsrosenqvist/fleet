@@ -1728,12 +1728,13 @@ fn render_output_section(
     f.render_widget(block, area);
 
     // Publish the inner dims so the refresh thread can pin the
-    // orchestrator's tmux window to the panel width. Packed as
+    // focused tmux window to the panel width. Packed as
     // `(w << 16) | h`. Zero stays zero until we actually have a non-
     // empty area — keeps the first capture from running before we
     // know how wide the panel is.
     let packed = (u32::from(inner.width) << 16) | u32::from(inner.height);
     state
+        .refresh_inputs
         .pane_size
         .store(packed, std::sync::atomic::Ordering::Relaxed);
 
@@ -1750,6 +1751,19 @@ fn render_output_section(
 }
 
 fn render_worker_output(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    // Prefer the live `tmux capture-pane` snapshot when this worker
+    // was spawned with `--detached`. Falls back to the static log
+    // tail for foreground / pre-stage-2 sessions, and to a muted
+    // placeholder when even that's empty.
+    if let Some(session) = state.selected()
+        && let Some(body) = state
+            .worker_panes
+            .get(&session.id)
+            .filter(|s| !s.is_empty())
+    {
+        render_ansi_pane(f, area, body);
+        return;
+    }
     if state.log_tail.is_empty() {
         render_output_placeholder(f, area, "(no logs yet)");
         return;
@@ -1771,10 +1785,13 @@ fn render_orchestrator_output(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         );
         return;
     };
-    // Parse `tmux capture-pane -e` ANSI escapes into styled spans so
-    // Claude Code's colors come through. On parse failure, fall back
-    // to plain text — a malformed capture should never blank the
-    // pane.
+    render_ansi_pane(f, area, body);
+}
+
+/// Render `body` (raw bytes from `tmux capture-pane -e`) as styled
+/// spans in `area`, tailed to fit. Falls back to plain text on ANSI
+/// parse failure so a malformed capture never blanks the pane.
+fn render_ansi_pane(f: &mut Frame<'_>, area: Rect, body: &str) {
     let text: ratatui::text::Text<'_> = ansi_to_tui::IntoText::into_text(&body)
         .unwrap_or_else(|_| ratatui::text::Text::raw(body.to_string()));
     let line_count = text.lines.len();
@@ -2008,9 +2025,31 @@ pub fn detail_kv_pairs(session: &Session) -> Vec<(&'static str, String)> {
     if let Some(branch) = session.branch.as_deref() {
         pairs.push(("branch", branch.to_string()));
     }
-    pairs.push(("updated", format!("{} ms (epoch)", session.updated_at_ms)));
+    pairs.push(("updated", format_epoch_ms(session.updated_at_ms)));
     pairs.push(("cost", format_cost(session.total_cost_usd())));
     pairs
+}
+
+/// Render a Unix-epoch-ms timestamp as `YYYY-MM-DD HH:MM:SS UTC` —
+/// the readable side of ISO 8601, with a space separator and an
+/// explicit zone tag so the value is unambiguous at a glance. UTC
+/// because turning a local TZ into a string in this crate would drag
+/// in a system-timezone lookup that's flaky on minimal devcontainer
+/// images. Falls back to the raw ms on the rare overflow / formatter
+/// failure so the value is still surfaced.
+#[must_use]
+pub fn format_epoch_ms(ms: u64) -> String {
+    use time::OffsetDateTime;
+    use time::macros::format_description;
+    let nanos = i128::from(ms).saturating_mul(1_000_000);
+    let Ok(dt) = OffsetDateTime::from_unix_timestamp_nanos(nanos) else {
+        return format!("{ms} ms (epoch)");
+    };
+    // Compile-time format descriptor — no allocation for the format
+    // string, single allocation for the output buffer.
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second] UTC");
+    dt.format(&fmt)
+        .unwrap_or_else(|_| format!("{ms} ms (epoch)"))
 }
 
 /// Short word for a state.

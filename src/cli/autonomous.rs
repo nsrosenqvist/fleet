@@ -145,8 +145,13 @@ impl Spawner for RealSpawner {
             .binary
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("cannot resolve fleet binary path (current_exe)"))?;
+        // Detached: autonomous-spawned workflows go through the same
+        // tmux wrapper so a user who later opens `fleet ui` (or runs
+        // `fleet sessions attach`) can attach to a running engine pick
+        // and watch the agent. On a server with no interactive user
+        // the tmux session still works fine — it's detached anyway.
         let mut child =
-            build_workflow_run_command(binary, &cmd.workflow, Some(&cmd.issue.human_id));
+            build_workflow_run_command(binary, &cmd.workflow, Some(&cmd.issue.human_id), true);
         child
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
