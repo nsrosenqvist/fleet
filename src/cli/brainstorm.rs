@@ -17,15 +17,21 @@
 //! fleet via the CLI — `fleet plan …`, `fleet issues …`,
 //! `fleet sessions …`. The system prompt (in
 //! `crate::brainstorm::prompt`) documents the available
-//! subcommands. There's intentionally no HTTP server / token
-//! plumbing: the agent is already on the host, the bridge's
-//! security boundary doesn't apply, and a parallel HTTP surface
-//! would just duplicate what the CLI already does.
+//! subcommands and is delivered to the agent via a per-agent
+//! launcher strategy (see `crate::brainstorm::launcher`) — the
+//! prompt body is passed as an argv flag tuned for each binary
+//! (`claude --append-system-prompt`, `aider --read`, etc.) rather
+//! than left as a file the agent might never read. There's
+//! intentionally no HTTP server / token plumbing: the agent is
+//! already on the host, the bridge's security boundary doesn't
+//! apply, and a parallel HTTP surface would just duplicate what
+//! the CLI already does.
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::brainstorm::launcher::launcher_for;
 use crate::brainstorm::prompt::{RepoSnapshot, render_prompt_for_repo};
 use crate::brainstorm::store::BrainstormStore;
 use crate::brainstorm::tmux;
@@ -82,18 +88,25 @@ pub fn run_default() -> Result<i32> {
         crate::brainstorm::prompt::render_prompt(&snapshot)
     });
     let prompt_path = store.prompt_path(&id);
-    std::fs::write(&prompt_path, prompt_body)
+    std::fs::write(&prompt_path, &prompt_body)
         .with_context(|| format!("writing prompt at {}", prompt_path.display()))?;
 
-    // Spawn the tmux session running the agent. The only env var
-    // the agent needs is the prompt path — fleet CLI commands
-    // (`fleet plan …`, `fleet issues …`, etc.) are how the agent
-    // talks back to fleet, no HTTP server / token plumbing.
+    // Spawn the tmux session running the agent. Per-agent argv is
+    // built by a launcher strategy (claude → `--append-system-prompt`,
+    // aider → `--read`, codex → `-c developer_instructions=…`) so
+    // the prompt actually reaches the model instead of just sitting
+    // on disk. `FLEET_BRAINSTORM_PROMPT` is still set as a pointer
+    // to the rendered prompt file — informational for the user and
+    // a hook for unsupported agents to read it themselves.
     let env: Vec<(String, String)> = vec![(
         "FLEET_BRAINSTORM_PROMPT".to_string(),
         prompt_path.display().to_string(),
     )];
-    let command = vec![agent.clone()];
+    let launcher = launcher_for(agent);
+    if let Some(warning) = launcher.unsupported_warning() {
+        eprintln!("warning: agent `{agent}`: {warning}");
+    }
+    let command = launcher.argv(agent, &prompt_path, &prompt_body);
     tmux::new_session(invoker.as_ref(), &session.tmux_session, &command, &env)
         .with_context(|| format!("spawning tmux session `{}`", session.tmux_session))?;
 
