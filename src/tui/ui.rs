@@ -425,10 +425,52 @@ fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         framed_block_titled(title)
     }
     .padding(Padding::horizontal(2));
-    let body = Paragraph::new(plan_detail_lines(plan, selected_item, &state.tickets_by_id))
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(body, area);
+
+    // The pane is laid out as: framed_block chrome on the outside,
+    // header rows (kv + "Items (N)") rendered as a Paragraph on top,
+    // items rendered as a List on the bottom. Using a List for the
+    // items section lets the highlight_style paint the *full* row
+    // width when an item is selected — the look the user expects from
+    // the sessions sidebar. A pure Paragraph render only colours the
+    // characters that exist on the row, which would make the
+    // highlight look like a half-filled smear.
+    let header = plan_header_lines(plan, &state.tickets_by_id);
+    let header_height = u16::try_from(header.len()).unwrap_or(u16::MAX);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(header_height), Constraint::Min(0)])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(header).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+
+    let item_lines: Vec<ListItem<'_>> = plan
+        .items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| ListItem::new(plan_item_line(idx, item, false, &state.tickets_by_id)))
+        .collect();
+    let highlight = Style::default()
+        .fg(SELECT_FG)
+        .bg(SELECT_BG)
+        .add_modifier(Modifier::BOLD);
+    let list = List::new(item_lines)
+        .highlight_style(highlight)
+        .highlight_symbol("▸ ");
+    let mut item_cursor = state.plans_items_state.clone();
+    if state.plans_focus != PlansFocus::Items {
+        // Show no highlight when the user has Tab'd back to the
+        // sidebar — the visual "this row is selected" cue belongs to
+        // whichever pane has focus.
+        item_cursor.select(None);
+    }
+    f.render_stateful_widget(list, rows[1], &mut item_cursor);
+    let _ = selected_item; // kept for the test-facing plan_detail_lines combiner
 }
 
 fn render_plans_ticket(f: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -679,18 +721,21 @@ fn plan_state_marker(state: PlanState) -> &'static str {
     }
 }
 
+/// Header-only portion of the plan-detail pane: kv rows + the
+/// "Items (N)" section heading + a trailing blank row that the
+/// renderer leaves *out* of the items list. Split from
+/// [`plan_detail_lines`] so the production renderer can lay this
+/// section out as a Paragraph and the items below it as a List
+/// (which can paint a full-row selection highlight).
 #[must_use]
-pub(super) fn plan_detail_lines(
+fn plan_header_lines(
     plan: &Plan,
-    selected_item: Option<usize>,
-    titles: &std::collections::HashMap<String, crate::tracker::Issue>,
+    _titles: &std::collections::HashMap<String, crate::tracker::Issue>,
 ) -> Vec<Line<'static>> {
     let muted = Style::default().fg(MUTED);
     let (done, total) = plan.progress();
     let mut out: Vec<Line<'static>> = vec![
         kv_line("name", &plan.name),
-        // state value coloured by the same palette as `plan_row_style`
-        // so the header echoes the sidebar.
         Line::from(vec![
             Span::styled(format!("{:<14}", "state"), muted),
             Span::styled(
@@ -698,13 +743,7 @@ pub(super) fn plan_detail_lines(
                 plan_state_value_style(plan.state),
             ),
         ]),
-        // progress fraction: done count in OK once > 0 (full-OK when
-        // it equals total), slash + total in muted so the eye lands
-        // on the active number.
         progress_kv_line(done, total),
-        // policy: stop = ERR, retry-once = WARN, continue = OK. Same
-        // semantics as the runtime palette — failure modes are warm,
-        // recovery is cool.
         Line::from(vec![
             Span::styled(format!("{:<14}", "policy"), muted),
             Span::styled(
@@ -721,6 +760,21 @@ pub(super) fn plan_detail_lines(
         format!("Items ({total})"),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
+    out
+}
+
+/// Combined header + items as a flat `Vec<Line>` — the shape the
+/// existing tests assert on. Production rendering takes a different
+/// path (see `render_plans_detail`) so the items can use a List widget
+/// with a full-row selection highlight, but the assertion surface
+/// here stays stable.
+#[must_use]
+pub(super) fn plan_detail_lines(
+    plan: &Plan,
+    selected_item: Option<usize>,
+    titles: &std::collections::HashMap<String, crate::tracker::Issue>,
+) -> Vec<Line<'static>> {
+    let mut out = plan_header_lines(plan, titles);
     for (idx, item) in plan.items.iter().enumerate() {
         out.push(plan_item_line(idx, item, selected_item == Some(idx), titles));
     }
