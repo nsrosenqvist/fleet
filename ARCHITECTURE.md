@@ -125,7 +125,8 @@ src/
 │   ├── workflow.rs       `fleet workflow {list|validate|run|resume|replay}`
 │   ├── sessions.rs       `fleet sessions {list|show|logs|reap|prune}`
 │   ├── issues.rs         `fleet issues list`
-│   └── autonomous.rs     `fleet autonomous run --once|--watch`
+│   ├── autonomous.rs     `fleet autonomous run --once|--watch`
+│   └── scheduler.rs      `fleet scheduler {enable|disable|status|tick --once}`
 │
 ├── tui/mod.rs            ratatui session browser, Shift+A autonomous toggle
 │
@@ -160,6 +161,15 @@ src/
 │   ├── github.rs         shells `gh issue list --json`
 │   └── git_bug.rs        shells `git-bug bug --format json`
 │
+├── code_host/            host-side PR / CI / code-host backend
+│   ├── mod.rs            CodeHost trait, PrSummary/PrDetail/ChecksSummary
+│   └── github.rs         shells `gh pr {list,view,checks,comment,create}`
+│
+├── scheduler/            loop-based workflow scheduler
+│   ├── mod.rs            SchedulerEngine state machine (pure)
+│   ├── store.rs          .fleet/scheduler_state.json (last_run_at)
+│   └── dispatcher.rs     SchedulerSpawn → `fleet workflow run` subprocess
+│
 ├── agent/                agent registry + cost + prompt-prefix builder
 │   ├── mod.rs            AgentSpec, AgentRegistry
 │   ├── registry.rs       default registry (claude-code preconfigured)
@@ -171,6 +181,8 @@ src/
 ├── worktree.rs           git worktree helpers (create/remove/branch/prune)
 │
 ├── autonomous.rs         supervisor engine driving TUI Shift+A + CLI watch
+│                         (one session per open tracker issue; orthogonal
+│                         to scheduler/ which fires on elapsed intervals)
 │
 ├── repo.rs               fleet root discovery (.fleet/ > .git/ > cwd)
 ├── repo_config.rs        .fleet/config.yaml schema + parsing

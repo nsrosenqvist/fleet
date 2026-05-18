@@ -51,6 +51,17 @@ The per-boundary deep-dives:
   designed; phased delivery underway (status table at the bottom of
   the page).
 
+## Scheduled / PR-aware workflows
+
+- [`scheduler.md`](./scheduler.md) — the `loop:` workflow field,
+  the per-PR fanout (`pr-list bind: per`), and the four PR-aware
+  node kinds (`pr-list`, `pr-checks`, `create-pr`, `pr-comment`).
+  Covers `.fleet/config.yaml`'s `code_host:` block, the `fleet
+  scheduler {enable,disable,status,tick}` CLI, the `FLEET_PR_*`
+  env vars, and how PR-bound sessions get worktrees on
+  `refs/pull/<n>/head`. Also documents the `fleet-pr` in-container
+  read CLI.
+
 ## Verification
 
 - [`SMOKE_E2E.md`](./SMOKE_E2E.md) — tiered end-to-end smoke test
