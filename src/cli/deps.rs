@@ -497,10 +497,11 @@ mod tests {
                 calls.push((id.to_string(), body.to_string()));
                 calls.len()
             };
-            if let Some(n) = *self.fail_after.lock().unwrap() {
-                if count > n {
-                    bail!("forced comment failure");
-                }
+            let fail_after = *self.fail_after.lock().unwrap();
+            if let Some(n) = fail_after
+                && count > n
+            {
+                bail!("forced comment failure");
             }
             Ok(())
         }

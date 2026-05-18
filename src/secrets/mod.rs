@@ -15,7 +15,7 @@
 //!   Cheapest, fits CI workflows where the token is already an env
 //!   var of the runner.
 //! - [`keychain::KeychainBackend`] — OS-native keyring (macOS
-//!   Security framework, Linux DBus Secret Service, Windows
+//!   Security framework, Linux `DBus` Secret Service, Windows
 //!   Credential Manager). The recommended path for interactive
 //!   workstations; `fleet secrets register` walks the user through
 //!   storing the token here.

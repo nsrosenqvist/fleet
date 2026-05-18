@@ -258,7 +258,7 @@ pub trait RuntimeAdapter: Send + Sync {
     /// Attach a PTY for an interactive session. `opts.env` is
     /// surfaced into the agent's process env so credentials /
     /// per-node context flow into the container the same way `exec`
-    /// does — historically attach_pty had no opts, which silently
+    /// does — historically `attach_pty` had no opts, which silently
     /// broke env passthrough for tmux-mode (`--detached`) workflow
     /// runs because the engine's `up --remote-env` only sets env for
     /// lifecycle commands, not subsequent exec calls.

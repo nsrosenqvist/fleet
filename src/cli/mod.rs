@@ -59,7 +59,7 @@ pub enum Command {
     /// Secrets management: register / list / test the secrets fleet
     /// resolves into the agent container's env at run time. Backed
     /// by the OS keychain by default (macOS Security framework /
-    /// Linux DBus Secret Service / Windows Credential Manager).
+    /// Linux `DBus` Secret Service / Windows Credential Manager).
     Secrets {
         #[command(subcommand)]
         sub: SecretsSub,
@@ -319,7 +319,7 @@ pub enum SecretsSub {
         /// Secret name (e.g. `claude_code_oauth_token`). Matched
         /// case-insensitively against agent `env_passthrough`
         /// declarations at resolve time, so `claude_code_oauth_token`
-        /// here resolves `CLAUDE_CODE_OAUTH_TOKEN` in env_passthrough.
+        /// here resolves `CLAUDE_CODE_OAUTH_TOKEN` in `env_passthrough`.
         name: String,
     },
 

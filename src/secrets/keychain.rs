@@ -2,7 +2,7 @@
 //!
 //! Resolves via the `keyring` crate, which routes to:
 //! - macOS: Security framework (same store the `security` CLI uses)
-//! - Linux: DBus Secret Service (GNOME Keyring / KWallet / KeePassXC / …)
+//! - Linux: `DBus` Secret Service (GNOME Keyring / `KWallet` / `KeePassXC` / …)
 //! - Windows: Credential Manager
 //!
 //! Storage shape is `(service, account)`. Concrete entry creation:
