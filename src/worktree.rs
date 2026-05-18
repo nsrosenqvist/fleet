@@ -86,6 +86,89 @@ pub fn head_sha(invoker: &dyn ProcessInvoker, dir: &Path) -> Result<String> {
         .with_context(|| format!("reading HEAD at {}", dir.display()))
 }
 
+// Stage 7 (scheduler dispatcher) wires `create_worktree_for` into
+// `run_for_pr`; the new types are intentionally unused for now so the
+// dead-code allow scopes to this module rather than every site that
+// will eventually touch it. Same pattern as `create_worktree`'s
+// historical wrappers.
+
+/// How [`create_worktree_for`] should populate the new worktree.
+///
+/// - `Fresh { base }` is the historical behaviour: cut a brand-new
+///   branch from the named ref. Used for issueless sessions and the
+///   per-issue autonomous flow.
+/// - `Pr { number, head_ref }` is the PR-bound flavour for scheduler
+///   per-PR fanout: fetch the PR's head ref into a local refspec
+///   (`fleet/pr-<n>`), then check the session branch out from there.
+///   Commits made in the worktree land on the session branch; pushing
+///   them to the PR requires an explicit
+///   `git push origin HEAD:<head_ref>` from the agent, kept explicit so
+///   the local PR snapshot is not implicitly authoritative.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // wired in stage 7 (scheduler dispatcher's run_for_pr).
+pub enum WorktreeSpec<'a> {
+    Fresh {
+        base: &'a str,
+    },
+    Pr {
+        number: u32,
+        /// PR's head branch on the remote. Kept on the spec for symmetry
+        /// even though the fetch ref is what we check out — the
+        /// dispatcher uses it later to drive
+        /// `git push origin HEAD:<head_ref>` when finalising a fix.
+        #[allow(dead_code)]
+        head_ref: &'a str,
+    },
+}
+
+/// Local refspec a PR-bound worktree's head is fetched into. Public
+/// so callers (the dispatcher, the prune story) can name it without
+/// duplicating the format string.
+#[must_use]
+#[allow(dead_code)] // wired in stage 7.
+pub fn pr_fetch_ref(number: u32) -> String {
+    format!("fleet/pr-{number}")
+}
+
+/// Create a worktree per `spec`. This is the generalised entry point
+/// `create_worktree` delegates to; existing callers that pass a bare
+/// `base: &str` keep working via the [`create_worktree`] wrapper.
+#[allow(dead_code)] // wired in stage 7.
+pub fn create_worktree_for(
+    invoker: &dyn ProcessInvoker,
+    repo_root: &Path,
+    target_path: &Path,
+    branch: &str,
+    spec: WorktreeSpec<'_>,
+) -> Result<()> {
+    match spec {
+        WorktreeSpec::Fresh { base } => create_worktree_fresh(invoker, repo_root, target_path, branch, base),
+        WorktreeSpec::Pr { number, head_ref: _ } => {
+            // Step 1: fetch the PR's head into a local ref. Force-update
+            // (leading `+`) so a force-pushed PR re-fetch overwrites
+            // the prior snapshot — the alternative is a non-fast-forward
+            // error that no caller would know how to recover from.
+            let fetch_ref = pr_fetch_ref(number);
+            invoker
+                .run(
+                    "git",
+                    vec![
+                        "-C".to_string(),
+                        repo_root.to_string_lossy().into_owned(),
+                        "fetch".to_string(),
+                        "origin".to_string(),
+                        format!("+refs/pull/{number}/head:{fetch_ref}"),
+                    ],
+                )
+                .with_context(|| {
+                    format!("fetching PR #{number} head into `{fetch_ref}`")
+                })?;
+            // Step 2: cut the session branch from the fetched ref.
+            create_worktree_fresh(invoker, repo_root, target_path, branch, &fetch_ref)
+        }
+    }
+}
+
 /// Create a new git worktree at `target_path` checked out on a new
 /// branch `branch`, based off `base` (a branch name, tag, or sha).
 ///
@@ -93,6 +176,16 @@ pub fn head_sha(invoker: &dyn ProcessInvoker, dir: &Path) -> Result<String> {
 /// worktree add …`. `target_path` is where the new working tree
 /// lands. The directory must not exist yet (git refuses otherwise).
 pub fn create_worktree(
+    invoker: &dyn ProcessInvoker,
+    repo_root: &Path,
+    target_path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<()> {
+    create_worktree_fresh(invoker, repo_root, target_path, branch, base)
+}
+
+fn create_worktree_fresh(
     invoker: &dyn ProcessInvoker,
     repo_root: &Path,
     target_path: &Path,
@@ -291,6 +384,104 @@ mod tests {
             "HEAD",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn pr_fetch_ref_uses_stable_format() {
+        assert_eq!(pr_fetch_ref(42), "fleet/pr-42");
+        assert_eq!(pr_fetch_ref(1), "fleet/pr-1");
+    }
+
+    #[test]
+    fn create_worktree_for_fresh_matches_legacy_argv() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run()
+            .with(
+                eq("git"),
+                eq(vec![
+                    "-C".to_string(),
+                    "/repo".to_string(),
+                    "worktree".to_string(),
+                    "add".to_string(),
+                    "-b".to_string(),
+                    "fleet/session-abc".to_string(),
+                    "/repo/.fleet/sessions/abc/worktree".to_string(),
+                    "main".to_string(),
+                ]),
+            )
+            .returning(|_, _| Ok(String::new()));
+        create_worktree_for(
+            &inv,
+            Path::new("/repo"),
+            &PathBuf::from("/repo/.fleet/sessions/abc/worktree"),
+            "fleet/session-abc",
+            WorktreeSpec::Fresh { base: "main" },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_worktree_for_pr_fetches_pull_ref_then_adds_worktree() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run()
+            .with(
+                eq("git"),
+                eq(vec![
+                    "-C".to_string(),
+                    "/repo".to_string(),
+                    "fetch".to_string(),
+                    "origin".to_string(),
+                    "+refs/pull/42/head:fleet/pr-42".to_string(),
+                ]),
+            )
+            .returning(|_, _| Ok(String::new()));
+        inv.expect_run()
+            .with(
+                eq("git"),
+                eq(vec![
+                    "-C".to_string(),
+                    "/repo".to_string(),
+                    "worktree".to_string(),
+                    "add".to_string(),
+                    "-b".to_string(),
+                    "fleet/session-pr42".to_string(),
+                    "/repo/.fleet/sessions/pr42/worktree".to_string(),
+                    "fleet/pr-42".to_string(),
+                ]),
+            )
+            .returning(|_, _| Ok(String::new()));
+        create_worktree_for(
+            &inv,
+            Path::new("/repo"),
+            &PathBuf::from("/repo/.fleet/sessions/pr42/worktree"),
+            "fleet/session-pr42",
+            WorktreeSpec::Pr {
+                number: 42,
+                head_ref: "feat/x",
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_worktree_for_pr_surfaces_fetch_error_with_context() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run()
+            .returning(|_, _| Err(anyhow::anyhow!("fatal: couldn't find pull/99/head")));
+        let err = create_worktree_for(
+            &inv,
+            Path::new("/repo"),
+            &PathBuf::from("/repo/.fleet/sessions/p/worktree"),
+            "fleet/session-p",
+            WorktreeSpec::Pr {
+                number: 99,
+                head_ref: "feat/x",
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("PR #99"), "got: {msg}");
+        assert!(msg.contains("fleet/pr-99"), "got: {msg}");
     }
 
     #[test]

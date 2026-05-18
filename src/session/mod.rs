@@ -60,6 +60,35 @@ pub struct IssueContext {
     #[serde(default)]
     pub labels: Vec<String>,
 }
+
+/// PR the workflow is acting on, when one was supplied (e.g. by the
+/// scheduler's per-PR fanout). Peer of [`IssueContext`] — a session
+/// can be bound to a PR, to an issue, to both, or to neither, and the
+/// two contexts are otherwise independent.
+///
+/// `human_id` is conventionally `"pr:<number>"` so bridge / UI code
+/// distinguishes PRs from tracker issues by prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrContext {
+    /// PR number on the code host (e.g. GitHub PR #42).
+    pub number: u32,
+    /// User-facing id, conventionally `"pr:<number>"`.
+    pub human_id: String,
+    pub title: String,
+    /// Branch the PR's head points at on the remote. The session's
+    /// worktree checks this branch out so the agent's commits land on
+    /// the PR's branch and `git push origin HEAD:<head_ref>` updates
+    /// the PR directly.
+    pub head_ref: String,
+    /// Commit SHA at the PR's head when the session was bound.
+    /// Surfaced as `FLEET_PR_HEAD_SHA` so workflow nodes can record
+    /// "the fix was applied on top of <sha>" without re-querying the
+    /// code host.
+    pub head_sha: String,
+    /// Base branch on the remote (where the PR wants to merge).
+    pub base_ref: String,
+    pub url: String,
+}
 // `store::SessionStore` is intentionally not re-exported yet: nothing in
 // the binary references it from outside the `session` module, so a
 // top-level `pub use` would trip the `unused_imports` lint that the

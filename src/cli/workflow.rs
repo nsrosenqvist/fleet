@@ -161,6 +161,9 @@ pub fn run_run(
         workspace: workspace_path,
         session_id: session_id.clone(),
         issue,
+        // PR binding lands in stage 7 (`run_for_pr`); the standard
+        // `run` path never binds a PR by itself.
+        pr: None,
         worktree: worktree_meta,
         cost: &config.cost,
         egress: enforcer.as_ref(),
@@ -339,6 +342,7 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         // `--issue` is lost across processes today. Workflows that
         // depend on `FLEET_ISSUE_*` post-resume should re-spawn instead.
         issue: None,
+        pr: None,
         // Worktree path + branch already live on the loaded session —
         // resume must not re-stamp (would bump updated_at_ms with no
         // change) and the executor's resume() doesn't read it.
@@ -429,6 +433,7 @@ pub fn run_sibling(session_id: &str, node_id: &str) -> Result<i32> {
         // Inherit the parent run's issue context so `FLEET_ISSUE_*`
         // is consistent across sibling subprocesses.
         issue: session.issue.clone(),
+        pr: None,
         // Worktree was provisioned by the parent run; siblings
         // don't re-stamp.
         worktree: None,
@@ -599,6 +604,7 @@ pub fn run_replay(
         // run via `workflow run --issue` is the supported path when
         // `FLEET_ISSUE_*` matters.
         issue: None,
+        pr: None,
         worktree: worktree_meta,
         cost: &config.cost,
         egress: enforcer.as_ref(),

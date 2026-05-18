@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use super::{IssueContext, SessionId, SessionState};
+use super::{IssueContext, PrContext, SessionId, SessionState};
 
 /// One session row. Owned by the store; mutated only via [`Session::transition_to`]
 /// so the state-machine rules are the single gate for state changes.
@@ -41,6 +41,14 @@ pub struct Session {
     /// nodes downstream of the gate.
     #[serde(default)]
     pub issue: Option<IssueContext>,
+    /// Pull request the workflow is acting on, if any. Peer of
+    /// [`Self::issue`] — a session can be bound to both (a PR-fix
+    /// session for a PR that resolves an issue) or to either alone.
+    /// `serde(default)` keeps backward compat with meta.json files
+    /// written before this field existed; sessions that predate the
+    /// PR-aware scheduler load with `pr: None`.
+    #[serde(default)]
+    pub pr: Option<PrContext>,
     /// Per-node `loop_back_to` counters. The executor mutates this
     /// in place as cycles fire; persistence keeps the counters honest
     /// across a `resume` boundary. Without it a gate placed
@@ -103,6 +111,7 @@ impl Session {
             state: SessionState::Created,
             current_node: None,
             issue: None,
+            pr: None,
             loop_counts: BTreeMap::new(),
             driver_pid: None,
             node_costs: BTreeMap::new(),
@@ -329,6 +338,56 @@ mod tests {
         let s: Session = serde_json::from_str(json).unwrap();
         assert!(s.issue.is_none());
         assert!(s.loop_counts.is_empty());
+        // Same backward-compat guarantee for the PR context.
+        assert!(s.pr.is_none());
+    }
+
+    #[test]
+    fn round_trips_with_pr_context() {
+        let mut s = fresh();
+        s.pr = Some(PrContext {
+            number: 42,
+            human_id: "pr:42".into(),
+            title: "Fix CI".into(),
+            head_ref: "feat/x".into(),
+            head_sha: "deadbeef".into(),
+            base_ref: "main".into(),
+            url: "https://github.com/o/r/pull/42".into(),
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+        let pr = back.pr.unwrap();
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.head_ref, "feat/x");
+    }
+
+    #[test]
+    fn session_with_pr_loads_alongside_issue() {
+        // Sessions can be bound to both an issue and a PR — the
+        // contexts are independent. Smoke the dual binding so the
+        // future "fix CI on the PR that closes #42" workflow has a
+        // stable data contract to lean on.
+        let mut s = fresh();
+        s.issue = Some(IssueContext {
+            id: "gh:42".into(),
+            human_id: "42".into(),
+            title: "Fix the parser".into(),
+            labels: Vec::new(),
+        });
+        s.pr = Some(PrContext {
+            number: 7,
+            human_id: "pr:7".into(),
+            title: "Fix parser".into(),
+            head_ref: "feat/x".into(),
+            head_sha: "abc".into(),
+            base_ref: "main".into(),
+            url: "https://github.com/o/r/pull/7".into(),
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert!(back.issue.is_some());
+        assert!(back.pr.is_some());
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::process::ProcessInvoker;
 use crate::runtime::devcontainer::Devcontainer;
 use crate::runtime::{ContainerSpec, ExecOpts, ImageId, MountSpec, RuntimeAdapter, host_arch_oci};
 use crate::session::store::SessionStore;
-use crate::session::{IssueContext, Session, SessionId, SessionState, now_ms};
+use crate::session::{IssueContext, PrContext, Session, SessionId, SessionState, now_ms};
 use crate::tracker::Tracker;
 
 /// What a node's run produced *besides* a Result. Today carries any
@@ -145,6 +145,10 @@ pub struct ExecuteRequest<'a> {
     /// `FLEET_ISSUE_ID` / `FLEET_ISSUE_HUMAN_ID` / `FLEET_ISSUE_TITLE`
     /// in both agent and bash node environments.
     pub issue: Option<IssueContext>,
+    /// PR the workflow is acting on, if any. Surfaces to nodes via
+    /// the `FLEET_PR_*` env block. Independent of `issue:` — a session
+    /// can bind to both, to either, or to neither.
+    pub pr: Option<PrContext>,
     /// Per-session worktree metadata (path + branch) to stamp onto
     /// the session's `meta.json` for later replay/inspection. `None`
     /// for non-git workspaces or when the caller chose not to isolate.
@@ -279,6 +283,9 @@ impl WorkflowExecutor {
         // subsequent `fleet workflow resume` after a gate doesn't
         // lose `FLEET_ISSUE_*` env on downstream nodes.
         session.issue.clone_from(&req.issue);
+        // Same story for `pr`: stamp so resume after a gate keeps
+        // `FLEET_PR_*` env intact.
+        session.pr.clone_from(&req.pr);
         // Stamp the per-session worktree the CLI provisioned (if any)
         // before persistence — without this, a crash between create()
         // and the next save() would lose the pointer the prune command
@@ -898,6 +905,9 @@ impl WorkflowExecutor {
             // original `--issue`; `execute()` copies `req.issue` here
             // at session creation.
             issue: session.issue.as_ref(),
+            // Same story for `pr`: session is the source of truth so
+            // resume after a gate keeps `FLEET_PR_*` env visible.
+            pr: session.pr.as_ref(),
         };
         let mut env = build_agent_env(agent, &agent_ctx);
         // Overlay any `secrets:`-configured values on top of the
@@ -1108,7 +1118,11 @@ impl WorkflowExecutor {
         // environment without polluting the outer shell. The issue comes
         // from the persisted session so a `resume` after a gate keeps
         // the original `--issue` context visible to bash scripts too.
-        let env_prefix = bash_issue_env_prefix(session.issue.as_ref());
+        let env_prefix = format!(
+            "{}{}",
+            bash_issue_env_prefix(session.issue.as_ref()),
+            bash_pr_env_prefix(session.pr.as_ref()),
+        );
         let cmd = format!(
             "cd {} && {env_prefix}{script}",
             shell_quote_path(req.workspace)
@@ -1975,6 +1989,10 @@ pub struct AgentContext<'a> {
     /// Optional issue the workflow is acting on. Exposed as the
     /// `FLEET_ISSUE_*` trio when set.
     pub issue: Option<&'a IssueContext>,
+    /// Optional PR the workflow is acting on. Exposed as the
+    /// `FLEET_PR_*` block when set. Independent of [`Self::issue`];
+    /// both may be set simultaneously.
+    pub pr: Option<&'a PrContext>,
 }
 
 /// Resolved prompt file: the user-authored source path (for
@@ -2027,6 +2045,15 @@ pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String
         env.push(("FLEET_ISSUE_ID".to_string(), issue.id.clone()));
         env.push(("FLEET_ISSUE_HUMAN_ID".to_string(), issue.human_id.clone()));
         env.push(("FLEET_ISSUE_TITLE".to_string(), issue.title.clone()));
+    }
+    if let Some(pr) = ctx.pr {
+        env.push(("FLEET_PR_NUMBER".to_string(), pr.number.to_string()));
+        env.push(("FLEET_PR_HUMAN_ID".to_string(), pr.human_id.clone()));
+        env.push(("FLEET_PR_TITLE".to_string(), pr.title.clone()));
+        env.push(("FLEET_PR_HEAD_REF".to_string(), pr.head_ref.clone()));
+        env.push(("FLEET_PR_HEAD_SHA".to_string(), pr.head_sha.clone()));
+        env.push(("FLEET_PR_BASE_REF".to_string(), pr.base_ref.clone()));
+        env.push(("FLEET_PR_URL".to_string(), pr.url.clone()));
     }
     env
 }
@@ -2213,6 +2240,29 @@ pub fn bash_issue_env_prefix(issue: Option<&IssueContext>) -> String {
         shell_quote_value(&ctx.id),
         shell_quote_value(&ctx.human_id),
         shell_quote_value(&ctx.title),
+    )
+}
+
+/// Bash-side counterpart of the `FLEET_PR_*` block in
+/// [`build_agent_env`]. Returns the empty string when no PR is
+/// bound. Pure; the bash-node runner concatenates this onto
+/// [`bash_issue_env_prefix`] so a session bound to both shows both
+/// blocks. The trailing space matters for chaining without quoting.
+#[must_use]
+pub fn bash_pr_env_prefix(pr: Option<&PrContext>) -> String {
+    let Some(p) = pr else {
+        return String::new();
+    };
+    format!(
+        "FLEET_PR_NUMBER={} FLEET_PR_HUMAN_ID={} FLEET_PR_TITLE={} \
+         FLEET_PR_HEAD_REF={} FLEET_PR_HEAD_SHA={} FLEET_PR_BASE_REF={} FLEET_PR_URL={} ",
+        shell_quote_value(&p.number.to_string()),
+        shell_quote_value(&p.human_id),
+        shell_quote_value(&p.title),
+        shell_quote_value(&p.head_ref),
+        shell_quote_value(&p.head_sha),
+        shell_quote_value(&p.base_ref),
+        shell_quote_value(&p.url),
     )
 }
 
@@ -2955,6 +3005,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -2993,6 +3044,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-missin"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3040,6 +3092,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-liar"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3168,6 +3221,7 @@ nodes:
             persona: Some("reviewer"),
             prompt: Some(&prompt),
             issue: Some(&issue),
+            pr: None,
         };
         let env = build_agent_env(&spec, &ctx);
         let keys: std::collections::HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
@@ -3262,6 +3316,69 @@ nodes:
         assert!(prefix.contains("FLEET_ISSUE_TITLE='' "), "got: {prefix}");
     }
 
+    fn sample_pr() -> PrContext {
+        PrContext {
+            number: 42,
+            human_id: "pr:42".to_string(),
+            title: "Fix CI".to_string(),
+            head_ref: "feat/x".to_string(),
+            head_sha: "deadbeef".to_string(),
+            base_ref: "main".to_string(),
+            url: "https://github.com/o/r/pull/42".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_agent_env_appends_pr_vars_when_present() {
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: Vec::new(),
+        };
+        let pr = sample_pr();
+        let ctx = AgentContext {
+            pr: Some(&pr),
+            ..AgentContext::default()
+        };
+        let env = build_agent_env(&spec, &ctx);
+        let has = |key: &str, val: &str| {
+            env.iter().any(|(k, v)| k == key && v == val)
+        };
+        assert!(has("FLEET_PR_NUMBER", "42"));
+        assert!(has("FLEET_PR_HUMAN_ID", "pr:42"));
+        assert!(has("FLEET_PR_TITLE", "Fix CI"));
+        assert!(has("FLEET_PR_HEAD_REF", "feat/x"));
+        assert!(has("FLEET_PR_HEAD_SHA", "deadbeef"));
+        assert!(has("FLEET_PR_BASE_REF", "main"));
+        assert!(has("FLEET_PR_URL", "https://github.com/o/r/pull/42"));
+    }
+
+    #[test]
+    fn build_agent_env_omits_pr_block_when_no_pr_bound() {
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: Vec::new(),
+        };
+        let env = build_agent_env(&spec, &AgentContext::default());
+        assert!(!env.iter().any(|(k, _)| k.starts_with("FLEET_PR_")));
+    }
+
+    #[test]
+    fn bash_pr_env_prefix_emits_quoted_block_with_trailing_space() {
+        let prefix = bash_pr_env_prefix(Some(&sample_pr()));
+        assert!(prefix.contains("FLEET_PR_NUMBER='42' "));
+        assert!(prefix.contains("FLEET_PR_HEAD_REF='feat/x' "));
+        assert!(prefix.contains("FLEET_PR_HEAD_SHA='deadbeef' "));
+        assert!(
+            prefix.ends_with(' '),
+            "must end with a space for splice chaining; got: {prefix}"
+        );
+    }
+
+    #[test]
+    fn bash_pr_env_prefix_empty_when_unbound() {
+        assert_eq!(bash_pr_env_prefix(None), "");
+    }
+
     #[test]
     fn bash_node_script_carries_issue_env_when_issue_present() {
         let yaml = "\
@@ -3296,6 +3413,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-iss"),
             issue: Some(sample_issue()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3332,6 +3450,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-trivial"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3376,6 +3495,7 @@ nodes:
             workspace: &wt_path,
             session_id: SessionId::new("s-wt"),
             issue: None,
+            pr: None,
             worktree: Some(WorktreeMeta {
                 path: &wt_path,
                 branch: "fleet/session-s-wt",
@@ -3427,6 +3547,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-no-wt"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3534,6 +3655,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-egress-env"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3598,6 +3720,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-lifecycle"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3638,6 +3761,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-cost"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3682,6 +3806,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-clean-marker"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3726,6 +3851,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-noparse"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3768,6 +3894,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fail"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3808,6 +3935,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-ghost"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3861,6 +3989,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bash"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3904,6 +4033,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bashfail"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -3953,6 +4083,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4019,6 +4150,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4080,6 +4212,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate-pid"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4121,6 +4254,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fail-pid"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4168,6 +4302,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-resume"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4228,6 +4363,7 @@ nodes:
             workspace: &wt,
             session_id: SessionId::new("s-resume-wt"),
             issue: None,
+            pr: None,
             worktree: Some(WorktreeMeta {
                 path: &wt,
                 branch: "fleet/session-s-resume-wt",
@@ -4284,6 +4420,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-done"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4328,6 +4465,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-ghost"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4416,6 +4554,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4496,6 +4635,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-only"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4569,6 +4709,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-loop"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4629,6 +4770,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bad"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4681,6 +4823,7 @@ nodes:
             workspace: &new_wt,
             session_id: SessionId::new("s-replay-wt"),
             issue: None,
+            pr: None,
             worktree: Some(WorktreeMeta {
                 path: &new_wt,
                 branch: "fleet/session-s-replay-wt",
@@ -4731,6 +4874,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-bad"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4776,6 +4920,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-no-src"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4848,6 +4993,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-top"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4901,6 +5047,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-empty"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -4985,6 +5132,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-gate-outputs"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -5085,6 +5233,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-replay-with-outputs"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -5215,6 +5364,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fanout-fail"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -5301,6 +5451,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -5353,6 +5504,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-fan-gate"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -5402,6 +5554,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new(session_id),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -5713,6 +5866,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-dia"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -5950,6 +6104,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6033,6 +6188,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6089,6 +6245,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-bad-fork"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6163,6 +6320,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6245,6 +6403,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6310,6 +6469,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6371,6 +6531,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6424,6 +6585,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-assert-unknown"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6544,6 +6706,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-loop-resume"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6622,6 +6785,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-issue-resume"),
             issue: Some(sample_issue()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6651,6 +6815,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-issue-resume"),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6714,6 +6879,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-override"),
             issue: Some(original.clone()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6740,6 +6906,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: SessionId::new("s-override"),
             issue: Some(replacement.clone()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -6802,6 +6969,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id: session_id.clone(),
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7122,6 +7290,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7215,6 +7384,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: Some(sample_issue()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7305,6 +7475,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: Some(sample_issue()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7393,6 +7564,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: Some(sample_issue()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7482,6 +7654,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: Some(sample_issue()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7555,6 +7728,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: Some(sample_issue()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7631,6 +7805,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7698,6 +7873,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None, // no bound ticket
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7762,6 +7938,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7827,6 +8004,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7895,6 +8073,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -7960,6 +8139,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -8034,6 +8214,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -8122,6 +8303,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -8233,6 +8415,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: Some(sample_issue()),
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
@@ -8341,6 +8524,7 @@ nodes:
             workspace: Path::new("/repo"),
             session_id,
             issue: None,
+            pr: None,
             worktree: None,
             cost: &crate::repo_config::CostConfig {
                 per_session_budget_usd: None,
