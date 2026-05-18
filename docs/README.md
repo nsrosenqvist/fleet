@@ -24,7 +24,9 @@ The per-boundary deep-dives:
   backends (OS keyring / 1Password CLI / host env var), the
   per-agent resolver chain, and how the resolved value reaches the
   agent container without touching the image or the container
-  filesystem.
+  filesystem. Also documents what agent runtime config
+  (`CLAUDE.md`, skills, subagents, hooks, MCP servers) reaches the
+  sandbox via the worktree and what doesn't.
 - [`network.md`](./network.md) — egress allowlist. The two enforcer
   backends (Podman `--internal` network + tinyproxy sidecar on Linux,
   host-side tinyproxy on macOS / Docker), the default allowlist

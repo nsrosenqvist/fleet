@@ -258,6 +258,114 @@ list`.
 Not implemented today. The trait shape is open; new tracker
 plugins plug into `src/tracker/`.
 
+## Agent runtime config
+
+Beyond secrets, agents take a lot of runtime configuration:
+`CLAUDE.md`, custom subagents and skills under `.claude/`, hook
+scripts, custom settings, MCP server registrations. None of this is
+mounted from the host — the sandbox sees only the worktree at
+`/workspace` plus the secrets-derived env (see
+[`sandbox.md`](./sandbox.md)). The rule is: **if you want it in the
+sandbox, it has to be in the worktree, or it has to be an env var.**
+
+### What reaches the agent automatically
+
+- **Project-local `.claude/`.** Anything checked into the working
+  branch under `.claude/CLAUDE.md`, `.claude/agents/`,
+  `.claude/skills/`, `.claude/hooks/`, `.claude/settings.json`, plus
+  `.mcp.json` at the repo root, shows up in `/workspace` and Claude
+  Code picks it up the same way it would on the host.
+- **The claude OAuth token.** Propagated via the trampoline
+  described above. Authorizes the model API and any claude.ai-
+  brokered MCP integrations attached to the same Anthropic account.
+
+### What does NOT reach the agent
+
+- **The host's `~/.claude/`.** User-scope `CLAUDE.md`, `agents/`,
+  `skills/`, `settings.json`, `hooks/`, `plugins/` — none of it is
+  bind-mounted. The container's `$HOME/.claude/` is created fresh
+  per session and only contains the trampoline-materialised
+  `.credentials.json`.
+- **Host MCP OAuth tokens** cached by Claude Code's `/mcp` flow on
+  the host. On Linux these live in `~/.claude/.credentials.json`
+  under internal keys; on macOS in the OS keychain. Fleet doesn't
+  extract them — see "Not done" below for why.
+- **Other host config:** `~/.ssh`, `~/.config/gh`, `~/.aws`,
+  `~/.netrc`, etc. The full mount list is in
+  [`sandbox.md`](./sandbox.md).
+
+### MCP server auth
+
+MCP servers reach the agent through Claude Code's normal config
+discovery (project-local `.mcp.json` and `.claude/settings.json` in
+the worktree). Auth depends on the server type:
+
+**claude.ai-brokered MCPs** (Context7, Google Drive, Mermaid Chart,
+etc. from the official marketplace) — authorized server-side
+against your Claude account, not via a local OAuth client. With
+`CLAUDE_CODE_OAUTH_TOKEN` reaching the container (the default
+`claude-code` agent already does), these are usable in-sandbox
+with no extra configuration. Per-MCP linkage (e.g. authorizing
+Google Drive against your account) is stored in your Anthropic
+account; complete it once on the host.
+
+**Third-party OAuth MCPs (HTTP / SSE)** — the OAuth flow can't run
+in a headless container, and fleet doesn't propagate host-side
+cached tokens. The supported pattern is a bearer header sourced
+from an env var:
+
+```json
+// .mcp.json (committed in the worktree)
+{
+  "mcpServers": {
+    "internal-docs": {
+      "type": "http",
+      "url": "https://docs.internal.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${INTERNAL_DOCS_TOKEN}" }
+    }
+  }
+}
+```
+
+```yaml
+# .fleet/config.yaml
+agents:
+  registry:
+    claude-code:
+      env_passthrough: [CLAUDE_CODE_OAUTH_TOKEN, INTERNAL_DOCS_TOKEN]
+secrets:
+  internal_docs_token:
+    backend: keychain
+    service: internal-docs-token
+```
+
+The token is fetched from the keychain at agent-spawn time and
+injected as `INTERNAL_DOCS_TOKEN` into the container. Claude Code
+substitutes it into the header at MCP-connect time.
+
+**Stdio MCPs** — same pattern with an API-key env var; no OAuth
+flow runs in-container.
+
+**Dynamic credentials** (short-lived tokens, SSO, custom auth) —
+Claude Code's `headersHelper` shell command in `.mcp.json` runs at
+every connect. Inside the sandbox it has access to env vars,
+`/artifacts/`, and whatever's in the image; not the host's
+credential store.
+
+### Not done
+
+- **No host-`~/.claude/` mount.** Adding one would let users reuse
+  global skills, agents, and hooks, but conflicts with the
+  isolation contract — the sandbox shares only the worktree and
+  `/artifacts`. If you want a skill or subagent in every fleet
+  session, commit it under `.claude/` in the worktree.
+- **No MCP OAuth token extraction from host `.credentials.json`.**
+  The on-disk layout isn't a stable contract, and OAuth refresh
+  typically depends on the client_id/client_secret pair Claude Code
+  registered with the upstream — propagating just the access token
+  would break on first refresh. Bearer-header + `secrets:` is the
+  supported path.
+
 ## Container-internal visibility
 
 Once a secret is in the container's env, the agent process can
