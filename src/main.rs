@@ -29,6 +29,7 @@ mod process;
 mod repo;
 mod repo_config;
 mod runtime;
+mod scheduler;
 mod secrets;
 mod session;
 mod tracker;
