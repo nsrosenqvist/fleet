@@ -136,7 +136,9 @@ pub fn run_run(
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
-    let executor = WorkflowExecutor::new(Arc::clone(&invoker)).with_tracker(tracker);
+    let executor = WorkflowExecutor::new(Arc::clone(&invoker))
+        .with_tracker(tracker)
+        .with_creation_label_stamp(config.autonomous.filter_labels.clone());
     // SIGINT handler shared with the executor: between nodes, the
     // executor checks this flag and aborts cleanly (marking the
     // session `Failed` with a "user interrupted" reason) rather than
@@ -322,7 +324,9 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
-    let executor = WorkflowExecutor::new(Arc::clone(&invoker)).with_tracker(tracker);
+    let executor = WorkflowExecutor::new(Arc::clone(&invoker))
+        .with_tracker(tracker)
+        .with_creation_label_stamp(config.autonomous.filter_labels.clone());
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -412,7 +416,8 @@ pub fn run_sibling(session_id: &str, node_id: &str) -> Result<i32> {
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
     let executor = crate::workflow::executor::WorkflowExecutor::new(Arc::clone(&invoker))
-        .with_tracker(tracker);
+        .with_tracker(tracker)
+        .with_creation_label_stamp(config.autonomous.filter_labels.clone());
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -579,7 +584,9 @@ pub fn run_replay(
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
-    let executor = WorkflowExecutor::new(Arc::clone(&invoker)).with_tracker(tracker);
+    let executor = WorkflowExecutor::new(Arc::clone(&invoker))
+        .with_tracker(tracker)
+        .with_creation_label_stamp(config.autonomous.filter_labels.clone());
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),

@@ -188,11 +188,16 @@ fn tick(
     }
     let tracker = Arc::clone(&setup.tracker);
     let root = setup.repo_root.clone();
+    // Clone the autonomous block so the move closure can consult the
+    // label gate without fighting the borrow checker against the
+    // already-captured tracker and root. Cheap — small struct.
+    let auto = setup.config.autonomous.clone();
     let list_open = move || -> Result<Vec<IssueContext>, String> {
         let issues = tracker.list_issues(&root).map_err(|e| format!("{e:#}"))?;
         let open: Vec<IssueContext> = issues
             .into_iter()
             .filter(|i| i.status == "open")
+            .filter(|i| auto.ticket_matches_filter(&i.labels))
             .map(|i| IssueContext {
                 id: i.id,
                 human_id: i.human_id,
@@ -574,6 +579,78 @@ mod tests {
             }
             other => panic!("expected TrackerError, got {other:?}"),
         }
+        assert!(spawner.take().is_empty());
+    }
+
+    #[test]
+    fn tick_drops_issues_missing_any_required_filter_label() {
+        // Two open issues; only the second carries both required
+        // labels. The tick must spawn against `2`, leaving `1` invisible.
+        let tracker = Arc::new(StubTracker {
+            issues: vec![
+                Issue {
+                    id: "gh:1".to_string(),
+                    human_id: "1".to_string(),
+                    title: "partial-labels".to_string(),
+                    status: "open".to_string(),
+                    labels: vec!["fleet".to_string()], // missing `agent`
+                },
+                Issue {
+                    id: "gh:2".to_string(),
+                    human_id: "2".to_string(),
+                    title: "both-labels".to_string(),
+                    status: "open".to_string(),
+                    labels: vec!["fleet".to_string(), "agent".to_string()],
+                },
+            ],
+        });
+        let (_d, mut setup) = setup_with_tracker(tracker);
+        setup.config.autonomous.filter_labels = vec!["fleet".to_string(), "agent".to_string()];
+        let mut engine = AutonomousEngine::new();
+        engine.toggle();
+        let spawner = RecordingSpawner::new();
+        let outcome = tick(&mut engine, Instant::now(), &setup, &[], &spawner);
+        match outcome {
+            AutonomousOutcome::Spawn(cmd) => {
+                assert_eq!(cmd.issue.human_id, "2", "must pick the fully-labeled issue");
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tick_with_filter_set_and_no_matching_issues_pauses_no_unclaimed() {
+        // Filter is set but every open issue is missing one of the
+        // required labels. The engine should report
+        // `NoUnclaimedIssues`, exactly as if the tracker were empty.
+        let tracker = Arc::new(StubTracker {
+            issues: vec![
+                Issue {
+                    id: "gh:1".to_string(),
+                    human_id: "1".to_string(),
+                    title: "partial-labels".to_string(),
+                    status: "open".to_string(),
+                    labels: vec!["fleet".to_string()],
+                },
+                Issue {
+                    id: "gh:2".to_string(),
+                    human_id: "2".to_string(),
+                    title: "unrelated".to_string(),
+                    status: "open".to_string(),
+                    labels: vec!["docs".to_string()],
+                },
+            ],
+        });
+        let (_d, mut setup) = setup_with_tracker(tracker);
+        setup.config.autonomous.filter_labels = vec!["fleet".to_string(), "agent".to_string()];
+        let mut engine = AutonomousEngine::new();
+        engine.toggle();
+        let spawner = RecordingSpawner::new();
+        let outcome = tick(&mut engine, Instant::now(), &setup, &[], &spawner);
+        assert_eq!(
+            outcome,
+            AutonomousOutcome::WaitedFor(PauseReason::NoUnclaimedIssues),
+        );
         assert!(spawner.take().is_empty());
     }
 

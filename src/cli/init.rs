@@ -296,6 +296,21 @@ agents:
 workflows:
   default: standard
 
+# autonomous:
+#   # Bounds + cadence for the supervisor (`fleet autonomous run`,
+#   # TUI Shift+A). Defaults shown.
+#   # max_parallel: 3
+#   # workflow: standard
+#   # scan_interval_secs: 10
+#   # spawn_cooldown_secs: 2
+#   #
+#   # Repo-wide label gate. Tickets must carry ALL of these labels to
+#   # be picked by the supervisor, and the same set is unioned onto
+#   # every ticket fleet creates (via `fleet issues create` or a
+#   # `tracker-create` workflow node). Empty (the default) = no
+#   # filtering and no creation-stamp.
+#   # filter_labels: []
+
 # orchestrator:
 #   # Binary fleet exec's inside the tmux pane for `fleet orchestrator`.
 #   # Override when your agent runtime is `claude-code`, `aider`, or a

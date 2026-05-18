@@ -253,7 +253,10 @@ impl Default for WorkflowsConfig {
 /// `autonomous:` block — bounds + cadence for the TUI's `Shift+A`
 /// autonomous mode. All fields optional; defaults are conservative
 /// enough that a user who flips the toggle without configuring
-/// anything still gets a sane supervisor.
+/// anything still gets a sane supervisor. [`Self::filter_labels`]
+/// gates which open tickets the supervisor considers, and the same
+/// list is stamped onto tickets fleet creates so the loop sees its
+/// own follow-ups on the next tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutonomousConfig {
     /// Maximum concurrent in-flight workflow runs autonomous mode is
@@ -276,6 +279,20 @@ pub struct AutonomousConfig {
     /// `labels` is a wildcard match — useful for staging a workflow
     /// override last in the list as a catch-all.
     pub routing: Vec<RoutingRule>,
+    /// Repo-wide label gate. To be a candidate for the supervisor, an
+    /// open ticket must carry **every** label in this list (ALL
+    /// semantics — see [`Self::ticket_matches_filter`]). The same
+    /// list is unioned onto every ticket fleet creates (via
+    /// `fleet issues create` or a `tracker-create` workflow node) so
+    /// fleet-spawned follow-ups pass the gate on the next tick — see
+    /// [`Self::stamp_creation_labels`]. Empty (the default) =
+    /// pre-feature behaviour: no filter and no stamp, byte-for-byte.
+    ///
+    /// Scope is intentionally limited to the autonomous tick + the
+    /// two ticket-creation call sites. `fleet issues list` and the
+    /// TUI spawn modal stay unfiltered so humans can deliberately
+    /// pick non-matching tickets.
+    pub filter_labels: Vec<String>,
 }
 
 /// One label-driven routing rule: if any of `labels` matches a label
@@ -303,6 +320,35 @@ impl AutonomousConfig {
         }
         &self.workflow
     }
+
+    /// True if `issue_labels` carries every label in
+    /// [`Self::filter_labels`]. An empty filter is a no-op (returns
+    /// true), preserving the pre-feature behaviour where every open
+    /// ticket is a candidate. Pure; the autonomous tick consults it
+    /// per candidate before passing the list to `rank_candidates_by_plan`.
+    #[must_use]
+    pub fn ticket_matches_filter(&self, issue_labels: &[String]) -> bool {
+        self.filter_labels
+            .iter()
+            .all(|needed| issue_labels.iter().any(|have| have == needed))
+    }
+
+    /// Merge [`Self::filter_labels`] into `supplied`, preserving the
+    /// caller's order and appending any missing filter labels in
+    /// config order. Used at both ticket-creation call sites
+    /// (`fleet issues create` and the `tracker-create` workflow node)
+    /// so a fleet-spawned ticket always carries the labels needed to
+    /// pass [`Self::ticket_matches_filter`] on the next tick.
+    #[must_use]
+    pub fn stamp_creation_labels(&self, supplied: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = supplied.to_vec();
+        for needed in &self.filter_labels {
+            if !out.iter().any(|l| l == needed) {
+                out.push(needed.clone());
+            }
+        }
+        out
+    }
 }
 
 /// A rule matches when its `labels` is empty (wildcard) or when at
@@ -326,6 +372,7 @@ impl Default for AutonomousConfig {
             scan_interval_secs: 10,
             spawn_cooldown_secs: 2,
             routing: Vec::new(),
+            filter_labels: Vec::new(),
         }
     }
 }
@@ -474,6 +521,11 @@ struct RawAutonomous {
     /// workflow, matching pre-routing behaviour exactly.
     #[serde(default)]
     routing: Option<Vec<RawRoutingRule>>,
+    /// Repo-wide label gate. Absent in the YAML → empty Vec → no
+    /// filtering and no creation-stamp, matching pre-feature
+    /// behaviour exactly.
+    #[serde(default)]
+    filter_labels: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -592,6 +644,7 @@ impl From<Raw> for RepoConfig {
                         })
                         .collect()
                 }),
+                filter_labels: a.filter_labels.unwrap_or(default_autonomous.filter_labels),
             },
             None => default_autonomous,
         };
@@ -854,6 +907,105 @@ autonomous:
             ]),
             "fast-track"
         );
+    }
+
+    #[test]
+    fn filter_labels_default_is_empty_and_matches_everything() {
+        let cfg = AutonomousConfig::default();
+        assert!(cfg.filter_labels.is_empty());
+        assert!(cfg.ticket_matches_filter(&[]));
+        assert!(cfg.ticket_matches_filter(&["anything".to_string()]));
+    }
+
+    #[test]
+    fn filter_labels_all_must_match_to_pass() {
+        let cfg = AutonomousConfig {
+            filter_labels: vec!["fleet".to_string(), "agent".to_string()],
+            ..AutonomousConfig::default()
+        };
+        // Exact set or superset → match.
+        assert!(cfg.ticket_matches_filter(&["fleet".to_string(), "agent".to_string()]));
+        assert!(cfg.ticket_matches_filter(&[
+            "fleet".to_string(),
+            "agent".to_string(),
+            "p1".to_string(),
+        ]));
+        // Subset, single label, or empty → drop.
+        assert!(!cfg.ticket_matches_filter(&["fleet".to_string()]));
+        assert!(!cfg.ticket_matches_filter(&["agent".to_string()]));
+        assert!(!cfg.ticket_matches_filter(&[]));
+        // Unrelated labels alone → drop.
+        assert!(!cfg.ticket_matches_filter(&["p1".to_string(), "docs".to_string()]));
+    }
+
+    #[test]
+    fn parses_filter_labels_block_from_yaml() {
+        let yaml = "\
+autonomous:
+  workflow: standard
+  filter_labels: [fleet, agent]
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(
+            cfg.autonomous.filter_labels,
+            vec!["fleet".to_string(), "agent".to_string()]
+        );
+    }
+
+    #[test]
+    fn filter_labels_absent_yields_empty_vec() {
+        // Pre-feature configs must still parse and behave exactly as
+        // before — empty Vec → no filtering, no stamping.
+        let yaml = "autonomous:\n  workflow: standard\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert!(cfg.autonomous.filter_labels.is_empty());
+    }
+
+    #[test]
+    fn stamp_creation_labels_unions_preserving_supplied_order() {
+        let cfg = AutonomousConfig {
+            filter_labels: vec!["fleet".to_string(), "agent".to_string()],
+            ..AutonomousConfig::default()
+        };
+        // Supplied labels keep their order; missing filter labels are
+        // appended in config order.
+        assert_eq!(
+            cfg.stamp_creation_labels(&["p1".to_string()]),
+            vec!["p1".to_string(), "fleet".to_string(), "agent".to_string()]
+        );
+        assert_eq!(
+            cfg.stamp_creation_labels(&[]),
+            vec!["fleet".to_string(), "agent".to_string()]
+        );
+    }
+
+    #[test]
+    fn stamp_creation_labels_dedups() {
+        let cfg = AutonomousConfig {
+            filter_labels: vec!["fleet".to_string(), "agent".to_string()],
+            ..AutonomousConfig::default()
+        };
+        // `fleet` is already supplied — must not appear twice.
+        assert_eq!(
+            cfg.stamp_creation_labels(&["fleet".to_string(), "p1".to_string()]),
+            vec!["fleet".to_string(), "p1".to_string(), "agent".to_string()]
+        );
+        // Every filter label already supplied — no growth, no reorder.
+        assert_eq!(
+            cfg.stamp_creation_labels(&["agent".to_string(), "fleet".to_string()]),
+            vec!["agent".to_string(), "fleet".to_string()]
+        );
+    }
+
+    #[test]
+    fn stamp_creation_labels_empty_filter_returns_supplied_unchanged() {
+        let cfg = AutonomousConfig::default();
+        assert!(cfg.filter_labels.is_empty());
+        assert_eq!(
+            cfg.stamp_creation_labels(&["p1".to_string(), "docs".to_string()]),
+            vec!["p1".to_string(), "docs".to_string()]
+        );
+        assert!(cfg.stamp_creation_labels(&[]).is_empty());
     }
 
     #[test]

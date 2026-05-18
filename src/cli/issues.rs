@@ -33,7 +33,7 @@ use crate::tracker::{Issue, Status, Tracker, build};
 /// CLI entry point for `fleet issues list`. Returns 0 on a clean listing
 /// (including the empty case), 1 on any tracker/IO failure.
 pub fn run_list() -> Result<i32> {
-    let (root, tracker) = open_tracker("list")?;
+    let (root, tracker, _config) = open_tracker("list")?;
     let issues = tracker
         .list_issues(&root)
         .with_context(|| format!("listing issues via `{}`", tracker.name()))?;
@@ -42,15 +42,20 @@ pub fn run_list() -> Result<i32> {
 }
 
 /// `fleet issues create <title> [--body …] [--label …]…` — file a new
-/// ticket via the configured tracker; print the new id on stdout.
+/// ticket via the configured tracker; print the new id on stdout. The
+/// repo's `autonomous.filter_labels` are unioned into `labels` before
+/// the create call so a fleet-spawned ticket passes the supervisor's
+/// label gate on the next tick. Empty `filter_labels` = pre-feature
+/// behaviour (caller-supplied labels pass through unchanged).
 pub fn run_create(title: &str, body: Option<&str>, labels: &[String]) -> Result<i32> {
     if title.trim().is_empty() {
         anyhow::bail!("issue title must be non-empty");
     }
-    let (root, tracker) = open_tracker("create")?;
+    let (root, tracker, config) = open_tracker("create")?;
     let body = body.unwrap_or("");
+    let stamped = config.autonomous.stamp_creation_labels(labels);
     let issue = tracker
-        .create(&root, title, body, labels)
+        .create(&root, title, body, &stamped)
         .with_context(|| format!("creating issue via `{}` (title: {title:?})", tracker.name()))?;
     println!("{}", issue.human_id);
     Ok(0)
@@ -58,7 +63,7 @@ pub fn run_create(title: &str, body: Option<&str>, labels: &[String]) -> Result<
 
 /// `fleet issues comment <id> <body>` — comment on a ticket.
 pub fn run_comment(id: &str, body: &str) -> Result<i32> {
-    let (root, tracker) = open_tracker("comment")?;
+    let (root, tracker, _config) = open_tracker("comment")?;
     tracker
         .comment(&root, id, body)
         .with_context(|| format!("commenting on `{id}` via `{}`", tracker.name()))?;
@@ -68,7 +73,7 @@ pub fn run_comment(id: &str, body: &str) -> Result<i32> {
 /// `fleet issues set-status <id> <open|in-progress|closed>`.
 pub fn run_set_status(id: &str, status_word: &str) -> Result<i32> {
     let status = parse_status(status_word)?;
-    let (root, tracker) = open_tracker("set-status")?;
+    let (root, tracker, _config) = open_tracker("set-status")?;
     tracker
         .set_status(&root, id, status)
         .with_context(|| format!("setting status on `{id}` via `{}`", tracker.name()))?;
@@ -80,7 +85,7 @@ pub fn run_add_label(id: &str, label: &str) -> Result<i32> {
     if label.trim().is_empty() {
         anyhow::bail!("label must be non-empty");
     }
-    let (root, tracker) = open_tracker("add-label")?;
+    let (root, tracker, _config) = open_tracker("add-label")?;
     tracker
         .add_label(&root, id, label)
         .with_context(|| format!("adding label `{label}` to `{id}` via `{}`", tracker.name()))?;
@@ -92,7 +97,7 @@ pub fn run_remove_label(id: &str, label: &str) -> Result<i32> {
     if label.trim().is_empty() {
         anyhow::bail!("label must be non-empty");
     }
-    let (root, tracker) = open_tracker("remove-label")?;
+    let (root, tracker, _config) = open_tracker("remove-label")?;
     tracker.remove_label(&root, id, label).with_context(|| {
         format!(
             "removing label `{label}` from `{id}` via `{}`",
@@ -102,23 +107,25 @@ pub fn run_remove_label(id: &str, label: &str) -> Result<i32> {
     Ok(0)
 }
 
-/// Build the configured tracker, or `bail!` with the same "not
-/// implemented" wording `run_list` already emits. Used by every
-/// `run_*` entry point so the message stays consistent.
-fn open_tracker(subcommand: &str) -> Result<(std::path::PathBuf, Box<dyn Tracker>)> {
+/// Build the configured tracker + return the loaded `RepoConfig` so
+/// callers needing autonomous-block knobs (e.g. `run_create`'s label
+/// stamp) don't have to re-load the file. Bails with the same
+/// "not implemented" wording for every subcommand so the message
+/// stays consistent.
+fn open_tracker(subcommand: &str) -> Result<(std::path::PathBuf, Box<dyn Tracker>, RepoConfig)> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
     let config =
         RepoConfig::load(root.join(".fleet/config.yaml")).context("loading .fleet/config.yaml")?;
     let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
-    let tracker = build(config.tracker, invoker).ok_or_else(|| {
+    let tracker = build(config.tracker, Arc::clone(&invoker)).ok_or_else(|| {
         anyhow::anyhow!(
             "fleet issues {subcommand}: tracker `{}` is not yet implemented \
              — pick git-bug or github in .fleet/config.yaml",
             config.tracker.as_str()
         )
     })?;
-    Ok((root, tracker))
+    Ok((root, tracker, config))
 }
 
 /// Parse the CLI `<status>` argument into the typed `Status` enum.

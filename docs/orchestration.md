@@ -278,6 +278,35 @@ fleet plan inject <id> <ticket> [--before <other>]
 Plan ids are `plan-<13 hex ms>-<4 hex counter>` — mirrors the
 session id format so lexicographic ≈ chronological.
 
+### Restricting the supervisor by label
+
+By default, `fleet autonomous run` considers every open ticket on the
+tracker. In repos where fleet shares a tracker with humans or other
+tools, set `autonomous.filter_labels` so the supervisor only picks
+tickets explicitly marked as fleet-domain:
+
+```yaml
+autonomous:
+  workflow: standard
+  filter_labels: [fleet, agent]
+```
+
+Semantics:
+
+- **ALL match.** A candidate must carry *every* label in the list.
+  `[fleet, agent]` → drops `[fleet]` alone, drops `[docs]`, keeps
+  `[fleet, agent, p1]`.
+- **Symmetric stamp.** The same list is unioned onto every ticket
+  fleet creates — via `fleet issues create` (called by the orchestrator
+  agent) or via a `tracker-create` workflow node. A workflow-spawned
+  follow-up ticket carries the labels needed to pass the gate on the
+  next supervisor tick.
+- **Scope is the tick + creation only.** `fleet issues list` and the
+  TUI spawn modal stay unfiltered, so a human can deliberately spawn
+  a workflow against a non-fleet ticket.
+- **Empty list = pre-feature behaviour.** No filtering, no stamping,
+  byte-for-byte.
+
 ### How plans compose with the deps graph
 
 The supervisor's tick:
@@ -289,6 +318,9 @@ The supervisor's tick:
    "any-open-issue" fallback tail.
 4. Engine picks the first unclaimed entry (respecting
    `autonomous.max_parallel`).
+
+Tickets that don't pass `autonomous.filter_labels` are dropped before
+step 1, so neither the plan walk nor the fallback considers them.
 
 A ticket is **deps-blocked** when at least one edge in
 `.fleet/deps.json` keyed by it is still active: either a

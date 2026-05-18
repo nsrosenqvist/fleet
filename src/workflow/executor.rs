@@ -116,6 +116,14 @@ pub struct WorkflowExecutor {
     /// tracker from `.fleet/config.yaml` and threads it in via
     /// [`Self::with_tracker`].
     tracker: Option<Arc<dyn Tracker>>,
+    /// Labels unioned into the `labels` field of every
+    /// `tracker-create` node's request, so a workflow-spawned ticket
+    /// carries the labels needed to pass the supervisor's
+    /// `autonomous.filter_labels` gate on the next tick. Empty (the
+    /// default) is the pre-feature behaviour — the agent-supplied
+    /// labels pass through unchanged. Threaded in by `cli::workflow`
+    /// from `RepoConfig::autonomous.filter_labels`.
+    creation_label_stamp: Vec<String>,
 }
 
 /// What [`WorkflowExecutor::execute`] needs to run one workflow. Bundled
@@ -210,6 +218,7 @@ impl WorkflowExecutor {
             invoker,
             clock: Box::new(now_ms),
             tracker: None,
+            creation_label_stamp: Vec::new(),
         }
     }
 
@@ -231,6 +240,19 @@ impl WorkflowExecutor {
     #[must_use]
     pub fn with_tracker(mut self, tracker: Option<Arc<dyn Tracker>>) -> Self {
         self.tracker = tracker;
+        self
+    }
+
+    /// Labels merged into the `labels` field of every
+    /// `tracker-create` node's request, so a workflow-spawned ticket
+    /// passes the supervisor's `autonomous.filter_labels` gate on the
+    /// next tick. Empty (the default) is the pre-feature behaviour —
+    /// agent-supplied labels pass through unchanged. Production
+    /// callers pass `config.autonomous.filter_labels.clone()`; tests
+    /// pass an empty Vec unless exercising the stamp path.
+    #[must_use]
+    pub fn with_creation_label_stamp(mut self, stamp: Vec<String>) -> Self {
+        self.creation_label_stamp = stamp;
         self
     }
 
@@ -1162,6 +1184,23 @@ impl WorkflowExecutor {
     ///
     /// Cross-link comments and `.fleet/deps.json` writes land in a
     /// follow-up commit; this commit ships only the creation path.
+    /// Union [`Self::creation_label_stamp`] into `supplied`,
+    /// preserving the caller's order and appending any missing stamp
+    /// labels in config order. Mirrors
+    /// `AutonomousConfig::stamp_creation_labels` — duplicated here
+    /// rather than referenced because the executor doesn't otherwise
+    /// hold a `RepoConfig` and threading one through every test seam
+    /// would dwarf the six lines of logic.
+    fn stamp_request_labels(&self, supplied: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = supplied.to_vec();
+        for needed in &self.creation_label_stamp {
+            if !out.iter().any(|l| l == needed) {
+                out.push(needed.clone());
+            }
+        }
+        out
+    }
+
     fn run_tracker_create_node(
         &self,
         req: &ExecuteRequest<'_>,
@@ -1225,12 +1264,17 @@ impl WorkflowExecutor {
         }
 
         let log_path = self.node_log_path(req, session, &node.id);
+        // Union the executor's configured stamp into the request's
+        // labels so a fleet-spawned ticket carries the labels the
+        // supervisor's `autonomous.filter_labels` gate needs. Empty
+        // stamp = pre-feature behaviour, request labels pass through.
+        let stamped_labels = self.stamp_request_labels(&request.labels);
         let created = tracker
             .create(
                 req.workspace,
                 &request.title,
                 &request.body,
-                &request.labels,
+                &stamped_labels,
             )
             .with_context(|| {
                 format!(
@@ -8196,5 +8240,123 @@ nodes:
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("forced link_parent failure"));
+    }
+
+    #[test]
+    fn stamp_request_labels_unions_preserving_supplied_order() {
+        // Direct unit test on the private helper. Mirrors the
+        // semantics of `AutonomousConfig::stamp_creation_labels`:
+        // supplied labels keep their position, missing stamp labels
+        // are appended in stamp-config order.
+        let invoker = Arc::new(MockProcessInvoker::new());
+        let exec = WorkflowExecutor::new(invoker)
+            .with_creation_label_stamp(vec!["fleet".to_string(), "agent".to_string()]);
+        assert_eq!(
+            exec.stamp_request_labels(&["p1".to_string()]),
+            vec!["p1".to_string(), "fleet".to_string(), "agent".to_string()]
+        );
+        assert_eq!(
+            exec.stamp_request_labels(&[]),
+            vec!["fleet".to_string(), "agent".to_string()]
+        );
+        // Already-supplied stamp label is not duplicated.
+        assert_eq!(
+            exec.stamp_request_labels(&["fleet".to_string(), "p1".to_string()]),
+            vec!["fleet".to_string(), "p1".to_string(), "agent".to_string()]
+        );
+    }
+
+    #[test]
+    fn stamp_request_labels_empty_stamp_returns_supplied_unchanged() {
+        // Pre-feature regression net: an executor built without
+        // `with_creation_label_stamp` (or with an empty stamp) must
+        // forward the agent's labels byte-for-byte.
+        let invoker = Arc::new(MockProcessInvoker::new());
+        let exec = WorkflowExecutor::new(invoker);
+        assert!(exec.stamp_request_labels(&[]).is_empty());
+        assert_eq!(
+            exec.stamp_request_labels(&["p1".to_string(), "docs".to_string()]),
+            vec!["p1".to_string(), "docs".to_string()]
+        );
+    }
+
+    #[test]
+    fn tracker_create_node_stamps_configured_filter_labels_onto_request() {
+        // End-to-end wiring check: the executor's
+        // `creation_label_stamp` reaches the tracker's `create` call.
+        // Agent emits `labels: ["needs-impl"]`; executor is built
+        // with stamp `["fleet","agent"]`; tracker must see all three
+        // in supplied-first / stamp-order.
+        let yaml = "\
+name: tc-stamp
+nodes:
+  - id: implement
+    type: bash
+    script: 'write outputs'
+    outputs: { recommend_ticket: recommend_ticket }
+  - id: file-dep
+    depends_on: [implement]
+    type: tracker-create
+    from: implement.recommend_ticket
+    link_parent: false
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = AgentRegistry::default();
+        let (_d, store) = build_store();
+        let dc = sample_devcontainer();
+        let session_id = SessionId::new("s-tc-stamp");
+        let af = store.session_dir(&session_id).join("artifacts");
+
+        let mut mock = MockProcessInvoker::new();
+        mock.expect_run().returning(move |_, _| {
+            std::fs::create_dir_all(&af).unwrap();
+            std::fs::write(
+                af.join("implement.outputs.json"),
+                r#"{"recommend_ticket":{"title":"t","body":"b","labels":["needs-impl"]}}"#,
+            )
+            .unwrap();
+            Ok(String::new())
+        });
+
+        let tracker =
+            Arc::new(MockCreateTracker::new().with_next_create(sample_created_issue("42")));
+        let executor = WorkflowExecutor::new(Arc::new(mock))
+            .with_clock(counter_clock())
+            .with_tracker(Some(
+                Arc::clone(&tracker) as Arc<dyn crate::tracker::Tracker>
+            ))
+            .with_creation_label_stamp(vec!["fleet".to_string(), "agent".to_string()]);
+
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &dc,
+            workspace: Path::new("/repo"),
+            session_id,
+            issue: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig {
+                per_session_budget_usd: None,
+                lifetime_budget_usd: None,
+            },
+            egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
+        };
+        let _session = executor.execute(&req).unwrap();
+
+        let calls = tracker.calls();
+        assert_eq!(calls.len(), 1, "expected one create call: {calls:?}");
+        // Debug formatting of Vec<String> renders as
+        // `["needs-impl", "fleet", "agent"]` — supplied first, then
+        // stamp labels in config order.
+        assert!(
+            calls[0].contains(r#"labels=["needs-impl", "fleet", "agent"]"#),
+            "stamp not applied as expected: {}",
+            calls[0]
+        );
     }
 }
