@@ -13,6 +13,8 @@ pub mod issues;
 pub mod orchestrator;
 pub mod plan;
 pub mod runtime;
+#[path = "scheduler.rs"]
+pub mod scheduler_cli;
 pub mod secrets;
 pub mod sessions;
 pub mod workflow;
@@ -76,6 +78,16 @@ pub enum Command {
     Autonomous {
         #[command(subcommand)]
         sub: AutonomousSub,
+    },
+
+    /// Loop-driven scheduler — fires workflows with `loop: <duration>`
+    /// on their elapsed-interval cadence, mints one session per
+    /// candidate (e.g. one per failing-CI PR). Same engine the TUI
+    /// surfaces in its status bar; driveable from cron for systems
+    /// that don't keep a TUI open.
+    Scheduler {
+        #[command(subcommand)]
+        sub: SchedulerSub,
     },
 
     /// Plan management: ordered ticket lists the autonomous
@@ -518,6 +530,30 @@ pub enum AutonomousSub {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum SchedulerSub {
+    /// Flip `.fleet/scheduler.enabled` on. Subsequent `tick --once`
+    /// runs (and any TUI-driven tick path) will actually mint
+    /// sessions; while disabled, the engine returns `Idle` and the
+    /// scheduler-state file is left untouched.
+    Enable,
+    /// Flip `.fleet/scheduler.enabled` off.
+    Disable,
+    /// List every workflow that has a `loop:` field, alongside its
+    /// last-run timestamp and next-due interval. Read-only — handy
+    /// for debugging why an expected workflow didn't fire.
+    Status,
+    /// Run a single scheduler tick: load workflows + sessions, decide
+    /// which are due, mint detached sessions for each candidate, and
+    /// persist updated `last_run_at`. Honours the enabled flag —
+    /// disabled runs are a no-op.
+    Tick {
+        /// Run one tick and exit. Required today (no `--watch` loop).
+        #[arg(long)]
+        once: bool,
+    },
+}
+
 /// Dispatch the parsed CLI. Returns the exit code to propagate.
 #[allow(clippy::too_many_lines)] // top-level match over every subcommand variant.
 pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
@@ -593,6 +629,12 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             IssuesSub::SetStatus { id, status } => issues::run_set_status(&id, &status),
             IssuesSub::AddLabel { id, label } => issues::run_add_label(&id, &label),
             IssuesSub::RemoveLabel { id, label } => issues::run_remove_label(&id, &label),
+        },
+        Command::Scheduler { sub } => match sub {
+            SchedulerSub::Enable => scheduler_cli::run_enable(),
+            SchedulerSub::Disable => scheduler_cli::run_disable(),
+            SchedulerSub::Status => scheduler_cli::run_status(),
+            SchedulerSub::Tick { once } => scheduler_cli::run_tick(once),
         },
         Command::Autonomous { sub } => match sub {
             AutonomousSub::Run { once, watch } => autonomous::run(once, watch),
