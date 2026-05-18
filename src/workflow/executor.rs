@@ -2350,6 +2350,10 @@ fn node_kind_word(kind: &NodeKind) -> &'static str {
         NodeKind::Assert { .. } => "assert",
         NodeKind::Fanout { .. } => "fanout",
         NodeKind::TrackerCreate { .. } => "tracker-create",
+        NodeKind::PrList { .. } => "pr-list",
+        NodeKind::PrChecks { .. } => "pr-checks",
+        NodeKind::CreatePr { .. } => "create-pr",
+        NodeKind::PrComment { .. } => "pr-comment",
     }
 }
 

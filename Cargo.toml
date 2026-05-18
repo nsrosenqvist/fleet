@@ -84,6 +84,11 @@ keyring = { version = "3", default-features = false, features = [
     "windows-native",
 ] }
 
+# Workflow `loop:` parser — accepts humane forms like `1h`, `30m`,
+# `6h30m`. Wrapped behind a 60s floor in `workflow::spec` to keep
+# the scheduler from hot-spinning.
+humantime = "2"
+
 [dev-dependencies]
 # Mocks `ProcessInvoker` and other traits so tests don't shell out.
 mockall = "0.13"

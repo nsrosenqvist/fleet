@@ -17,7 +17,7 @@
 use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
 
-use super::spec::{NodeKind, Workflow};
+use super::spec::{NodeKind, PrBindMode, Workflow};
 
 /// Run all static checks on `wf`. Returns the first error found; callers
 /// surface it verbatim — error wording is part of the user-facing contract.
@@ -25,6 +25,7 @@ pub fn validate(wf: &Workflow) -> Result<()> {
     check_unique_ids(wf)?;
     check_references(wf)?;
     check_no_cycles(wf)?;
+    check_pr_list_bind_per_is_root(wf)?;
     Ok(())
 }
 
@@ -59,6 +60,31 @@ fn check_references(wf: &Workflow) -> Result<()> {
         if let NodeKind::Fanout { siblings } = &n.kind {
             for s in siblings {
                 id_must_exist(s, "fanout.siblings", &n.id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `pr-list` with `bind: per` is consumed by the scheduler before the
+/// executor runs — it's the workflow's root by construction. Predecessors
+/// would mean nodes were expected to run *before* the scheduler had a
+/// reason to mint sessions, which the per-PR fanout doesn't support.
+fn check_pr_list_bind_per_is_root(wf: &Workflow) -> Result<()> {
+    for n in &wf.nodes {
+        if let NodeKind::PrList {
+            bind: Some(PrBindMode::Per),
+            ..
+        } = &n.kind
+        {
+            if !n.depends_on.is_empty() {
+                bail!(
+                    "workflow `{}` node `{}`: pr-list with `bind: per` must be the \
+                     workflow's first node (no `depends_on:`) — the scheduler consumes \
+                     it before any executor node runs",
+                    wf.name,
+                    n.id,
+                );
             }
         }
     }
@@ -332,6 +358,61 @@ nodes:
     #[test]
     fn empty_workflow_is_valid() {
         let wf = parse("name: empty\nnodes: []");
+        validate(&wf).unwrap();
+    }
+
+    #[test]
+    fn pr_list_bind_per_with_depends_on_is_rejected() {
+        let wf = parse(
+            "\
+name: bad-root
+nodes:
+  - id: prep
+    agent: claude
+  - id: pick
+    depends_on: [prep]
+    type: pr-list
+    bind: per
+",
+        );
+        let err = validate(&wf).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must be the workflow's first node"), "got: {msg}");
+        assert!(msg.contains("pick"), "got: {msg}");
+    }
+
+    #[test]
+    fn pr_list_bind_per_as_root_is_accepted() {
+        let wf = parse(
+            "\
+name: ok
+nodes:
+  - id: pick
+    type: pr-list
+    bind: per
+  - id: report
+    depends_on: [pick]
+    agent: claude
+",
+        );
+        validate(&wf).unwrap();
+    }
+
+    #[test]
+    fn pr_list_without_bind_does_not_require_root_position() {
+        // Without `bind: per` the node runs inside the current session
+        // like any other host-side node, so `depends_on:` is allowed.
+        let wf = parse(
+            "\
+name: ok
+nodes:
+  - id: prep
+    agent: claude
+  - id: pick
+    depends_on: [prep]
+    type: pr-list
+",
+        );
         validate(&wf).unwrap();
     }
 }

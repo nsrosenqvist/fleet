@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_yml::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// A complete workflow: name + ordered list of nodes. The order of `nodes`
 /// is not the execution order — [`super::validate`] computes that from the
@@ -36,6 +37,101 @@ pub struct Workflow {
     /// follow-up tickets in a row. `None` falls back to
     /// [`DEFAULT_MAX_RECOMMENDED_TICKETS`].
     pub max_recommended_tickets: Option<u32>,
+    /// Scheduled-loop interval. When `Some`, the
+    /// [`crate::scheduler::SchedulerEngine`] fires this workflow once per
+    /// elapsed interval. Parsed from a humantime string (`1h`, `30m`,
+    /// `6h30m`). A hard floor of [`MIN_LOOP_INTERVAL`] applies at parse
+    /// time to keep the scheduler from hot-spinning.
+    ///
+    /// Mutually exclusive with `trigger.autonomous`: that engine fires
+    /// per open issue, the scheduler fires per elapsed interval — a
+    /// workflow opting into both would be claimed twice. The parser
+    /// rejects the combination up front.
+    pub loop_interval: Option<Duration>,
+    /// Policy when a scheduler tick is ready to fire but a session of
+    /// this workflow is still running. `Skip` (default) defers to the
+    /// next interval; `Run` spawns anyway, accepting that multiple
+    /// instances may overlap (e.g. when each session has its own PR
+    /// scope and overlap is harmless).
+    pub on_overlap: OnOverlap,
+}
+
+/// Minimum accepted `loop:` interval. Anything shorter would risk the
+/// TUI-driven scheduler tick loop hot-spinning between idempotent
+/// rescans; 60s is comfortable headroom over the ~10/s tick cadence
+/// without requiring an explicit debounce of its own.
+pub const MIN_LOOP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Per-workflow overlap policy. Drives the scheduler's decision when a
+/// tick is ready to fire and a session of the same workflow is already
+/// in `Running` / `AwaitingGate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnOverlap {
+    /// Defer the tick; the scheduler waits another interval before
+    /// retrying. The safe default — a stalled session can't trigger a
+    /// runaway slate of sibling sessions.
+    #[default]
+    Skip,
+    /// Spawn the new session anyway. Reasonable for workflows whose
+    /// candidate enumeration is naturally disjoint (each tick mints
+    /// sessions bound to *new* PRs), so overlap means "two ticks did
+    /// non-overlapping work."
+    Run,
+}
+
+/// How a `pr-list` node feeds the rest of the workflow.
+///
+/// `Some(Per)`: the *scheduler* consumes this node before the executor
+/// runs. The list of PR candidates becomes one independent session per
+/// PR (each with its own [`crate::session::PrContext`] and worktree on
+/// the PR's head). Downstream nodes run inside each minted session.
+///
+/// `None`: the node runs inside the current session like any host-side
+/// node, emitting a structured `{ prs, count }` output for downstream
+/// `when:` / `outputs:` consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrBindMode {
+    /// One session per PR. The node must be the workflow's root (no
+    /// `depends_on:`) so the executor never reaches it after the
+    /// scheduler consumes it.
+    Per,
+}
+
+/// CI-status filter on `pr-list`. Implementations evaluate against the
+/// PR's check-suite rollup. `Pending` matches checks that haven't
+/// completed; `Skipped` matches checks the CI system marked as skipped
+/// (distinct from missing checks entirely).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CiStatus {
+    Success,
+    Failure,
+    Pending,
+    Skipped,
+}
+
+/// PR state filter on `pr-list`. Mirrors GitHub's three lifecycle
+/// values; defaults to [`PrState::Open`] for the common "look at
+/// active PRs only" case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrState {
+    #[default]
+    Open,
+    Closed,
+    Merged,
+}
+
+/// Filter applied to `pr-list`. Empty / defaulted fields are treated as
+/// "no filter on that dimension" — `state` defaults to `Open` because
+/// that is what every practical caller wants.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrFilter {
+    pub ci_status: Option<CiStatus>,
+    pub state: PrState,
+    pub labels: Vec<String>,
 }
 
 /// Per-session cap applied when a workflow doesn't declare one.
@@ -140,6 +236,38 @@ pub enum NodeKind {
     /// when an issue context is present; cross-link comments and
     /// `.fleet/deps.json` entries land in a follow-up commit.
     TrackerCreate { from: String, link_parent: bool },
+    /// Enumerate pull requests via the configured
+    /// [`crate::code_host::CodeHost`]. `bind: Some(Per)` is the
+    /// per-PR fanout entry point consumed by the scheduler — see
+    /// [`PrBindMode`]. With `bind: None`, the node runs inside the
+    /// current session and emits `{ prs, count }` as a structured
+    /// output.
+    PrList {
+        filter: PrFilter,
+        bind: Option<PrBindMode>,
+    },
+    /// Read CI checks for a pull request. `pr` may be `None` (use the
+    /// session's bound [`crate::session::PrContext`]), an explicit
+    /// numeric literal as a string, or a dotted `<node>.<output>`
+    /// reference resolved against the `OutputMap` at run time. The
+    /// node writes `{ has_failures, failed_count, pending_count,
+    /// checks }` as outputs.
+    PrChecks { pr: Option<String> },
+    /// Open a pull request via the configured `CodeHost`. `base` and
+    /// `head` default at execute time: `base` to the remote's default
+    /// branch, `head` to the worktree's current branch. The node emits
+    /// `{ number, url, head_sha }` as outputs. Host-side; supersedes
+    /// the legacy `bash` invocation of `gh pr create`.
+    CreatePr {
+        title: String,
+        body: String,
+        base: Option<String>,
+        head: Option<String>,
+        draft: bool,
+    },
+    /// Post a comment on a pull request via the configured `CodeHost`.
+    /// `pr` resolves like [`NodeKind::PrChecks::pr`]. No outputs.
+    PrComment { body: String, pr: Option<String> },
 }
 
 /// `artifacts:` block. Both lists default to empty; bare strings are paths
@@ -200,6 +328,13 @@ struct RawWorkflow {
     nodes: Vec<RawNode>,
     #[serde(default)]
     max_recommended_tickets: Option<u32>,
+    /// `loop: 1h` — humantime string parsed into [`Duration`] at
+    /// conversion time. `loop` is a Rust reserved word, so we
+    /// serde-rename and store under [`Workflow::loop_interval`].
+    #[serde(default, rename = "loop")]
+    loop_interval: Option<String>,
+    #[serde(default)]
+    on_overlap: Option<OnOverlap>,
 }
 
 #[derive(Deserialize, Default)]
@@ -239,6 +374,43 @@ struct RawNode {
     from: Option<String>,
     #[serde(default)]
     link_parent: Option<bool>,
+    // PR node kinds.
+    #[serde(default)]
+    filter: Option<RawPrFilter>,
+    #[serde(default)]
+    bind: Option<PrBindMode>,
+    #[serde(default)]
+    pr: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    head: Option<String>,
+    #[serde(default)]
+    draft: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPrFilter {
+    #[serde(default)]
+    ci_status: Option<CiStatus>,
+    #[serde(default)]
+    state: Option<PrState>,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+impl From<RawPrFilter> for PrFilter {
+    fn from(r: RawPrFilter) -> Self {
+        Self {
+            ci_status: r.ci_status,
+            state: r.state.unwrap_or_default(),
+            labels: r.labels,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -271,6 +443,41 @@ impl TryFrom<RawWorkflow> for Workflow {
                 raw.name,
             );
         }
+        let loop_interval = match raw.loop_interval {
+            Some(s) => {
+                let trimmed = s.trim();
+                let d = humantime::parse_duration(trimmed).map_err(|e| {
+                    anyhow!(
+                        "workflow `{}`: `loop: {}` is not a valid humantime duration \
+                         (try `1h`, `30m`, `6h30m`): {e}",
+                        raw.name,
+                        trimmed,
+                    )
+                })?;
+                if d < MIN_LOOP_INTERVAL {
+                    bail!(
+                        "workflow `{}`: `loop: {}` resolves to {:?} which is below the \
+                         {}s minimum (the scheduler would hot-spin)",
+                        raw.name,
+                        trimmed,
+                        d,
+                        MIN_LOOP_INTERVAL.as_secs(),
+                    );
+                }
+                Some(d)
+            }
+            None => None,
+        };
+        if loop_interval.is_some() && trigger.autonomous {
+            bail!(
+                "workflow `{}`: `loop:` and `trigger.autonomous: true` are mutually \
+                 exclusive — the scheduler fires per elapsed interval, autonomous \
+                 mode fires per open issue; opting into both would have two engines \
+                 claim the same workflow",
+                raw.name,
+            );
+        }
+        let on_overlap = raw.on_overlap.unwrap_or_default();
         let nodes: Vec<Node> = raw
             .nodes
             .into_iter()
@@ -282,6 +489,8 @@ impl TryFrom<RawWorkflow> for Workflow {
             trigger,
             nodes,
             max_recommended_tickets: raw.max_recommended_tickets,
+            loop_interval,
+            on_overlap,
         })
     }
 }
@@ -332,9 +541,36 @@ impl TryFrom<RawNode> for Node {
                 // the workflow author having to spell it out.
                 link_parent: raw.link_parent.unwrap_or(true),
             },
+            "pr-list" => NodeKind::PrList {
+                // `filter:` is optional — an absent block means
+                // "default filter" (open PRs, no CI / label
+                // constraint). That matches the common "list every
+                // open PR" case without forcing boilerplate.
+                filter: raw.filter.map(Into::into).unwrap_or_default(),
+                bind: raw.bind,
+            },
+            "pr-checks" => NodeKind::PrChecks { pr: raw.pr },
+            "create-pr" => NodeKind::CreatePr {
+                title: raw
+                    .title
+                    .ok_or_else(|| anyhow!("create-pr node `{}` missing `title:`", raw.id))?,
+                body: raw
+                    .body
+                    .ok_or_else(|| anyhow!("create-pr node `{}` missing `body:`", raw.id))?,
+                base: raw.base,
+                head: raw.head,
+                draft: raw.draft.unwrap_or(false),
+            },
+            "pr-comment" => NodeKind::PrComment {
+                body: raw
+                    .body
+                    .ok_or_else(|| anyhow!("pr-comment node `{}` missing `body:`", raw.id))?,
+                pr: raw.pr,
+            },
             other => bail!(
                 "node `{}` has unknown `type: {other}` \
-                 (allowed: agent, bash, gate, assert, fanout, tracker-create)",
+                 (allowed: agent, bash, gate, assert, fanout, tracker-create, \
+                 pr-list, pr-checks, create-pr, pr-comment)",
                 raw.id
             ),
         };
@@ -847,5 +1083,283 @@ nodes:
         let wf = Workflow::from_str_at(yaml, "/x").unwrap();
         assert!(wf.node("b").is_some());
         assert!(wf.node("c").is_none());
+    }
+
+    // === Stage 1: scheduler + PR node-kind parsing ===
+
+    #[test]
+    fn loop_field_absent_resolves_to_none() {
+        let yaml = "name: x\nnodes: []";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        assert!(wf.loop_interval.is_none());
+    }
+
+    #[test]
+    fn loop_field_parses_humantime_durations() {
+        for (input, expected_secs) in [
+            ("1h", 3600u64),
+            ("30m", 1800),
+            ("6h30m", 6 * 3600 + 30 * 60),
+            ("90s", 90),
+        ] {
+            let yaml = format!("name: x\nloop: {input}\nnodes: []\n");
+            let wf = Workflow::from_str_at(&yaml, "/x").unwrap();
+            assert_eq!(
+                wf.loop_interval,
+                Some(Duration::from_secs(expected_secs)),
+                "input `{input}` should parse to {expected_secs}s"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_rejects_durations_below_floor() {
+        let yaml = "name: x\nloop: 30s\nnodes: []\n";
+        let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("below the 60s minimum"), "got: {msg}");
+    }
+
+    #[test]
+    fn loop_rejects_unparseable_duration_with_humantime_hint() {
+        let yaml = "name: x\nloop: 'twice a day'\nnodes: []\n";
+        let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a valid humantime duration"), "got: {msg}");
+        assert!(msg.contains("1h"), "should hint humantime examples; got: {msg}");
+    }
+
+    #[test]
+    fn loop_and_autonomous_together_are_rejected() {
+        let yaml = "\
+name: clash
+trigger:
+  autonomous: true
+loop: 1h
+nodes:
+  - id: n
+    agent: claude
+";
+        let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mutually exclusive"), "got: {msg}");
+        assert!(msg.contains("clash"), "should name the workflow; got: {msg}");
+    }
+
+    #[test]
+    fn on_overlap_defaults_to_skip() {
+        let yaml = "name: x\nloop: 1h\nnodes: []\n";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(wf.on_overlap, OnOverlap::Skip);
+    }
+
+    #[test]
+    fn on_overlap_parses_explicit_run() {
+        let yaml = "name: x\nloop: 1h\non_overlap: run\nnodes: []\n";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(wf.on_overlap, OnOverlap::Run);
+    }
+
+    #[test]
+    fn parses_pr_list_with_filter_and_bind_per() {
+        let yaml = "\
+name: x
+nodes:
+  - id: pick
+    type: pr-list
+    filter:
+      ci_status: failure
+      state: open
+      labels: [needs-review]
+    bind: per
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        match &wf.nodes[0].kind {
+            NodeKind::PrList { filter, bind } => {
+                assert_eq!(filter.ci_status, Some(CiStatus::Failure));
+                assert_eq!(filter.state, PrState::Open);
+                assert_eq!(filter.labels, vec!["needs-review".to_string()]);
+                assert_eq!(*bind, Some(PrBindMode::Per));
+            }
+            other => panic!("expected PrList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pr_list_with_no_filter_and_no_bind_uses_defaults() {
+        let yaml = "\
+name: x
+nodes:
+  - id: pick
+    type: pr-list
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        match &wf.nodes[0].kind {
+            NodeKind::PrList { filter, bind } => {
+                assert!(filter.ci_status.is_none());
+                assert_eq!(filter.state, PrState::Open);
+                assert!(filter.labels.is_empty());
+                assert!(bind.is_none());
+            }
+            other => panic!("expected PrList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pr_checks_node_with_default_pr_reference() {
+        let yaml = "\
+name: x
+nodes:
+  - id: probe
+    type: pr-checks
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        match &wf.nodes[0].kind {
+            NodeKind::PrChecks { pr } => assert!(pr.is_none()),
+            other => panic!("expected PrChecks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pr_checks_node_with_explicit_pr_reference() {
+        let yaml = "\
+name: x
+nodes:
+  - id: probe
+    type: pr-checks
+    pr: '${pick.prs.0.number}'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        match &wf.nodes[0].kind {
+            NodeKind::PrChecks { pr } => assert_eq!(pr.as_deref(), Some("${pick.prs.0.number}")),
+            other => panic!("expected PrChecks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_create_pr_with_all_fields() {
+        let yaml = "\
+name: x
+nodes:
+  - id: open_pr
+    type: create-pr
+    title: 'fleet change'
+    body: 'see commit'
+    base: main
+    head: feature/foo
+    draft: true
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        match &wf.nodes[0].kind {
+            NodeKind::CreatePr {
+                title,
+                body,
+                base,
+                head,
+                draft,
+            } => {
+                assert_eq!(title, "fleet change");
+                assert_eq!(body, "see commit");
+                assert_eq!(base.as_deref(), Some("main"));
+                assert_eq!(head.as_deref(), Some("feature/foo"));
+                assert!(*draft);
+            }
+            other => panic!("expected CreatePr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_create_pr_with_defaulted_base_head_draft() {
+        let yaml = "\
+name: x
+nodes:
+  - id: open_pr
+    type: create-pr
+    title: t
+    body: b
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        match &wf.nodes[0].kind {
+            NodeKind::CreatePr {
+                base, head, draft, ..
+            } => {
+                assert!(base.is_none());
+                assert!(head.is_none());
+                assert!(!*draft);
+            }
+            other => panic!("expected CreatePr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_pr_missing_title_errors_clearly() {
+        let yaml = "\
+name: x
+nodes:
+  - id: open_pr
+    type: create-pr
+    body: b
+";
+        let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
+        assert!(format!("{err:#}").contains("create-pr node `open_pr` missing `title:`"));
+    }
+
+    #[test]
+    fn create_pr_missing_body_errors_clearly() {
+        let yaml = "\
+name: x
+nodes:
+  - id: open_pr
+    type: create-pr
+    title: t
+";
+        let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
+        assert!(format!("{err:#}").contains("create-pr node `open_pr` missing `body:`"));
+    }
+
+    #[test]
+    fn parses_pr_comment_with_explicit_pr_reference() {
+        let yaml = "\
+name: x
+nodes:
+  - id: announce
+    type: pr-comment
+    body: 'fleet pushed a fix'
+    pr: '42'
+";
+        let wf = Workflow::from_str_at(yaml, "/x").unwrap();
+        match &wf.nodes[0].kind {
+            NodeKind::PrComment { body, pr } => {
+                assert_eq!(body, "fleet pushed a fix");
+                assert_eq!(pr.as_deref(), Some("42"));
+            }
+            other => panic!("expected PrComment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_comment_missing_body_errors_clearly() {
+        let yaml = "\
+name: x
+nodes:
+  - id: announce
+    type: pr-comment
+";
+        let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
+        assert!(format!("{err:#}").contains("pr-comment node `announce` missing `body:`"));
+    }
+
+    #[test]
+    fn unknown_node_type_error_lists_pr_kinds_in_allowed() {
+        let yaml = "\
+name: x
+nodes:
+  - id: weird
+    type: turbocharger
+";
+        let err = Workflow::from_str_at(yaml, "/x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pr-list"), "got: {msg}");
+        assert!(msg.contains("create-pr"), "got: {msg}");
     }
 }
