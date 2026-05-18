@@ -28,6 +28,11 @@ use crate::agent::AgentRegistry;
 pub struct RepoConfig {
     pub runtime: RuntimeConfig,
     pub tracker: Tracker,
+    /// `code_host:` — see [`CodeHostChoice`]. Independent of
+    /// [`Self::tracker`] so a repo can mix backends (e.g. git-bug
+    /// issues with GitHub PRs). Defaults to
+    /// [`CodeHostChoice::Auto`] which detects from the git remote.
+    pub code_host: CodeHostChoice,
     pub agents: AgentsConfig,
     pub workflows: WorkflowsConfig,
     pub autonomous: AutonomousConfig,
@@ -213,6 +218,36 @@ impl Tracker {
             Self::Github => "github",
             Self::Linear => "linear",
             Self::Jira => "jira",
+        }
+    }
+}
+
+/// `code_host:` — pull-request / CI / code-review backend. Independent
+/// of `tracker`: a repo can have `tracker: git-bug` with `code_host:
+/// github` because issues and PRs are orthogonal concerns.
+///
+/// `Auto` (default) inspects `git remote get-url origin` and picks a
+/// backend by host: `github.com` → [`Self::Github`]. Unknown hosts
+/// fall back to "no code host," which is the right behaviour for
+/// pure-issue workflows that never touch a PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodeHostChoice {
+    #[default]
+    Auto,
+    Github,
+}
+
+impl CodeHostChoice {
+    /// Stable kebab-case rendering. Mirrors [`Tracker::as_str`];
+    /// surfaces in `fleet doctor` output and config-validation
+    /// messages once those wire in.
+    #[must_use]
+    #[allow(dead_code)] // first caller lands with `fleet doctor` integration.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Github => "github",
         }
     }
 }
@@ -471,6 +506,8 @@ struct Raw {
     #[serde(default)]
     tracker: Option<Tracker>,
     #[serde(default)]
+    code_host: Option<CodeHostChoice>,
+    #[serde(default)]
     agents: Option<RawAgents>,
     #[serde(default)]
     workflows: Option<RawWorkflows>,
@@ -578,6 +615,7 @@ impl From<Raw> for RepoConfig {
         let Self {
             runtime: default_runtime,
             tracker: default_tracker,
+            code_host: default_code_host,
             agents: default_agents,
             workflows: default_workflows,
             autonomous: default_autonomous,
@@ -606,6 +644,7 @@ impl From<Raw> for RepoConfig {
             None => default_runtime,
         };
         let tracker = raw.tracker.unwrap_or(default_tracker);
+        let code_host = raw.code_host.unwrap_or(default_code_host);
         let agents = match raw.agents {
             Some(a) => {
                 let default = a.default.unwrap_or(default_agents.default);
@@ -675,6 +714,7 @@ impl From<Raw> for RepoConfig {
         Self {
             runtime,
             tracker,
+            code_host,
             agents,
             workflows,
             autonomous,
@@ -747,6 +787,42 @@ mod tests {
         let yaml = "tracker: github\n";
         let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
         assert_eq!(cfg.orchestrator.agent, "claude");
+    }
+
+    #[test]
+    fn code_host_defaults_to_auto() {
+        let cfg = RepoConfig::default();
+        assert_eq!(cfg.code_host, CodeHostChoice::Auto);
+    }
+
+    #[test]
+    fn code_host_parses_explicit_github_choice() {
+        let yaml = "code_host: github\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.code_host, CodeHostChoice::Github);
+    }
+
+    #[test]
+    fn code_host_is_independent_of_tracker_choice() {
+        // The whole point of the abstraction: git-bug for issues,
+        // github for PRs is a supported configuration.
+        let yaml = "tracker: git-bug\ncode_host: github\n";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert_eq!(cfg.tracker, Tracker::GitBug);
+        assert_eq!(cfg.code_host, CodeHostChoice::Github);
+    }
+
+    #[test]
+    fn code_host_rejects_unknown_string_with_serde_error() {
+        let yaml = "code_host: bitbucket\n";
+        // Unknown variants surface as a serde error containing the
+        // bad value, with the parse-time file-path context.
+        let err = RepoConfig::from_str_at(yaml, "/x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bitbucket") || msg.contains("unknown variant"),
+            "expected unknown-variant error; got: {msg}"
+        );
     }
 
     #[test]

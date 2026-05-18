@@ -15,7 +15,7 @@
 //! this module only parses.
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yml::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -103,7 +103,7 @@ pub enum PrBindMode {
 /// PR's check-suite rollup. `Pending` matches checks that haven't
 /// completed; `Skipped` matches checks the CI system marked as skipped
 /// (distinct from missing checks entirely).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CiStatus {
     Success,
@@ -115,7 +115,7 @@ pub enum CiStatus {
 /// PR state filter on `pr-list`. Mirrors GitHub's three lifecycle
 /// values; defaults to [`PrState::Open`] for the common "look at
 /// active PRs only" case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrState {
     #[default]
