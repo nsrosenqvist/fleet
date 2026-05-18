@@ -1,18 +1,21 @@
 #![allow(dead_code)]
 //! Scheduler → subprocess dispatcher.
 //!
-//! Stage 4 ships the data types (`SchedulerSpawn`, `SpawnSeed`) so the
-//! engine can return spawn commands in a stable shape. Stage 7 wires
-//! `dispatch_spawns` to actually invoke `fleet workflow run …` per
-//! spawn — at that point the `run_for_pr` CLI path exists and the
-//! dispatcher can call it without needing a forward declaration.
+//! The engine (`scheduler::mod`) is pure; this module turns its
+//! `SchedulerSpawn` outputs into actual `fleet workflow run …`
+//! subprocess invocations. Each spawn becomes one detached run; each
+//! detached run mints its own tmux session and its own on-disk
+//! session row in `.fleet/sessions/`.
 //!
-//! Today this module exposes:
-//! - `SchedulerSpawn` / `SpawnSeed`: what the engine emits.
-//! - `build_run_for_pr_argv` / `build_run_anonymous_argv`: argv
-//!   builders the dispatcher will hand to `std::process::Command`.
-//!   Pure functions so stage 8's CLI-side tests can pin the exact
-//!   argv shape before stage 7's subprocess plumbing lands.
+//! The argv builders (`build_run_for_pr_argv`,
+//! `build_run_anonymous_argv`) are pure so tests can pin the exact
+//! shape without spawning subprocesses; `dispatch_spawns` wraps them
+//! in `std::process::Command::spawn`.
+
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::{Context, Result};
 
 use crate::code_host::PrSummary;
 
@@ -82,6 +85,43 @@ pub fn build_run_anonymous_argv(fleet_binary: &str, workflow: &str) -> Vec<Strin
         workflow.to_string(),
         "--detached".to_string(),
     ]
+}
+
+/// Spawn one subprocess per `SchedulerSpawn`. Each child is a
+/// fully-detached `fleet workflow run … --detached` invocation; the
+/// child mints its own tmux session and on-disk session row. The
+/// dispatcher does not wait for the child — `--detached` returns
+/// immediately, and the scheduler tick has already debounced.
+///
+/// Returns one result per spawn so the caller can log per-workflow
+/// failures without one bad spawn poisoning the rest of the slate.
+pub fn dispatch_spawns(spawns: &[SchedulerSpawn], fleet_binary: &Path) -> Vec<Result<()>> {
+    spawns
+        .iter()
+        .map(|s| dispatch_one(s, fleet_binary))
+        .collect()
+}
+
+fn dispatch_one(spawn: &SchedulerSpawn, fleet_binary: &Path) -> Result<()> {
+    let argv = match &spawn.seed {
+        SpawnSeed::Pr(pr) => build_run_for_pr_argv(
+            &fleet_binary.to_string_lossy(),
+            &spawn.workflow,
+            pr.number,
+            spawn.start_after_node.as_deref(),
+        ),
+        SpawnSeed::Anonymous => {
+            build_run_anonymous_argv(&fleet_binary.to_string_lossy(), &spawn.workflow)
+        }
+    };
+    // argv[0] is the program; the rest are flags. spawn() returns as
+    // soon as the child is up — the child's own `--detached` then
+    // backgrounds the actual workflow run via tmux.
+    Command::new(&argv[0])
+        .args(&argv[1..])
+        .spawn()
+        .with_context(|| format!("spawning `{}` for workflow `{}`", argv.join(" "), spawn.workflow))?;
+    Ok(())
 }
 
 #[cfg(test)]

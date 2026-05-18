@@ -74,14 +74,17 @@ pub fn run_validate(name: &str) -> Result<i32> {
 /// `preassigned_session_id` carries the wrapper-minted id into the
 /// inner invocation. When `None` (the inline path or a first-class
 /// CLI call), a fresh id is minted as before.
+#[allow(clippy::too_many_arguments)]
 pub fn run_run(
     name: &str,
     issue_id: Option<&str>,
+    pr_number: Option<u32>,
     preassigned_session_id: Option<&str>,
+    start_after_node: Option<&str>,
     detached: bool,
 ) -> Result<i32> {
     if detached {
-        return run_run_detached(name, issue_id);
+        return run_run_detached(name, issue_id, pr_number, start_after_node);
     }
 
     let cwd = std::env::current_dir().context("reading current directory")?;
@@ -119,13 +122,27 @@ pub fn run_run(
         None => None,
     };
 
-    // Provision the per-session worktree if the workspace is a git
-    // repo. On non-git workspaces (the `Local` adapter, scratch dirs)
-    // fall back to running directly against the repo root — without
-    // isolation between parallel sessions and without replay's
-    // code-state snapshot guarantee. We log loudly so users don't
-    // wonder why two sessions stomp on each other's files.
-    let provision = provision_worktree(invoker.as_ref(), &root, &store, &session_id, "HEAD")?;
+    // PR binding: resolve via the configured code host and prepare the
+    // worktree to check out the PR's head branch instead of HEAD.
+    let pr_context = match pr_number {
+        Some(n) => Some(resolve_pr(&config, &root, Arc::clone(&invoker), n)?),
+        None => None,
+    };
+
+    // Provision the per-session worktree. For a PR-bound run the
+    // worktree fetches the PR's head ref and bases on it; for the
+    // usual issueless / issue-bound path we cut from HEAD.
+    let provision = match &pr_context {
+        Some(p) => provision_worktree_for_pr(
+            invoker.as_ref(),
+            &root,
+            &store,
+            &session_id,
+            p.number,
+            &p.head_ref,
+        )?,
+        None => provision_worktree(invoker.as_ref(), &root, &store, &session_id, "HEAD")?,
+    };
     let workspace_path: &Path = provision
         .as_ref()
         .map_or(root.as_path(), |p| p.path.as_path());
@@ -163,14 +180,13 @@ pub fn run_run(
         workspace: workspace_path,
         session_id: session_id.clone(),
         issue,
-        // PR binding lands in stage 7 (`run_for_pr`); the standard
-        // `run` path never binds a PR by itself.
-        pr: None,
+        pr: pr_context,
         worktree: worktree_meta,
         cost: &config.cost,
         egress: enforcer.as_ref(),
         interrupt_flag: Some(Arc::clone(&interrupt)),
         secrets: &config.secrets,
+        start_after_node,
     };
 
     println!("{session_id}");
@@ -211,7 +227,12 @@ pub fn run_run(
 /// than after we've half-set things up. `pipe-pane` mirrors the pane
 /// to `.fleet/sessions/<id>/transcript.log` for post-hoc forensics
 /// — same shape as the orchestrator.
-fn run_run_detached(name: &str, issue_id: Option<&str>) -> Result<i32> {
+fn run_run_detached(
+    name: &str,
+    issue_id: Option<&str>,
+    pr_number: Option<u32>,
+    start_after_node: Option<&str>,
+) -> Result<i32> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = repo::fleet_root(&cwd);
     let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
@@ -240,6 +261,14 @@ fn run_run_detached(name: &str, issue_id: Option<&str>) -> Result<i32> {
     if let Some(id) = issue_id {
         argv.push("--issue".to_string());
         argv.push(id.to_string());
+    }
+    if let Some(n) = pr_number {
+        argv.push("--pr".to_string());
+        argv.push(n.to_string());
+    }
+    if let Some(node) = start_after_node {
+        argv.push("--start-after-node".to_string());
+        argv.push(node.to_string());
     }
     let env = vec![(
         crate::session::SESSION_TMUX_ENV.to_string(),
@@ -355,6 +384,7 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         egress: enforcer.as_ref(),
         interrupt_flag: None,
         secrets: &config.secrets,
+        start_after_node: None,
     };
     println!("{session_id}");
     let resumed = executor.resume(&req)?;
@@ -450,6 +480,7 @@ pub fn run_sibling(session_id: &str, node_id: &str) -> Result<i32> {
         // the tmux session and reaches every window.
         interrupt_flag: None,
         secrets: &config.secrets,
+        start_after_node: None,
     };
 
     // Hydrate the parent's outputs map so `when:` predicates and
@@ -618,6 +649,7 @@ pub fn run_replay(
         egress: enforcer.as_ref(),
         interrupt_flag: None,
         secrets: &config.secrets,
+        start_after_node: None,
     };
 
     println!("{new_id}");
@@ -700,6 +732,54 @@ fn provision_worktree(
     let wt_path = session_dir.join("worktree");
     let branch = worktree::session_branch_name(session_id.as_str());
     worktree::create_worktree(invoker, root, &wt_path, &branch, base)?;
+    Ok(Some(WorktreeProvision {
+        path: wt_path,
+        branch,
+    }))
+}
+
+/// Provision a worktree that bases on a PR's head ref. Fetches the
+/// PR locally as `fleet/pr-<n>` and cuts the session branch from
+/// there; commits land on the session branch and the agent's
+/// explicit `git push origin HEAD:<head_ref>` updates the PR.
+fn provision_worktree_for_pr(
+    invoker: &dyn ProcessInvoker,
+    root: &Path,
+    store: &SessionStore,
+    session_id: &SessionId,
+    pr_number: u32,
+    head_ref: &str,
+) -> Result<Option<WorktreeProvision>> {
+    if !worktree::is_git_repo(invoker, root) {
+        tracing::warn!(
+            workspace = %root.display(),
+            "workspace is not a git repo — PR-bound run cannot provision a worktree; \
+             refusing to share the host tree for a PR fix",
+        );
+        anyhow::bail!(
+            "PR-bound run requires a git workspace; {} is not a git repo",
+            root.display(),
+        );
+    }
+    let session_dir = store.session_dir(session_id);
+    std::fs::create_dir_all(&session_dir).with_context(|| {
+        format!(
+            "creating per-session directory at {} for the worktree parent",
+            session_dir.display()
+        )
+    })?;
+    let wt_path = session_dir.join("worktree");
+    let branch = worktree::session_branch_name(session_id.as_str());
+    worktree::create_worktree_for(
+        invoker,
+        root,
+        &wt_path,
+        &branch,
+        worktree::WorktreeSpec::Pr {
+            number: pr_number,
+            head_ref,
+        },
+    )?;
     Ok(Some(WorktreeProvision {
         path: wt_path,
         branch,
@@ -883,6 +963,37 @@ fn resolve_issue(
 #[must_use]
 pub fn pick_issue<'a>(issues: &'a [Issue], requested: &str) -> Option<&'a Issue> {
     issues.iter().find(|i| i.human_id == requested)
+}
+
+/// Resolve a PR via the configured code host and build a
+/// [`PrContext`] for the session. Errors if no code host is
+/// configured (e.g. `code_host: auto` with an unrecognised remote)
+/// — running `--pr` without one isn't a meaningful operation.
+fn resolve_pr(
+    config: &RepoConfig,
+    repo_root: &Path,
+    invoker: Arc<dyn ProcessInvoker>,
+    number: u32,
+) -> Result<crate::session::PrContext> {
+    let Some(host) = crate::code_host::build(config.code_host, invoker, repo_root) else {
+        anyhow::bail!(
+            "no code host available — `--pr {number}` requires `code_host:` to resolve to a \
+             concrete backend (`auto` saw no recognised remote; set `code_host: github` \
+             explicitly in `.fleet/config.yaml` if the remote isn't auto-detected)"
+        );
+    };
+    let detail = host
+        .read_pr(repo_root, number)
+        .with_context(|| format!("resolving PR #{number} via `{}`", host.name()))?;
+    Ok(crate::session::PrContext {
+        number: detail.summary.number,
+        human_id: format!("pr:{number}"),
+        title: detail.summary.title,
+        head_ref: detail.summary.head_ref,
+        head_sha: detail.summary.head_sha,
+        base_ref: detail.summary.base_ref,
+        url: detail.summary.url,
+    })
 }
 
 /// Enumerate workflows under `<root>/.fleet/workflows/`. Returns the

@@ -194,6 +194,14 @@ pub struct ExecuteRequest<'a> {
     /// no-op and the host-env / host-file fallbacks in
     /// [`build_agent_env`] apply.
     pub secrets: &'a std::collections::BTreeMap<String, crate::secrets::SecretBackendConfig>,
+    /// Skip every node in topo order up to and including the named
+    /// id. Used by the scheduler dispatcher's `run_for_pr` path: the
+    /// scheduler consumes the workflow's `pr-list bind: per` root
+    /// before minting per-PR sessions, so the executor must start
+    /// from the *next* node when those sessions actually run.
+    /// `None` (the default for hand-fired runs) preserves the
+    /// pre-feature behaviour byte-for-byte.
+    pub start_after_node: Option<&'a str>,
 }
 
 /// Per-session worktree bookkeeping, threaded into [`ExecuteRequest`]
@@ -321,8 +329,32 @@ impl WorkflowExecutor {
         req.store.save(&session)?;
 
         let egress_setup = req.egress.setup(req.session_id.as_str())?;
+        // `start_after_node` shifts the starting index past the named
+        // node so the dispatcher's `run_for_pr` path doesn't re-run
+        // the `pr-list` root the scheduler already consumed. None →
+        // start at 0 (the historical behaviour).
+        let start_idx = match req.start_after_node {
+            Some(name) => order
+                .iter()
+                .position(|id| id == name)
+                .map(|i| i + 1)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "--start-after-node `{name}` is not a node in workflow `{}`",
+                        req.workflow.name,
+                    )
+                })?,
+            None => 0,
+        };
         let run_outcome = (|| -> Result<()> {
-            self.run_loop(req, &mut session, &order, 0, &egress_setup, LoopBound::Full)?;
+            self.run_loop(
+                req,
+                &mut session,
+                &order,
+                start_idx,
+                &egress_setup,
+                LoopBound::Full,
+            )?;
             self.finalize(req, &mut session)
         })();
         if let Err(err) = req.egress.teardown(&egress_setup) {
@@ -3413,6 +3445,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3452,6 +3485,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -3500,6 +3534,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -3821,6 +3856,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3858,6 +3894,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3906,6 +3943,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.worktree_path.as_deref(), Some(wt_path.as_path()));
@@ -3955,6 +3993,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert!(session.worktree_path.is_none());
@@ -4063,6 +4102,7 @@ nodes:
             egress: &enforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -4128,6 +4168,7 @@ nodes:
             egress: &enforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         executor.execute(&req).unwrap();
         assert_eq!(*enforcer.setup_calls.lock().unwrap(), 1);
@@ -4169,6 +4210,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -4214,6 +4256,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         let active =
@@ -4259,6 +4302,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -4302,6 +4346,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -4343,6 +4388,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("unknown agent `ghost`"));
@@ -4397,6 +4443,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -4441,6 +4488,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("bash node `bad` failed"));
@@ -4491,6 +4539,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::AwaitingGate);
@@ -4558,6 +4607,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let final_session = executor.execute(&req).unwrap();
 
@@ -4620,6 +4670,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::AwaitingGate);
@@ -4662,6 +4713,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let _ = executor.execute(&req).unwrap_err();
         let loaded = store.load(&SessionId::new("s-fail-pid")).unwrap();
@@ -4710,6 +4762,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         // First execute pauses at the gate.
         let paused = executor.execute(&req).unwrap();
@@ -4774,6 +4827,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let paused = executor.execute(&req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -4828,6 +4882,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         // First run completes (no gate).
         let done = executor.execute(&req).unwrap();
@@ -4873,6 +4928,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.resume(&req).unwrap_err();
         assert!(
@@ -4962,6 +5018,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
 
         let replayed = executor.replay(&req, &src_id, "review").unwrap();
@@ -5043,6 +5100,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
 
         let replayed = executor.replay_only(&req, &src_id, "mid").unwrap();
@@ -5117,6 +5175,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
 
         let replayed = executor.replay_only(&req, &src_id, "revise").unwrap();
@@ -5178,6 +5237,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor
             .replay_only(&req, &src_id, "nonexistent")
@@ -5234,6 +5294,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
 
         let replayed = executor.replay(&req, &src_id, "review").unwrap();
@@ -5282,6 +5343,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
 
         let err = executor.replay(&req, &src_id, "nope").unwrap_err();
@@ -5328,6 +5390,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor
             .replay(&req, &SessionId::new("s-does-not-exist"), "only")
@@ -5401,6 +5464,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
 
         let replayed = executor.replay(&req, &src_id, "a").unwrap();
@@ -5455,6 +5519,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let replayed = executor.replay(&req, &src_id, "only").unwrap();
         assert_eq!(replayed.state, SessionState::Completed);
@@ -5540,6 +5605,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
 
         // The `decide` bash node "produces" its declared outputs as a
@@ -5641,6 +5707,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let replayed = executor.replay(&req, &src_id, "act").unwrap();
         assert_eq!(replayed.state, SessionState::Completed);
@@ -5772,6 +5839,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -5859,6 +5927,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -5912,6 +5981,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(
@@ -5962,6 +6032,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         (session, script_log)
@@ -6274,6 +6345,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6512,6 +6584,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6596,6 +6669,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6653,6 +6727,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -6728,6 +6803,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6811,6 +6887,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6877,6 +6954,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6939,6 +7017,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -6993,6 +7072,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -7114,6 +7194,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let paused = executor.execute(&req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -7193,6 +7274,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let paused = executor.execute(&exec_req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -7223,6 +7305,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let resumed = executor.resume(&resume_req).unwrap();
         assert_eq!(resumed.state, SessionState::Completed);
@@ -7287,6 +7370,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         executor.execute(&exec_req).unwrap();
 
@@ -7314,6 +7398,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let resumed = executor.resume(&resume_req).unwrap();
         assert_eq!(resumed.issue, Some(replacement));
@@ -7377,6 +7462,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         // when:-false skipped the assert; workflow Completes despite
@@ -7747,6 +7833,94 @@ nodes:
     }
 
     #[test]
+    fn execute_with_start_after_node_skips_predecessors() {
+        // 3-node linear bash workflow with start_after_node="write_a"
+        // → only b and c run. We check by looking at the per-node logs
+        // under `.fleet/sessions/<id>/logs/`.
+        let yaml = "\
+name: skipper
+nodes:
+  - id: write_a
+    type: bash
+    script: 'true'
+  - id: write_b
+    depends_on: [write_a]
+    type: bash
+    script: 'true'
+  - id: write_c
+    depends_on: [write_b]
+    type: bash
+    script: 'true'
+";
+        let wf = Workflow::from_str_at(yaml, "/x.yaml").unwrap();
+        let session_id = SessionId::new("s-skipafter");
+        let adapter = local_adapter_with_stdout("");
+        let agents = crate::agent::AgentRegistry::default();
+        let devcontainer = sample_devcontainer();
+        let (dir, store) = build_store();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &devcontainer,
+            workspace: dir.path(),
+            session_id: session_id.clone(),
+            issue: None,
+            pr: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig::default(),
+            egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
+            start_after_node: Some("write_a"),
+        };
+        let session = executor.execute(&req).unwrap();
+        assert_eq!(session.state, SessionState::Completed);
+        let logs = store.session_dir(&session_id).join("logs");
+        assert!(
+            !logs.join("write_a.log").exists(),
+            "write_a log should not exist; got logs dir = {logs:?}",
+        );
+        assert!(logs.join("write_b.log").exists());
+        assert!(logs.join("write_c.log").exists());
+    }
+
+    #[test]
+    fn execute_with_start_after_node_unknown_id_errors() {
+        let yaml = "name: x\nnodes:\n  - id: a\n    type: bash\n    script: 'true'\n";
+        let wf = Workflow::from_str_at(yaml, "/x.yaml").unwrap();
+        let adapter = local_adapter_with_stdout("");
+        let agents = crate::agent::AgentRegistry::default();
+        let devcontainer = sample_devcontainer();
+        let (dir, store) = build_store();
+        let executor = executor_returning("");
+        let req = ExecuteRequest {
+            workflow: &wf,
+            adapter: &adapter,
+            agents: &agents,
+            store: &store,
+            devcontainer: &devcontainer,
+            workspace: dir.path(),
+            session_id: SessionId::new("s-bad"),
+            issue: None,
+            pr: None,
+            worktree: None,
+            cost: &crate::repo_config::CostConfig::default(),
+            egress: &crate::egress::NoopEnforcer,
+            interrupt_flag: None,
+            secrets: empty_secrets_static(),
+            start_after_node: Some("nonexistent"),
+        };
+        let err = executor.execute(&req).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a node in workflow"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
     fn detect_current_branch_errors_on_detached_head() {
         let mut inv = MockProcessInvoker::new();
         inv.expect_run().returning(|_, _| Ok("HEAD".to_string()));
@@ -7824,6 +7998,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
 
@@ -7918,6 +8093,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         executor.execute(&req).unwrap();
         let calls = tracker.calls();
@@ -8009,6 +8185,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         executor.execute(&req).unwrap();
 
@@ -8098,6 +8275,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         executor.execute(&req).unwrap();
 
@@ -8188,6 +8366,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         executor.execute(&req).unwrap();
 
@@ -8262,6 +8441,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         executor.execute(&req).unwrap();
         // Plans directory may not even exist; tracker-create
@@ -8339,6 +8519,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         executor.execute(&req).unwrap();
         let deps_path = deps_path_for(&store);
@@ -8407,6 +8588,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         executor.execute(&req).unwrap();
         let calls = tracker.calls();
@@ -8472,6 +8654,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("requires a tracker"));
@@ -8538,6 +8721,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -8607,6 +8791,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("title"));
@@ -8673,6 +8858,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("forced tracker create failure"));
@@ -8748,6 +8934,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -8837,6 +9024,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -8949,6 +9137,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("forced link_parent failure"));
@@ -9058,6 +9247,7 @@ nodes:
             egress: &crate::egress::NoopEnforcer,
             interrupt_flag: None,
             secrets: empty_secrets_static(),
+            start_after_node: None,
         };
         let _session = executor.execute(&req).unwrap();
 

@@ -175,14 +175,28 @@ pub enum WorkflowSub {
     Run {
         name: String,
         /// Issue id to act on (matches the tracker's `human_id`).
-        #[arg(long)]
+        /// Mutually exclusive with `--pr`.
+        #[arg(long, conflicts_with = "pr")]
         issue: Option<String>,
+        /// Pull request number to act on. Resolves the PR through the
+        /// configured code host and threads its head ref / sha into
+        /// the session so the worktree checks out the PR's branch.
+        /// Mutually exclusive with `--issue`.
+        #[arg(long, conflicts_with = "issue")]
+        pr: Option<u32>,
         /// Pre-minted session id (set by the `--detached` wrapper so
         /// the inner inherits the same id the wrapper printed). When
         /// absent, a fresh id is minted as before. Internal: not
         /// surfaced in `--help` output.
         #[arg(long, hide = true)]
         session_id: Option<String>,
+        /// Skip every node up to and including the named id, then
+        /// resume execution from the next topo position. Internal:
+        /// the scheduler dispatcher sets this when minting a session
+        /// from a `pr-list bind: per` root the scheduler already
+        /// consumed.
+        #[arg(long, hide = true)]
+        start_after_node: Option<String>,
         /// Wrap the run in a tmux session for live attach. See the
         /// command-level docs above for the full lifecycle.
         #[arg(long)]
@@ -505,6 +519,7 @@ pub enum AutonomousSub {
 }
 
 /// Dispatch the parsed CLI. Returns the exit code to propagate.
+#[allow(clippy::too_many_lines)] // top-level match over every subcommand variant.
 pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
     let command = cli.command.unwrap_or(Command::Ui);
     match command {
@@ -525,9 +540,18 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             WorkflowSub::Run {
                 name,
                 issue,
+                pr,
                 session_id,
+                start_after_node,
                 detached,
-            } => workflow::run_run(&name, issue.as_deref(), session_id.as_deref(), detached),
+            } => workflow::run_run(
+                &name,
+                issue.as_deref(),
+                pr,
+                session_id.as_deref(),
+                start_after_node.as_deref(),
+                detached,
+            ),
             WorkflowSub::Resume { session } => workflow::run_resume(&session),
             WorkflowSub::RunSibling { session_id, node } => {
                 workflow::run_sibling(&session_id, &node)
