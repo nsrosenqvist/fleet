@@ -339,8 +339,8 @@ const DEFAULT_DEVCONTAINER_JSON: &str = "\
 
 /// `.fleet/workflows/standard.yaml` — the canonical planner → coder →
 /// reviewer flow. Three agent nodes plus a bounded revision cycle and
-/// a final `gh pr create` step that only fires on an `approve`
-/// verdict. The artifact contract chains `plan.md` from `plan` into
+/// a final `create-pr` step that only fires on an `approve` verdict.
+/// The artifact contract chains `plan.md` from `plan` into
 /// `implement`'s inputs; the reviewer's `outputs: { decision: … }`
 /// feeds the `when:`-gated fork.
 const DEFAULT_WORKFLOW_STANDARD: &str = r#"# Default `standard` workflow shipped by `fleet init`.
@@ -399,8 +399,9 @@ nodes:
   - id: open_pr
     depends_on: [review]
     when: 'review.decision == "approve"'
-    type: bash
-    script: 'gh pr create --title "${FLEET_ISSUE_TITLE:-fleet change}" --body "Automated PR for issue ${FLEET_ISSUE_HUMAN_ID:-?}"'
+    type: create-pr
+    title: '${FLEET_ISSUE_TITLE:-fleet change}'
+    body: 'Automated PR for issue ${FLEET_ISSUE_HUMAN_ID:-?}'
   - id: file-dep
     depends_on: [implement]
     when: 'implement.outcome == "blocked" && implement.recommend_ticket != ""'
@@ -528,7 +529,7 @@ Produce two artifacts under /artifacts:
 
          {"decision": "changes_requested"}
 
-     `approve` triggers `gh pr create`; `changes_requested` triggers
+     `approve` triggers `create-pr`; `changes_requested` triggers
      the bounded revise loop. Any other value falls through both
      branches — useful when the implementer was blocked and there's
      no real diff worth reviewing (write `{"decision": "noop"}` in
@@ -691,7 +692,14 @@ mod tests {
             Some("review.decision == \"approve\""),
             "open_pr must gate on approve"
         );
-        assert!(matches!(open_pr.kind, NodeKind::Bash { .. }));
+        // Migrated from the legacy `gh pr create` bash hack to the
+        // first-class CreatePr NodeKind in stage 5 of the loop-
+        // scheduler / PR-aware feature.
+        assert!(
+            matches!(open_pr.kind, NodeKind::CreatePr { .. }),
+            "open_pr should use the CreatePr NodeKind; got {:?}",
+            open_pr.kind,
+        );
     }
 
     #[test]

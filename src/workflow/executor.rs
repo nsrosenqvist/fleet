@@ -116,6 +116,14 @@ pub struct WorkflowExecutor {
     /// tracker from `.fleet/config.yaml` and threads it in via
     /// [`Self::with_tracker`].
     tracker: Option<Arc<dyn Tracker>>,
+    /// Code-host handle for PR-aware nodes (`pr-list`, `pr-checks`,
+    /// `create-pr`, `pr-comment`). `None` disables those node kinds
+    /// — they fail with a clear "no code host configured" error at
+    /// `run_node` dispatch. Built from `.fleet/config.yaml`'s
+    /// `code_host:` block (or auto-detected from the git remote) in
+    /// `cli::workflow::build_code_host_arc`; threaded in via
+    /// [`Self::with_code_host`].
+    code_host: Option<Arc<dyn crate::code_host::CodeHost>>,
     /// Labels unioned into the `labels` field of every
     /// `tracker-create` node's request, so a workflow-spawned ticket
     /// carries the labels needed to pass the supervisor's
@@ -222,6 +230,7 @@ impl WorkflowExecutor {
             invoker,
             clock: Box::new(now_ms),
             tracker: None,
+            code_host: None,
             creation_label_stamp: Vec::new(),
         }
     }
@@ -244,6 +253,19 @@ impl WorkflowExecutor {
     #[must_use]
     pub fn with_tracker(mut self, tracker: Option<Arc<dyn Tracker>>) -> Self {
         self.tracker = tracker;
+        self
+    }
+
+    /// Set the code-host backend used by `pr-list` / `pr-checks` /
+    /// `create-pr` / `pr-comment` nodes. `None` (the default) makes
+    /// those node kinds fail loudly at run time — they need a
+    /// configured code host to do anything useful.
+    #[must_use]
+    pub fn with_code_host(
+        mut self,
+        code_host: Option<Arc<dyn crate::code_host::CodeHost>>,
+    ) -> Self {
+        self.code_host = code_host;
         self
     }
 
@@ -820,6 +842,58 @@ impl WorkflowExecutor {
                     node_costs: Vec::new(),
                     extra_outputs: emitted,
                 }
+            }
+            NodeKind::PrList { filter, bind } => {
+                // `bind: per` is consumed by the scheduler before any
+                // executor node runs; reaching here means stage 7's
+                // dispatcher didn't skip past the root. Treat as an
+                // internal error rather than running it for real.
+                if matches!(bind, Some(crate::workflow::spec::PrBindMode::Per)) {
+                    bail!(
+                        "internal: pr-list node `{}` with `bind: per` reached run_node — \
+                         the scheduler dispatcher should have set --start-after-node to \
+                         skip past it",
+                        node.id,
+                    );
+                }
+                let emitted = self.run_pr_list_node(req, node, filter, session)?;
+                NodeOutcome {
+                    node_costs: Vec::new(),
+                    extra_outputs: emitted,
+                }
+            }
+            NodeKind::PrChecks { pr } => {
+                let emitted = self.run_pr_checks_node(req, node, pr.as_deref(), session, outputs)?;
+                NodeOutcome {
+                    node_costs: Vec::new(),
+                    extra_outputs: emitted,
+                }
+            }
+            NodeKind::CreatePr {
+                title,
+                body,
+                base,
+                head,
+                draft,
+            } => {
+                let emitted = self.run_create_pr_node(
+                    req,
+                    node,
+                    title,
+                    body,
+                    base.as_deref(),
+                    head.as_deref(),
+                    *draft,
+                    session,
+                )?;
+                NodeOutcome {
+                    node_costs: Vec::new(),
+                    extra_outputs: emitted,
+                }
+            }
+            NodeKind::PrComment { body, pr } => {
+                self.run_pr_comment_node(req, node, body, pr.as_deref(), session, outputs)?;
+                NodeOutcome::empty()
             }
             // Unsupported kinds were rejected earlier in `execute`; this
             // branch is just an exhaustiveness guard.
@@ -1453,6 +1527,179 @@ impl WorkflowExecutor {
             })?;
         }
         Ok(())
+    }
+
+    /// Host-side `pr-list` handler. Emits the PR list as a JSON-
+    /// stringified output (`prs`) plus a scalar `count`. `bind: per`
+    /// is intercepted at the `run_node` dispatch — by the time we
+    /// reach this body, `bind` is `None` and the node simply
+    /// produces outputs for downstream nodes inside the current
+    /// session.
+    fn run_pr_list_node(
+        &self,
+        req: &ExecuteRequest<'_>,
+        node: &Node,
+        filter: &crate::workflow::spec::PrFilter,
+        session: &Session,
+    ) -> Result<Vec<((String, String), String)>> {
+        let host = self.require_code_host_for(node)?;
+        let prs = host
+            .list_prs(req.workspace, filter)
+            .with_context(|| format!("pr-list node `{}`: list_prs failed", node.id))?;
+        let log_path = self.node_log_path(req, session, &node.id);
+        let mut body = format!("--- pr-list ---\n{} PR(s) matched\n", prs.len());
+        for p in &prs {
+            use std::fmt::Write;
+            let _ = writeln!(body, "  #{} {}", p.number, p.title);
+        }
+        if let Err(err) = std::fs::write(&log_path, body) {
+            tracing::warn!(?err, log = %log_path.display(), "writing pr-list log failed");
+        }
+        let prs_json = serde_json::to_string(&prs).with_context(|| {
+            format!("pr-list node `{}`: serialising PR list to JSON", node.id)
+        })?;
+        Ok(vec![
+            ((node.id.clone(), "count".to_string()), prs.len().to_string()),
+            ((node.id.clone(), "prs".to_string()), prs_json),
+        ])
+    }
+
+    /// Host-side `pr-checks` handler. Resolves which PR to query
+    /// (explicit literal / dotted-ref / bound PR context), calls
+    /// `pr_checks`, emits the scalar pre-aggregates `has_failures`,
+    /// `failed_count`, `pending_count` plus the full checks list as
+    /// a JSON-stringified `checks` output for downstream parsing.
+    fn run_pr_checks_node(
+        &self,
+        req: &ExecuteRequest<'_>,
+        node: &Node,
+        pr_ref: Option<&str>,
+        session: &Session,
+        outputs: &OutputMap,
+    ) -> Result<Vec<((String, String), String)>> {
+        let host = self.require_code_host_for(node)?;
+        let number = resolve_pr_number(node, pr_ref, session, outputs)?;
+        let summary = host
+            .pr_checks(req.workspace, number)
+            .with_context(|| format!("pr-checks node `{}`: pr_checks failed", node.id))?;
+        let log_path = self.node_log_path(req, session, &node.id);
+        let body = format!(
+            "--- pr-checks (#{number}) ---\n\
+             has_failures={} failed={} pending={}\n",
+            summary.has_failures, summary.failed_count, summary.pending_count,
+        );
+        if let Err(err) = std::fs::write(&log_path, body) {
+            tracing::warn!(?err, log = %log_path.display(), "writing pr-checks log failed");
+        }
+        let checks_json = serde_json::to_string(&summary.checks).with_context(|| {
+            format!("pr-checks node `{}`: serialising checks list to JSON", node.id)
+        })?;
+        Ok(vec![
+            (
+                (node.id.clone(), "has_failures".to_string()),
+                summary.has_failures.to_string(),
+            ),
+            (
+                (node.id.clone(), "failed_count".to_string()),
+                summary.failed_count.to_string(),
+            ),
+            (
+                (node.id.clone(), "pending_count".to_string()),
+                summary.pending_count.to_string(),
+            ),
+            ((node.id.clone(), "checks".to_string()), checks_json),
+        ])
+    }
+
+    /// Host-side `create-pr` handler. Resolves `base`/`head`
+    /// defaults from the worktree's git state when the YAML omits
+    /// them, calls `create_pr`, emits `number`, `url`, `head_sha`.
+    /// Supersedes the legacy `gh pr create` bash escape hatch in
+    /// `standard.yaml`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_create_pr_node(
+        &self,
+        req: &ExecuteRequest<'_>,
+        node: &Node,
+        title: &str,
+        body: &str,
+        base: Option<&str>,
+        head: Option<&str>,
+        draft: bool,
+        session: &Session,
+    ) -> Result<Vec<((String, String), String)>> {
+        let host = self.require_code_host_for(node)?;
+        let base = base
+            .map(str::to_string)
+            .or_else(|| detect_default_base(self.invoker.as_ref(), req.workspace))
+            .unwrap_or_else(|| "main".to_string());
+        let head = match head {
+            Some(s) => s.to_string(),
+            None => detect_current_branch(self.invoker.as_ref(), req.workspace).with_context(
+                || format!("create-pr node `{}`: resolving HEAD branch failed", node.id),
+            )?,
+        };
+        let summary = host
+            .create_pr(req.workspace, title, body, &base, &head, draft)
+            .with_context(|| format!("create-pr node `{}`: create_pr failed", node.id))?;
+        let log_path = self.node_log_path(req, session, &node.id);
+        let body_log = format!(
+            "--- create-pr ---\nopened #{} at {} (head_sha={})\n",
+            summary.number, summary.url, summary.head_sha,
+        );
+        if let Err(err) = std::fs::write(&log_path, body_log) {
+            tracing::warn!(?err, log = %log_path.display(), "writing create-pr log failed");
+        }
+        Ok(vec![
+            (
+                (node.id.clone(), "number".to_string()),
+                summary.number.to_string(),
+            ),
+            ((node.id.clone(), "url".to_string()), summary.url),
+            ((node.id.clone(), "head_sha".to_string()), summary.head_sha),
+        ])
+    }
+
+    /// Host-side `pr-comment` handler. No outputs; runs the
+    /// `pr_comment` write and writes a one-line log entry.
+    fn run_pr_comment_node(
+        &self,
+        req: &ExecuteRequest<'_>,
+        node: &Node,
+        body: &str,
+        pr_ref: Option<&str>,
+        session: &Session,
+        outputs: &OutputMap,
+    ) -> Result<()> {
+        let host = self.require_code_host_for(node)?;
+        let number = resolve_pr_number(node, pr_ref, session, outputs)?;
+        host.pr_comment(req.workspace, number, body)
+            .with_context(|| format!("pr-comment node `{}`: pr_comment failed", node.id))?;
+        let log_path = self.node_log_path(req, session, &node.id);
+        let log_body = format!("--- pr-comment ---\nposted comment on PR #{number}\n");
+        if let Err(err) = std::fs::write(&log_path, log_body) {
+            tracing::warn!(?err, log = %log_path.display(), "writing pr-comment log failed");
+        }
+        Ok(())
+    }
+
+    /// Borrow the configured code host, or surface a clear error
+    /// naming the node so workflow authors see why a PR-aware node
+    /// refused to run.
+    fn require_code_host_for(
+        &self,
+        node: &Node,
+    ) -> Result<Arc<dyn crate::code_host::CodeHost>> {
+        self.code_host
+            .clone()
+            .ok_or_else(|| {
+                anyhow!(
+                    "PR-aware node `{}` requires a code host but the executor was built \
+                     without one — pass `WorkflowExecutor::with_code_host(Some(...))` \
+                     or set `code_host:` in `.fleet/config.yaml`",
+                    node.id,
+                )
+            })
     }
 
     fn run_assert_node(
@@ -2556,6 +2803,113 @@ fn parse_output_ref(reference: &str) -> Result<(&str, &str)> {
         );
     }
     Ok((node, name))
+}
+
+/// Resolve which PR number a `pr-checks` / `pr-comment` node should
+/// act on. Accepts three forms, tried in order:
+/// 1. A bare numeric literal in `pr_ref` (`pr: "42"`).
+/// 2. A dotted `<node>.<output>` reference resolved against the run's
+///    `outputs` map (`pr: ${probe.number}`).
+/// 3. No `pr_ref` → fall back to the session's bound [`PrContext`].
+///
+/// Surfaces a clear "session has no bound PR" error when both the
+/// explicit ref and the session fallback are absent.
+fn resolve_pr_number(
+    node: &Node,
+    pr_ref: Option<&str>,
+    session: &Session,
+    outputs: &OutputMap,
+) -> Result<u32> {
+    if let Some(raw) = pr_ref {
+        let trimmed = raw.trim();
+        // Form 1: numeric literal.
+        if let Ok(n) = trimmed.parse::<u32>() {
+            return Ok(n);
+        }
+        // Form 2: dotted reference into outputs.
+        let (src_node, src_name) = parse_output_ref(trimmed).with_context(|| {
+            format!(
+                "node `{}`: `pr: {trimmed}` is not a numeric literal or a `<node>.<output>` \
+                 reference",
+                node.id
+            )
+        })?;
+        let value = outputs
+            .get(&(src_node.to_string(), src_name.to_string()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "node `{}`: `pr: {trimmed}` resolves to no upstream output \
+                     (did the producing node fail or skip?)",
+                    node.id,
+                )
+            })?;
+        return value.parse::<u32>().with_context(|| {
+            format!(
+                "node `{}`: upstream output `{trimmed}` value `{value}` is not a PR number",
+                node.id,
+            )
+        });
+    }
+    session.pr.as_ref().map(|p| p.number).ok_or_else(|| {
+        anyhow!(
+            "node `{}`: no `pr:` reference set and session has no bound PR — \
+             scope this node to a PR via `pr:` or run the workflow with `--pr <n>`",
+            node.id,
+        )
+    })
+}
+
+/// Resolve the repo's default branch by reading the remote's symbolic
+/// ref. Returns `None` if git refuses for any reason — callers
+/// typically fall back to `"main"`. Pure modulo the subprocess call;
+/// tests can stub via `MockProcessInvoker`.
+fn detect_default_base(invoker: &dyn ProcessInvoker, repo_root: &Path) -> Option<String> {
+    let out = invoker
+        .run(
+            "git",
+            vec![
+                "-C".to_string(),
+                repo_root.to_string_lossy().into_owned(),
+                "symbolic-ref".to_string(),
+                "--short".to_string(),
+                "refs/remotes/origin/HEAD".to_string(),
+            ],
+        )
+        .ok()?;
+    let s = out.trim();
+    s.strip_prefix("origin/").map(str::to_string).or_else(|| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    })
+}
+
+/// Resolve the worktree's current branch name. Errors out rather
+/// than guessing — `create-pr` must know which branch to use as
+/// `head`, and silently defaulting could push to the wrong place.
+fn detect_current_branch(invoker: &dyn ProcessInvoker, repo_root: &Path) -> Result<String> {
+    let out = invoker
+        .run(
+            "git",
+            vec![
+                "-C".to_string(),
+                repo_root.to_string_lossy().into_owned(),
+                "rev-parse".to_string(),
+                "--abbrev-ref".to_string(),
+                "HEAD".to_string(),
+            ],
+        )
+        .context("running `git rev-parse --abbrev-ref HEAD`")?;
+    let s = out.trim();
+    if s.is_empty() || s == "HEAD" {
+        bail!(
+            "the worktree is in a detached-HEAD state — `create-pr` cannot infer the \
+             source branch; pass `head:` explicitly"
+        );
+    }
+    Ok(s.to_string())
 }
 
 #[cfg(test)]
@@ -7230,6 +7584,132 @@ nodes:
     fn parse_output_ref_rejects_nested_paths() {
         let err = parse_output_ref("a.b.c").unwrap_err();
         assert!(format!("{err}").contains("nested paths are not supported"));
+    }
+
+    fn pr_node_with_id(id: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            depends_on: vec![],
+            when: None,
+            kind: NodeKind::PrChecks { pr: None },
+            artifacts: crate::workflow::spec::ArtifactsSpec::default(),
+            outputs: std::collections::BTreeMap::new(),
+            loop_back_to: None,
+            max_loops: None,
+        }
+    }
+
+    fn session_with_pr(number: u32) -> Session {
+        let mut s = Session::new(SessionId::new("s-test"), "wf", 0);
+        s.pr = Some(PrContext {
+            number,
+            human_id: format!("pr:{number}"),
+            title: "x".into(),
+            head_ref: "feat/x".into(),
+            head_sha: "abc".into(),
+            base_ref: "main".into(),
+            url: "https://github.com/o/r/pull/x".into(),
+        });
+        s
+    }
+
+    #[test]
+    fn resolve_pr_number_uses_numeric_literal() {
+        let node = pr_node_with_id("probe");
+        let session = Session::new(SessionId::new("s"), "wf", 0);
+        let outputs = OutputMap::new();
+        let n = resolve_pr_number(&node, Some("42"), &session, &outputs).unwrap();
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn resolve_pr_number_uses_dotted_output_ref() {
+        let node = pr_node_with_id("probe");
+        let session = Session::new(SessionId::new("s"), "wf", 0);
+        let mut outputs = OutputMap::new();
+        outputs.insert(("pick".to_string(), "number".to_string()), "7".to_string());
+        let n = resolve_pr_number(&node, Some("pick.number"), &session, &outputs).unwrap();
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn resolve_pr_number_falls_back_to_session_pr_when_no_ref() {
+        let node = pr_node_with_id("probe");
+        let session = session_with_pr(13);
+        let outputs = OutputMap::new();
+        let n = resolve_pr_number(&node, None, &session, &outputs).unwrap();
+        assert_eq!(n, 13);
+    }
+
+    #[test]
+    fn resolve_pr_number_errors_when_no_ref_and_no_session_pr() {
+        let node = pr_node_with_id("probe");
+        let session = Session::new(SessionId::new("s"), "wf", 0);
+        let outputs = OutputMap::new();
+        let err = resolve_pr_number(&node, None, &session, &outputs).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("session has no bound PR"), "got: {msg}");
+        assert!(msg.contains("probe"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_pr_number_errors_when_upstream_output_missing() {
+        let node = pr_node_with_id("probe");
+        let session = Session::new(SessionId::new("s"), "wf", 0);
+        let outputs = OutputMap::new();
+        let err = resolve_pr_number(&node, Some("pick.number"), &session, &outputs).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no upstream output"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_pr_number_errors_when_upstream_value_not_a_number() {
+        let node = pr_node_with_id("probe");
+        let session = Session::new(SessionId::new("s"), "wf", 0);
+        let mut outputs = OutputMap::new();
+        outputs.insert(("pick".to_string(), "number".to_string()), "abc".to_string());
+        let err = resolve_pr_number(&node, Some("pick.number"), &session, &outputs).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is not a PR number"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn detect_default_base_strips_origin_prefix() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run().returning(|_, _| Ok("origin/main".to_string()));
+        let v = detect_default_base(&inv, Path::new("/repo"));
+        assert_eq!(v.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn detect_default_base_returns_none_when_git_errors() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run()
+            .returning(|_, _| Err(anyhow!("no symbolic ref")));
+        assert!(detect_default_base(&inv, Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn detect_current_branch_returns_short_name() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run().returning(|_, _| Ok("feat/x".to_string()));
+        let v = detect_current_branch(&inv, Path::new("/repo")).unwrap();
+        assert_eq!(v, "feat/x");
+    }
+
+    #[test]
+    fn detect_current_branch_errors_on_detached_head() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run().returning(|_, _| Ok("HEAD".to_string()));
+        let err = detect_current_branch(&inv, Path::new("/repo")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("detached-HEAD"),
+            "got: {err:#}"
+        );
     }
 
     #[test]

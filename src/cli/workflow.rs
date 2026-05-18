@@ -136,8 +136,10 @@ pub fn run_run(
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
+    let code_host = build_code_host_arc(&config, Arc::clone(&invoker), &root);
     let executor = WorkflowExecutor::new(Arc::clone(&invoker))
         .with_tracker(tracker)
+        .with_code_host(code_host)
         .with_creation_label_stamp(config.autonomous.filter_labels.clone());
     // SIGINT handler shared with the executor: between nodes, the
     // executor checks this flag and aborts cleanly (marking the
@@ -327,8 +329,10 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
+    let code_host = build_code_host_arc(&config, Arc::clone(&invoker), &root);
     let executor = WorkflowExecutor::new(Arc::clone(&invoker))
         .with_tracker(tracker)
+        .with_code_host(code_host)
         .with_creation_label_stamp(config.autonomous.filter_labels.clone());
     let req = ExecuteRequest {
         workflow: &wf,
@@ -419,8 +423,10 @@ pub fn run_sibling(session_id: &str, node_id: &str) -> Result<i32> {
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
+    let code_host = build_code_host_arc(&config, Arc::clone(&invoker), &root);
     let executor = crate::workflow::executor::WorkflowExecutor::new(Arc::clone(&invoker))
         .with_tracker(tracker)
+        .with_code_host(code_host)
         .with_creation_label_stamp(config.autonomous.filter_labels.clone());
     let req = ExecuteRequest {
         workflow: &wf,
@@ -589,8 +595,10 @@ pub fn run_replay(
 
     let enforcer = build_workflow_enforcer(&config, adapter.as_ref(), Arc::clone(&invoker));
     let tracker = build_tracker_arc(&config, Arc::clone(&invoker));
+    let code_host = build_code_host_arc(&config, Arc::clone(&invoker), &root);
     let executor = WorkflowExecutor::new(Arc::clone(&invoker))
         .with_tracker(tracker)
+        .with_code_host(code_host)
         .with_creation_label_stamp(config.autonomous.filter_labels.clone());
     let req = ExecuteRequest {
         workflow: &wf,
@@ -756,6 +764,18 @@ fn build_tracker_arc(
     build_tracker(config.tracker, invoker).map(Arc::from)
 }
 
+/// Build the configured code host. Same shape as
+/// [`build_tracker_arc`] but for PR-aware nodes; returns `None` when
+/// `code_host: auto` doesn't recognise the git remote (the executor
+/// then refuses PR-aware nodes at run time with a clear error).
+fn build_code_host_arc(
+    config: &RepoConfig,
+    invoker: Arc<dyn ProcessInvoker>,
+    repo_root: &Path,
+) -> Option<Arc<dyn crate::code_host::CodeHost>> {
+    crate::code_host::build(config.code_host, invoker, repo_root).map(Arc::from)
+}
+
 fn build_workflow_enforcer(
     config: &RepoConfig,
     adapter: &dyn crate::runtime::RuntimeAdapter,
@@ -793,6 +813,17 @@ fn fleet_default_allowlist_hosts(config: &RepoConfig) -> Vec<String> {
     // (git-bug, future Linear/Jira) only get added when the host is
     // known and stable.
     if matches!(config.tracker, crate::repo_config::Tracker::Github) {
+        hosts.push("api.github.com".to_string());
+        hosts.push("github.com".to_string());
+    }
+    // Code-host: when the configured (or auto-detected) code host is
+    // GitHub, ensure its hosts are admitted even on a non-GitHub
+    // tracker. The explicit "tracker and code-host are independent"
+    // case — e.g. `tracker: git-bug` + `code_host: github`.
+    if matches!(
+        config.code_host,
+        crate::repo_config::CodeHostChoice::Github | crate::repo_config::CodeHostChoice::Auto,
+    ) {
         hosts.push("api.github.com".to_string());
         hosts.push("github.com".to_string());
     }
