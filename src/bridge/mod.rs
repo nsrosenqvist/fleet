@@ -85,8 +85,15 @@ pub struct Bridge {
 impl Bridge {
     /// Start the bridge for `session`. The tracker handle is shared
     /// with the listener thread; the bridge holds it for the
-    /// listener's lifetime.
-    pub fn start(session: &Session, tracker: Arc<dyn Tracker>, repo_root: PathBuf) -> Result<Self> {
+    /// listener's lifetime. `code_host` is optional — when `None`,
+    /// the `/pr/*` routes return 404 with a clear "no code host
+    /// configured" message.
+    pub fn start(
+        session: &Session,
+        tracker: Arc<dyn Tracker>,
+        code_host: Option<Arc<dyn crate::code_host::CodeHost>>,
+        repo_root: PathBuf,
+    ) -> Result<Self> {
         let server = tiny_http::Server::http("127.0.0.1:0")
             .map_err(|e| anyhow!("starting bridge HTTP server on loopback: {e}"))?;
         let port = server
@@ -96,12 +103,15 @@ impl Bridge {
             .port();
         let token = mint_token().context("minting bridge bearer token")?;
         let bound_ticket = session.issue.as_ref().map(|i| i.human_id.clone());
+        let bound_pr = session.pr.as_ref().map(|p| p.number);
         let shutdown = Arc::new(AtomicBool::new(false));
         let join = spawn_listener(
             server,
             token.clone(),
             bound_ticket,
+            bound_pr,
             tracker,
+            code_host,
             repo_root,
             Arc::clone(&shutdown),
         );
@@ -147,11 +157,14 @@ impl Drop for Bridge {
 /// Spawn the listener thread. Borrows the parameters needed to
 /// service requests; returns the join handle so [`Bridge`] can
 /// shut it down on drop.
+#[allow(clippy::too_many_arguments)]
 fn spawn_listener(
     server: tiny_http::Server,
     token: String,
     bound_ticket: Option<String>,
+    bound_pr: Option<u32>,
     tracker: Arc<dyn Tracker>,
+    code_host: Option<Arc<dyn crate::code_host::CodeHost>>,
     repo_root: PathBuf,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
@@ -159,7 +172,15 @@ fn spawn_listener(
         while !shutdown.load(Ordering::SeqCst) {
             match server.recv_timeout(SHUTDOWN_POLL) {
                 Ok(Some(req)) => {
-                    handle_request(req, &token, bound_ticket.as_deref(), &*tracker, &repo_root);
+                    handle_request(
+                        req,
+                        &token,
+                        bound_ticket.as_deref(),
+                        bound_pr,
+                        &*tracker,
+                        code_host.as_deref(),
+                        &repo_root,
+                    );
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -175,11 +196,14 @@ fn spawn_listener(
 /// rather than propagated because `tiny_http`'s `send_response` errors
 /// only occur when the client has already gone away; there's no
 /// caller-actionable recovery.
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     mut req: tiny_http::Request,
     token: &str,
     bound_ticket: Option<&str>,
+    bound_pr: Option<u32>,
     tracker: &dyn Tracker,
+    code_host: Option<&dyn crate::code_host::CodeHost>,
     repo_root: &std::path::Path,
 ) {
     if let Err(response) = require_bearer(&req, token) {
@@ -188,7 +212,16 @@ fn handle_request(
     }
     let method = req.method().clone();
     let url = req.url().to_string();
-    let response = dispatch(&method, &url, &mut req, bound_ticket, tracker, repo_root);
+    let response = dispatch(
+        &method,
+        &url,
+        &mut req,
+        bound_ticket,
+        bound_pr,
+        tracker,
+        code_host,
+        repo_root,
+    );
     respond(req, &response);
 }
 
@@ -226,12 +259,15 @@ fn require_bearer(req: &tiny_http::Request, expected: &str) -> Result<(), JsonRe
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     method: &tiny_http::Method,
     url: &str,
     req: &mut tiny_http::Request,
     bound_ticket: Option<&str>,
+    bound_pr: Option<u32>,
     tracker: &dyn Tracker,
+    code_host: Option<&dyn crate::code_host::CodeHost>,
     repo_root: &std::path::Path,
 ) -> JsonResponse {
     let (path, query) = split_path_query(url);
@@ -250,8 +286,36 @@ fn dispatch(
         }),
         (tiny_http::Method::Get, "/read") => handle_read(query, bound_ticket, tracker, repo_root),
         (tiny_http::Method::Get, "/list") => handle_list(tracker, repo_root),
+        (tiny_http::Method::Get, "/pr/read") => with_code_host(code_host, |host| {
+            handle_pr_read(query, bound_pr, host, repo_root)
+        }),
+        (tiny_http::Method::Get, "/pr/checks") => with_code_host(code_host, |host| {
+            handle_pr_checks(query, bound_pr, host, repo_root)
+        }),
+        (tiny_http::Method::Get, "/pr/check-logs") => with_code_host(code_host, |host| {
+            handle_pr_check_logs(query, bound_pr, host, repo_root)
+        }),
         _ => JsonResponse::error(404, "no_route", &format!("no route for {method} {path}")),
     }
+}
+
+/// Helper: a PR route can only fire when the bridge has a code host
+/// configured. Without one we return 404 — there is no useful action
+/// to take. Mirrors `with_bound` for tracker writes.
+fn with_code_host(
+    host: Option<&dyn crate::code_host::CodeHost>,
+    f: impl FnOnce(&dyn crate::code_host::CodeHost) -> JsonResponse,
+) -> JsonResponse {
+    host.map_or_else(
+        || {
+            JsonResponse::error(
+                404,
+                "no_code_host",
+                "this bridge was started without a code host; PR routes unavailable",
+            )
+        },
+        f,
+    )
 }
 
 /// Helper: a write route can only fire when the session has a bound
@@ -387,6 +451,91 @@ fn handle_list(tracker: &dyn Tracker, repo_root: &std::path::Path) -> JsonRespon
             }
         },
         Err(err) => JsonResponse::error(500, "tracker_error", &format!("{err:#}")),
+    }
+}
+
+/// Resolve which PR number a `/pr/*` route should target. `?number=N`
+/// in the query wins; otherwise default to the session's bound PR.
+/// Returns `None` when neither is available so the handler can
+/// surface 400.
+fn resolve_pr_target(query: Option<&str>, bound_pr: Option<u32>) -> Option<u32> {
+    query
+        .and_then(|q| query_value(q, "number"))
+        .and_then(|s| s.parse::<u32>().ok())
+        .or(bound_pr)
+}
+
+fn handle_pr_read(
+    query: Option<&str>,
+    bound_pr: Option<u32>,
+    host: &dyn crate::code_host::CodeHost,
+    repo_root: &std::path::Path,
+) -> JsonResponse {
+    let Some(number) = resolve_pr_target(query, bound_pr) else {
+        return JsonResponse::error(
+            400,
+            "no_target",
+            "no ?number= query parameter and no bound PR to default to",
+        );
+    };
+    match host.read_pr(repo_root, number) {
+        Ok(detail) => match serde_json::to_value(&detail) {
+            Ok(v) => JsonResponse::ok(v),
+            Err(err) => {
+                JsonResponse::error(500, "serde_error", &format!("encoding PrDetail: {err}"))
+            }
+        },
+        Err(err) => JsonResponse::error(500, "code_host_error", &format!("{err:#}")),
+    }
+}
+
+fn handle_pr_checks(
+    query: Option<&str>,
+    bound_pr: Option<u32>,
+    host: &dyn crate::code_host::CodeHost,
+    repo_root: &std::path::Path,
+) -> JsonResponse {
+    let Some(number) = resolve_pr_target(query, bound_pr) else {
+        return JsonResponse::error(
+            400,
+            "no_target",
+            "no ?number= query parameter and no bound PR to default to",
+        );
+    };
+    match host.pr_checks(repo_root, number) {
+        Ok(summary) => match serde_json::to_value(&summary) {
+            Ok(v) => JsonResponse::ok(v),
+            Err(err) => {
+                JsonResponse::error(500, "serde_error", &format!("encoding ChecksSummary: {err}"))
+            }
+        },
+        Err(err) => JsonResponse::error(500, "code_host_error", &format!("{err:#}")),
+    }
+}
+
+fn handle_pr_check_logs(
+    query: Option<&str>,
+    bound_pr: Option<u32>,
+    host: &dyn crate::code_host::CodeHost,
+    repo_root: &std::path::Path,
+) -> JsonResponse {
+    let Some(number) = resolve_pr_target(query, bound_pr) else {
+        return JsonResponse::error(
+            400,
+            "no_target",
+            "no ?number= query parameter and no bound PR to default to",
+        );
+    };
+    let Some(check) = query.and_then(|q| query_value(q, "check")) else {
+        return JsonResponse::error(
+            400,
+            "no_check",
+            "missing required ?check=<name> query parameter",
+        );
+    };
+    match host.pr_check_logs(repo_root, number, &check) {
+        Ok(logs) => JsonResponse::ok(serde_json::json!({ "logs": logs })),
+        Err(err) => JsonResponse::error(500, "code_host_error", &format!("{err:#}")),
     }
 }
 
@@ -608,6 +757,97 @@ mod tests {
         s
     }
 
+    fn session_with_pr(number: u32) -> Session {
+        let mut s = sample_session(None);
+        s.pr = Some(crate::session::PrContext {
+            number,
+            human_id: format!("pr:{number}"),
+            title: "Fix x".into(),
+            head_ref: "feat/x".into(),
+            head_sha: "abc".into(),
+            base_ref: "main".into(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+        });
+        s
+    }
+
+    /// Mock code host: records calls + returns canned data. Mirror
+    /// of `MockTracker` for the PR side; same minimal-surface ethos.
+    struct MockCodeHost {
+        calls: Mutex<Vec<String>>,
+        detail: Mutex<Option<crate::code_host::PrDetail>>,
+        summary: Mutex<Option<crate::code_host::ChecksSummary>>,
+        logs: Mutex<Option<String>>,
+    }
+
+    impl MockCodeHost {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                detail: Mutex::new(None),
+                summary: Mutex::new(None),
+                logs: Mutex::new(None),
+            }
+        }
+
+        fn record(&self, c: String) {
+            self.calls.lock().unwrap().push(c);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn with_detail(self, d: crate::code_host::PrDetail) -> Self {
+            *self.detail.lock().unwrap() = Some(d);
+            self
+        }
+
+        fn with_summary(self, s: crate::code_host::ChecksSummary) -> Self {
+            *self.summary.lock().unwrap() = Some(s);
+            self
+        }
+
+        fn with_logs(self, s: &str) -> Self {
+            *self.logs.lock().unwrap() = Some(s.to_string());
+            self
+        }
+    }
+
+    impl crate::code_host::CodeHost for MockCodeHost {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn read_pr(&self, _: &std::path::Path, n: u32) -> Result<crate::code_host::PrDetail> {
+            self.record(format!("read_pr({n})"));
+            self.detail
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow!("no detail set"))
+        }
+        fn pr_checks(
+            &self,
+            _: &std::path::Path,
+            n: u32,
+        ) -> Result<crate::code_host::ChecksSummary> {
+            self.record(format!("pr_checks({n})"));
+            self.summary
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow!("no summary set"))
+        }
+        fn pr_check_logs(&self, _: &std::path::Path, n: u32, check: &str) -> Result<String> {
+            self.record(format!("pr_check_logs({n}, {check})"));
+            self.logs
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow!("no logs set"))
+        }
+    }
+
     /// Speak HTTP/1.1 to the bridge by hand. Returns
     /// `(status_code, body)`. Avoids pulling in an HTTP-client dep.
     fn http_call(
@@ -699,7 +939,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
         let dir = tempdir().unwrap();
         let session = sample_session(Some("42"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         assert!(
             bridge
                 .url_for_container()
@@ -713,7 +953,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
         let dir = tempdir().unwrap();
         let session = sample_session(Some("42"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, _) = http_call(&bridge.loopback_url(), "GET", "/list", None, None);
         assert_eq!(status, 401);
     }
@@ -723,7 +963,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
         let dir = tempdir().unwrap();
         let session = sample_session(Some("42"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, body) = http_call(
             &bridge.loopback_url(),
             "GET",
@@ -741,7 +981,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::clone(&mock) as _;
         let dir = tempdir().unwrap();
         let session = sample_session(Some("42"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, body) = http_call(
             &bridge.loopback_url(),
             "POST",
@@ -760,7 +1000,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::clone(&mock) as _;
         let dir = tempdir().unwrap();
         let session = sample_session(None);
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, body) = http_call(
             &bridge.loopback_url(),
             "POST",
@@ -780,7 +1020,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::clone(&mock) as _;
         let dir = tempdir().unwrap();
         let session = sample_session(Some("7"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, _) = http_call(
             &bridge.loopback_url(),
             "POST",
@@ -812,7 +1052,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::clone(&mock) as _;
         let dir = tempdir().unwrap();
         let session = sample_session(Some("5"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, body) = http_call(
             &bridge.loopback_url(),
             "GET",
@@ -845,7 +1085,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::clone(&mock) as _;
         let dir = tempdir().unwrap();
         let session = sample_session(Some("5"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, _) = http_call(
             &bridge.loopback_url(),
             "GET",
@@ -875,7 +1115,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::clone(&mock) as _;
         let dir = tempdir().unwrap();
         let session = sample_session(Some("1"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, body) = http_call(
             &bridge.loopback_url(),
             "GET",
@@ -893,7 +1133,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
         let dir = tempdir().unwrap();
         let session = sample_session(Some("1"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, _) = http_call(
             &bridge.loopback_url(),
             "GET",
@@ -911,7 +1151,7 @@ mod tests {
         let tracker: Arc<dyn Tracker> = Arc::clone(&mock) as _;
         let dir = tempdir().unwrap();
         let session = sample_session(Some("1"));
-        let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
         let (status, body) = http_call(
             &bridge.loopback_url(),
             "POST",
@@ -924,13 +1164,194 @@ mod tests {
     }
 
     #[test]
+    fn pr_route_returns_404_when_no_code_host_configured() {
+        let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
+        let dir = tempdir().unwrap();
+        let session = session_with_pr(42);
+        let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
+        let (status, body) = http_call(
+            &bridge.loopback_url(),
+            "GET",
+            "/pr/read",
+            Some(bridge.token()),
+            None,
+        );
+        assert_eq!(status, 404, "body={body}");
+        assert!(body.contains("no_code_host"), "got: {body}");
+    }
+
+    #[test]
+    fn pr_read_route_defaults_to_bound_pr_when_query_omits_number() {
+        let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
+        let detail = crate::code_host::PrDetail {
+            summary: crate::code_host::PrSummary {
+                number: 42,
+                title: "Fix x".into(),
+                head_ref: "feat/x".into(),
+                head_sha: "abc".into(),
+                base_ref: "main".into(),
+                state: crate::code_host::PrState::Open,
+                draft: false,
+                url: "https://github.com/o/r/pull/42".into(),
+                labels: vec![],
+            },
+            body: "details".into(),
+            author: "alice".into(),
+        };
+        let host = Arc::new(MockCodeHost::new().with_detail(detail));
+        let host_arc: Arc<dyn crate::code_host::CodeHost> = Arc::clone(&host) as _;
+        let dir = tempdir().unwrap();
+        let session = session_with_pr(42);
+        let bridge =
+            Bridge::start(&session, tracker, Some(host_arc), dir.path().to_path_buf()).unwrap();
+        let (status, body) = http_call(
+            &bridge.loopback_url(),
+            "GET",
+            "/pr/read",
+            Some(bridge.token()),
+            None,
+        );
+        assert_eq!(status, 200, "body={body}");
+        assert!(body.contains("\"number\":42"), "got: {body}");
+        assert_eq!(host.calls(), vec!["read_pr(42)".to_string()]);
+    }
+
+    #[test]
+    fn pr_read_route_with_explicit_number_overrides_bound_pr() {
+        let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
+        let detail = crate::code_host::PrDetail {
+            summary: crate::code_host::PrSummary {
+                number: 7,
+                title: "Other PR".into(),
+                head_ref: "feat/y".into(),
+                head_sha: "def".into(),
+                base_ref: "main".into(),
+                state: crate::code_host::PrState::Open,
+                draft: false,
+                url: "https://github.com/o/r/pull/7".into(),
+                labels: vec![],
+            },
+            body: "x".into(),
+            author: "bob".into(),
+        };
+        let host = Arc::new(MockCodeHost::new().with_detail(detail));
+        let host_arc: Arc<dyn crate::code_host::CodeHost> = Arc::clone(&host) as _;
+        let dir = tempdir().unwrap();
+        let session = session_with_pr(42);
+        let bridge =
+            Bridge::start(&session, tracker, Some(host_arc), dir.path().to_path_buf()).unwrap();
+        let (status, _) = http_call(
+            &bridge.loopback_url(),
+            "GET",
+            "/pr/read?number=7",
+            Some(bridge.token()),
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(host.calls(), vec!["read_pr(7)".to_string()]);
+    }
+
+    #[test]
+    fn pr_route_400_when_neither_bound_pr_nor_query_number() {
+        let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
+        let host = Arc::new(MockCodeHost::new());
+        let host_arc: Arc<dyn crate::code_host::CodeHost> = Arc::clone(&host) as _;
+        let dir = tempdir().unwrap();
+        let session = sample_session(None);
+        let bridge =
+            Bridge::start(&session, tracker, Some(host_arc), dir.path().to_path_buf()).unwrap();
+        let (status, body) = http_call(
+            &bridge.loopback_url(),
+            "GET",
+            "/pr/read",
+            Some(bridge.token()),
+            None,
+        );
+        assert_eq!(status, 400);
+        assert!(body.contains("no_target"));
+    }
+
+    #[test]
+    fn pr_checks_route_serialises_summary() {
+        let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
+        let summary = crate::code_host::ChecksSummary {
+            checks: vec![crate::code_host::Check {
+                name: "build".into(),
+                conclusion: crate::code_host::CheckConclusion::Failure,
+                details_url: None,
+                run_id: None,
+            }],
+            has_failures: true,
+            failed_count: 1,
+            pending_count: 0,
+        };
+        let host = Arc::new(MockCodeHost::new().with_summary(summary));
+        let host_arc: Arc<dyn crate::code_host::CodeHost> = Arc::clone(&host) as _;
+        let dir = tempdir().unwrap();
+        let session = session_with_pr(42);
+        let bridge =
+            Bridge::start(&session, tracker, Some(host_arc), dir.path().to_path_buf()).unwrap();
+        let (status, body) = http_call(
+            &bridge.loopback_url(),
+            "GET",
+            "/pr/checks",
+            Some(bridge.token()),
+            None,
+        );
+        assert_eq!(status, 200, "body={body}");
+        assert!(body.contains("\"has_failures\":true"), "got: {body}");
+        assert!(body.contains("\"failed_count\":1"), "got: {body}");
+    }
+
+    #[test]
+    fn pr_check_logs_route_proxies_to_code_host() {
+        let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
+        let host = Arc::new(MockCodeHost::new().with_logs("failed: foo\nbar"));
+        let host_arc: Arc<dyn crate::code_host::CodeHost> = Arc::clone(&host) as _;
+        let dir = tempdir().unwrap();
+        let session = session_with_pr(42);
+        let bridge =
+            Bridge::start(&session, tracker, Some(host_arc), dir.path().to_path_buf()).unwrap();
+        let (status, body) = http_call(
+            &bridge.loopback_url(),
+            "GET",
+            "/pr/check-logs?check=build",
+            Some(bridge.token()),
+            None,
+        );
+        assert_eq!(status, 200, "body={body}");
+        assert!(body.contains("failed: foo"), "got: {body}");
+        assert_eq!(host.calls(), vec!["pr_check_logs(42, build)".to_string()]);
+    }
+
+    #[test]
+    fn pr_check_logs_route_400_without_check_parameter() {
+        let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
+        let host = Arc::new(MockCodeHost::new());
+        let host_arc: Arc<dyn crate::code_host::CodeHost> = Arc::clone(&host) as _;
+        let dir = tempdir().unwrap();
+        let session = session_with_pr(42);
+        let bridge =
+            Bridge::start(&session, tracker, Some(host_arc), dir.path().to_path_buf()).unwrap();
+        let (status, body) = http_call(
+            &bridge.loopback_url(),
+            "GET",
+            "/pr/check-logs",
+            Some(bridge.token()),
+            None,
+        );
+        assert_eq!(status, 400);
+        assert!(body.contains("no_check"), "got: {body}");
+    }
+
+    #[test]
     fn dropping_bridge_stops_listener_promptly() {
         let tracker: Arc<dyn Tracker> = Arc::new(MockTracker::new());
         let dir = tempdir().unwrap();
         let session = sample_session(Some("1"));
         let url;
         {
-            let bridge = Bridge::start(&session, tracker, dir.path().to_path_buf()).unwrap();
+            let bridge = Bridge::start(&session, tracker, None, dir.path().to_path_buf()).unwrap();
             url = bridge.loopback_url();
         }
         // After drop, connecting to the listener's port should fail.

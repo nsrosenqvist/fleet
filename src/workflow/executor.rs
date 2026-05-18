@@ -926,8 +926,13 @@ impl WorkflowExecutor {
         self.tracker
             .as_ref()
             .map(|tracker| {
-                Bridge::start(session, Arc::clone(tracker), workspace.to_path_buf())
-                    .with_context(|| format!("starting bridge for agent node `{node_id}`"))
+                Bridge::start(
+                    session,
+                    Arc::clone(tracker),
+                    self.code_host.clone(),
+                    workspace.to_path_buf(),
+                )
+                .with_context(|| format!("starting bridge for agent node `{node_id}`"))
             })
             .transpose()
     }
@@ -1022,7 +1027,19 @@ impl WorkflowExecutor {
         // binary mid-run. `fleet_tracker_mount` handles the gating
         // (see its doc-comment for the exact skip conditions).
         let extra_mounts = if bridge.is_some() {
-            fleet_tracker_mount(req.adapter, &image).map_or_else(Vec::new, |m| vec![m])
+            let mut mounts = Vec::new();
+            if let Some(m) = fleet_tracker_mount(req.adapter, &image) {
+                mounts.push(m);
+            }
+            // Mount fleet-pr alongside fleet-tracker. Same gating: arch
+            // match + host binary co-located with `fleet`. When the
+            // sibling binary isn't present, the agent simply doesn't get
+            // the PR-read CLI; that's a degraded mode rather than a hard
+            // failure, since not every workflow needs PR access.
+            if let Some(m) = fleet_pr_mount(req.adapter, &image) {
+                mounts.push(m);
+            }
+            mounts
         } else {
             Vec::new()
         };
@@ -2412,9 +2429,37 @@ fn fleet_tracker_mount(adapter: &dyn RuntimeAdapter, image: &ImageId) -> Option<
 /// (alongside `current_exe()`'s `fleet`). `None` when the path can't
 /// be resolved or the candidate file doesn't exist.
 fn locate_sibling_fleet_tracker() -> Option<PathBuf> {
+    locate_sibling_binary("fleet-tracker")
+}
+
+/// Same as [`fleet_tracker_mount`] but for the `fleet-pr` binary —
+/// agent containers see it at `/usr/local/bin/fleet-pr`. Identical
+/// arch / co-location gating; missing binary collapses to "don't
+/// mount" so PR-aware reads degrade to "no fleet-pr in PATH" rather
+/// than failing the workflow.
+fn fleet_pr_mount(adapter: &dyn RuntimeAdapter, image: &ImageId) -> Option<MountSpec> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let host_path = locate_sibling_fleet_pr()?;
+    if !host_arch_matches_image(adapter, image) {
+        return None;
+    }
+    Some(MountSpec {
+        host_path,
+        container_path: PathBuf::from("/usr/local/bin/fleet-pr"),
+        read_only: true,
+    })
+}
+
+fn locate_sibling_fleet_pr() -> Option<PathBuf> {
+    locate_sibling_binary("fleet-pr")
+}
+
+fn locate_sibling_binary(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let candidate = dir.join("fleet-tracker");
+    let candidate = dir.join(name);
     if candidate.is_file() {
         Some(candidate)
     } else {

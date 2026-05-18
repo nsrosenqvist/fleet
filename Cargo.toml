@@ -19,6 +19,15 @@ path = "src/main.rs"
 name = "fleet-tracker"
 path = "src/bin/fleet-tracker.rs"
 
+# Same shape as fleet-tracker, but for the PR-side bridge surface.
+# Bind-mounted into agent containers at /usr/local/bin/fleet-pr so a
+# CI-fix agent can `fleet-pr checks`, `fleet-pr check-logs build`,
+# etc. against its bound PR. Reads only — writes (open PR, comment
+# on PR) go through workflow nodes.
+[[bin]]
+name = "fleet-pr"
+path = "src/bin/fleet-pr.rs"
+
 [dependencies]
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
