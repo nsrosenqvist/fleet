@@ -48,12 +48,48 @@ fn state_word_matches_serde_renames() {
 fn detail_kv_pairs_omits_worktree_rows_when_unset() {
     // Non-git sessions never get worktree_path/branch populated;
     // the detail view stays compact, matching pre-worktree
-    // behaviour exactly.
+    // behaviour exactly. Issueless sessions similarly omit the
+    // ticket / pr rows.
     let s = session("s-1", "standard", SessionState::Running, 1);
     let pairs = detail_kv_pairs(&s);
     let labels: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
     assert!(!labels.contains(&"worktree"));
     assert!(!labels.contains(&"branch"));
+    assert!(!labels.contains(&"ticket"));
+    assert!(!labels.contains(&"pr"));
+}
+
+#[test]
+fn detail_kv_pairs_surfaces_ticket_id_and_title_when_issue_bound() {
+    let s = session_with_ticket("s-1", "standard", "14b3415");
+    let pairs = detail_kv_pairs(&s);
+    let by_key: std::collections::BTreeMap<&str, &str> =
+        pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    // session_with_ticket sets title to "T"; the helper just
+    // builds a generic issue, so just confirm format shape.
+    let ticket = by_key.get("ticket").copied().expect("ticket row");
+    assert!(ticket.starts_with("#14b3415"), "got: {ticket}");
+    assert!(ticket.contains('T'), "got: {ticket}");
+}
+
+#[test]
+fn detail_kv_pairs_surfaces_pr_number_and_title_when_pr_bound() {
+    let mut s = session("s-1", "standard", SessionState::Running, 1);
+    s.pr = Some(crate::session::PrContext {
+        number: 42,
+        human_id: "pr:42".to_string(),
+        title: "Fix CI on the parser".to_string(),
+        head_ref: "feat/parser".to_string(),
+        head_sha: "abc".to_string(),
+        base_ref: "main".to_string(),
+        url: "https://github.com/o/r/pull/42".to_string(),
+    });
+    let pairs = detail_kv_pairs(&s);
+    let by_key: std::collections::BTreeMap<&str, &str> =
+        pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let pr = by_key.get("pr").copied().expect("pr row");
+    assert!(pr.starts_with("#42"), "got: {pr}");
+    assert!(pr.contains("Fix CI on the parser"), "got: {pr}");
 }
 
 #[test]

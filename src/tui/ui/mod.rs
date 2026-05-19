@@ -235,6 +235,16 @@ pub fn detail_kv_pairs(session: &Session) -> Vec<(&'static str, String)> {
                 .unwrap_or_else(|| "-".to_string()),
         ),
     ];
+    // Surface the binding (ticket / PR) prominently so the operator
+    // sees what this session is *for* without leaving the details
+    // pane. Issue and PR are independent bindings — a session can
+    // have either, both, or neither (issueless workflows).
+    if let Some(issue) = session.issue.as_ref() {
+        pairs.push(("ticket", format!("#{} {}", issue.human_id, issue.title)));
+    }
+    if let Some(pr) = session.pr.as_ref() {
+        pairs.push(("pr", format!("#{} {}", pr.number, pr.title)));
+    }
     if let Some(path) = session.worktree_path.as_deref() {
         pairs.push(("worktree", path.display().to_string()));
     }
