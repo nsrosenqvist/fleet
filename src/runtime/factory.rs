@@ -59,14 +59,14 @@ pub fn build_adapter(
 /// Post-resolution adapter kind. Distinct from [`AdapterChoice`] because the
 /// `Auto` variant is gone — by this point we've collapsed it against the probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResolvedKind {
+pub enum ResolvedKind {
     Podman,
     Docker,
     AppleContainer,
     Local,
 }
 
-fn resolve_kind(choice: AdapterChoice, probe: &ProbeReport) -> Result<ResolvedKind> {
+pub fn resolve_kind(choice: AdapterChoice, probe: &ProbeReport) -> Result<ResolvedKind> {
     match choice {
         AdapterChoice::Auto => match probe.recommended {
             Some(BackendKind::Podman) => Ok(ResolvedKind::Podman),

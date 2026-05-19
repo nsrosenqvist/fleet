@@ -541,6 +541,19 @@ impl AppState {
     /// pending_spawn-watcher dance is unchanged from the
     /// workflow-only era; only the command shape grew.
     fn spawn_selected(&mut self, workflow: &str, issue: Option<&str>) {
+        // Same pre-flight as autonomous / scheduler: refuse to
+        // spawn when the configured runtime daemon isn't answering,
+        // so a stopped Docker doesn't produce a useless "started"
+        // session that fails seconds later at devcontainer build.
+        if let Some(Err(msg)) = self
+            .doctor
+            .as_ref()
+            .map(|d| d.engine_reachable.clone())
+        {
+            self.status.flash(format!(" spawn refused: {msg} "));
+            self.view = View::Sessions;
+            return;
+        }
         let binary = match resolve_fleet_binary() {
             Ok(p) => p,
             Err(err) => {
@@ -775,6 +788,18 @@ impl AppState {
         }
         self.last_scheduler_tick = Some(now);
 
+        // Same pre-flight as the autonomous engine: if the runtime
+        // daemon is unreachable, surface why instead of spawning
+        // sessions that will all fail at `devcontainer build`.
+        if let Some(Err(msg)) = self
+            .doctor
+            .as_ref()
+            .map(|d| d.engine_reachable.clone())
+        {
+            self.scheduler.set_status(format!("scheduler: ON · {msg}"));
+            return;
+        }
+
         let workflows = match self.load_loop_workflows() {
             Ok(w) => w,
             Err(err) => {
@@ -887,6 +912,21 @@ impl AppState {
     }
 
     fn dispatch_autonomous_spawn(&mut self, cmd: &autonomous::SpawnCommand, store: &SessionStore) {
+        // Pre-flight the runtime. Without this, a stopped Docker
+        // daemon turns into N silently-failing sessions accumulating
+        // on disk because the engine has no way to know the spawn
+        // can never succeed. Reuses the cached doctor snapshot; the
+        // engine_reachable result is refreshed on every reload, so
+        // a "user just started Docker" recovery only needs an `r`.
+        if let Some(Err(msg)) = self
+            .doctor
+            .as_ref()
+            .map(|d| d.engine_reachable.clone())
+        {
+            self.autonomous
+                .set_status(format!("autonomous: ON · {msg}"));
+            return;
+        }
         let binary = match resolve_fleet_binary() {
             Ok(p) => p,
             Err(err) => {

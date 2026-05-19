@@ -24,6 +24,14 @@ pub struct DoctorSnapshot {
     pub configured_hardening: String,
     pub tracker: String,
     pub adapter: Result<(String, Capabilities), String>,
+    /// Result of the per-engine "is your daemon up?" check. `Ok(())`
+    /// when the daemon answered, `Err(msg)` when it didn't (with a
+    /// user-facing hint about how to start it). Distinct from
+    /// [`Self::adapter`], which only verifies the engine binary is
+    /// on PATH — a stopped Docker daemon passes the install check
+    /// but fails this one. Local / Apple Container have no daemon
+    /// so always Ok.
+    pub engine_reachable: Result<(), String>,
     pub agents: Vec<(String, Vec<String>)>,
 }
 
@@ -37,6 +45,16 @@ impl DoctorSnapshot {
             Ok(adapter) => Ok((adapter.name().to_string(), adapter.capabilities())),
             Err(err) => Err(format!("{err:#}")),
         };
+        // Daemon health is a separate concern from "is the binary
+        // installed". Run the canonical `<engine> info` shell-out
+        // here so the breadcrumb / spawn dispatchers can refuse
+        // ahead of time instead of letting every workflow run die
+        // at `devcontainer build` with the same cryptic error.
+        let engine_reachable = crate::runtime::health::check_engine_reachable(
+            invoker.as_ref(),
+            &config.runtime,
+            &probe_report,
+        );
         let agents: Vec<(String, Vec<String>)> = config
             .agents
             .registry
@@ -50,6 +68,7 @@ impl DoctorSnapshot {
             configured_hardening: config.runtime.hardening.as_str().to_string(),
             tracker: config.tracker.as_str().to_string(),
             adapter,
+            engine_reachable,
             agents,
         }
     }

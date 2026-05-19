@@ -26,6 +26,7 @@ pub mod devcontainer;
 pub mod devcontainer_cli;
 pub mod docker;
 pub mod factory;
+pub mod health;
 pub mod local;
 pub mod podman;
 

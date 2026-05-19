@@ -57,8 +57,13 @@ pub(super) fn render_breadcrumb(f: &mut Frame<'_>, area: Rect, state: &AppState)
     // doctor snapshot probed in `terminal::run`; muted when missing
     // (e.g. tests that bypass `run`). `auto:●` is green when the
     // engine is on, muted when off.
+    // `runtime:●` is green only when both the install check (engine
+    // binary on PATH) AND the reachability check (daemon answering)
+    // pass. Either failure → red, so the operator sees the dot
+    // change colour the moment Docker is stopped and doesn't waste
+    // a `Shift+A` only to discover every spawn fails the same way.
     let runtime_color = match state.doctor.as_ref() {
-        Some(d) if d.adapter.is_ok() => OK,
+        Some(d) if d.adapter.is_ok() && d.engine_reachable.is_ok() => OK,
         Some(_) => ERR,
         None => MUTED,
     };
