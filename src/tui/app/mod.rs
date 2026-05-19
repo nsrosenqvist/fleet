@@ -96,6 +96,16 @@ pub(super) struct AppState {
     pub(super) config: RepoConfig,
     /// Autonomous supervisor. Off by default; toggled via `Shift+A`.
     pub(super) autonomous: autonomous::AutonomousEngine,
+    /// Loop-based scheduler. Off by default; toggled via `Shift+L`.
+    /// Independent of [`Self::autonomous`] — a repo can enable
+    /// either, both, or neither.
+    pub(super) scheduler: crate::scheduler::SchedulerEngine,
+    /// Wall-clock debounce for [`Self::scheduler_tick`]. The TUI
+    /// event loop runs ~10×/s; without this guard each iteration
+    /// would re-read workflows + sessions + state from disk. 10s is
+    /// the safe floor — the `loop:` interval itself has a 60s
+    /// minimum, so a finer debounce buys nothing.
+    pub(super) last_scheduler_tick: Option<std::time::Instant>,
     /// Tracker built lazily on first `Shift+A` — the `gh`/`git-bug`
     /// construction happens then, not at TUI startup, so users who
     /// never use autonomous mode aren't blocked by tracker setup.
@@ -247,6 +257,8 @@ impl AppState {
             spawn: SpawnPickerState::empty(),
             config,
             autonomous: autonomous::AutonomousEngine::new(),
+            scheduler: crate::scheduler::SchedulerEngine::new(),
+            last_scheduler_tick: None,
             tracker: TrackerState::Pending,
             overlay: Overlay::None,
             plans: Vec::new(),
@@ -475,6 +487,10 @@ impl AppState {
         }
         if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('A')) {
             self.toggle_autonomous();
+            return Action::None;
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('L')) {
+            self.toggle_scheduler();
             return Action::None;
         }
         if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('T')) {

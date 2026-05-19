@@ -652,6 +652,15 @@ impl AppState {
         self.autonomous.toggle();
     }
 
+    /// `Shift+L` handler. Flips the scheduler engine's enabled flag
+    /// and resets the tick debounce so the very next event-loop
+    /// iteration fires a fresh tick instead of waiting out a stale
+    /// 10-second window.
+    pub(in crate::tui) fn toggle_scheduler(&mut self) {
+        self.scheduler.toggle();
+        self.last_scheduler_tick = None;
+    }
+
     pub(in crate::tui) fn ensure_tracker(&mut self) -> Option<Arc<dyn crate::tracker::Tracker>> {
         if matches!(self.tracker, TrackerState::Pending) {
             let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
@@ -707,6 +716,138 @@ impl AppState {
         if let autonomous::AutonomousOutcome::Spawn(cmd) = outcome {
             self.dispatch_autonomous_spawn(&cmd, store);
         }
+    }
+
+    /// Parallel to [`Self::autonomous_tick`] for the loop scheduler.
+    /// Debounced to 10 seconds wall-clock — the TUI event loop runs
+    /// ~10×/s, but each tick reloads workflows + sessions + state
+    /// from disk, and `loop:` intervals are at least 60s so a finer
+    /// cadence buys nothing. The `last_scheduler_tick` `None` ⇒
+    /// "fire immediately" path lets a fresh `Shift+L` produce
+    /// instant feedback.
+    pub(in crate::tui) fn scheduler_tick(
+        &mut self,
+        store: &SessionStore,
+        now: std::time::Instant,
+    ) {
+        if !self.scheduler.enabled() {
+            return;
+        }
+        const TICK_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(10);
+        if let Some(last) = self.last_scheduler_tick {
+            if now.duration_since(last) < TICK_DEBOUNCE {
+                return;
+            }
+        }
+        self.last_scheduler_tick = Some(now);
+
+        let workflows = match self.load_loop_workflows() {
+            Ok(w) => w,
+            Err(err) => {
+                self.scheduler.set_status(format!(
+                    "scheduler: ON · workflow load failed: {err:#}",
+                ));
+                return;
+            }
+        };
+        if workflows.is_empty() {
+            self.scheduler
+                .set_status("scheduler: ON · no workflows with `loop:` configured");
+            return;
+        }
+
+        let state_store = crate::scheduler::store::SchedulerStateStore::for_fleet_dir(
+            &self.root.join(".fleet"),
+        );
+        let mut state = match state_store.load() {
+            Ok(s) => s,
+            Err(err) => {
+                self.scheduler
+                    .set_status(format!("scheduler: ON · state load failed: {err:#}"));
+                return;
+            }
+        };
+
+        let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+        let code_host = crate::code_host::build(self.config.code_host, invoker, &self.root);
+        let root = self.root.clone();
+        let list_prs = |_workflow: &str, filter: &crate::code_host::PrFilter| {
+            let host = code_host
+                .as_ref()
+                .ok_or_else(|| "no code host configured for pr-list".to_string())?;
+            host.list_prs(&root, filter).map_err(|e| format!("{e:#}"))
+        };
+        let outcome = self.scheduler.step(
+            std::time::SystemTime::now(),
+            now,
+            &workflows,
+            &self.sessions,
+            &state,
+            list_prs,
+        );
+        let (spawns, marks) = match outcome {
+            crate::scheduler::SchedulerOutcome::Idle => return,
+            crate::scheduler::SchedulerOutcome::WaitedFor(reason) => match reason {
+                crate::scheduler::SkipReason::NoWorkflowDue => return,
+                crate::scheduler::SkipReason::AllSuppressedOrEmpty { marks } => {
+                    (Vec::new(), marks)
+                }
+            },
+            crate::scheduler::SchedulerOutcome::Spawn { spawns, marks } => (spawns, marks),
+        };
+        for (name, ts) in &marks {
+            state.last_run_at.insert(name.clone(), *ts);
+        }
+        if let Err(err) = state_store.save(&state) {
+            self.scheduler
+                .set_status(format!("scheduler: ON · state save failed: {err:#}"));
+        }
+        if !spawns.is_empty() {
+            let Ok(binary) = std::env::current_exe() else {
+                self.scheduler.set_status(
+                    "scheduler: ON · spawn failed: cannot resolve fleet binary (current_exe)",
+                );
+                return;
+            };
+            for res in crate::scheduler::dispatcher::dispatch_spawns(&spawns, &binary) {
+                if let Err(err) = res {
+                    self.scheduler
+                        .set_status(format!("scheduler: ON · spawn failed: {err:#}"));
+                }
+            }
+            if let Err(err) = self.reload(store) {
+                tracing::warn!(?err, "scheduler post-spawn reload failed");
+            }
+        }
+    }
+
+    /// Load every parseable workflow under `.fleet/workflows/` that
+    /// declares a `loop:` interval. Per-file parse failures are
+    /// logged via the status line and skipped — one bad YAML
+    /// shouldn't disable the whole scheduler.
+    fn load_loop_workflows(&self) -> anyhow::Result<Vec<crate::workflow::spec::Workflow>> {
+        let wf_dir = self.root.join(".fleet/workflows");
+        let entries = match std::fs::read_dir(&wf_dir) {
+            Ok(e) => e,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(anyhow::anyhow!(err)),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if ext != "yaml" && ext != "yml" {
+                continue;
+            }
+            match crate::workflow::spec::Workflow::from_path(&path) {
+                Ok(wf) if wf.loop_interval.is_some() => out.push(wf),
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(?err, path = %path.display(), "scheduler: skipping bad workflow");
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn dispatch_autonomous_spawn(&mut self, cmd: &autonomous::SpawnCommand, store: &SessionStore) {

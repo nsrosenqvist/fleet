@@ -257,6 +257,21 @@ GitHub credential.
 | `fleet scheduler tick --once` | Runs one tick. No-op when disabled. Exits non-zero if any spawn failed. |
 | `fleet workflow run <name> --pr <n>` | Run a workflow against PR `<n>`. Worktree is provisioned from the PR's head. |
 
+## TUI integration
+
+`Shift+L` ("Loop") toggles the scheduler from inside the TUI, same
+shape as `Shift+A` for autonomous mode. The breadcrumb's right side
+carries a `sched:●` dot: green when the engine is on, muted when off.
+A per-tick debounce caps the on-screen scheduler at one tick every 10
+seconds — finer wouldn't help because the `loop:` interval floor is
+already 60s.
+
+The TUI- and CLI-driven tick paths share the same on-disk state file.
+Don't run `fleet scheduler tick --once` from cron in a repo whose TUI
+session has the scheduler enabled — the last-writer-wins atomic
+guarantee on `.fleet/scheduler_state.json` survives the race, but a
+sufficiently unlucky overlap could miss an interval.
+
 ## Operational notes
 
 - **Single driver assumption.** The scheduler-state file is written

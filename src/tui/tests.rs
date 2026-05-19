@@ -1499,6 +1499,65 @@ fn shift_a_toggles_autonomous_with_buildable_tracker() {
 }
 
 #[test]
+fn shift_l_toggles_scheduler_on_then_off() {
+    // Parallel to the Shift+A test: the scheduler engine starts off,
+    // Shift+L flips it on, Shift+L again flips it off. Independent of
+    // the tracker (the scheduler has no tracker dependency).
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().to_path_buf());
+    let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+    assert!(!state.scheduler.enabled());
+    state.handle_key(
+        KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+        &store,
+    );
+    assert!(state.scheduler.enabled(), "Shift+L should enable");
+    state.handle_key(
+        KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+        &store,
+    );
+    assert!(!state.scheduler.enabled(), "Shift+L again should disable");
+}
+
+#[test]
+fn scheduler_tick_is_a_noop_when_disabled() {
+    // Engine disabled → tick should not touch the wall clock or
+    // attempt to load workflows. Smoke this end-to-end via the
+    // public method; the engine itself returns Idle, which means
+    // last_scheduler_tick stays None.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().to_path_buf());
+    let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+    assert!(state.last_scheduler_tick.is_none());
+    state.scheduler_tick(&store, std::time::Instant::now());
+    assert!(
+        state.last_scheduler_tick.is_none(),
+        "disabled scheduler tick must not stamp last_scheduler_tick"
+    );
+}
+
+#[test]
+fn scheduler_tick_after_enable_advances_debounce_clock() {
+    // Empty repo (no `.fleet/workflows/`), but the tick still runs:
+    // it loads zero workflows and sets a "no workflows configured"
+    // status. The debounce timestamp must advance regardless so the
+    // next iteration short-circuits.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().to_path_buf());
+    let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+    state.toggle_scheduler();
+    assert!(state.scheduler.enabled());
+    let now = std::time::Instant::now();
+    state.scheduler_tick(&store, now);
+    assert_eq!(state.last_scheduler_tick, Some(now));
+    assert!(
+        state.scheduler.status().contains("no workflows"),
+        "got: {}",
+        state.scheduler.status()
+    );
+}
+
+#[test]
 fn shift_a_refuses_to_enable_with_unimplemented_tracker() {
     // Linear's `tracker::build` returns None — toggle must
     // explain why instead of pretending autonomous mode is live.

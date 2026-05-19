@@ -22,9 +22,11 @@ use super::state_word;
 /// dot badges for the runtime adapter (probed at startup) and the
 /// autonomous engine (off until `Shift+A`).
 pub(super) fn render_breadcrumb(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    // Right column widened from 22 to 32 to fit the new `sched:●`
+    // dot alongside `runtime:●  auto:●`.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(22)])
+        .constraints([Constraint::Min(0), Constraint::Length(32)])
         .split(area);
 
     let repo_chip = state
@@ -65,6 +67,11 @@ pub(super) fn render_breadcrumb(f: &mut Frame<'_>, area: Rect, state: &AppState)
     } else {
         MUTED
     };
+    let sched_color = if state.scheduler.enabled() {
+        OK
+    } else {
+        MUTED
+    };
     let right = Line::from(vec![
         Span::styled("runtime", muted),
         Span::raw(":"),
@@ -73,6 +80,10 @@ pub(super) fn render_breadcrumb(f: &mut Frame<'_>, area: Rect, state: &AppState)
         Span::styled("auto", muted),
         Span::raw(":"),
         Span::styled("●", Style::default().fg(auto_color)),
+        Span::raw("  "),
+        Span::styled("sched", muted),
+        Span::raw(":"),
+        Span::styled("●", Style::default().fg(sched_color)),
         Span::raw(" "),
     ]);
     f.render_widget(

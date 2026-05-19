@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Scheduler → subprocess dispatcher.
 //!
 //! The engine (`scheduler::mod`) is pure; this module turns its

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Persistence for the loop scheduler.
 //!
 //! `.fleet/scheduler_state.json` holds a single map `workflow_name →

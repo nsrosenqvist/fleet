@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Loop-driven workflow scheduler.
 //!
 //! Parallel to [`crate::autonomous::AutonomousEngine`]: a pure state

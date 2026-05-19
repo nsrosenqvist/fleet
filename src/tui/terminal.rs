@@ -178,7 +178,9 @@ fn drive(
         // autonomous supervisor decide whether to fire anything. The
         // engine debounces internally so this is cheap to call every
         // iteration.
-        state.autonomous_tick(store, std::time::Instant::now());
+        let tick_now = std::time::Instant::now();
+        state.autonomous_tick(store, tick_now);
+        state.scheduler_tick(store, tick_now);
         // Reap any workflow-run subprocess we kicked off — surfaces
         // non-zero exits as an error overlay before the next draw.
         state.poll_pending_spawn();
