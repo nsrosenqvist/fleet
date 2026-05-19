@@ -160,8 +160,18 @@ impl AutonomousEngine {
                 return AutonomousOutcome::WaitedFor(PauseReason::TrackerError(err));
             }
         };
+        // Only sessions still doing work hold their issue's claim.
+        // Failed / Completed / Crashed sessions are terminal — leaving
+        // them in `claimed` would silently block a `fleet plan retry`
+        // (or hand-restart of the same ticket) from ever spawning,
+        // because the engine would treat the dead session's bound
+        // issue as already-in-progress on every tick. Same predicate
+        // as the slot-count above, intentionally — "in-flight for
+        // slot accounting" and "in-flight for claim accounting" are
+        // the same set.
         let claimed: std::collections::HashSet<String> = in_flight
             .iter()
+            .filter(|s| matches!(s.state, SessionState::Running | SessionState::AwaitingGate))
             .filter_map(|s| s.issue.as_ref().map(|i| i.id.clone()))
             .collect();
         let Some(candidate) = open_issues.into_iter().find(|i| !claimed.contains(&i.id)) else {
@@ -572,6 +582,27 @@ mod tests {
         match out {
             AutonomousOutcome::Spawn(cmd) => assert_eq!(cmd.issue.human_id, "43"),
             other => panic!("expected Spawn(#43), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_terminal_sessions_do_not_block_their_issues_from_respawning() {
+        // Regression for the retry-after-failure bug: a Failed session
+        // bound to #42 used to keep #42 in the "claimed" set, so a
+        // subsequent `fleet plan retry` (which flips the plan item
+        // back to Pending but leaves the dead session in place for
+        // forensics) would never see the engine respawn the ticket.
+        // Only Running / AwaitingGate sessions hold the claim now.
+        let mut e = AutonomousEngine::new();
+        e.toggle();
+        let sessions = vec![
+            terminal_session("s-old", Some("42"), SessionState::Failed),
+            terminal_session("s-crash", Some("42"), SessionState::Crashed),
+        ];
+        let out = e.step(t0(), &cfg(), &sessions, || Ok(vec![issue("42")]));
+        match out {
+            AutonomousOutcome::Spawn(cmd) => assert_eq!(cmd.issue.human_id, "42"),
+            other => panic!("expected Spawn(#42), got {other:?}"),
         }
     }
 
