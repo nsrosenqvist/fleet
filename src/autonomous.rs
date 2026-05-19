@@ -331,11 +331,20 @@ pub fn reconcile_plans_from_sessions(
 pub fn reconcile_one_plan(sessions: &[Session], plan: &mut Plan) -> bool {
     let mut changed = false;
     let policy = plan.on_item_failure;
+    // Sessions older than the plan's last user-driven mutation are
+    // "stale" — `fleet plan retry` / inject / pause-resume all bump
+    // `plan.updated_at_ms`, and after a retry the dead Failed
+    // session still lives on disk with its own (older) timestamp.
+    // Without this filter, reconcile would walk the dead session,
+    // see "newest for ticket #X is Failed", re-apply the Stop
+    // policy, and quietly undo the retry the user just performed.
+    let watermark = plan.updated_at_ms;
     for item_idx in 0..plan.items.len() {
         let ticket_id = plan.items[item_idx].ticket_id.clone();
         let newest = sessions
             .iter()
             .filter(|s| s.issue.as_ref().is_some_and(|i| i.human_id == ticket_id))
+            .filter(|s| s.updated_at_ms > watermark)
             .max_by_key(|s| s.updated_at_ms);
         let Some(session) = newest else {
             continue;
@@ -961,7 +970,7 @@ mod tests {
     #[test]
     fn rank_candidates_by_plan_pulls_plan_items_to_the_front_in_order() {
         let open = vec![issue("99"), issue("43"), issue("42"), issue("100")];
-        let plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let plan = plan_with("plan-1", "p", &["42", "43"], 0);
         let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
         let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
         // Plan items first (42, 43 — in plan order), then leftover
@@ -972,7 +981,7 @@ mod tests {
     #[test]
     fn rank_candidates_by_plan_uses_oldest_plan_first_across_multiple() {
         let open = vec![issue("88"), issue("42"), issue("77")];
-        let older = plan_with("plan-A", "first", &["42"], 1_000);
+        let older = plan_with("plan-A", "first", &["42"], 0);
         let newer = plan_with("plan-B", "second", &["77"], 2_000);
         // Pass plans in the "wrong" order to confirm the sort fires.
         let ordered = rank_candidates_by_plan(open, &[newer, older], &empty_deps());
@@ -983,7 +992,7 @@ mod tests {
     #[test]
     fn rank_candidates_by_plan_skips_non_active_plans() {
         let open = vec![issue("99"), issue("42")];
-        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
         plan.state = PlanState::Paused;
         let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
         let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
@@ -995,7 +1004,7 @@ mod tests {
     #[test]
     fn rank_candidates_by_plan_skips_non_pending_items() {
         let open = vec![issue("99"), issue("42"), issue("43")];
-        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 0);
         // Item 0 (42) is already in progress; should not be
         // re-prioritized. Item 1 (43) stays pending.
         plan.items[0].state = PlanItemState::InProgress;
@@ -1008,7 +1017,7 @@ mod tests {
     #[test]
     fn rank_candidates_by_plan_drops_deps_blocked_tickets() {
         let open = vec![issue("99"), issue("42"), issue("43")];
-        let plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let plan = plan_with("plan-1", "p", &["42", "43"], 0);
         // 42 → blocked_on 43; 43 is still open, so 42 is blocked.
         let deps = deps_with(vec![DepEdge {
             blocked: "42".into(),
@@ -1029,7 +1038,7 @@ mod tests {
         // closed). The edge is still in deps.json (the store doesn't
         // auto-clear), but the scheduler treats it as cleared.
         let open = vec![issue("42")];
-        let plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let plan = plan_with("plan-1", "p", &["42"], 0);
         let deps = deps_with(vec![DepEdge {
             blocked: "42".into(),
             blocked_on: "99".into(),
@@ -1086,7 +1095,7 @@ mod tests {
 
     #[test]
     fn reconcile_one_plan_promotes_pending_to_in_progress_when_session_running() {
-        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 0);
         let sessions = vec![session_with_state("s-1", "42", SessionState::Running, 100)];
         let changed = reconcile_one_plan(&sessions, &mut plan);
         assert!(changed);
@@ -1101,7 +1110,7 @@ mod tests {
 
     #[test]
     fn reconcile_one_plan_completes_item_when_session_completed() {
-        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
         let sessions = vec![session_with_state(
             "s-1",
             "42",
@@ -1115,7 +1124,7 @@ mod tests {
 
     #[test]
     fn reconcile_one_plan_marks_failed_for_failed_or_crashed_sessions() {
-        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 0);
         let sessions = vec![
             session_with_state("s-1", "42", SessionState::Failed, 100),
             session_with_state("s-2", "43", SessionState::Crashed, 100),
@@ -1130,7 +1139,7 @@ mod tests {
         // A retry: an older session Failed at updated_ms=100, a newer
         // session is now Running at updated_ms=300. Item state should
         // reflect the newer session.
-        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
         let sessions = vec![
             session_with_state("s-old", "42", SessionState::Failed, 100),
             session_with_state("s-new", "42", SessionState::Running, 300),
@@ -1145,7 +1154,7 @@ mod tests {
 
     #[test]
     fn reconcile_one_plan_is_idempotent_when_state_already_matches() {
-        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
         plan.items[0].state = PlanItemState::Completed;
         plan.items[0].session_id = Some(SessionId::new("s-1"));
         let sessions = vec![session_with_state(
@@ -1160,7 +1169,7 @@ mod tests {
 
     #[test]
     fn reconcile_one_plan_ignores_sessions_with_no_bound_ticket() {
-        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
         let mut s = Session::new(SessionId::new("s-orphan"), "standard", 0);
         s.transition_to(SessionState::Running, 1).unwrap();
         // session.issue = None
@@ -1173,7 +1182,7 @@ mod tests {
     fn reconcile_one_plan_skips_sessions_in_created_state() {
         // Created is transient — promoting items based on it would
         // flicker InProgress and back to Pending within a tick.
-        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
         let s = session_with_state("s-1", "42", SessionState::Created, 100);
         let changed = reconcile_one_plan(&[s], &mut plan);
         assert!(!changed);
@@ -1184,8 +1193,37 @@ mod tests {
     use crate::plans::ItemFailurePolicy;
 
     #[test]
+    fn reconcile_ignores_dead_sessions_older_than_plan_updated_at_ms() {
+        // Regression: after `fleet plan retry` the failed session
+        // stays on disk for forensics and the plan's updated_at_ms
+        // jumps to "now". Reconcile used to find that dead Failed
+        // session, see "newest session for ticket #X is Failed",
+        // and re-apply the Stop policy — silently undoing the
+        // retry. The watermark filter now skips sessions older
+        // than the plan's last user-driven mutation.
+        let mut plan = plan_with("plan-1", "p", &["42"], 100);
+        plan.on_item_failure = ItemFailurePolicy::Stop;
+        // Post-retry shape: item back to Pending, session_id kept
+        // for forensics, plan.updated_at_ms = 500 (the retry
+        // timestamp). The dead session's updated_at_ms is 200 —
+        // older than the plan, so reconcile must ignore it.
+        plan.items[0].session_id = Some(SessionId::new("s-old"));
+        plan.updated_at_ms = 500;
+        let sessions = vec![session_with_state(
+            "s-old",
+            "42",
+            SessionState::Failed,
+            200,
+        )];
+        let changed = reconcile_one_plan(&sessions, &mut plan);
+        assert!(!changed, "stale Failed session must not re-trigger the policy");
+        assert_eq!(plan.items[0].state, PlanItemState::Pending);
+        assert_eq!(plan.state, PlanState::Active);
+    }
+
+    #[test]
     fn failure_policy_stop_pauses_plan_when_item_fails() {
-        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 0);
         plan.on_item_failure = ItemFailurePolicy::Stop;
         let sessions = vec![session_with_state("s-1", "42", SessionState::Failed, 100)];
         let _ = reconcile_one_plan(&sessions, &mut plan);
@@ -1195,7 +1233,7 @@ mod tests {
 
     #[test]
     fn failure_policy_continue_leaves_plan_active() {
-        let mut plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 0);
         plan.on_item_failure = ItemFailurePolicy::Continue;
         let sessions = vec![session_with_state("s-1", "42", SessionState::Failed, 100)];
         let _ = reconcile_one_plan(&sessions, &mut plan);
@@ -1205,7 +1243,7 @@ mod tests {
 
     #[test]
     fn failure_policy_retry_once_re_marks_item_pending_first_time() {
-        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
         plan.on_item_failure = ItemFailurePolicy::RetryOnce;
         let sessions = vec![session_with_state("s-1", "42", SessionState::Failed, 100)];
         let _ = reconcile_one_plan(&sessions, &mut plan);
@@ -1220,7 +1258,7 @@ mod tests {
 
     #[test]
     fn failure_policy_retry_once_falls_back_to_stop_on_second_failure() {
-        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
         plan.on_item_failure = ItemFailurePolicy::RetryOnce;
         // Simulate first-failure-already-applied state.
         plan.items[0].retry_count = 1;
@@ -1245,7 +1283,7 @@ mod tests {
         // reconcile). The next reconcile sees the same session
         // state and shouldn't re-pause the plan or otherwise touch
         // anything.
-        let mut plan = plan_with("plan-1", "p", &["42"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
         plan.on_item_failure = ItemFailurePolicy::Stop;
         plan.items[0].state = PlanItemState::Failed;
         plan.items[0].session_id = Some(SessionId::new("s-1"));
@@ -1264,7 +1302,7 @@ mod tests {
         // closes (out of the open set), a second tick should
         // prioritize 42 again in plan order.
 
-        let plan = plan_with("plan-1", "p", &["42", "43"], 1_000);
+        let plan = plan_with("plan-1", "p", &["42", "43"], 0);
 
         // First tick: 42 is blocked on the still-open 51.
         let open_with_blocker = vec![issue("42"), issue("43"), issue("51")];
@@ -1295,7 +1333,7 @@ mod tests {
         // newly-filed prerequisite is inserted before the bound
         // parent in the plan. The ranker should pick it up first on
         // the next tick.
-        let mut plan = plan_with("plan-1", "p", &["42", "44"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42", "44"], 0);
         // Simulate tracker-create injecting #51 before #42.
         plan.items
             .insert(0, crate::plans::PlanItem::pending_injected("51"));
@@ -1319,7 +1357,7 @@ mod tests {
         // The whole point of Continue: when item 0 fails, item 1
         // stays Pending and the supervisor's next tick will pick
         // it up.
-        let mut plan = plan_with("plan-1", "p", &["42", "43", "44"], 1_000);
+        let mut plan = plan_with("plan-1", "p", &["42", "43", "44"], 0);
         plan.on_item_failure = ItemFailurePolicy::Continue;
         let sessions = vec![session_with_state("s-1", "42", SessionState::Failed, 100)];
         let _ = reconcile_one_plan(&sessions, &mut plan);
