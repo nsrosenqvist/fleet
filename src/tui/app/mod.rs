@@ -101,6 +101,14 @@ pub(super) struct AppState {
     pub(super) config: RepoConfig,
     /// Autonomous supervisor. Off by default; toggled via `Shift+A`.
     pub(super) autonomous: autonomous::AutonomousEngine,
+    /// Mirror of the most recent `autonomous.status()` we've seen.
+    /// Used by [`Self::autonomous_tick`] to detect status changes so
+    /// it can hand verbose ones ("spawned X for #Y") off to
+    /// [`Self::status`] for the same 4-second TTL + dismiss-on-key
+    /// treatment ordinary flashes get. Initialised to the engine's
+    /// own steady-state default so the very first tick doesn't
+    /// produce a no-op flash.
+    pub(super) last_seen_autonomous_status: String,
     /// Loop-based scheduler. Off by default; toggled via `Shift+L`.
     /// Independent of [`Self::autonomous`] — a repo can enable
     /// either, both, or neither.
@@ -262,6 +270,7 @@ impl AppState {
             spawn: SpawnPickerState::empty(),
             config,
             autonomous: autonomous::AutonomousEngine::new(),
+            last_seen_autonomous_status: autonomous::AutonomousEngine::new().status().to_string(),
             scheduler: crate::scheduler::SchedulerEngine::new(),
             last_scheduler_tick: None,
             tracker: TrackerState::Pending,

@@ -23,22 +23,13 @@ use crate::tui::theme::{ACCENT, ERR, MUTED, OK, badge, chip, key as theme_key, s
 use super::lifetime_cost;
 
 pub(super) fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    // Autonomous-mode badge takes priority — even with a flash
-    // pending, surfacing "autonomous: ON · ..." is more useful than
-    // a per-action result that the autonomous engine itself may have
-    // produced.
-    if state.autonomous.enabled() || state.autonomous.status() != "autonomous: OFF" {
-        let line = Line::from(vec![
-            badge(" auto ", ACCENT),
-            Span::raw(" "),
-            Span::styled(
-                state.autonomous.status().to_string(),
-                Style::default().fg(ACCENT),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
-        return;
-    }
+    // Flashes ride the single StatusBar channel — autonomous engine
+    // status changes ("spawned X for #Y") are routed through
+    // `surface_autonomous_status_change` so they decay with the
+    // same TTL and dismiss-on-key semantics as plan toggles, kill
+    // confirmations, etc. The breadcrumb's `auto:●` dot remains the
+    // source of truth for "is autonomous enabled?" — the bottom bar
+    // doesn't need to repeat it.
     if let Some(msg) = state.status.current() {
         let trimmed = msg.trim();
         // Heuristic: status messages naming a failure (kill

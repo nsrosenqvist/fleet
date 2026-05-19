@@ -649,9 +649,17 @@ impl AppState {
                 "autonomous: cannot enable — tracker `{}` is not implemented yet",
                 self.config.tracker.as_str(),
             ));
+            self.surface_autonomous_status_change();
             return;
         }
         self.autonomous.toggle();
+        // toggle() flips the engine status to the bare "autonomous:
+        // ON"/"OFF" toggle string; surface_autonomous_status_change
+        // recognises those as steady-state and skips them, so a
+        // toggle alone doesn't fire a flash. Any verbose status that
+        // was on screen before the toggle has already been dismissed
+        // by `input::handle_key`.
+        self.surface_autonomous_status_change();
     }
 
     /// `Shift+L` handler. Flips the scheduler engine's enabled flag
@@ -718,6 +726,30 @@ impl AppState {
         if let autonomous::AutonomousOutcome::Spawn(cmd) = outcome {
             self.dispatch_autonomous_spawn(&cmd, store);
         }
+        self.surface_autonomous_status_change();
+    }
+
+    /// Compare the engine's current `status()` to the mirror; if it
+    /// changed AND the new value is more than the bare on/off
+    /// toggle, route it through the [`StatusBar`] so the verbose
+    /// part ("spawned X for #Y", "tracker error: …") decays in 4s
+    /// like every other flash. The compact "auto:●" badge in the
+    /// breadcrumb still shows the engine's enabled state regardless.
+    pub(in crate::tui) fn surface_autonomous_status_change(&mut self) {
+        let current = self.autonomous.status();
+        if current == self.last_seen_autonomous_status {
+            return;
+        }
+        let snapshot = current.to_string();
+        self.last_seen_autonomous_status.clone_from(&snapshot);
+        // The bare "autonomous: ON" / "autonomous: OFF" are
+        // steady-state toggle indicators, not action results — those
+        // are surfaced by the breadcrumb dot, not the bottom bar, so
+        // skip them.
+        if snapshot == "autonomous: ON" || snapshot == "autonomous: OFF" {
+            return;
+        }
+        self.status.flash(snapshot);
     }
 
     /// Parallel to [`Self::autonomous_tick`] for the loop scheduler.
