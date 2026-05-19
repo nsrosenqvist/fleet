@@ -25,7 +25,7 @@ use crate::session::SessionId;
 use crate::session::store::SessionStore;
 use crate::session::{ClockIdSource, IdSource, Session, SessionState, now_ms};
 use crate::tracker::{Issue, Tracker, build as build_tracker};
-use crate::workflow::executor::{ExecuteRequest, WorkflowExecutor, WorktreeMeta};
+use crate::workflow::executor::{ExecuteRequest, GitGuardPolicy, WorkflowExecutor, WorktreeMeta};
 use crate::workflow::spec::Workflow;
 use crate::workflow::validate::validate;
 use crate::worktree;
@@ -74,7 +74,7 @@ pub fn run_validate(name: &str) -> Result<i32> {
 /// `preassigned_session_id` carries the wrapper-minted id into the
 /// inner invocation. When `None` (the inline path or a first-class
 /// CLI call), a fresh id is minted as before.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn run_run(
     name: &str,
     issue_id: Option<&str>,
@@ -129,6 +129,11 @@ pub fn run_run(
         None => None,
     };
 
+    // Resolve the protected-branch set once for this session: the
+    // worktree guard and (via env into the shim) the `fleet-git`
+    // shim both consume it. See `crate::policy` for the policy.
+    let protected = crate::policy::protected_branches(invoker.as_ref(), &root, &config.runtime.git);
+
     // Provision the per-session worktree. For a PR-bound run the
     // worktree fetches the PR's head ref and bases on it; for the
     // usual issueless / issue-bound path we cut from HEAD.
@@ -140,8 +145,16 @@ pub fn run_run(
             &session_id,
             p.number,
             &p.head_ref,
+            &protected,
         )?,
-        None => provision_worktree(invoker.as_ref(), &root, &store, &session_id, "HEAD")?,
+        None => provision_worktree(
+            invoker.as_ref(),
+            &root,
+            &store,
+            &session_id,
+            "HEAD",
+            &protected,
+        )?,
     };
     let workspace_path: &Path = provision
         .as_ref()
@@ -187,6 +200,11 @@ pub fn run_run(
         interrupt_flag: Some(Arc::clone(&interrupt)),
         secrets: &config.secrets,
         start_after_node,
+        git_guard: GitGuardPolicy {
+            enabled: config.runtime.git.enabled,
+            protected: &protected,
+            allow_push_to: &config.runtime.git.allow_push_to,
+        },
     };
 
     println!("{session_id}");
@@ -363,6 +381,7 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         .with_tracker(tracker)
         .with_code_host(code_host)
         .with_creation_label_stamp(config.autonomous.filter_labels.clone());
+    let protected = crate::policy::protected_branches(invoker.as_ref(), &root, &config.runtime.git);
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -385,6 +404,11 @@ pub fn run_resume(session_id: &str) -> Result<i32> {
         interrupt_flag: None,
         secrets: &config.secrets,
         start_after_node: None,
+        git_guard: GitGuardPolicy {
+            enabled: config.runtime.git.enabled,
+            protected: &protected,
+            allow_push_to: &config.runtime.git.allow_push_to,
+        },
     };
     println!("{session_id}");
     let resumed = executor.resume(&req)?;
@@ -458,6 +482,7 @@ pub fn run_sibling(session_id: &str, node_id: &str) -> Result<i32> {
         .with_tracker(tracker)
         .with_code_host(code_host)
         .with_creation_label_stamp(config.autonomous.filter_labels.clone());
+    let protected = crate::policy::protected_branches(invoker.as_ref(), &root, &config.runtime.git);
     let req = ExecuteRequest {
         workflow: &wf,
         adapter: adapter.as_ref(),
@@ -481,6 +506,11 @@ pub fn run_sibling(session_id: &str, node_id: &str) -> Result<i32> {
         interrupt_flag: None,
         secrets: &config.secrets,
         start_after_node: None,
+        git_guard: GitGuardPolicy {
+            enabled: config.runtime.git.enabled,
+            protected: &protected,
+            allow_push_to: &config.runtime.git.allow_push_to,
+        },
     };
 
     // Hydrate the parent's outputs map so `when:` predicates and
@@ -549,6 +579,7 @@ pub fn run_sibling(session_id: &str, node_id: &str) -> Result<i32> {
 /// - The issue context is not re-resolved; new agent nodes won't see
 ///   `FLEET_ISSUE_*`. Re-spawn via `workflow run --issue <id>` if a
 ///   replay needs them.
+#[allow(clippy::too_many_lines)]
 pub fn run_replay(
     session_id: &str,
     rerun_from: Option<&str>,
@@ -606,8 +637,10 @@ pub fn run_replay(
     // or pre-worktree-feature meta.json), replay falls back to the
     // shared repo root — same behaviour the src session had, so
     // replay's contract isn't surprising.
+    let protected =
+        crate::policy::protected_branches(invoker.as_ref(), &root, &config.runtime.git);
     let provision = if let Some(branch) = src.branch.as_deref() {
-        provision_worktree(invoker.as_ref(), &root, &store, &new_id, branch)?
+        provision_worktree(invoker.as_ref(), &root, &store, &new_id, branch, &protected)?
     } else {
         tracing::warn!(
             src = %session_id,
@@ -650,6 +683,11 @@ pub fn run_replay(
         interrupt_flag: None,
         secrets: &config.secrets,
         start_after_node: None,
+        git_guard: GitGuardPolicy {
+            enabled: config.runtime.git.enabled,
+            protected: &protected,
+            allow_push_to: &config.runtime.git.allow_push_to,
+        },
     };
 
     println!("{new_id}");
@@ -713,6 +751,7 @@ fn provision_worktree(
     store: &SessionStore,
     session_id: &SessionId,
     base: &str,
+    protected: &[String],
 ) -> Result<Option<WorktreeProvision>> {
     if !worktree::is_git_repo(invoker, root) {
         tracing::warn!(
@@ -731,7 +770,7 @@ fn provision_worktree(
     })?;
     let wt_path = session_dir.join("worktree");
     let branch = worktree::session_branch_name(session_id.as_str());
-    worktree::create_worktree(invoker, root, &wt_path, &branch, base)?;
+    worktree::create_worktree(invoker, root, &wt_path, &branch, base, protected)?;
     Ok(Some(WorktreeProvision {
         path: wt_path,
         branch,
@@ -749,6 +788,7 @@ fn provision_worktree_for_pr(
     session_id: &SessionId,
     pr_number: u32,
     head_ref: &str,
+    protected: &[String],
 ) -> Result<Option<WorktreeProvision>> {
     if !worktree::is_git_repo(invoker, root) {
         tracing::warn!(
@@ -779,6 +819,7 @@ fn provision_worktree_for_pr(
             number: pr_number,
             head_ref,
         },
+        protected,
     )?;
     Ok(Some(WorktreeProvision {
         path: wt_path,

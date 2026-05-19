@@ -34,7 +34,7 @@
 //!   (the user is told to commit before running).
 //! - **Untracked files in the host worktree.** Same: not carried.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 use crate::process::ProcessInvoker;
@@ -133,6 +133,13 @@ pub fn pr_fetch_ref(number: u32) -> String {
 /// Create a worktree per `spec`. This is the generalised entry point
 /// `create_worktree` delegates to; existing callers that pass a bare
 /// `base: &str` keep working via the [`create_worktree`] wrapper.
+///
+/// `protected` is the set of refs the new worktree's checkout must
+/// not be. Belt-and-suspenders: [`session_branch_name`] already
+/// prefixes `fleet/session-`, so the assertion only ever fires on
+/// a programming error, but plumbing it through means future callers
+/// (the parallel scheduler, replay paths, the [`CreatePr`] handler)
+/// can't accidentally bypass the guard.
 #[allow(dead_code)] // wired in stage 7.
 pub fn create_worktree_for(
     invoker: &dyn ProcessInvoker,
@@ -140,7 +147,9 @@ pub fn create_worktree_for(
     target_path: &Path,
     branch: &str,
     spec: WorktreeSpec<'_>,
+    protected: &[String],
 ) -> Result<()> {
+    assert_branch_not_protected(branch, protected)?;
     match spec {
         WorktreeSpec::Fresh { base } => create_worktree_fresh(invoker, repo_root, target_path, branch, base),
         WorktreeSpec::Pr { number, head_ref: _ } => {
@@ -169,19 +178,37 @@ pub fn create_worktree_for(
     }
 }
 
+/// Refuse to create a worktree whose checked-out branch is a
+/// protected ref. Session branches are always ephemeral
+/// `fleet/session-*` — landing on `main` would defeat isolation.
+fn assert_branch_not_protected(branch: &str, protected: &[String]) -> Result<()> {
+    if protected.iter().any(|p| p == branch) {
+        bail!(
+            "refusing to create session worktree on protected branch `{branch}`: \
+             session branches must be ephemeral (protected set: {protected:?})"
+        );
+    }
+    Ok(())
+}
+
 /// Create a new git worktree at `target_path` checked out on a new
 /// branch `branch`, based off `base` (a branch name, tag, or sha).
 ///
 /// `repo_root` is the path *of the main repo* — `git -C <root>
 /// worktree add …`. `target_path` is where the new working tree
 /// lands. The directory must not exist yet (git refuses otherwise).
+///
+/// `protected` is the set of refs `branch` must not match — see
+/// [`create_worktree_for`] for the rationale.
 pub fn create_worktree(
     invoker: &dyn ProcessInvoker,
     repo_root: &Path,
     target_path: &Path,
     branch: &str,
     base: &str,
+    protected: &[String],
 ) -> Result<()> {
+    assert_branch_not_protected(branch, protected)?;
     create_worktree_fresh(invoker, repo_root, target_path, branch, base)
 }
 
@@ -382,6 +409,7 @@ mod tests {
             &PathBuf::from("/repo/.fleet/sessions/abc/worktree"),
             "fleet/session-abc",
             "HEAD",
+            &[],
         )
         .unwrap();
     }
@@ -416,6 +444,7 @@ mod tests {
             &PathBuf::from("/repo/.fleet/sessions/abc/worktree"),
             "fleet/session-abc",
             WorktreeSpec::Fresh { base: "main" },
+            &[],
         )
         .unwrap();
     }
@@ -459,6 +488,7 @@ mod tests {
                 number: 42,
                 head_ref: "feat/x",
             },
+            &[],
         )
         .unwrap();
     }
@@ -477,6 +507,7 @@ mod tests {
                 number: 99,
                 head_ref: "feat/x",
             },
+            &[],
         )
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -495,6 +526,7 @@ mod tests {
             &PathBuf::from("/repo/.fleet/sessions/abc/worktree"),
             "fleet/session-abc",
             "HEAD",
+            &[],
         )
         .unwrap_err();
         // The context wrapping includes the target path so callers
@@ -614,5 +646,55 @@ mod tests {
             .returning(|_, _| Err(anyhow::anyhow!("not a git repository")));
         let err = head_sha(&inv, Path::new("/somewhere")).unwrap_err();
         assert!(format!("{err:#}").contains("/somewhere"));
+    }
+
+    #[test]
+    fn create_worktree_rejects_protected_branch_loudly() {
+        let inv = MockProcessInvoker::new(); // no expectations: must not reach git
+        let err = create_worktree(
+            &inv,
+            Path::new("/repo"),
+            &PathBuf::from("/repo/.fleet/sessions/main/worktree"),
+            "main", // collision with the protected ref
+            "HEAD",
+            &["main".to_string()],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("protected"), "got: {msg}");
+        assert!(msg.contains("main"), "got: {msg}");
+    }
+
+    #[test]
+    fn create_worktree_accepts_session_branch_when_main_is_protected() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run().returning(|_, _| Ok(String::new()));
+        create_worktree(
+            &inv,
+            Path::new("/repo"),
+            &PathBuf::from("/repo/.fleet/sessions/abc/worktree"),
+            "fleet/session-abc",
+            "HEAD",
+            &["main".to_string(), "master".to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_worktree_for_pr_rejects_protected_session_branch() {
+        let inv = MockProcessInvoker::new(); // must not reach git
+        let err = create_worktree_for(
+            &inv,
+            Path::new("/repo"),
+            &PathBuf::from("/repo/.fleet/sessions/p/worktree"),
+            "main", // again, a misuse — caller passing protected as the new branch name
+            WorktreeSpec::Pr {
+                number: 5,
+                head_ref: "feat/x",
+            },
+            &["main".to_string()],
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("protected"));
     }
 }

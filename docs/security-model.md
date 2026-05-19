@@ -54,7 +54,7 @@ isolation, explicit opt-in). Each adapter applies different hardening
 to the same boundary; the per-adapter rows in
 [`sandbox.md`](./sandbox.md) spell out which.
 
-Three independent layers. Each has its own deep-dive:
+Four independent layers. Each has its own deep-dive:
 
 ### 1. Filesystem — [`sandbox.md`](./sandbox.md)
 
@@ -126,6 +126,47 @@ client that resolves an allowlisted name to an attacker IP), or
 kernel-level egress on the macOS path (the macOS enforcer is env-only
 — a hostile agent that unsets `HTTPS_PROXY` reaches the network
 directly).
+
+### 4. Git push — `fleet-git` shim
+
+- The `fleet-git` binary is bind-mounted into the devcontainer at
+  `/usr/local/bin/git` so it shadows the real git in the container's
+  PATH. Most invocations pass through unchanged; `git push` is
+  screened against a protected-branch policy.
+- The protected set is resolved per session: `runtime.git.protected_branches`
+  unioned with the remote's default branch (`git symbolic-ref
+  refs/remotes/origin/HEAD`). When detection fails, falls back to
+  `[main, master]` and logs a warning. Explicit user names *add* to
+  the detected set; the default branch is always protected.
+- The shim also enforces an explicit allowlist (`runtime.git.allow_push_to`).
+  Default is the empty list → push nothing from inside the container.
+  The container's job is to *produce commits* on the session's
+  `fleet/session-<id>` branch; pushing is a deliberate act done on
+  the host. Add specific branch names when a workflow legitimately
+  needs preview / CI runs triggered from the agent.
+- Every shim invocation is logged as one JSON line to
+  `/artifacts/git.log` inside the container (i.e. the session's
+  artifacts dir on the host) for forensic review.
+- Disable per-repo with `runtime.git.enabled: false` in
+  `.fleet/config.yaml` — only sensible when an external boundary
+  (server-side branch protection, dedicated push-credential broker)
+  already gives equivalent or stronger protection.
+
+**Protects against:** an agent that pushes to `main` either by
+mistake (misread prompt) or by adversarial instruction (poisoned
+README). Harness-agnostic: the policy lives below the LLM harness,
+so Claude Code, Codex, Aider, and any other agent that shells out
+to `git` are all subject to the same denial.
+
+**Does not protect against:** tools that invoke `/usr/bin/git` by
+absolute path — they bypass the PATH shadow. The two cases in the
+default devcontainer environment are `cargo` (uses libgit2
+in-process, doesn't push) and bespoke scripts that hard-code the
+path. Closing this gap requires renaming the real git binary at
+image-build time, which fights devcontainer cache reuse; defense-in-
+depth, not a hard boundary. The orchestrator (host tmux, foreground
+planning surface) is also intentionally out of scope — see
+[`orchestration.md`](./orchestration.md).
 
 ## Explicit non-goals
 

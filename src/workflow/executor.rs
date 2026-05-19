@@ -202,6 +202,22 @@ pub struct ExecuteRequest<'a> {
     /// `None` (the default for hand-fired runs) preserves the
     /// pre-feature behaviour byte-for-byte.
     pub start_after_node: Option<&'a str>,
+    /// Defense-in-depth `git push` policy for this run. Resolved by
+    /// the caller from `runtime.git` + `policy::protected_branches`
+    /// and threaded down so the shim mount + env are gated on the
+    /// same already-evaluated set the worktree assertion used.
+    pub git_guard: GitGuardPolicy<'a>,
+}
+
+/// Pre-resolved git-guard policy threaded into [`ExecuteRequest`].
+/// `enabled` mirrors `runtime.git.enabled`; `protected` and
+/// `allow_push_to` are the already-evaluated lists (see
+/// `crate::policy::protected_branches`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitGuardPolicy<'a> {
+    pub enabled: bool,
+    pub protected: &'a [String],
+    pub allow_push_to: &'a [String],
 }
 
 /// Per-session worktree bookkeeping, threaded into [`ExecuteRequest`]
@@ -1046,6 +1062,7 @@ impl WorkflowExecutor {
         // or the happy path.
         let bridge = self.start_bridge_for_agent(session, req.workspace, &node.id)?;
         push_bridge_env(&mut env, bridge.as_ref());
+        push_git_guard_env(&mut env, req.git_guard, session.id.as_str());
 
         let image = req
             .adapter
@@ -1058,7 +1075,7 @@ impl WorkflowExecutor {
         // agent shouldn't be able to rewrite its own write-authority
         // binary mid-run. `fleet_tracker_mount` handles the gating
         // (see its doc-comment for the exact skip conditions).
-        let extra_mounts = if bridge.is_some() {
+        let mut extra_mounts = if bridge.is_some() {
             let mut mounts = Vec::new();
             if let Some(m) = fleet_tracker_mount(req.adapter, &image) {
                 mounts.push(m);
@@ -1075,6 +1092,18 @@ impl WorkflowExecutor {
         } else {
             Vec::new()
         };
+        // Defense-in-depth `git push` guard: bind-mount the fleet-git
+        // shim at /usr/local/bin/git so any `git push` the agent
+        // issues is screened against the protected-branch policy.
+        // Independent of the bridge — guard applies even when no
+        // tracker is configured. Same arch / co-location gating as
+        // the tracker mounts; missing binary collapses to no mount
+        // (which falls back to the implicit no-creds boundary).
+        if req.git_guard.enabled {
+            if let Some(m) = fleet_git_mount(req.adapter, &image) {
+                extra_mounts.push(m);
+            }
+        }
         // When running as a fanout sibling subprocess, the per-
         // sibling tmux dispatcher sets `FLEET_FANOUT_SIBLING` so we
         // can disambiguate the devcontainer CLI container identity
@@ -1680,7 +1709,7 @@ impl WorkflowExecutor {
         let host = self.require_code_host_for(node)?;
         let base = base
             .map(str::to_string)
-            .or_else(|| detect_default_base(self.invoker.as_ref(), req.workspace))
+            .or_else(|| crate::policy::detect_default_branch(self.invoker.as_ref(), req.workspace))
             .unwrap_or_else(|| "main".to_string());
         let head = match head {
             Some(s) => s.to_string(),
@@ -2488,6 +2517,27 @@ fn locate_sibling_fleet_pr() -> Option<PathBuf> {
     locate_sibling_binary("fleet-pr")
 }
 
+/// Same as [`fleet_tracker_mount`] but for the `fleet-git` shim —
+/// bind-mounted at `/usr/local/bin/git` so it shadows the real git
+/// in the container's PATH. Identical arch / co-location gating; the
+/// missing binary collapses to "don't mount" rather than failing the
+/// workflow (defense-in-depth: a missing shim re-exposes the implicit
+/// no-credentials boundary, not a hard failure).
+fn fleet_git_mount(adapter: &dyn RuntimeAdapter, image: &ImageId) -> Option<MountSpec> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let host_path = locate_sibling_binary("fleet-git")?;
+    if !host_arch_matches_image(adapter, image) {
+        return None;
+    }
+    Some(MountSpec {
+        host_path,
+        container_path: PathBuf::from("/usr/local/bin/git"),
+        read_only: true,
+    })
+}
+
 fn locate_sibling_binary(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -2523,6 +2573,40 @@ pub fn push_bridge_env(env: &mut Vec<(String, String)>, bridge: Option<&Bridge>)
     env.push(("FLEET_BRIDGE_URL".to_string(), b.url_for_container()));
     env.push(("FLEET_BRIDGE_TOKEN".to_string(), b.token().to_string()));
     env.push(("NO_PROXY".to_string(), BRIDGE_HOST.to_string()));
+}
+
+/// Append the `FLEET_*` env vars the `fleet-git` shim reads:
+/// - `FLEET_PROTECTED_BRANCHES` / `FLEET_ALLOW_PUSH_TO`: newline-
+///   joined; the shim parses them back into `Vec<String>`.
+/// - `FLEET_SESSION_ID`: opaque session id copied into log lines.
+/// - `FLEET_GIT_LOG`: in-container path where the shim appends one
+///   JSON line per invocation. We point it at `/artifacts/git.log`
+///   so it lands in the bind-mounted per-session artifacts dir for
+///   forensic review.
+///
+/// No-op when `policy.enabled == false` — disabling the guard means
+/// neither the shim mount nor any of its env should appear.
+pub fn push_git_guard_env(
+    env: &mut Vec<(String, String)>,
+    policy: GitGuardPolicy<'_>,
+    session_id: &str,
+) {
+    if !policy.enabled {
+        return;
+    }
+    env.push((
+        "FLEET_PROTECTED_BRANCHES".to_string(),
+        crate::policy::encode_for_env(policy.protected),
+    ));
+    env.push((
+        "FLEET_ALLOW_PUSH_TO".to_string(),
+        crate::policy::encode_for_env(policy.allow_push_to),
+    ));
+    env.push(("FLEET_SESSION_ID".to_string(), session_id.to_string()));
+    env.push((
+        "FLEET_GIT_LOG".to_string(),
+        "/artifacts/git.log".to_string(),
+    ));
 }
 
 /// Read the agent node's `prompt_file:` (if any) into a [`PromptArtifact`].
@@ -2933,33 +3017,6 @@ fn resolve_pr_number(
              scope this node to a PR via `pr:` or run the workflow with `--pr <n>`",
             node.id,
         )
-    })
-}
-
-/// Resolve the repo's default branch by reading the remote's symbolic
-/// ref. Returns `None` if git refuses for any reason — callers
-/// typically fall back to `"main"`. Pure modulo the subprocess call;
-/// tests can stub via `MockProcessInvoker`.
-fn detect_default_base(invoker: &dyn ProcessInvoker, repo_root: &Path) -> Option<String> {
-    let out = invoker
-        .run(
-            "git",
-            vec![
-                "-C".to_string(),
-                repo_root.to_string_lossy().into_owned(),
-                "symbolic-ref".to_string(),
-                "--short".to_string(),
-                "refs/remotes/origin/HEAD".to_string(),
-            ],
-        )
-        .ok()?;
-    let s = out.trim();
-    s.strip_prefix("origin/").map(str::to_string).or_else(|| {
-        if s.is_empty() {
-            None
-        } else {
-            Some(s.to_string())
-        }
     })
 }
 
@@ -3446,6 +3503,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3486,6 +3544,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -3535,6 +3594,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -3857,6 +3917,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3895,6 +3956,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -3944,6 +4006,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.worktree_path.as_deref(), Some(wt_path.as_path()));
@@ -3994,6 +4057,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert!(session.worktree_path.is_none());
@@ -4103,6 +4167,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -4169,6 +4234,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         executor.execute(&req).unwrap();
         assert_eq!(*enforcer.setup_calls.lock().unwrap(), 1);
@@ -4211,6 +4277,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -4257,6 +4324,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         let active =
@@ -4303,6 +4371,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -4347,6 +4416,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -4389,6 +4459,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("unknown agent `ghost`"));
@@ -4444,6 +4515,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -4489,6 +4561,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("bash node `bad` failed"));
@@ -4540,6 +4613,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::AwaitingGate);
@@ -4608,6 +4682,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let final_session = executor.execute(&req).unwrap();
 
@@ -4671,6 +4746,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::AwaitingGate);
@@ -4714,6 +4790,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let _ = executor.execute(&req).unwrap_err();
         let loaded = store.load(&SessionId::new("s-fail-pid")).unwrap();
@@ -4763,6 +4840,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         // First execute pauses at the gate.
         let paused = executor.execute(&req).unwrap();
@@ -4828,6 +4906,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let paused = executor.execute(&req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -4883,6 +4962,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         // First run completes (no gate).
         let done = executor.execute(&req).unwrap();
@@ -4929,6 +5009,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.resume(&req).unwrap_err();
         assert!(
@@ -5019,6 +5100,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
 
         let replayed = executor.replay(&req, &src_id, "review").unwrap();
@@ -5101,6 +5183,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
 
         let replayed = executor.replay_only(&req, &src_id, "mid").unwrap();
@@ -5176,6 +5259,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
 
         let replayed = executor.replay_only(&req, &src_id, "revise").unwrap();
@@ -5238,6 +5322,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor
             .replay_only(&req, &src_id, "nonexistent")
@@ -5295,6 +5380,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
 
         let replayed = executor.replay(&req, &src_id, "review").unwrap();
@@ -5344,6 +5430,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
 
         let err = executor.replay(&req, &src_id, "nope").unwrap_err();
@@ -5391,6 +5478,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor
             .replay(&req, &SessionId::new("s-does-not-exist"), "only")
@@ -5465,6 +5553,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
 
         let replayed = executor.replay(&req, &src_id, "a").unwrap();
@@ -5520,6 +5609,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let replayed = executor.replay(&req, &src_id, "only").unwrap();
         assert_eq!(replayed.state, SessionState::Completed);
@@ -5606,6 +5696,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
 
         // The `decide` bash node "produces" its declared outputs as a
@@ -5708,6 +5799,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let replayed = executor.replay(&req, &src_id, "act").unwrap();
         assert_eq!(replayed.state, SessionState::Completed);
@@ -5840,6 +5932,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -5928,6 +6021,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -5982,6 +6076,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(
@@ -6033,6 +6128,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         (session, script_log)
@@ -6346,6 +6442,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6585,6 +6682,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6670,6 +6768,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6728,6 +6827,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -6804,6 +6904,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6888,6 +6989,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -6955,6 +7057,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -7018,6 +7121,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -7073,6 +7177,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -7195,6 +7300,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let paused = executor.execute(&req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -7275,6 +7381,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let paused = executor.execute(&exec_req).unwrap();
         assert_eq!(paused.state, SessionState::AwaitingGate);
@@ -7306,6 +7413,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let resumed = executor.resume(&resume_req).unwrap();
         assert_eq!(resumed.state, SessionState::Completed);
@@ -7371,6 +7479,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         executor.execute(&exec_req).unwrap();
 
@@ -7399,6 +7508,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let resumed = executor.resume(&resume_req).unwrap();
         assert_eq!(resumed.issue, Some(replacement));
@@ -7463,6 +7573,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         // when:-false skipped the assert; workflow Completes despite
@@ -7809,22 +7920,6 @@ nodes:
     }
 
     #[test]
-    fn detect_default_base_strips_origin_prefix() {
-        let mut inv = MockProcessInvoker::new();
-        inv.expect_run().returning(|_, _| Ok("origin/main".to_string()));
-        let v = detect_default_base(&inv, Path::new("/repo"));
-        assert_eq!(v.as_deref(), Some("main"));
-    }
-
-    #[test]
-    fn detect_default_base_returns_none_when_git_errors() {
-        let mut inv = MockProcessInvoker::new();
-        inv.expect_run()
-            .returning(|_, _| Err(anyhow!("no symbolic ref")));
-        assert!(detect_default_base(&inv, Path::new("/repo")).is_none());
-    }
-
-    #[test]
     fn detect_current_branch_returns_short_name() {
         let mut inv = MockProcessInvoker::new();
         inv.expect_run().returning(|_, _| Ok("feat/x".to_string()));
@@ -7875,6 +7970,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: Some("write_a"),
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -7912,6 +8008,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: Some("nonexistent"),
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(
@@ -7999,6 +8096,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
 
@@ -8094,6 +8192,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         executor.execute(&req).unwrap();
         let calls = tracker.calls();
@@ -8186,6 +8285,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         executor.execute(&req).unwrap();
 
@@ -8276,6 +8376,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         executor.execute(&req).unwrap();
 
@@ -8367,6 +8468,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         executor.execute(&req).unwrap();
 
@@ -8442,6 +8544,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         executor.execute(&req).unwrap();
         // Plans directory may not even exist; tracker-create
@@ -8520,6 +8623,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         executor.execute(&req).unwrap();
         let deps_path = deps_path_for(&store);
@@ -8589,6 +8693,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         executor.execute(&req).unwrap();
         let calls = tracker.calls();
@@ -8655,6 +8760,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("requires a tracker"));
@@ -8722,6 +8828,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -8792,6 +8899,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("title"));
@@ -8859,6 +8967,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("forced tracker create failure"));
@@ -8935,6 +9044,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         let msg = format!("{err:#}");
@@ -9025,6 +9135,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let session = executor.execute(&req).unwrap();
         assert_eq!(session.state, SessionState::Completed);
@@ -9138,6 +9249,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let err = executor.execute(&req).unwrap_err();
         assert!(format!("{err:#}").contains("forced link_parent failure"));
@@ -9248,6 +9360,7 @@ nodes:
             interrupt_flag: None,
             secrets: empty_secrets_static(),
             start_after_node: None,
+            git_guard: GitGuardPolicy::default(),
         };
         let _session = executor.execute(&req).unwrap();
 

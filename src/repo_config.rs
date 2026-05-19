@@ -49,7 +49,7 @@ pub struct RepoConfig {
 }
 
 /// `runtime:` block — which adapter to instantiate, how to harden it, where
-/// the devcontainer lives, and the network egress policy.
+/// the devcontainer lives, and the network + git-guard policies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub adapter: AdapterChoice,
@@ -62,6 +62,10 @@ pub struct RuntimeConfig {
     /// install still works; security-conscious users opt into
     /// `allowlist` per-repo.
     pub network: NetworkConfig,
+    /// `runtime.git` — defense-in-depth guard against an agent
+    /// inside the devcontainer pushing to protected refs. Default
+    /// `enabled: true` so existing repos get protection on upgrade.
+    pub git: GitGuardConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -71,6 +75,39 @@ impl Default for RuntimeConfig {
             hardening: HardeningChoice::Auto,
             devcontainer: PathBuf::from(".devcontainer/devcontainer.json"),
             network: NetworkConfig::default(),
+            git: GitGuardConfig::default(),
+        }
+    }
+}
+
+/// `runtime.git:` — controls the `fleet-git` shim bind-mounted into
+/// devcontainers at `/usr/local/bin/git`.
+///
+/// - `enabled` (default `true`): when false, the shim is not mounted
+///   and there's no container-side protection. Disabling makes sense
+///   only when the user has a stronger external boundary (e.g.,
+///   server-side branch protection on the remote) and is taking the
+///   tradeoff knowingly.
+/// - `protected_branches` (default `[]` → auto-detect from
+///   `origin/HEAD`): refs the shim refuses to push to. Explicit
+///   names *add* to the auto-detected set rather than replacing it
+///   — there is no way to make the default branch pushable from
+///   inside the container.
+/// - `allow_push_to` (default `[]` → push nothing): exact ref names
+///   the shim *will* allow. Protected wins on overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitGuardConfig {
+    pub enabled: bool,
+    pub protected_branches: Vec<String>,
+    pub allow_push_to: Vec<String>,
+}
+
+impl Default for GitGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            protected_branches: Vec::new(),
+            allow_push_to: Vec::new(),
         }
     }
 }
@@ -582,6 +619,8 @@ struct RawRuntime {
     devcontainer: Option<PathBuf>,
     #[serde(default)]
     network: Option<RawNetwork>,
+    #[serde(default)]
+    git: Option<RawGitGuard>,
 }
 
 #[derive(Deserialize, Default)]
@@ -590,6 +629,16 @@ struct RawNetwork {
     policy: Option<NetworkPolicy>,
     #[serde(default)]
     extra_hosts: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawGitGuard {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    protected_branches: Option<Vec<String>>,
+    #[serde(default)]
+    allow_push_to: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -634,11 +683,24 @@ impl From<Raw> for RepoConfig {
                     },
                     None => default_runtime.network,
                 };
+                let git = match r.git {
+                    Some(g) => GitGuardConfig {
+                        enabled: g.enabled.unwrap_or(default_runtime.git.enabled),
+                        protected_branches: g
+                            .protected_branches
+                            .unwrap_or(default_runtime.git.protected_branches),
+                        allow_push_to: g
+                            .allow_push_to
+                            .unwrap_or(default_runtime.git.allow_push_to),
+                    },
+                    None => default_runtime.git,
+                };
                 RuntimeConfig {
                     adapter: r.adapter.unwrap_or(default_runtime.adapter),
                     hardening: r.hardening.unwrap_or(default_runtime.hardening),
                     devcontainer: r.devcontainer.unwrap_or(default_runtime.devcontainer),
                     network,
+                    git,
                 }
             }
             None => default_runtime,
@@ -1252,6 +1314,60 @@ runtime:
         assert_eq!(NetworkPolicy::Open.as_str(), "open");
         assert_eq!(NetworkPolicy::None.as_str(), "none");
         assert_eq!(NetworkPolicy::Allowlist.as_str(), "allowlist");
+    }
+
+    #[test]
+    fn git_guard_defaults_to_enabled_with_empty_lists() {
+        // No runtime.git block → enabled (defense-in-depth on by
+        // default), no user-configured names, no allowlist.
+        let cfg = RepoConfig::from_str_at("runtime:\n  adapter: docker\n", "/x").unwrap();
+        assert!(cfg.runtime.git.enabled);
+        assert!(cfg.runtime.git.protected_branches.is_empty());
+        assert!(cfg.runtime.git.allow_push_to.is_empty());
+    }
+
+    #[test]
+    fn missing_git_block_falls_back_to_defaults() {
+        // Same as above but no runtime block at all — defaults still
+        // apply, which means a brand-new `.fleet/config.yaml: ""`
+        // gets the guard on.
+        let cfg = RepoConfig::from_str_at("", "/x").unwrap();
+        assert!(cfg.runtime.git.enabled);
+    }
+
+    #[test]
+    fn parses_git_guard_block() {
+        let yaml = "\
+runtime:
+  git:
+    enabled: true
+    protected_branches:
+      - release
+      - hotfix
+    allow_push_to:
+      - fleet/session-abc
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert!(cfg.runtime.git.enabled);
+        assert_eq!(
+            cfg.runtime.git.protected_branches,
+            vec!["release".to_string(), "hotfix".to_string()]
+        );
+        assert_eq!(
+            cfg.runtime.git.allow_push_to,
+            vec!["fleet/session-abc".to_string()]
+        );
+    }
+
+    #[test]
+    fn git_guard_disabled_when_explicitly_off() {
+        let yaml = "\
+runtime:
+  git:
+    enabled: false
+";
+        let cfg = RepoConfig::from_str_at(yaml, "/x").unwrap();
+        assert!(!cfg.runtime.git.enabled);
     }
 
     #[test]

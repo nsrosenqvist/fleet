@@ -287,6 +287,25 @@ runtime:
   # Devcontainer that defines the agent environment.
   devcontainer: .devcontainer/devcontainer.json
 
+  # Defense-in-depth `git push` guard. The `fleet-git` shim is
+  # bind-mounted into the devcontainer at /usr/local/bin/git and
+  # blocks pushes to protected refs. See docs/security.md.
+  # git:
+  #   # When false, the shim is not mounted at all.
+  #   enabled: true
+  #   # Refs the shim refuses to push to. Empty = auto-detect the
+  #   # remote's default branch via origin/HEAD (with a fallback to
+  #   # [main, master] if detection fails). Explicit names ADD to the
+  #   # detected set rather than replacing it — the default branch is
+  #   # always protected.
+  #   protected_branches: []
+  #   # Refs the shim WILL allow pushing to. Default empty: push
+  #   # nothing from inside the container. Add the session branch
+  #   # (or a pattern your workflow needs) when you want preview /
+  #   # CI runs to be triggerable from the agent. Exact-name match;
+  #   # protected wins on overlap.
+  #   allow_push_to: []
+
 # git-bug | github | linear | jira
 tracker: git-bug
 

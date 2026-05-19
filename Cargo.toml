@@ -28,6 +28,15 @@ path = "src/bin/fleet-tracker.rs"
 name = "fleet-pr"
 path = "src/bin/fleet-pr.rs"
 
+# Defense-in-depth `git push` guard. Bind-mounted into agent containers
+# at /usr/local/bin/git so any `git push` the agent issues is screened
+# against the protected-branch policy resolved from `runtime.git` in
+# .fleet/config.yaml. See docs/security.md for the threat model and
+# the residual `/usr/bin/git`-hardcoded-path gap.
+[[bin]]
+name = "fleet-git"
+path = "src/bin/fleet-git.rs"
+
 [dependencies]
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

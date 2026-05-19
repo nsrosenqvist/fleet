@@ -25,6 +25,7 @@ mod deps;
 mod egress;
 mod orchestrator;
 mod plans;
+mod policy;
 mod process;
 mod repo;
 mod repo_config;
