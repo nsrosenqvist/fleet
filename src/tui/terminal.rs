@@ -129,10 +129,23 @@ fn drive(
                         // orchestrator on first invocation, respawn
                         // the agent if the pane is dead, or just
                         // attach if everything's alive.
-                        let exe =
-                            std::env::current_exe().context("locating current fleet binary")?;
-                        if let Err(err) = run_suspended(terminal, &exe, &["orchestrator"]) {
-                            state.status.flash(format!(" orchestrator failed: {err:#} "));
+                        // Use the same defensive path resolution the spawn
+                        // dispatchers do — `current_exe()` returns
+                        // `<path> (deleted)` after a `cargo build` while
+                        // the TUI is running, and Linux can't exec from
+                        // that. `resolve_fleet_binary` strips the suffix
+                        // and verifies the new path exists.
+                        match crate::tui::app::resolve_fleet_binary() {
+                            Ok(exe) => {
+                                if let Err(err) = run_suspended(terminal, &exe, &["orchestrator"]) {
+                                    state.status.flash(format!(" orchestrator failed: {err:#} "));
+                                }
+                            }
+                            Err(err) => {
+                                state
+                                    .status
+                                    .flash(format!(" orchestrator failed: {err:#} "));
+                            }
                         }
                         // Detach left the tmux session at `window-size
                         // latest` (host terminal width). Ask the

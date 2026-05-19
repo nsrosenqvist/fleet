@@ -33,7 +33,7 @@ pub(in crate::tui) use status::StatusBar;
 // without a longer path.
 pub(in crate::tui) use doctor::DoctorSnapshot;
 pub(in crate::tui) use sessions::sort_sessions;
-pub use spawn::build_workflow_run_command;
+pub use spawn::{build_workflow_run_command, resolve_fleet_binary};
 pub(in crate::tui) use spawn::{IssuesState, PendingSpawn, SpawnPickerState, SpawnTab};
 
 // Test-only re-exports — these support the `super::tests` module's

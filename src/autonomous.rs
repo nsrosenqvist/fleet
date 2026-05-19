@@ -230,6 +230,22 @@ pub fn rank_candidates_by_plan(
     let open_set: HashSet<String> = open.iter().map(|i| i.human_id.clone()).collect();
     let is_blocked = |ticket: &str| ticket_is_blocked(ticket, &open_set, deps);
 
+    // Tickets that appear as a `Failed` item in any plan are
+    // suppressed: a failure on those tickets means the user must
+    // explicitly `fleet plan retry` (or Shift+R) before autonomous
+    // re-tries. Without this gate the engine spins through fresh
+    // sessions every scan interval against the same broken ticket,
+    // accumulating Failed sessions on disk indefinitely. The
+    // suppression covers all plan states — Failed items in
+    // Active plans still need human attention; Paused plans signal
+    // even more strongly that autonomous should keep its hands off.
+    let suppressed_by_failure: HashSet<String> = plans
+        .iter()
+        .flat_map(|p| p.items.iter())
+        .filter(|it| it.state == PlanItemState::Failed)
+        .map(|it| it.ticket_id.clone())
+        .collect();
+
     let mut prioritized: Vec<IssueContext> = Vec::new();
     let mut leftover = open;
 
@@ -252,6 +268,9 @@ pub fn rank_candidates_by_plan(
             if is_blocked(&item.ticket_id) {
                 continue;
             }
+            if suppressed_by_failure.contains(&item.ticket_id) {
+                continue;
+            }
             if let Some(pos) = leftover.iter().position(|i| i.human_id == item.ticket_id) {
                 prioritized.push(leftover.remove(pos));
             }
@@ -260,7 +279,7 @@ pub fn rank_candidates_by_plan(
     // Append non-blocked leftover (the any-open-issue fallback) so
     // tickets not currently in any plan still get picked once the
     // plan queue is exhausted.
-    leftover.retain(|i| !is_blocked(&i.human_id));
+    leftover.retain(|i| !is_blocked(&i.human_id) && !suppressed_by_failure.contains(&i.human_id));
     prioritized.extend(leftover);
     prioritized
 }
@@ -1012,6 +1031,37 @@ mod tests {
         let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
         // Only 43 is prioritized; 99 + 42 fall through as leftover.
         assert_eq!(ids, vec!["43", "99", "42"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_suppresses_tickets_with_failed_plan_items() {
+        // Regression: when an item in a plan is Failed, the engine
+        // used to keep respawning the same ticket on every scan
+        // interval, accumulating Failed sessions on disk. Failed
+        // items are now suppressed across all plan states until
+        // the user runs `fleet plan retry` (which flips them back
+        // to Pending).
+        let open = vec![issue("42"), issue("43"), issue("44")];
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 0);
+        plan.items[0].state = PlanItemState::Failed;
+        let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        // 42 is filtered (Failed); 43 is still Pending; 44 is open
+        // but not in any plan, so falls through as leftover.
+        assert_eq!(ids, vec!["43", "44"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_suppresses_failed_items_even_in_paused_plans() {
+        // A Paused plan with a Failed item — the ticket should
+        // still be suppressed, since pausing doesn't undo the
+        // failure, it just stops the engine from picking new items.
+        let open = vec![issue("42")];
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
+        plan.items[0].state = PlanItemState::Failed;
+        plan.state = PlanState::Paused;
+        let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
+        assert!(ordered.is_empty(), "Failed-in-paused must be suppressed; got {ordered:?}");
     }
 
     #[test]
