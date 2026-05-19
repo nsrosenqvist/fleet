@@ -383,12 +383,27 @@ pub(in crate::tui) fn plan_row_label(
     } else {
         ""
     };
+    // Lead with the plan name + progress so the user sees what
+    // each row is *for* at a glance. The full `plan-<13hex>-<4hex>`
+    // id is in the details pane already; carrying it on every row
+    // burned ~24 columns on noise. A short id stub (last segment of
+    // the id) is kept as a parenthetical so two plans sharing a
+    // name are still distinguishable.
     format!(
-        "{warning_prefix}{} {} {done}/{total} {}",
+        "{warning_prefix}{} {} {done}/{total} ({})",
         plan_state_marker(plan.state),
-        plan.id,
         plan.name,
+        plan_id_stub(&plan.id),
     )
+}
+
+/// Last `-`-segment of the plan id (the per-mint counter).
+/// Stable enough to disambiguate two plans created in the same
+/// millisecond without dragging the whole hex blob along.
+fn plan_id_stub(id: &crate::plans::PlanId) -> String {
+    let s = id.as_str();
+    s.rsplit_once('-')
+        .map_or_else(|| s.to_string(), |(_, tail)| format!("…{tail}"))
 }
 
 #[must_use]

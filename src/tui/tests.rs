@@ -1654,13 +1654,22 @@ fn sample_plan() -> Plan {
 }
 
 #[test]
-fn plan_row_label_shows_marker_id_progress_and_name() {
+fn plan_row_label_leads_with_name_and_progress() {
+    // Row now puts the plan name first (the meaningful identifier
+    // at a glance) followed by the progress fraction; the full id
+    // is no longer in the row — only a short stub kept as a
+    // disambiguator for plans with identical names. Full id lives
+    // in the details pane.
     let p = sample_plan();
     let label = plan_row_label(&p, &no_cycles());
     assert!(label.starts_with('●'), "active marker expected: {label}");
-    assert!(label.contains("plan-1"));
-    assert!(label.contains("1/3"));
-    assert!(label.contains("Parser refactor"));
+    assert!(label.contains("Parser refactor"), "got: {label}");
+    assert!(label.contains("1/3"), "got: {label}");
+    // ID stub keeps the last `-`-segment with a leading ellipsis
+    // so two plans with the same name are still distinguishable.
+    assert!(label.contains("(…"), "expected id stub; got: {label}");
+    // Full 17-char id no longer in the row.
+    assert!(!label.contains("plan-1 "), "got: {label}");
 }
 
 #[test]
