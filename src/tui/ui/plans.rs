@@ -129,6 +129,11 @@ pub(super) fn render_plans_detail(f: &mut Frame<'_>, area: Rect, state: &AppStat
 
     f.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), rows[0]);
 
+    // Each item renders as 1 or 2 lines (title row + optional session
+    // row when a session is bound). `ListItem::new` takes a
+    // `Vec<Line>` which becomes a multi-line item; the highlight bar
+    // spans the whole item which is what we want — selection covers
+    // both lines.
     let item_lines: Vec<ListItem<'_>> = plan
         .items
         .iter()
@@ -458,7 +463,7 @@ pub(in crate::tui) fn plan_detail_lines(
 ) -> Vec<Line<'static>> {
     let mut out = plan_header_lines(plan, titles);
     for (idx, item) in plan.items.iter().enumerate() {
-        out.push(plan_item_line(
+        out.extend(plan_item_line(
             idx,
             item,
             selected_item == Some(idx),
@@ -478,7 +483,7 @@ fn plan_item_line(
     item: &crate::plans::PlanItem,
     is_selected: bool,
     titles: &std::collections::HashMap<String, crate::tracker::Issue>,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let muted = Style::default().fg(MUTED);
     let item_state = item.state;
     let recede = matches!(
@@ -515,14 +520,19 @@ fn plan_item_line(
             Style::default().fg(WARN).add_modifier(Modifier::ITALIC),
         ));
     }
+    let mut lines = vec![Line::from(spans)];
     if let Some(session) = &item.session_id {
-        spans.push(Span::styled("  · session ", muted));
-        spans.push(Span::styled(
-            session.to_string(),
-            Style::default().fg(IDENT),
-        ));
+        // Wrap the session id onto a second line so the full id is
+        // always readable regardless of terminal width. Indent under
+        // the state column (cursor + idx + marker + state-word
+        // padding ≈ 22 cols) so the session lines up with the title
+        // text above it.
+        lines.push(Line::from(vec![
+            Span::styled("                      · session ", muted),
+            Span::styled(session.to_string(), Style::default().fg(IDENT)),
+        ]));
     }
-    Line::from(spans)
+    lines
 }
 
 /// Build the "progress" row of the plan header. The done count adopts

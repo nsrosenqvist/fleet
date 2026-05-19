@@ -92,6 +92,51 @@ pub fn run_abandon(id: &str, reason: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
+/// `fleet plan retry <id>`. Walks every item in state `Failed` and
+/// flips it back to `Pending` so the autonomous supervisor picks it
+/// up on the next tick. The plan itself is set to `Active` (the
+/// stop-on-failure policy pauses on the first failure; without
+/// resuming here, the user would have to do it as a second step).
+///
+/// `retry_count` is intentionally NOT reset — it's the supervisor's
+/// `RetryOnce` bookkeeping and a manual `fleet plan retry` shouldn't
+/// hand the engine more retries than the policy allows. The prior
+/// `session_id` is kept for forensics; the new run mints a fresh
+/// session.
+///
+/// Stdout reports how many items were flipped + whether the plan
+/// was resumed, so a scripted caller can confirm without a follow-up
+/// `plan show`.
+pub fn run_retry(id: &str) -> Result<i32> {
+    let store = open_store()?;
+    let mut plan = load_plan(&store, id)?;
+    let flipped = plan
+        .items
+        .iter_mut()
+        .filter(|it| it.state == crate::plans::PlanItemState::Failed)
+        .map(|it| it.state = crate::plans::PlanItemState::Pending)
+        .count();
+    if flipped == 0 {
+        eprintln!("plan {}: no failed items to retry", plan.id);
+        return Ok(0);
+    }
+    let resumed = plan.state == PlanState::Paused;
+    if resumed {
+        plan.state = PlanState::Active;
+    }
+    plan.updated_at_ms = now_ms();
+    store
+        .save(&plan)
+        .with_context(|| format!("saving plan `{}` after retry", plan.id))?;
+    println!(
+        "plan {}: retried {flipped} failed item{}{}",
+        plan.id,
+        if flipped == 1 { "" } else { "s" },
+        if resumed { " · resumed" } else { "" },
+    );
+    Ok(0)
+}
+
 /// `fleet plan inject <id> <ticket-id> [--before <other-id>]`. Adds
 /// a `Pending` item with `injected: false` (the CLI surface is for
 /// human edits; `injected: true` is reserved for the workflow

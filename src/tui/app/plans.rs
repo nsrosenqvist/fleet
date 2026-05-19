@@ -21,6 +21,10 @@ impl AppState {
             self.complete_selected_plan();
             return Action::None;
         }
+        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('R')) {
+            self.retry_failed_plan_items();
+            return Action::None;
+        }
         match key.code {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Esc | KeyCode::Char('p') => {
@@ -155,6 +159,71 @@ impl AppState {
             Err(err) => {
                 plan.state = previous;
                 self.set_flash(format!(" plan save failed: {err:#} "));
+            }
+        }
+    }
+
+    /// Flip every `Failed` item in the selected plan back to
+    /// `Pending` and unpause the plan if it was paused by the
+    /// `on_item_failure: stop` policy. Same shape as
+    /// [`crate::cli::plan::run_retry`]; both surfaces share the
+    /// resume-and-flip semantics so the user doesn't have to follow
+    /// the retry with a separate Shift+P.
+    fn retry_failed_plan_items(&mut self) {
+        let Some(idx) = self.plans_list_state.selected() else {
+            self.set_flash(" no plan selected ");
+            return;
+        };
+        // Compute the result up front so the mutable borrow on `plan`
+        // ends before we touch `self.set_flash`. Otherwise the
+        // compiler conservatively assumes the flash call could
+        // re-borrow the plans vec.
+        let result: Option<(String, usize, bool, Result<(), String>)> = match self
+            .plans
+            .get_mut(idx)
+        {
+            Some(plan) => {
+                let plan_id = plan.id.to_string();
+                let flipped = plan
+                    .items
+                    .iter_mut()
+                    .filter(|it| it.state == crate::plans::PlanItemState::Failed)
+                    .map(|it| it.state = crate::plans::PlanItemState::Pending)
+                    .count();
+                if flipped == 0 {
+                    Some((plan_id, 0_usize, false, Ok(())))
+                } else {
+                    let resumed = plan.state == crate::plans::PlanState::Paused;
+                    if resumed {
+                        plan.state = crate::plans::PlanState::Active;
+                    }
+                    plan.updated_at_ms = now_ms();
+                    let save = PlanStore::for_repo(&self.root)
+                        .save(plan)
+                        .map_err(|e| format!("{e:#}"));
+                    Some((plan_id, flipped, resumed, save))
+                }
+            }
+            None => None,
+        };
+        let Some((plan_id, flipped, resumed, save)) = result else {
+            return;
+        };
+        if flipped == 0 {
+            self.set_flash(format!(" plan `{plan_id}` has no failed items "));
+            return;
+        }
+        match save {
+            Ok(()) => {
+                let msg = if resumed {
+                    format!(" plan `{plan_id}`: retried {flipped} item(s) · resumed ")
+                } else {
+                    format!(" plan `{plan_id}`: retried {flipped} item(s) ")
+                };
+                self.set_flash(msg);
+            }
+            Err(err) => {
+                self.set_flash(format!(" plan save failed: {err} "));
             }
         }
     }

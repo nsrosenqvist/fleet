@@ -469,6 +469,12 @@ pub enum PlanSub {
     /// items. Idempotent and additive — existing items aren't
     /// reordered or removed, and the epic isn't written back.
     Sync { id: String },
+
+    /// Reset every failed item in `<id>` back to `Pending` and
+    /// resume the plan if it was paused by the `on_item_failure:
+    /// stop` policy. Per-item `retry_count` and the prior session
+    /// id are kept for forensics — re-runs spawn fresh sessions.
+    Retry { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -665,6 +671,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             PlanSub::Resume { id } => plan::run_resume(&id),
             PlanSub::Complete { id } => plan::run_complete(&id),
             PlanSub::Abandon { id, reason } => plan::run_abandon(&id, reason.as_deref()),
+            PlanSub::Retry { id } => plan::run_retry(&id),
             PlanSub::Sync { id } => plan::run_sync(&id),
             PlanSub::Inject { id, ticket, before } => {
                 plan::run_inject(&id, &ticket, before.as_deref())
