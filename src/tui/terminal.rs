@@ -91,10 +91,10 @@ fn event_loop(
     // reaped — the default "N sessions" line is more useful.
     if let Some(report) = reap_report {
         if !report.reaped.is_empty() {
-            state.status_line = format!(
+            state.status.flash(format!(
                 " reaped {} crashed session(s) on startup ",
                 report.reaped.len()
-            );
+            ));
         }
     }
     // Background thread polls the orchestrator pane and the panel-size
@@ -132,7 +132,7 @@ fn drive(
                         let exe =
                             std::env::current_exe().context("locating current fleet binary")?;
                         if let Err(err) = run_suspended(terminal, &exe, &["orchestrator"]) {
-                            state.status_line = format!(" orchestrator failed: {err:#} ");
+                            state.status.flash(format!(" orchestrator failed: {err:#} "));
                         }
                         // Detach left the tmux session at `window-size
                         // latest` (host terminal width). Ask the
@@ -144,7 +144,7 @@ fn drive(
                         // Closed on detach; reload so the sidebar
                         // marker is current.
                         if let Err(err) = state.reload(store) {
-                            state.status_line = format!(" reload failed: {err:#} ");
+                            state.status.flash(format!(" reload failed: {err:#} "));
                         }
                     }
                     Action::OpenTrackerTui { exe, args } => {
@@ -154,7 +154,7 @@ fn drive(
                         // dance any more — so we can launch it
                         // directly.
                         if let Err(err) = run_suspended(terminal, std::path::Path::new(exe), args) {
-                            state.status_line = format!(" {exe} failed: {err:#} ");
+                            state.status.flash(format!(" {exe} failed: {err:#} "));
                         }
                     }
                     Action::AttachWorker { tmux_name } => {
@@ -164,11 +164,11 @@ fn drive(
                         // shape as `OpenOrchestrator`; only the tmux
                         // target name differs.
                         if let Err(err) = run_attach_script(terminal, &tmux_name) {
-                            state.status_line = format!(" attach failed: {err:#} ");
+                            state.status.flash(format!(" attach failed: {err:#} "));
                         }
                         state.request_focused_repin();
                         if let Err(err) = state.reload(store) {
-                            state.status_line = format!(" reload failed: {err:#} ");
+                            state.status.flash(format!(" reload failed: {err:#} "));
                         }
                     }
                 }

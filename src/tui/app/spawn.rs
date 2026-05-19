@@ -356,7 +356,7 @@ impl AppState {
         // pre-tracker UX from the old picker.
         let raw = self.spawn.filter.trim().to_string();
         if raw.is_empty() {
-            self.status_line = " spawn: no issue selected ".to_string();
+            self.status.flash(" spawn: no issue selected ".to_string());
             self.view = View::Sessions;
             return;
         }
@@ -367,7 +367,7 @@ impl AppState {
     fn submit_workflow_tab(&mut self) {
         let filtered = self.spawn.filtered_workflows();
         let Some(entry) = filtered.get(self.spawn.workflow_idx) else {
-            self.status_line = " spawn: no workflow selected ".to_string();
+            self.status.flash(" spawn: no workflow selected ".to_string());
             self.view = View::Sessions;
             return;
         };
@@ -541,11 +541,13 @@ impl AppState {
     /// pending_spawn-watcher dance is unchanged from the
     /// workflow-only era; only the command shape grew.
     fn spawn_selected(&mut self, workflow: &str, issue: Option<&str>) {
-        let Ok(binary) = std::env::current_exe() else {
-            self.status_line =
-                " spawn failed: cannot resolve fleet binary path (current_exe) ".to_string();
-            self.view = View::Sessions;
-            return;
+        let binary = match resolve_fleet_binary() {
+            Ok(p) => p,
+            Err(err) => {
+                self.status.flash(format!(" spawn failed: {err:#} "));
+                self.view = View::Sessions;
+                return;
+            }
         };
 
         let started_at_ms = now_ms();
@@ -583,7 +585,7 @@ impl AppState {
 
         match cmd.spawn() {
             Ok(child) => {
-                self.status_line = format!(" spawned `{label}` — press `r` to refresh ");
+                self.status.flash(format!(" spawned `{label}` — press `r` to refresh "));
                 self.pending_spawn = Some(PendingSpawn {
                     name: label,
                     child,
@@ -592,7 +594,7 @@ impl AppState {
                 });
             }
             Err(err) => {
-                self.status_line = format!(" spawn `{label}` failed: {err:#} ");
+                self.status.flash(format!(" spawn `{label}` failed: {err:#} "));
             }
         }
         self.view = View::Sessions;
@@ -623,7 +625,7 @@ impl AppState {
                             tail.trim_end(),
                         ),
                     };
-                    self.status_line = format!(" spawn `{}` failed — press any key ", pending.name);
+                    self.status.flash(format!(" spawn `{}` failed — press any key ", pending.name));
                 }
                 let _ = pending.started_at_ms;
             }
@@ -803,11 +805,13 @@ impl AppState {
                 .set_status(format!("scheduler: ON · state save failed: {err:#}"));
         }
         if !spawns.is_empty() {
-            let Ok(binary) = std::env::current_exe() else {
-                self.scheduler.set_status(
-                    "scheduler: ON · spawn failed: cannot resolve fleet binary (current_exe)",
-                );
-                return;
+            let binary = match resolve_fleet_binary() {
+                Ok(p) => p,
+                Err(err) => {
+                    self.scheduler
+                        .set_status(format!("scheduler: ON · spawn failed: {err:#}"));
+                    return;
+                }
             };
             for res in crate::scheduler::dispatcher::dispatch_spawns(&spawns, &binary) {
                 if let Err(err) = res {
@@ -851,11 +855,13 @@ impl AppState {
     }
 
     fn dispatch_autonomous_spawn(&mut self, cmd: &autonomous::SpawnCommand, store: &SessionStore) {
-        let Ok(binary) = std::env::current_exe() else {
-            self.autonomous.set_status(
-                "autonomous: ON · spawn failed: cannot resolve fleet binary (current_exe)",
-            );
-            return;
+        let binary = match resolve_fleet_binary() {
+            Ok(p) => p,
+            Err(err) => {
+                self.autonomous
+                    .set_status(format!("autonomous: ON · spawn failed: {err:#}"));
+                return;
+            }
         };
         // Detached: TUI-driven autonomous spawns get the same tmux
         // wrapping as a manual spawn so users can attach to watch
@@ -960,7 +966,32 @@ pub fn list_workflows_dir(root: &Path) -> Vec<String> {
 /// preview / attach machinery as the orchestrator. CI-style callers
 /// (`fleet workflow run` from a shell) pass `false` and keep the
 /// inline blocking semantics they've always had.
-#[must_use]
+/// Resolve the path of the running fleet binary, defending against
+/// Linux's ` (deleted)` suffix that `current_exe()` returns when the
+/// in-process executable was unlinked (typical for a `cargo build`
+/// rebuild while the TUI is running). Strips the suffix and verifies
+/// the path still resolves; otherwise surfaces a clear "binary moved"
+/// error so the status bar can flash something useful.
+///
+/// Used by every TUI code path that spawns `fleet workflow run …` as
+/// a subprocess: spawn-picker, autonomous-mode dispatcher,
+/// scheduler dispatcher.
+pub fn resolve_fleet_binary() -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    let raw = std::env::current_exe().context("resolving current fleet binary via current_exe()")?;
+    let s = raw.to_string_lossy();
+    let stripped = s.strip_suffix(" (deleted)").unwrap_or(&s);
+    let path = PathBuf::from(stripped.to_string());
+    if !path.is_file() {
+        anyhow::bail!(
+            "fleet binary `{}` is gone — was the TUI's binary rebuilt or moved \
+             while it was running? Relaunch fleet to pick up the new path.",
+            path.display(),
+        );
+    }
+    Ok(path)
+}
+
 pub fn build_workflow_run_command(
     fleet_binary: &Path,
     workflow_name: &str,

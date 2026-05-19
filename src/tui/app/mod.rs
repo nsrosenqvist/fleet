@@ -23,6 +23,8 @@ mod doctor;
 mod plans;
 mod sessions;
 mod spawn;
+mod status;
+pub(in crate::tui) use status::StatusBar;
 
 // Re-exports — anything the input/event-loop side, tests, or sibling
 // `tui` modules reach for through `super::app::*` lives here. Types
@@ -77,7 +79,10 @@ pub(super) struct AppState {
     /// Re-read on selection change so it doesn't go stale across refreshes.
     pub(super) log_tail: Vec<String>,
     pub(super) last_selected_id: Option<String>,
-    pub(super) status_line: String,
+    /// Encapsulated bottom-bar state. Owns the transient flash
+    /// message + TTL + dismiss-on-keystroke semantics. Replaces
+    /// the historical `(status_line, flash_set_at)` pair.
+    pub(in crate::tui) status: StatusBar,
     /// Which top-level view is active. Toggled by `d`.
     pub(super) view: View,
     /// Lazily-computed doctor snapshot. `None` until the user enters
@@ -251,7 +256,7 @@ impl AppState {
             list_state: ListState::default(),
             log_tail: Vec::new(),
             last_selected_id: None,
-            status_line: " ready ".to_string(),
+            status: StatusBar::default(),
             view: View::Sessions,
             doctor: None,
             spawn: SpawnPickerState::empty(),
@@ -292,6 +297,14 @@ impl AppState {
         Ok(state)
     }
 
+    /// Thin shim that forwards to [`StatusBar::flash`]. Kept on
+    /// [`AppState`] so existing call sites compile without the
+    /// `self.status.flash(...)` rename; new code should prefer
+    /// calling `self.status.flash(...)` directly.
+    pub(in crate::tui) fn set_flash(&mut self, msg: impl Into<String>) {
+        self.status.flash(msg);
+    }
+
     pub(super) fn reload(&mut self, store: &SessionStore) -> Result<()> {
         let ids = store.list().context("listing sessions")?;
         let mut sessions = Vec::with_capacity(ids.len());
@@ -320,7 +333,7 @@ impl AppState {
         if let Err(err) =
             crate::autonomous::reconcile_plans_from_sessions(&self.sessions, &plan_store, now_ms())
         {
-            self.status_line = format!(" reconcile failed: {err:#} ");
+            self.status.flash(format!(" reconcile failed: {err:#} "));
         }
         self.refresh_plans();
         self.refresh_orchestrators();
@@ -330,7 +343,6 @@ impl AppState {
             .unwrap_or_else(|_| crate::deps::DepsDoc::empty());
         self.cycle_nodes = crate::deps::nodes_in_cycle(&doc);
         self.deps_doc = doc;
-        self.status_line = super::ui::render_status_line(&self.sessions, &self.plans);
         // Sessions may have appeared / disappeared on reload, so the
         // worker target list the refresh thread polls needs to track.
         self.publish_refresh_inputs();
@@ -448,14 +460,14 @@ impl AppState {
         let store = OrchestratorStore::for_repo(&self.root);
         let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
         if let Err(err) = crate::orchestrator::reaper::reap(&store, invoker.as_ref(), now_ms()) {
-            self.status_line = format!(" orchestrator: reap failed: {err:#} ");
+            self.status.flash(format!(" orchestrator: reap failed: {err:#} "));
         }
         self.orchestrators.clear();
         if store.exists() {
             match store.load() {
                 Ok(s) => self.orchestrators.push(s),
                 Err(err) => {
-                    self.status_line = format!(" orchestrator: load failed: {err:#} ");
+                    self.status.flash(format!(" orchestrator: load failed: {err:#} "));
                 }
             }
         }
@@ -514,7 +526,7 @@ impl AppState {
                 if matches!(key.code, KeyCode::Char('y' | 'Y')) {
                     self.run_confirm_action(&action, store);
                 } else {
-                    self.status_line = " kill cancelled ".to_string();
+                    self.status.flash(" kill cancelled ".to_string());
                 }
             }
             Overlay::Error { .. } => {

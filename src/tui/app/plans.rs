@@ -91,7 +91,7 @@ impl AppState {
 
     fn toggle_selected_plan_pause(&mut self) {
         let Some(idx) = self.plans_list_state.selected() else {
-            self.status_line = " no plan selected ".to_string();
+            self.set_flash(" no plan selected ");
             return;
         };
         let Some(plan) = self.plans.get_mut(idx) else {
@@ -101,11 +101,12 @@ impl AppState {
             PlanState::Active => PlanState::Paused,
             PlanState::Paused => PlanState::Active,
             PlanState::Completed | PlanState::Abandoned => {
-                self.status_line = format!(
+                let msg = format!(
                     " plan `{}` is {} — pause/resume only applies to active plans ",
                     plan.id,
                     crate::tui::ui::plan_state_word(plan.state),
                 );
+                self.set_flash(msg);
                 return;
             }
         };
@@ -113,58 +114,61 @@ impl AppState {
         plan.state = target;
         plan.updated_at_ms = now_ms();
         let store = PlanStore::for_repo(&self.root);
+        let plan_id = plan.id.clone();
         match store.save(plan) {
             Ok(()) => {
-                self.status_line = format!(
+                self.set_flash(format!(
                     " plan `{}` → {} ",
-                    plan.id,
-                    crate::tui::ui::plan_state_word(target)
-                );
+                    plan_id,
+                    crate::tui::ui::plan_state_word(target),
+                ));
             }
             Err(err) => {
                 plan.state = previous;
-                self.status_line = format!(" plan save failed: {err:#} ");
+                self.set_flash(format!(" plan save failed: {err:#} "));
             }
         }
     }
 
     fn complete_selected_plan(&mut self) {
         let Some(idx) = self.plans_list_state.selected() else {
-            self.status_line = " no plan selected ".to_string();
+            self.set_flash(" no plan selected ");
             return;
         };
         let Some(plan) = self.plans.get_mut(idx) else {
             return;
         };
         if plan.state == PlanState::Completed {
-            self.status_line = format!(" plan `{}` already completed ", plan.id);
+            let msg = format!(" plan `{}` already completed ", plan.id);
+            self.set_flash(msg);
             return;
         }
         let previous = plan.state;
         plan.state = PlanState::Completed;
         plan.updated_at_ms = now_ms();
         let store = PlanStore::for_repo(&self.root);
+        let plan_id = plan.id.clone();
         match store.save(plan) {
             Ok(()) => {
-                self.status_line = format!(" plan `{}` → completed ", plan.id);
+                self.set_flash(format!(" plan `{plan_id}` → completed "));
             }
             Err(err) => {
                 plan.state = previous;
-                self.status_line = format!(" plan save failed: {err:#} ");
+                self.set_flash(format!(" plan save failed: {err:#} "));
             }
         }
     }
 
     fn unblock_selected_plan_item(&mut self) {
         if self.plans_focus != PlansFocus::Items {
-            self.status_line = " press Tab to focus items before unblocking ".to_string();
+            self.set_flash(" press Tab to focus items before unblocking ");
             return;
         }
         let Some(plan) = self.selected_plan() else {
             return;
         };
         let Some(item_idx) = self.plans_items_state.selected() else {
-            self.status_line = " no item selected ".to_string();
+            self.set_flash(" no item selected ");
             return;
         };
         let Some(item) = plan.items.get(item_idx) else {
@@ -174,12 +178,14 @@ impl AppState {
         let deps_store = crate::deps::DepsStore::for_repo(&self.root);
         match deps_store.remove_edges_for_blocked(&ticket) {
             Ok(n) => {
-                self.status_line =
-                    format!(" ticket `{ticket}`: cleared {n} dep edge{} ", plural(n));
+                self.set_flash(format!(
+                    " ticket `{ticket}`: cleared {n} dep edge{} ",
+                    plural(n),
+                ));
                 self.refresh_cycle_nodes_only();
             }
             Err(err) => {
-                self.status_line = format!(" unblock failed: {err:#} ");
+                self.set_flash(format!(" unblock failed: {err:#} "));
             }
         }
     }
@@ -213,7 +219,7 @@ impl AppState {
                 }
             }
             Err(err) => {
-                self.status_line = format!(" tracker list failed: {err:#} ");
+                self.set_flash(format!(" tracker list failed: {err:#} "));
             }
         }
     }
@@ -228,7 +234,7 @@ impl AppState {
         let ids = match store.list() {
             Ok(ids) => ids,
             Err(err) => {
-                self.status_line = format!(" plans: list failed: {err:#} ");
+                self.set_flash(format!(" plans: list failed: {err:#} "));
                 self.plans.clear();
                 self.plans_list_state.select(None);
                 return;
@@ -239,7 +245,7 @@ impl AppState {
             match store.load(&id) {
                 Ok(p) => plans.push(p),
                 Err(err) => {
-                    self.status_line = format!(" plans: load `{id}` failed: {err:#} ");
+                    self.set_flash(format!(" plans: load `{id}` failed: {err:#} "));
                 }
             }
         }

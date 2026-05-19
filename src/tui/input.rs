@@ -18,6 +18,16 @@ use super::app::{Action, AppState};
 /// Per-tick keyboard dispatch. Returns the [`Action`] the event loop
 /// should perform (quit, suspend to open the orchestrator, etc.) or
 /// [`Action::None`] when the keystroke was fully consumed in-place.
+///
+/// Dismissing the status flash here means *any* keystroke clears
+/// stale messages — the user moving on is the signal that they've
+/// acknowledged whatever was shown. If the handler itself emits a
+/// new flash (e.g. `Shift+P` flashes "plan → paused"), that flash
+/// supersedes the clear because writes happen after the dismiss.
+/// Mouse and paste events deliberately don't reach this path, so a
+/// Shift-mouse text-selection for copying doesn't wipe the error
+/// the user is trying to read.
 pub(super) fn handle_key(state: &mut AppState, key: KeyEvent, store: &SessionStore) -> Action {
+    state.status.dismiss();
     state.handle_key(key, store)
 }

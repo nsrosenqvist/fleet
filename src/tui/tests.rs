@@ -503,7 +503,7 @@ fn confirm_overlay_n_cancels_without_kill() {
     );
     assert_eq!(state.selected().unwrap().state, SessionState::Running);
     assert!(matches!(state.overlay, Overlay::None));
-    assert!(state.status_line.contains("cancelled"));
+    assert!(state.status.current().unwrap_or("").contains("cancelled"));
 }
 
 #[test]
@@ -563,7 +563,7 @@ fn handle_key_shift_k_on_terminal_session_is_a_noop_with_status_message() {
     // Already-terminal short-circuits before the confirm even
     // opens — status line gets the note; no overlay.
     assert_eq!(state.selected().unwrap().state, SessionState::Completed);
-    assert!(state.status_line.contains("already"));
+    assert!(state.status.current().unwrap_or("").contains("already"));
     assert!(matches!(state.overlay, Overlay::None));
 }
 
@@ -625,9 +625,9 @@ fn handle_key_shift_t_for_placeholder_tracker_flashes_status() {
     );
     assert_eq!(action, Action::None);
     assert!(
-        state.status_line.contains("linear") && state.status_line.contains("no local TUI"),
+        state.status.current().unwrap_or("").contains("linear") && state.status.current().unwrap_or("").contains("no local TUI"),
         "expected status line to explain the no-op, got {:?}",
-        state.status_line
+        state.status.current().unwrap_or("")
     );
 }
 
@@ -818,9 +818,9 @@ fn poll_pending_spawn_surfaces_nonzero_exit_as_error_overlay() {
         other => panic!("expected Error overlay, got {other:?}"),
     }
     assert!(
-        state.status_line.contains("review-only"),
+        state.status.current().unwrap_or("").contains("review-only"),
         "status line should name the failed workflow; got: {}",
-        state.status_line,
+        state.status.current().unwrap_or(""),
     );
 }
 
@@ -2353,9 +2353,9 @@ fn shift_p_is_a_noop_with_status_when_plan_is_completed() {
     // State left alone; status line explains why.
     assert_eq!(state.plans[0].state, PlanState::Completed);
     assert!(
-        state.status_line.contains("completed"),
+        state.status.current().unwrap_or("").contains("completed"),
         "got: {}",
-        state.status_line
+        state.status.current().unwrap_or("")
     );
 }
 
@@ -2418,9 +2418,9 @@ fn u_with_sidebar_focus_emits_status_message_and_does_nothing() {
     let doc = deps_store.load().unwrap();
     assert_eq!(doc.edges.len(), 1);
     assert!(
-        state.status_line.contains("Tab"),
+        state.status.current().unwrap_or("").contains("Tab"),
         "got: {}",
-        state.status_line
+        state.status.current().unwrap_or("")
     );
 }
 

@@ -61,10 +61,10 @@ impl AppState {
                 args: &["dash"],
             },
             Tracker::Linear | Tracker::Jira => {
-                self.status_line = format!(
+                self.status.flash(format!(
                     " tracker {} has no local TUI ",
                     self.config.tracker.as_str()
-                );
+                ));
                 Action::None
             }
         }
@@ -72,11 +72,11 @@ impl AppState {
 
     pub(in crate::tui) fn prompt_kill_selected(&mut self) {
         let Some(session) = self.selected() else {
-            self.status_line = " kill: no session selected ".to_string();
+            self.status.flash(" kill: no session selected ".to_string());
             return;
         };
         if session.state.is_terminal() {
-            self.status_line = format!(" {} already {:?} ", session.id, session.state);
+            self.status.flash(format!(" {} already {:?} ", session.id, session.state));
             return;
         }
         self.overlay = Overlay::Confirm {
@@ -114,7 +114,7 @@ impl AppState {
                 self.config =
                     RepoConfig::load(self.root.join(".fleet/config.yaml")).unwrap_or_default();
                 if let Err(err) = self.reload(store) {
-                    self.status_line = format!(" reload failed: {err:#} ");
+                    self.status.flash(format!(" reload failed: {err:#} "));
                 }
                 Action::None
             }
@@ -164,11 +164,11 @@ impl AppState {
             return Action::None;
         };
         if session.state.is_terminal() {
-            self.status_line = format!(
+            self.status.flash(format!(
                 " {} is {} — attach is only for live sessions ",
                 session.id,
                 crate::tui::ui::state_word(session.state)
-            );
+            ));
             return Action::None;
         }
         // `worker_panes` is populated by the refresh thread when
@@ -176,10 +176,10 @@ impl AppState {
         // for "is the tmux pane alive?". This avoids a synchronous
         // `tmux has-session` round-trip on the input thread.
         if !self.worker_panes.contains_key(&session.id) {
-            self.status_line = format!(
+            self.status.flash(format!(
                 " {} has no live tmux pane — was it spawned with --detached? ",
                 session.id
-            );
+            ));
             return Action::None;
         }
         Action::AttachWorker {
@@ -276,7 +276,7 @@ impl AppState {
             return;
         };
         if session.state.is_terminal() {
-            self.status_line = format!(" {} already {:?} ", session.id, session.state);
+            self.status.flash(format!(" {} already {:?} ", session.id, session.state));
             return;
         }
         if let Err(err) = session.transition_to(SessionState::Failed, now_ms()) {
@@ -291,7 +291,7 @@ impl AppState {
             };
             return;
         }
-        self.status_line = format!(" {} → failed ", session.id);
+        self.status.flash(format!(" {} → failed ", session.id));
     }
 }
 

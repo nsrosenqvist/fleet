@@ -1,5 +1,10 @@
 //! Bottom status bar — action-driven flashes, autonomous mode badge,
 //! and the per-view keybinding legend.
+//!
+//! Flash state is owned by [`crate::tui::app::StatusBar`]. This
+//! module is now a pure renderer: it asks the bar for `current()`
+//! (which encapsulates the TTL) and either paints that flash or
+//! falls back to the legend.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -7,18 +12,21 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+#[cfg(test)]
 use crate::plans::{Plan, PlanState};
+#[cfg(test)]
 use crate::session::Session;
 use crate::tui::app::{AppState, View};
 use crate::tui::theme::{ACCENT, ERR, MUTED, OK, badge, chip, key as theme_key, sep};
 
+#[cfg(test)]
 use super::lifetime_cost;
 
 pub(super) fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    // Action-driven flashes replace the legend rather than appending to
-    // it — long error messages from a real shell-out can run past the
-    // right edge of a typical terminal and chop off the relevant text.
-    // Anything load-bearing belongs on the left.
+    // Autonomous-mode badge takes priority — even with a flash
+    // pending, surfacing "autonomous: ON · ..." is more useful than
+    // a per-action result that the autonomous engine itself may have
+    // produced.
     if state.autonomous.enabled() || state.autonomous.status() != "autonomous: OFF" {
         let line = Line::from(vec![
             badge(" auto ", ACCENT),
@@ -31,13 +39,14 @@ pub(super) fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
-    let trimmed = state.status_line.trim();
-    if !trimmed.is_empty() && trimmed != "ready" && !is_steady_state_line(trimmed) {
-        // Heuristic: status messages naming a failure (kill rejected,
-        // spawn failed, reload failed) get the error badge; everything
-        // else is treated as info. The wording is deliberate — every
-        // failure path in `app.rs` includes "failed" or "rejected" in
-        // its status line.
+    if let Some(msg) = state.status.current() {
+        let trimmed = msg.trim();
+        // Heuristic: status messages naming a failure (kill
+        // rejected, spawn failed, reload failed) get the error
+        // badge; everything else reads as info. The wording is
+        // deliberate — every failure path in the app modules
+        // includes "failed", "rejected", or "error" in its flash
+        // string.
         let is_error =
             trimmed.contains("failed") || trimmed.contains("rejected") || trimmed.contains("error");
         let (glyph, color) = if is_error {
@@ -61,36 +70,10 @@ pub(super) fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 }
 
-/// `true` when `s` is the steady-state status line produced by
-/// [`render_status_line`] (`N sessions`, possibly with cost/plan
-/// suffixes). Those aren't action results — they're the default the
-/// app resets to on every `reload`, so we should show the legend
-/// instead of badging them as a flash.
-fn is_steady_state_line(s: &str) -> bool {
-    // The render_status_line shape always begins with a digit count
-    // followed by " sessions". Anything matching that is the
-    // information line, not a transient flash.
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_digit() {
-        return false;
-    }
-    // Skip the rest of the leading number, then look for ` sessions`.
-    while let Some(c) = chars.clone().next() {
-        if c.is_ascii_digit() {
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    chars.as_str().starts_with(" sessions")
-}
-
 /// Build the bottom-bar legend for the active view. Capital letters
 /// stand for Shift-modified bindings (`K` = Shift+K, etc.) — no `⇧`
 /// glyph because the case already carries the meaning.
+#[allow(clippy::too_many_lines)] // one match arm per view; each is a flat list of spans.
 fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = vec![chip("[fleet]", ACCENT), sep()];
     match state.view {
@@ -117,6 +100,9 @@ fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
                 theme_key("A"),
                 Span::raw(" auto"),
                 sep(),
+                theme_key("L"),
+                Span::raw(" loop"),
+                sep(),
                 theme_key("T"),
                 Span::raw(" tracker"),
                 sep(),
@@ -136,6 +122,12 @@ fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
                 sep(),
                 theme_key("r"),
                 Span::raw(" re-probe"),
+                sep(),
+                theme_key("A"),
+                Span::raw(" auto"),
+                sep(),
+                theme_key("L"),
+                Span::raw(" loop"),
                 sep(),
                 theme_key("q"),
                 Span::raw(" quit"),
@@ -173,6 +165,12 @@ fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
                 theme_key("u"),
                 Span::raw(" unblock"),
                 sep(),
+                theme_key("A"),
+                Span::raw(" auto"),
+                sep(),
+                theme_key("L"),
+                Span::raw(" loop"),
+                sep(),
                 theme_key("r"),
                 Span::raw(" reload"),
                 sep(),
@@ -186,8 +184,11 @@ fn status_legend_spans(state: &AppState) -> Vec<Span<'static>> {
     spans
 }
 
-/// Render the status-bar tail used by the sidebar when autonomous
-/// mode isn't taking over the line.
+/// Render the steady-state "N sessions · …" tail. The live status
+/// bar no longer pre-builds this — `state.status` owns the flash
+/// channel directly — but tests still assert against the wording,
+/// so the helper survives gated on `cfg(test)`.
+#[cfg(test)]
 #[must_use]
 pub(in crate::tui) fn render_status_line(sessions: &[Session], plans: &[Plan]) -> String {
     let (total, samples) = lifetime_cost(sessions);

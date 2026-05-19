@@ -24,11 +24,14 @@ mod status_bar;
 // callers reach for through `super::ui::*` lives here. Inside the `ui`
 // tree, submodules pull from each other via `super::` directly.
 //
-// `plan_state_word` and `render_status_line` are surfaced for the
-// non-test path (app.rs status-line composition); the rest are
+// `plan_state_word` is surfaced for the non-test path; the rest are
 // test-only re-exports that mirror the pre-split flat `ui::*`
-// surface tests assert against.
+// surface tests assert against. `render_status_line` survives as a
+// test-only helper now — the live renderer reads from
+// `state.status` directly and no longer needs the steady-state line
+// pre-built into `status_line`.
 pub(super) use plans::plan_state_word;
+#[cfg(test)]
 pub(super) use status_bar::render_status_line;
 
 #[cfg(test)]
@@ -201,7 +204,9 @@ pub fn format_cost(cost: Option<f64>) -> String {
 }
 
 /// Walk every session and sum the ones with cost data. Returns
-/// `(total, samples)`.
+/// `(total, samples)`. Only `render_status_line` consumes this now,
+/// which itself is `cfg(test)` — gated together.
+#[cfg(test)]
 #[must_use]
 pub fn lifetime_cost(sessions: &[Session]) -> (f64, usize) {
     let mut total = 0.0;
