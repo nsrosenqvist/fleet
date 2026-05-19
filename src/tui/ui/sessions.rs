@@ -211,6 +211,8 @@ pub(in crate::tui) fn session_row_label(
     plans: &[Plan],
     cycle_nodes: &std::collections::HashSet<String>,
 ) -> String {
+    use std::fmt::Write as _;
+
     let cost_suffix = session
         .total_cost_usd()
         .map_or_else(String::new, |v| format!(" ${v:.2}"));
@@ -219,17 +221,60 @@ pub(in crate::tui) fn session_row_label(
     } else {
         ""
     };
+    // Lead with the meaningful subject so the row tells the user
+    // what this session is *for* — a 20-char hex session id alone
+    // can't be cross-referenced at a glance. Order:
+    //   <marker> <subject> <workflow> [· title] [$cost] [· plan]
+    // where `subject` is `#<issue>` / `pr:<n>` / a trailing
+    // session-id stub when neither binding is present.
+    let (subject, title) = subject_and_title(session);
     let mut label = format!(
-        "{warning_prefix}{} {} {}{cost_suffix}",
+        "{warning_prefix}{} {subject} {}{cost_suffix}",
         state_marker(session.state),
-        session.id,
         session.workflow,
     );
+    if let Some(title) = title {
+        let _ = write!(label, " — {}", truncate_for_row(&title, 60));
+    }
     if let Some(annotation) = plan_annotation_for(session, plans) {
-        use std::fmt::Write as _;
         let _ = write!(label, " · {annotation}");
     }
     label
+}
+
+/// Return the meaningful identifier for a session and its title (if
+/// any). PRs and issues take precedence; sessions with neither
+/// fall back to a short session-id stub so consecutive issueless
+/// sessions are still distinguishable.
+fn subject_and_title(session: &Session) -> (String, Option<String>) {
+    if let Some(pr) = session.pr.as_ref() {
+        return (format!("pr:{}", pr.number), Some(pr.title.clone()));
+    }
+    if let Some(issue) = session.issue.as_ref() {
+        return (
+            format!("#{}", issue.human_id),
+            Some(issue.title.clone()),
+        );
+    }
+    // No binding — show a short id stub. Full id is in the details
+    // pane; the stub here just disambiguates consecutive rows.
+    let raw = session.id.as_str();
+    let stub = raw
+        .rsplit_once('-')
+        .map_or(raw, |(_, tail)| tail);
+    (format!("s-…{stub}"), None)
+}
+
+/// Trim a string at a char boundary (not a byte index) so we don't
+/// slice multi-byte UTF-8 in half. Adds an ellipsis when truncation
+/// happened so the user knows there's more to read in the details
+/// pane.
+fn truncate_for_row(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }
 
 #[must_use]

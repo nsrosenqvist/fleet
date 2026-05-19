@@ -1846,6 +1846,35 @@ fn session_row_label_preserves_cost_suffix_before_plan_annotation() {
 }
 
 #[test]
+fn session_row_label_leads_with_ticket_id_and_includes_title() {
+    let s = session_with_ticket("s-1", "standard", "14b3415");
+    let label = session_row_label(&s, &[], &no_cycles());
+    assert!(label.contains("#14b3415"), "got: {label}");
+    // session_with_ticket sets title to "T" in the helper; that's
+    // enough to verify the dash separator + title shape.
+    assert!(label.contains(" — T"), "got: {label}");
+    // Session id should NOT lead the row anymore — that's noise.
+    assert!(!label.contains("s-1"), "got: {label}");
+}
+
+#[test]
+fn session_row_label_falls_back_to_id_stub_when_no_ticket_or_pr() {
+    let s = session("s-0019e4-0042", "standard", SessionState::Running, 1);
+    let label = session_row_label(&s, &[], &no_cycles());
+    assert!(label.contains("s-…0042"), "got: {label}");
+}
+
+#[test]
+fn session_row_label_truncates_long_titles_with_ellipsis() {
+    let mut s = session_with_ticket("s-1", "standard", "42");
+    s.issue.as_mut().unwrap().title =
+        "A really long ticket title that won't fit cleanly in the workers pane and \
+         keeps going past the soft limit".to_string();
+    let label = session_row_label(&s, &[], &no_cycles());
+    assert!(label.contains('…'), "expected ellipsis; got: {label}");
+}
+
+#[test]
 fn session_row_label_prepends_warning_when_session_ticket_is_in_cycle() {
     let s = session_with_ticket("s-1", "standard", "43");
     let mut cycles = std::collections::HashSet::new();
