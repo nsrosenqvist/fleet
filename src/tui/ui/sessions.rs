@@ -18,7 +18,7 @@ use crate::plans::{Plan, PlanState};
 use crate::session::Session;
 use crate::tui::app::{AppState, SessionsFocus};
 use crate::tui::theme::{
-    ACCENT, MUTED, OK, SELECT_BG, SELECT_FG, WARN, framed_block, framed_block_accent,
+    ACCENT, IDENT, MUTED, OK, SELECT_BG, SELECT_FG, WARN, framed_block, framed_block_accent,
     framed_block_titled, kv_line,
 };
 
@@ -398,7 +398,13 @@ fn detail_lines_for(target: &DetailTarget<'_>) -> Vec<Line<'static>> {
 fn worker_detail_lines(session: &Session) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = detail_kv_pairs(session)
         .into_iter()
-        .map(|(k, v)| kv_line(k, &v))
+        .map(|(k, v)| match k {
+            // Ticket / PR ids get the same cyan-bold IDENT treatment
+            // the plans view uses for ticket ids, so the eye lands on
+            // "what this is for" the same way across views.
+            "ticket" | "pr" => kv_line_with_ident_id(k, &v),
+            _ => kv_line(k, &v),
+        })
         .collect();
     if !session.node_costs.is_empty() {
         lines.push(Line::from(""));
@@ -408,6 +414,24 @@ fn worker_detail_lines(session: &Session) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// kv row where `value` is `<id> <title…>`. Splits at the first space
+/// so the id gets the IDENT colour + bold (matching the plans view's
+/// ticket-id style) and the title reads as plain text. The label
+/// stays muted like every other kv row.
+fn kv_line_with_ident_id(key: &str, value: &str) -> Line<'static> {
+    let muted = Style::default().fg(MUTED);
+    let ident_style = Style::default().fg(IDENT).add_modifier(Modifier::BOLD);
+    let (id, title) = value.split_once(' ').unwrap_or((value, ""));
+    let mut spans = vec![
+        Span::styled(format!("{key:<14}"), muted),
+        Span::styled(id.to_string(), ident_style),
+    ];
+    if !title.is_empty() {
+        spans.push(Span::raw(format!(" {title}")));
+    }
+    Line::from(spans)
 }
 
 fn orchestrator_detail_lines(orch: &OrchestratorSession) -> Vec<Line<'static>> {
