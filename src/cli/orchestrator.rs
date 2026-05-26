@@ -80,7 +80,29 @@ pub fn run_default() -> Result<i32> {
         eprintln!("warning: orchestrator reap failed: {err:#}");
     }
 
-    if store.exists() {
+    // Dispatch on the *union* of "meta on disk" and "tmux session
+    // alive" — either is sufficient to say "an orchestrator is in
+    // play; just attach". A common asymmetric state to defend
+    // against is `rm -rf .fleet/orchestrator/` (a reset script, or
+    // a previous failed-but-side-effect-succeeded spawn) leaving
+    // tmux alive while meta is gone. Without this, the next launch
+    // tries spawn_fresh, hits `tmux new-session` against an
+    // already-existing session, and dies with `duplicate session:
+    // fl-orchestrator`.
+    let meta_exists = store.exists();
+    let tmux_alive = tmux::has_session(invoker.as_ref(), TMUX_SESSION_NAME);
+    if meta_exists || tmux_alive {
+        // Synthesize the meta when tmux is up but meta was wiped,
+        // so the rest of the flow has something to load. The agent
+        // name comes from config — that's what spawn_fresh would
+        // have used, and matches what's actually executing in the
+        // tmux pane (the launcher inherits from config too).
+        if !meta_exists {
+            let session = OrchestratorSession::new(&config.orchestrator.agent, now_ms());
+            store
+                .save(&session)
+                .with_context(|| "synthesising orchestrator meta after tmux-alive / meta-missing")?;
+        }
         ensure_alive(&store, &root, &invoker)?;
     } else {
         spawn_fresh(&store, &config, &root, &invoker)?;
