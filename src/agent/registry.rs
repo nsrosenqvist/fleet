@@ -131,6 +131,16 @@ fn claude_code_default() -> AgentSpec {
 /// claude with the rendered prompt in print mode. Kept as a single
 /// `const &str` so the registry stays a value object — no shell
 /// templating, no string concatenation at registration time.
+///
+/// `--dangerously-skip-permissions` is intentional: fleet runs each
+/// agent in a per-session devcontainer with a per-session worktree
+/// and the `fleet-git` push guard already mounted — the container
+/// is the sandbox. Claude's in-container `permissionMode: "default"`
+/// would block every Write tool / Bash redirect on interactive
+/// approval, which is impossible in an unattended pipeline and was
+/// observed (transcript: "The environment does not have
+/// `Write(/artifacts/**)` permission configured…") failing every
+/// planner node.
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) const CLAUDE_CODE_ENTRY_SCRIPT: &str = "\
 set -e
@@ -140,7 +150,7 @@ if [ -n \"$TOKEN\" ]; then
   printf '{\"claudeAiOauth\":{\"accessToken\":\"%s\",\"scopes\":[\"user:inference\"],\"subscriptionType\":\"subscription\"}}\\n' \"$TOKEN\" > \"$HOME/.claude/.credentials.json\"
   chmod 600 \"$HOME/.claude/.credentials.json\"
 fi
-exec claude -p \"${FLEET_PROMPT:-No prompt provided. Please summarise what claude code is in two sentences.}\"
+exec claude --dangerously-skip-permissions -p \"${FLEET_PROMPT:-No prompt provided. Please summarise what claude code is in two sentences.}\"
 ";
 
 #[cfg(test)]
@@ -173,6 +183,20 @@ mod tests {
             spec.env_passthrough
                 .iter()
                 .any(|e| e == "CLAUDE_CODE_OAUTH_TOKEN")
+        );
+    }
+
+    #[test]
+    fn default_claude_code_invokes_with_dangerously_skip_permissions() {
+        // The agent runs in a per-session devcontainer sandbox; an
+        // interactive in-container permission prompt deadlocks the
+        // unattended pipeline. Pin the flag so a future "clean up
+        // dangerous-sounding flags" refactor can't silently re-break
+        // every planner / coder / reviewer node.
+        let script = &claude_code_default().command[2];
+        assert!(
+            script.contains("--dangerously-skip-permissions"),
+            "trampoline must opt out of claude's in-container permission gate: {script}",
         );
     }
 
