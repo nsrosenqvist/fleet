@@ -284,6 +284,23 @@ pub(crate) fn build_attach_script(session: &str) -> String {
     let status_left =
         " #[fg=colour141,bold]#S#[default] #[fg=brightblack]│#[default] ctrl+b d to detach ";
     let q_status_left = shell_single_quote(status_left);
+    // The session arrives at this script pinned to the TUI preview
+    // pane's small dimensions (the refresh thread set
+    // `window-size manual` + `resize-window` to make capture-pane
+    // produce a useful snapshot). Setting `window-size latest`
+    // alone does NOT trigger a re-fit — it only changes the policy
+    // for future client-add events, and tmux doesn't re-evaluate
+    // size when an option flips. The first attach therefore stays
+    // at the pinned-small dimensions; detach/reattach works
+    // because by then `latest` mode is already in effect during
+    // the new client's attach.
+    //
+    // Fix: explicit-resize to the host terminal's actual dimensions
+    // BEFORE attaching. Read with `tput`; fall back to a sensible
+    // default so the script still runs on stripped-down systems.
+    // Order matters: flip to `manual` to make `resize-window` take,
+    // then resize, then set `latest` so subsequent detach/reattach
+    // cycles continue to fit the latest client automatically.
     format!(
         "set -e
 tmux set-option -t {s} status on >/dev/null 2>&1 || true
@@ -292,6 +309,10 @@ tmux set-option -t {s} status-left {q_status_left} >/dev/null 2>&1 || true
 tmux set-option -t {s} status-left-length 60 >/dev/null 2>&1 || true
 tmux set-option -t {s} window-status-current-style 'fg=colour141,bold' >/dev/null 2>&1 || true
 tmux set-option -t {s} window-status-style 'fg=colour250' >/dev/null 2>&1 || true
+COLS=$(tput cols 2>/dev/null || echo 200)
+LINES=$(tput lines 2>/dev/null || echo 50)
+tmux set-option -t {s} window-size manual >/dev/null 2>&1 || true
+tmux resize-window -t {s} -x \"$COLS\" -y \"$LINES\" >/dev/null 2>&1 || true
 tmux set-option -t {s} window-size latest >/dev/null 2>&1 || true
 exec tmux attach -t {s}
 "
@@ -427,6 +448,51 @@ mod tests {
             script.contains(&format!("set-option -t '{TMUX_SESSION_NAME}' status on")),
             "script: {script}"
         );
+    }
+
+    #[test]
+    fn attach_script_explicit_resizes_to_host_terminal_dims_before_attach() {
+        // Regression: setting `window-size latest` doesn't itself
+        // re-fit the window — it only changes the policy. The
+        // first attach therefore stays at whatever size the refresh
+        // thread last pinned (the small preview pane's dims).
+        // Explicit `resize-window -x $COLS -y $LINES` before the
+        // `exec tmux attach` makes the FIRST attach render at the
+        // host terminal's full size; subsequent attaches use the
+        // `latest` policy as before.
+        let script = build_attach_script(TMUX_SESSION_NAME);
+        // The order matters: manual → resize → latest → attach.
+        // Without manual flipped first, resize-window is a no-op
+        // because the window-size policy overrides the explicit
+        // resize.
+        let manual_idx = script
+            .find("window-size manual")
+            .expect("attach script must flip to manual before explicit resize");
+        let resize_idx = script
+            .find("resize-window")
+            .expect("attach script must explicit-resize before attach");
+        let latest_idx = script
+            .rfind("window-size latest")
+            .expect("attach script must restore latest mode for subsequent attaches");
+        let attach_idx = script
+            .find("exec tmux attach")
+            .expect("attach script should exec tmux attach");
+        assert!(
+            manual_idx < resize_idx,
+            "manual must precede resize (script: {script})"
+        );
+        assert!(
+            resize_idx < latest_idx,
+            "resize must precede the latest restoration (script: {script})"
+        );
+        assert!(
+            latest_idx < attach_idx,
+            "latest must be set before attach (script: {script})"
+        );
+        // The dimensions come from tput so the explicit resize
+        // matches whatever terminal the user launched fleet from.
+        assert!(script.contains("tput cols"), "must read tput cols");
+        assert!(script.contains("tput lines"), "must read tput lines");
     }
 
     #[test]
