@@ -16,7 +16,7 @@ use ratatui::widgets::Paragraph;
 use crate::plans::{Plan, PlanState};
 #[cfg(test)]
 use crate::session::Session;
-use crate::tui::app::{AppState, View};
+use crate::tui::app::{AppState, FlashKind, View};
 use crate::tui::theme::{ACCENT, ERR, MUTED, OK, badge, chip, key as theme_key, sep};
 
 #[cfg(test)]
@@ -32,18 +32,13 @@ pub(super) fn render_status(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     // doesn't need to repeat it.
     if let Some(msg) = state.status.current() {
         let trimmed = msg.trim();
-        // Heuristic: status messages naming a failure (kill
-        // rejected, spawn failed, reload failed) get the error
-        // badge; everything else reads as info. The wording is
-        // deliberate — every failure path in the app modules
-        // includes "failed", "rejected", or "error" in its flash
-        // string.
-        let is_error =
-            trimmed.contains("failed") || trimmed.contains("rejected") || trimmed.contains("error");
-        let (glyph, color) = if is_error {
-            (" ! ", ERR)
-        } else {
-            (" ✓ ", OK)
+        // Kind is set at write time (`flash` vs `flash_error`), so
+        // the renderer doesn't have to guess from message contents
+        // any more. Errors get the err badge + colour and stick
+        // until the user presses a key.
+        let (glyph, color) = match state.status.current_kind() {
+            Some(FlashKind::Error) => (" ! ", ERR),
+            _ => (" ✓ ", OK),
         };
         let line = Line::from(vec![
             badge(glyph, color),

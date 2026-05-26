@@ -88,7 +88,7 @@ impl AppState {
             }
             KeyCode::Char('r') => {
                 if let Err(err) = self.reload(store) {
-                    self.status.flash(format!(" reload failed: {err:#} "));
+                    self.status.flash_error(format!(" reload failed: {err:#} "));
                 }
                 self.doctor = Some(DoctorSnapshot::probe(self.root.clone()));
                 Action::None

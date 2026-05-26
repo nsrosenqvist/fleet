@@ -114,7 +114,7 @@ impl AppState {
                 self.config =
                     RepoConfig::load(self.root.join(".fleet/config.yaml")).unwrap_or_default();
                 if let Err(err) = self.reload(store) {
-                    self.status.flash(format!(" reload failed: {err:#} "));
+                    self.status.flash_error(format!(" reload failed: {err:#} "));
                 }
                 Action::None
             }
@@ -291,7 +291,7 @@ impl AppState {
             };
             return;
         }
-        self.status.flash(format!(" {} → failed ", session.id));
+        self.status.flash_error(format!(" {} → failed ", session.id));
     }
 }
 

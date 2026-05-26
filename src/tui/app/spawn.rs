@@ -550,14 +550,14 @@ impl AppState {
             .as_ref()
             .map(|d| d.engine_reachable.clone())
         {
-            self.status.flash(format!(" spawn refused: {msg} "));
+            self.status.flash_error(format!(" spawn refused: {msg} "));
             self.view = View::Sessions;
             return;
         }
         let binary = match resolve_fleet_binary() {
             Ok(p) => p,
             Err(err) => {
-                self.status.flash(format!(" spawn failed: {err:#} "));
+                self.status.flash_error(format!(" spawn failed: {err:#} "));
                 self.view = View::Sessions;
                 return;
             }
@@ -607,7 +607,7 @@ impl AppState {
                 });
             }
             Err(err) => {
-                self.status.flash(format!(" spawn `{label}` failed: {err:#} "));
+                self.status.flash_error(format!(" spawn `{label}` failed: {err:#} "));
             }
         }
         self.view = View::Sessions;
@@ -638,7 +638,7 @@ impl AppState {
                             tail.trim_end(),
                         ),
                     };
-                    self.status.flash(format!(" spawn `{}` failed — press any key ", pending.name));
+                    self.status.flash_error(format!(" spawn `{}` failed — press any key ", pending.name));
                 }
                 let _ = pending.started_at_ms;
             }
@@ -762,7 +762,19 @@ impl AppState {
         if snapshot == "autonomous: ON" || snapshot == "autonomous: OFF" {
             return;
         }
-        self.status.flash(snapshot);
+        // Failure-flavoured engine status (spawn refused, tracker
+        // error, daemon unreachable, cannot enable) should stick
+        // so the operator can read / copy the diagnostic.
+        if snapshot.contains("failed")
+            || snapshot.contains("error")
+            || snapshot.contains("refused")
+            || snapshot.contains("rejected")
+            || snapshot.contains("cannot enable")
+        {
+            self.status.flash_error(snapshot);
+        } else {
+            self.status.flash(snapshot);
+        }
     }
 
     /// Parallel to [`Self::autonomous_tick`] for the loop scheduler.

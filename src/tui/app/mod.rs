@@ -24,7 +24,7 @@ mod plans;
 mod sessions;
 mod spawn;
 mod status;
-pub(in crate::tui) use status::StatusBar;
+pub(in crate::tui) use status::{FlashKind, StatusBar};
 
 // Re-exports — anything the input/event-loop side, tests, or sibling
 // `tui` modules reach for through `super::app::*` lives here. Types
@@ -342,7 +342,7 @@ impl AppState {
         if let Err(err) =
             crate::autonomous::reconcile_plans_from_sessions(&self.sessions, &plan_store, now_ms())
         {
-            self.status.flash(format!(" reconcile failed: {err:#} "));
+            self.status.flash_error(format!(" reconcile failed: {err:#} "));
         }
         self.refresh_plans();
         self.refresh_orchestrators();
@@ -469,14 +469,14 @@ impl AppState {
         let store = OrchestratorStore::for_repo(&self.root);
         let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
         if let Err(err) = crate::orchestrator::reaper::reap(&store, invoker.as_ref(), now_ms()) {
-            self.status.flash(format!(" orchestrator: reap failed: {err:#} "));
+            self.status.flash_error(format!(" orchestrator: reap failed: {err:#} "));
         }
         self.orchestrators.clear();
         if store.exists() {
             match store.load() {
                 Ok(s) => self.orchestrators.push(s),
                 Err(err) => {
-                    self.status.flash(format!(" orchestrator: load failed: {err:#} "));
+                    self.status.flash_error(format!(" orchestrator: load failed: {err:#} "));
                 }
             }
         }
