@@ -47,6 +47,8 @@ impl InitPlan {
 /// - `.fleet/sessions/` — empty; the session store fills this in
 /// - `.devcontainer/` directory
 /// - `.devcontainer/devcontainer.json` — minimal Ubuntu base image
+/// - `.devcontainer/Dockerfile` — Node.js + `claude-code` CLI layered
+///   on top of the base image so the default agent works out of the box
 pub fn perform_init(root: &Path) -> Result<InitPlan> {
     let mut plan = InitPlan::default();
 
@@ -116,6 +118,12 @@ pub fn perform_init(root: &Path) -> Result<InitPlan> {
         &devcontainer_dir.join("devcontainer.json"),
         root,
         DEFAULT_DEVCONTAINER_JSON,
+        &mut plan,
+    )?;
+    ensure_file(
+        &devcontainer_dir.join("Dockerfile"),
+        root,
+        DEFAULT_DEVCONTAINER_DOCKERFILE,
         &mut plan,
     )?;
 
@@ -337,8 +345,11 @@ workflows:
 #   agent: claude
 ";
 
-/// Default `.devcontainer/devcontainer.json`. Minimal so it always
-/// builds; the user is expected to edit it for their project.
+/// Default `.devcontainer/devcontainer.json`. Points at a sibling
+/// Dockerfile that layers Node + the `claude-code` CLI on top of the
+/// Microsoft Ubuntu base so the default `claude-code` agent works
+/// out of the box; users who pick a different agent can swap the
+/// install line in the Dockerfile.
 ///
 /// `workspaceMount` is set explicitly because the devcontainer CLI's
 /// default mount target is `/workspaces/${localWorkspaceFolderBasename}`
@@ -350,10 +361,32 @@ workflows:
 const DEFAULT_DEVCONTAINER_JSON: &str = "\
 {
   \"name\": \"fleet workspace\",
-  \"image\": \"mcr.microsoft.com/devcontainers/base:ubuntu\",
+  \"build\": { \"dockerfile\": \"Dockerfile\" },
   \"workspaceMount\": \"source=${localWorkspaceFolder},target=/workspace,type=bind\",
   \"workspaceFolder\": \"/workspace\"
 }
+";
+
+/// Default `.devcontainer/Dockerfile`. Ships Node.js LTS + the
+/// `claude-code` CLI on `/usr/bin/claude` so the default agent
+/// trampoline (`exec claude -p …` from `agent::registry`) actually
+/// has something to exec. Built once per image, cached across
+/// per-session containers — putting the install in `postCreateCommand`
+/// would re-incur the ~30 s npm pull every time fleet spawns a
+/// session, which autonomous mode does often.
+const DEFAULT_DEVCONTAINER_DOCKERFILE: &str = "\
+# fleet's default agent image: Ubuntu base + Node.js LTS +
+# @anthropic-ai/claude-code on PATH. Swap the npm line for `pipx
+# install aider-chat` etc. if you change `runtime.agent` in
+# .fleet/config.yaml.
+FROM mcr.microsoft.com/devcontainers/base:ubuntu
+
+USER root
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \\
+ && apt-get install -y --no-install-recommends nodejs \\
+ && rm -rf /var/lib/apt/lists/* \\
+ && npm install -g @anthropic-ai/claude-code \\
+ && npm cache clean --force
 ";
 
 /// `.fleet/workflows/standard.yaml` — the canonical planner → coder →
@@ -591,6 +624,7 @@ mod tests {
         assert!(root.join(".fleet/config.yaml").is_file());
         assert!(root.join(".devcontainer").is_dir());
         assert!(root.join(".devcontainer/devcontainer.json").is_file());
+        assert!(root.join(".devcontainer/Dockerfile").is_file());
 
         assert_created(&plan, ".fleet");
         assert_created(&plan, ".fleet/workflows");
@@ -599,6 +633,7 @@ mod tests {
         assert_created(&plan, ".fleet/config.yaml");
         assert_created(&plan, ".devcontainer");
         assert_created(&plan, ".devcontainer/devcontainer.json");
+        assert_created(&plan, ".devcontainer/Dockerfile");
         assert!(plan.already_present.is_empty());
     }
 
@@ -621,6 +656,7 @@ mod tests {
             ".fleet/config.yaml",
             ".devcontainer",
             ".devcontainer/devcontainer.json",
+            ".devcontainer/Dockerfile",
         ] {
             assert_present(&plan, expected);
         }
@@ -874,6 +910,33 @@ mod tests {
         assert_eq!(
             parsed.get("name").and_then(|v| v.as_str()),
             Some("fleet workspace")
+        );
+        // The template builds from a sibling Dockerfile rather than
+        // pulling a bare base image — the Dockerfile is where the
+        // claude-code install layers in.
+        assert_eq!(
+            parsed
+                .pointer("/build/dockerfile")
+                .and_then(|v| v.as_str()),
+            Some("Dockerfile"),
+        );
+    }
+
+    #[test]
+    fn default_devcontainer_dockerfile_installs_claude_code_on_path() {
+        // The shipped Dockerfile is the reason the default
+        // `claude-code` agent works out of the box — if this
+        // regresses, every new `fleet init` plants a container in
+        // which `exec claude` fails with "command not found".
+        let dockerfile = DEFAULT_DEVCONTAINER_DOCKERFILE;
+        assert!(
+            dockerfile.starts_with("# fleet")
+                && dockerfile.contains("FROM mcr.microsoft.com/devcontainers/base:ubuntu"),
+            "Dockerfile must extend the Ubuntu devcontainer base",
+        );
+        assert!(
+            dockerfile.contains("npm install -g @anthropic-ai/claude-code"),
+            "Dockerfile must install the claude-code CLI",
         );
     }
 
