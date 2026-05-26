@@ -71,6 +71,14 @@ impl AppState {
     }
 
     pub(in crate::tui) fn prompt_kill_selected(&mut self) {
+        // Branch on which sidebar pane has focus. Worker pane → kill
+        // the selected worker. Orchestrator pane → tear down the
+        // orchestrator's tmux session (same surface `fleet
+        // orchestrator kill` exposes from the CLI).
+        if self.sessions_focus == SessionsFocus::Orchestrator {
+            self.prompt_kill_orchestrator();
+            return;
+        }
         let Some(session) = self.selected() else {
             self.status.flash(" kill: no session selected ".to_string());
             return;
@@ -88,6 +96,30 @@ impl AppState {
         };
     }
 
+    fn prompt_kill_orchestrator(&mut self) {
+        // Skip the confirm dialog when there's nothing to kill.
+        // `orchestrators` is the loaded list; empty / all-closed
+        // means the synthetic "not running" row is the only thing
+        // showing.
+        let any_live = self
+            .orchestrators
+            .iter()
+            .any(|o| !matches!(o.state, crate::orchestrator::OrchestratorState::Closed));
+        if !any_live {
+            self.status
+                .flash(" orchestrator: not running ".to_string());
+            return;
+        }
+        self.overlay = Overlay::Confirm {
+            prompt: format!(
+                "Kill the orchestrator (`{}` tmux session)?\n\n\
+                 The next Enter on this row will spawn a fresh agent.",
+                crate::orchestrator::TMUX_SESSION_NAME,
+            ),
+            action: ConfirmAction::KillOrchestrator,
+        };
+    }
+
     pub(in crate::tui) fn run_confirm_action(
         &mut self,
         action: &ConfirmAction,
@@ -95,6 +127,7 @@ impl AppState {
     ) {
         match action {
             ConfirmAction::KillSelected => self.mark_selected_failed(store),
+            ConfirmAction::KillOrchestrator => self.kill_orchestrator(store),
         }
     }
 
@@ -266,6 +299,62 @@ impl AppState {
         let next_usize = usize::try_from(next).unwrap_or(0);
         self.list_state.select(Some(next_usize));
         self.refresh_log_tail();
+    }
+
+    /// Tear down the orchestrator's tmux session and flip its meta
+    /// to Closed. Mirrors `cli::orchestrator::run_kill`; `reload()`
+    /// repopulates `orchestrators` so the synthetic "not running"
+    /// row appears on the next frame. `store` is the worker session
+    /// store, passed in for the reload — orchestrator meta lives in
+    /// a sibling [`crate::orchestrator::store::OrchestratorStore`]
+    /// we open here on demand.
+    fn kill_orchestrator(&mut self, store: &SessionStore) {
+        let invoker: std::sync::Arc<dyn crate::process::ProcessInvoker> =
+            std::sync::Arc::new(crate::process::RealProcessInvoker);
+        if let Err(err) = crate::orchestrator::tmux::kill_session(
+            invoker.as_ref(),
+            crate::orchestrator::TMUX_SESSION_NAME,
+        ) {
+            self.status.flash_error(format!(
+                " orchestrator kill failed: {err:#} "
+            ));
+            return;
+        }
+        // Flip the meta to Closed so the sidebar marker reflects the
+        // tear-down even before the next refresh tick repopulates
+        // the captured pane. Idempotent — silent when no meta exists.
+        let orch_store = crate::orchestrator::store::OrchestratorStore::for_repo(&self.root);
+        if orch_store.exists() {
+            match orch_store.load() {
+                Ok(mut meta) => {
+                    meta.state = crate::orchestrator::OrchestratorState::Closed;
+                    meta.updated_at_ms = now_ms();
+                    if let Err(err) = orch_store.save(&meta) {
+                        self.status.flash_error(format!(
+                            " orchestrator meta save failed: {err:#} "
+                        ));
+                    }
+                }
+                Err(err) => {
+                    self.status.flash_error(format!(
+                        " orchestrator meta load failed: {err:#} "
+                    ));
+                }
+            }
+        }
+        // Clear the captured pane so the preview doesn't keep
+        // showing stale claude output until the refresh thread
+        // catches up.
+        self.orchestrator_pane = None;
+        if let Err(err) = self.reload(store) {
+            self.status
+                .flash_error(format!(" reload failed: {err:#} "));
+            return;
+        }
+        self.status.flash(format!(
+            " orchestrator (`{}`) killed ",
+            crate::orchestrator::TMUX_SESSION_NAME,
+        ));
     }
 
     fn mark_selected_failed(&mut self, store: &SessionStore) {

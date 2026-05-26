@@ -222,7 +222,13 @@ pub(super) enum Overlay {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ConfirmAction {
+    /// Mark the selected worker as Failed and persist.
     KillSelected,
+    /// Tear down the orchestrator's `fl-orchestrator` tmux session
+    /// and flip its meta to Closed. The orchestrator pane goes back
+    /// to the "not running" synthetic row; a subsequent Enter
+    /// spawns a fresh agent.
+    KillOrchestrator,
 }
 
 /// Closed enum so the event loop's dispatch stays exhaustive.
