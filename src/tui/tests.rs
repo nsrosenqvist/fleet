@@ -373,6 +373,85 @@ fn app_state_reload_preserves_selection_by_id() {
 }
 
 #[test]
+fn maybe_auto_reload_picks_up_out_of_process_state_transitions() {
+    // Simulates the user staring at a Running worker that fails
+    // out-of-process (autonomous mode, CLI, scheduler). The periodic
+    // auto-reload must pick the meta.json change up without an `r`
+    // keystroke.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().to_path_buf());
+    store
+        .create(&session("s-1", "wf", SessionState::Running, 100))
+        .unwrap();
+    let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+    assert_eq!(state.sessions[0].state, SessionState::Running);
+
+    // Out-of-process: worker fails, meta.json rewritten.
+    let mut updated = store.load(&SessionId::new("s-1")).unwrap();
+    updated.transition_to(SessionState::Failed, 200).unwrap();
+    store.save(&updated).unwrap();
+
+    // First call: never reloaded → reloads now, regardless of clock.
+    let t0 = std::time::Instant::now();
+    state.maybe_auto_reload(&store, t0);
+    assert_eq!(state.sessions[0].state, SessionState::Failed);
+}
+
+#[test]
+fn maybe_auto_reload_debounces_within_interval() {
+    // Two back-to-back calls inside the debounce window must only
+    // hit disk once — otherwise the event loop (which calls this
+    // ~10×/s) would re-read every session's meta.json every tick.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().to_path_buf());
+    store
+        .create(&session("s-1", "wf", SessionState::Running, 100))
+        .unwrap();
+    let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+
+    let t0 = std::time::Instant::now();
+    state.maybe_auto_reload(&store, t0);
+
+    // Out-of-process mutation; the debounce should swallow it for now.
+    let mut updated = store.load(&SessionId::new("s-1")).unwrap();
+    updated.transition_to(SessionState::Failed, 200).unwrap();
+    store.save(&updated).unwrap();
+
+    // Same instant → no second reload.
+    state.maybe_auto_reload(&store, t0);
+    assert_eq!(state.sessions[0].state, SessionState::Running);
+
+    // After the interval elapses, the next call picks the change up.
+    let t1 = t0 + std::time::Duration::from_secs(4);
+    state.maybe_auto_reload(&store, t1);
+    assert_eq!(state.sessions[0].state, SessionState::Failed);
+}
+
+#[test]
+fn maybe_auto_reload_skipped_while_overlay_up() {
+    // A periodic reload while a confirm dialog is open could shift
+    // the underlying `selected()` pointer between draw and accept.
+    // The dispatch refuses, leaving the sidebar pinned.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().to_path_buf());
+    store
+        .create(&session("s-1", "wf", SessionState::Running, 100))
+        .unwrap();
+    let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+    state.overlay = Overlay::Error {
+        message: "stuck".to_string(),
+    };
+
+    // Out-of-process change.
+    let mut updated = store.load(&SessionId::new("s-1")).unwrap();
+    updated.transition_to(SessionState::Failed, 200).unwrap();
+    store.save(&updated).unwrap();
+
+    state.maybe_auto_reload(&store, std::time::Instant::now());
+    assert_eq!(state.sessions[0].state, SessionState::Running);
+}
+
+#[test]
 fn app_state_selects_first_session_on_initial_load() {
     let tmp = tempfile::tempdir().unwrap();
     let store = SessionStore::at(tmp.path().to_path_buf());

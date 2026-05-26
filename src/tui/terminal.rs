@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result, bail};
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -57,7 +57,19 @@ pub fn run() -> Result<i32> {
 
     let mut stdout = io::stdout();
     enable_raw_mode().context("enabling terminal raw mode")?;
-    execute!(stdout, EnterAlternateScreen).context("entering alternate screen")?;
+    // `EnableMouseCapture` intercepts wheel + click events so they
+    // arrive as `Event::Mouse(...)`, which the dispatch ignores
+    // (only `Event::Key` is matched). Without this, terminals like
+    // GNOME Terminal / Konsole translate scroll wheel into Up/Down
+    // arrow keystrokes that move the sidebar selection — surprising
+    // for a list the user is reading, not navigating.
+    //
+    // Trade-off: native shift-mouse text selection breaks; most
+    // terminals fall back to a shift-click / chord override that
+    // bypasses capture for copy-paste. Acceptable since the
+    // alternative is the every-scroll-jumps-the-cursor surprise.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("entering alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("constructing ratatui terminal")?;
 
@@ -66,7 +78,11 @@ pub fn run() -> Result<i32> {
     // user staring at a useless raw-mode terminal.
     let loop_result = event_loop(&mut terminal, &root, &store, reap_report);
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+    );
     let _ = terminal.show_cursor();
     loop_result
 }
@@ -194,6 +210,10 @@ fn drive(
         let tick_now = std::time::Instant::now();
         state.autonomous_tick(store, tick_now);
         state.scheduler_tick(store, tick_now);
+        // Periodic sidebar reload — picks up out-of-process state
+        // transitions (a worker that failed since the last keystroke)
+        // without forcing the user to press `r`.
+        state.maybe_auto_reload(store, tick_now);
         // Reap any workflow-run subprocess we kicked off — surfaces
         // non-zero exits as an error overlay before the next draw.
         state.poll_pending_spawn();
@@ -225,7 +245,11 @@ fn run_attach_script(
 ) -> Result<()> {
     let script = crate::cli::orchestrator::build_attach_script(tmux_name);
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+    );
     let _ = terminal.show_cursor();
 
     let result = std::process::Command::new("bash")
@@ -233,7 +257,11 @@ fn run_attach_script(
         .status()
         .with_context(|| format!("running attach script for `{tmux_name}`"));
 
-    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+    );
     let _ = enable_raw_mode();
     let _ = terminal.clear();
 
@@ -251,7 +279,11 @@ fn run_suspended(
 ) -> Result<()> {
     // Tear down — order mirrors the setup in `run` (reverse).
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+    );
     let _ = terminal.show_cursor();
 
     let exe_display = exe.display().to_string();
@@ -263,7 +295,11 @@ fn run_suspended(
 
     // Re-enter even if the subprocess errored — otherwise the user
     // is dropped into a half-broken terminal.
-    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+    );
     let _ = enable_raw_mode();
     let _ = terminal.clear();
 

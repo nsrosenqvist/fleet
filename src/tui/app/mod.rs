@@ -69,6 +69,12 @@ use crate::session::{Session, SessionId, now_ms};
 /// detail pane.
 pub(super) const LOG_TAIL_LINES: usize = 25;
 
+/// How often [`AppState::maybe_auto_reload`] is allowed to re-scan
+/// `.fleet/sessions/`. 3s strikes the balance between "user sees a
+/// failed worker stop showing as running within a few seconds" and
+/// "don't churn the disk on every tick".
+pub(super) const AUTO_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// In-memory app state. Held by the event loop, mutated by key handlers,
 /// snapshotted by the render functions.
 pub(super) struct AppState {
@@ -129,6 +135,11 @@ pub(super) struct AppState {
     /// the safe floor — the `loop:` interval itself has a 60s
     /// minimum, so a finer debounce buys nothing.
     pub(super) last_scheduler_tick: Option<std::time::Instant>,
+    /// Wall-clock debounce for [`Self::maybe_auto_reload`]. Periodic
+    /// sidebar reload picks up session state transitions written by
+    /// out-of-process workers (autonomous-spawned, CLI-spawned,
+    /// scheduler-spawned) without the user having to press `r`.
+    pub(super) last_auto_reload: Option<std::time::Instant>,
     /// Tracker built lazily on first `Shift+A` — the `gh`/`git-bug`
     /// construction happens then, not at TUI startup, so users who
     /// never use autonomous mode aren't blocked by tracker setup.
@@ -295,6 +306,7 @@ impl AppState {
             last_seen_autonomous_status: autonomous::AutonomousEngine::new().status().to_string(),
             scheduler: crate::scheduler::SchedulerEngine::new(),
             last_scheduler_tick: None,
+            last_auto_reload: None,
             tracker: TrackerState::Pending,
             overlay: Overlay::None,
             plans: Vec::new(),
@@ -378,6 +390,38 @@ impl AppState {
         // worker target list the refresh thread polls needs to track.
         self.publish_refresh_inputs();
         Ok(())
+    }
+
+    /// Periodic auto-reload of the sidebar. Called every event-loop
+    /// iteration; internally debounced to once per
+    /// [`AUTO_RELOAD_INTERVAL`]. Picks up session-state transitions
+    /// (Running → Failed / Completed / Crashed) that out-of-process
+    /// workers write to disk, so the user doesn't have to press `r`
+    /// to see a failed worker stop showing as running.
+    ///
+    /// Skipped while an overlay is up so a periodic refresh can't
+    /// surprise the user mid-confirm (the underlying `selected()`
+    /// pointer could shift). Errors flash through the status bar —
+    /// they don't propagate, because a transient fs hiccup
+    /// shouldn't take the TUI down.
+    pub(super) fn maybe_auto_reload(
+        &mut self,
+        store: &SessionStore,
+        now: std::time::Instant,
+    ) {
+        if !matches!(self.overlay, Overlay::None) {
+            return;
+        }
+        if let Some(last) = self.last_auto_reload {
+            if now.duration_since(last) < AUTO_RELOAD_INTERVAL {
+                return;
+            }
+        }
+        self.last_auto_reload = Some(now);
+        if let Err(err) = self.reload(store) {
+            self.status
+                .flash_error(format!(" auto-reload failed: {err:#} "));
+        }
     }
 
     /// Start the background refresh thread that polls `tmux
