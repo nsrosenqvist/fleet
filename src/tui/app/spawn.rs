@@ -657,13 +657,26 @@ impl AppState {
     }
 
     pub(in crate::tui) fn toggle_autonomous(&mut self) {
-        if !self.autonomous.enabled() && self.ensure_tracker().is_none() {
-            self.autonomous.set_status(format!(
-                "autonomous: cannot enable — tracker `{}` is not implemented yet",
-                self.config.tracker.as_str(),
-            ));
-            self.surface_autonomous_status_change();
-            return;
+        if !self.autonomous.enabled() {
+            // Pre-flight before enabling so the user sees the reason
+            // immediately on the keypress, not buried in a status
+            // flash N seconds later when the first tick fails. Order
+            // mirrors the dispatch path: tracker first (broader gate),
+            // then runtime daemon.
+            if self.ensure_tracker().is_none() {
+                self.autonomous.set_status(format!(
+                    "autonomous: cannot enable — tracker `{}` is not implemented yet",
+                    self.config.tracker.as_str(),
+                ));
+                self.surface_autonomous_status_change();
+                return;
+            }
+            if let Some(msg) = self.runtime_not_ready_msg() {
+                self.autonomous
+                    .set_status(format!("autonomous: cannot enable — {msg}"));
+                self.surface_autonomous_status_change();
+                return;
+            }
         }
         self.autonomous.toggle();
         // toggle() flips the engine status to the bare "autonomous:
@@ -678,10 +691,36 @@ impl AppState {
     /// `Shift+L` handler. Flips the scheduler engine's enabled flag
     /// and resets the tick debounce so the very next event-loop
     /// iteration fires a fresh tick instead of waiting out a stale
-    /// 10-second window.
+    /// 10-second window. Refuses to enable when the runtime daemon
+    /// isn't reachable, with a flash naming the reason — same
+    /// pre-flight as `toggle_autonomous`.
     pub(in crate::tui) fn toggle_scheduler(&mut self) {
+        if !self.scheduler.enabled() {
+            if let Some(msg) = self.runtime_not_ready_msg() {
+                self.scheduler
+                    .set_status(format!("scheduler: cannot enable — {msg}"));
+                return;
+            }
+        }
         self.scheduler.toggle();
         self.last_scheduler_tick = None;
+    }
+
+    /// Returns `Some(reason)` when the configured runtime can't
+    /// currently accept a spawn — either the adapter never built
+    /// (binary missing) or the daemon isn't answering. `None` when
+    /// the runtime is ready, or when no doctor snapshot has been
+    /// taken yet (tests / early-startup; let the spawn dispatcher's
+    /// own pre-flight catch it instead of blocking the toggle).
+    fn runtime_not_ready_msg(&self) -> Option<String> {
+        let doctor = self.doctor.as_ref()?;
+        if let Err(err) = doctor.adapter.as_ref() {
+            return Some(format!("runtime adapter not available: {err}"));
+        }
+        if let Err(err) = doctor.engine_reachable.as_ref() {
+            return Some(err.clone());
+        }
+        None
     }
 
     pub(in crate::tui) fn ensure_tracker(&mut self) -> Option<Arc<dyn crate::tracker::Tracker>> {

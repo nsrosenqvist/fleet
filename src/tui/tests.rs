@@ -1617,6 +1617,83 @@ fn shift_a_refuses_to_enable_with_unimplemented_tracker() {
 }
 
 #[test]
+fn shift_a_refuses_to_enable_when_runtime_daemon_unreachable() {
+    // Mirror of the tracker-not-implemented refusal but for the
+    // runtime-daemon path. The doctor snapshot's
+    // engine_reachable holds a user-facing message; toggle should
+    // surface it on the engine status line and leave the engine
+    // disabled, so the user sees the reason on the keypress
+    // instead of buried in a status flash after the first failed
+    // tick.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().join("sessions"));
+    let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+    // Hand-stamp a doctor snapshot with engine_reachable in Err.
+    state.doctor = Some(crate::tui::app::DoctorSnapshot {
+        root: tmp.path().to_path_buf(),
+        initialised: true,
+        configured_adapter: "docker".to_string(),
+        configured_hardening: "none".to_string(),
+        tracker: "git-bug".to_string(),
+        adapter: Ok((
+            "docker".to_string(),
+            crate::runtime::capabilities::Capabilities::default(),
+        )),
+        engine_reachable: Err(
+            "docker daemon not reachable — start Docker Desktop".to_string(),
+        ),
+        agents: Vec::new(),
+    });
+    state.handle_key(
+        KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+        &store,
+    );
+    assert!(
+        !state.autonomous.enabled(),
+        "engine must NOT enable while the runtime daemon is unreachable"
+    );
+    let status = state.autonomous.status();
+    assert!(
+        status.contains("cannot enable") && status.contains("docker daemon"),
+        "got: {status}"
+    );
+}
+
+#[test]
+fn shift_l_refuses_to_enable_when_runtime_daemon_unreachable() {
+    // Same pre-flight for the loop scheduler.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().join("sessions"));
+    let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+    state.doctor = Some(crate::tui::app::DoctorSnapshot {
+        root: tmp.path().to_path_buf(),
+        initialised: true,
+        configured_adapter: "docker".to_string(),
+        configured_hardening: "none".to_string(),
+        tracker: "git-bug".to_string(),
+        adapter: Ok((
+            "docker".to_string(),
+            crate::runtime::capabilities::Capabilities::default(),
+        )),
+        engine_reachable: Err("docker daemon not reachable".to_string()),
+        agents: Vec::new(),
+    });
+    state.handle_key(
+        KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+        &store,
+    );
+    assert!(
+        !state.scheduler.enabled(),
+        "scheduler must NOT enable while the runtime daemon is unreachable"
+    );
+    assert!(
+        state.scheduler.status().contains("cannot enable"),
+        "got: {}",
+        state.scheduler.status()
+    );
+}
+
+#[test]
 fn shift_a_works_from_doctor_view_too() {
     // Toggle is global, not Sessions-only — modal dispatch
     // shouldn't swallow it.
