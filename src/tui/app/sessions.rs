@@ -34,6 +34,7 @@ impl AppState {
         });
         let Some((current_id, logs_dir)) = id_and_logs_dir else {
             self.log_tail.clear();
+            self.transcript_tail = None;
             self.last_selected_id = None;
             return;
         };
@@ -42,6 +43,29 @@ impl AppState {
         }
         self.last_selected_id = Some(current_id);
         self.log_tail = read_latest_log_tail(&logs_dir, LOG_TAIL_LINES);
+        self.refresh_transcript_tail();
+    }
+
+    /// Re-tail the selected session's `transcript.log`. Cheap (bounded
+    /// file read) — called on selection change and on each refresh
+    /// tick for the focused worker so the fallback stays current. Kept
+    /// separate from [`Self::refresh_log_tail`] so the periodic path
+    /// can skip the `last_selected_id` early-return that protects
+    /// `log_tail` from redundant disk reads.
+    pub(in crate::tui) fn refresh_transcript_tail(&mut self) {
+        let Some(session) = self.selected() else {
+            self.transcript_tail = None;
+            return;
+        };
+        let path = self
+            .root
+            .join(".fleet/sessions")
+            .join(session.id.as_str())
+            .join("transcript.log");
+        // 64 KB is enough for "the last screenful or two of agent
+        // output" without dragging in megabytes of scrollback on
+        // long-running sessions.
+        self.transcript_tail = super::spawn::read_tail_string(&path, 64 * 1024);
     }
 
     /// Resolve Shift+T to a tracker-TUI launch. Returns

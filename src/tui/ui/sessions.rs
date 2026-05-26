@@ -555,18 +555,31 @@ fn render_output_section(
 }
 
 fn render_worker_output(f: &mut Frame<'_>, area: Rect, state: &AppState) {
-    // Prefer the live `tmux capture-pane` snapshot when this worker
-    // was spawned with `--detached`. Falls back to the static log
-    // tail for foreground / pre-stage-2 sessions, and to a muted
-    // placeholder when even that's empty.
-    if let Some(session) = state.selected()
-        && let Some(body) = state
+    // Three-tier fallback. From freshest to most-stale:
+    //   1. `worker_panes` — live `tmux capture-pane` snapshot of a
+    //      `--detached` worker's pane (refresh thread, ~1.5 s).
+    //   2. `transcript_tail` — `tmux pipe-pane` recording of the same
+    //      pane on disk. Survives the tmux session dying between two
+    //      capture ticks, and is also what we have *before* the first
+    //      tick lands. ANSI-rich; same renderer as tier 1.
+    //   3. `log_tail` — per-node `*.log`. For agent nodes this is just
+    //      a "ran in tmux pane" placeholder written *after* the agent
+    //      exits, so it's only useful for bash / foreground-exec
+    //      nodes; kept as the last non-placeholder tier.
+    // Then the muted "(no logs yet)" placeholder.
+    if let Some(session) = state.selected() {
+        if let Some(body) = state
             .worker_panes
             .get(&session.id)
             .filter(|s| !s.is_empty())
-    {
-        render_ansi_pane(f, area, body);
-        return;
+        {
+            render_ansi_pane(f, area, body);
+            return;
+        }
+        if let Some(body) = state.transcript_tail.as_deref().filter(|s| !s.is_empty()) {
+            render_ansi_pane(f, area, body);
+            return;
+        }
     }
     if state.log_tail.is_empty() {
         render_output_placeholder(f, area, "(no logs yet)");

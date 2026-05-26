@@ -323,6 +323,37 @@ fn read_latest_log_tail_ignores_non_log_files() {
 }
 
 #[test]
+fn refresh_log_tail_populates_transcript_tail_from_transcript_log() {
+    // The middle tier of the worker-output fallback. plan.log is
+    // empty until the agent exits; transcript.log is what tmux's
+    // pipe-pane is recording *now*. Selecting a running session
+    // should read the latter so the user sees live activity rather
+    // than "(no logs yet)".
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().to_path_buf());
+    let s = session("s-x", "standard", SessionState::Running, 100);
+    store.create(&s).unwrap();
+    let sess_dir = tmp.path().join(".fleet/sessions/s-x");
+    std::fs::create_dir_all(&sess_dir).unwrap();
+    std::fs::write(sess_dir.join("transcript.log"), "agent output line\n").unwrap();
+    let state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+    assert_eq!(
+        state.transcript_tail.as_deref(),
+        Some("agent output line\n"),
+    );
+}
+
+#[test]
+fn refresh_log_tail_clears_transcript_tail_when_no_session_selected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::at(tmp.path().to_path_buf());
+    let mut state = AppState::new(tmp.path().to_path_buf(), &store).unwrap();
+    state.transcript_tail = Some("stale".to_string());
+    state.refresh_log_tail();
+    assert!(state.transcript_tail.is_none());
+}
+
+#[test]
 fn app_state_reload_preserves_selection_by_id() {
     let tmp = tempfile::tempdir().unwrap();
     let store = SessionStore::at(tmp.path().to_path_buf());

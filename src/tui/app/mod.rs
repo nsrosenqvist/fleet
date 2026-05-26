@@ -78,6 +78,16 @@ pub(super) struct AppState {
     /// Tail of the most-recently-touched log under the selected session.
     /// Re-read on selection change so it doesn't go stale across refreshes.
     pub(super) log_tail: Vec<String>,
+    /// Tail of the selected session's `transcript.log` — what tmux's
+    /// `pipe-pane` is recording from the worker pane in real time.
+    /// Sits between [`Self::worker_panes`] (live `capture-pane`) and
+    /// [`Self::log_tail`] (post-exit per-node placeholder) in the
+    /// worker-output fallback ladder so the user still sees what the
+    /// agent was doing when the tmux session has died (or the first
+    /// `capture-pane` tick hasn't landed yet). ANSI-rich; rendered via
+    /// `render_ansi_pane`. Refreshed on selection change and on each
+    /// `WorkerPane` update for the selected worker.
+    pub(super) transcript_tail: Option<String>,
     pub(super) last_selected_id: Option<String>,
     /// Encapsulated bottom-bar state. Owns the transient flash
     /// message + TTL + dismiss-on-keystroke semantics. Replaces
@@ -269,6 +279,7 @@ impl AppState {
             sessions: Vec::new(),
             list_state: ListState::default(),
             log_tail: Vec::new(),
+            transcript_tail: None,
             last_selected_id: None,
             status: StatusBar::default(),
             view: View::Sessions,
@@ -447,22 +458,45 @@ impl AppState {
     /// last tick. Mutates the per-target pane snapshots in place;
     /// the renderer reads them on the next draw.
     pub(super) fn drain_refresh_updates(&mut self) {
-        let Some(rx) = self.refresh_update_rx.as_ref() else {
-            return;
+        // Drain into a Vec first so `self` isn't borrowed during the
+        // dispatch loop — handlers below need `&mut self`.
+        let updates: Vec<RefreshUpdate> = {
+            let Some(rx) = self.refresh_update_rx.as_ref() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            while let Ok(update) = rx.try_recv() {
+                buf.push(update);
+            }
+            buf
         };
-        while let Ok(update) = rx.try_recv() {
+        for update in updates {
             match update {
                 RefreshUpdate::OrchestratorPane(snapshot) => {
                     self.orchestrator_pane = snapshot;
                 }
-                RefreshUpdate::WorkerPane { session_id, output } => match output {
-                    Some(body) => {
-                        self.worker_panes.insert(session_id, body);
+                RefreshUpdate::WorkerPane { session_id, output } => {
+                    // If this update is for the worker the user is
+                    // currently looking at, re-tail its transcript.log
+                    // so the fallback stays fresh even when the live
+                    // capture-pane returns empty / errors out (e.g.
+                    // tmux session died between two ticks). Cheap —
+                    // one bounded file read per ~1.5s per worker.
+                    let is_selected = self
+                        .selected()
+                        .is_some_and(|s| s.id == session_id);
+                    match output {
+                        Some(body) => {
+                            self.worker_panes.insert(session_id, body);
+                        }
+                        None => {
+                            self.worker_panes.remove(&session_id);
+                        }
                     }
-                    None => {
-                        self.worker_panes.remove(&session_id);
+                    if is_selected {
+                        self.refresh_transcript_tail();
                     }
-                },
+                }
             }
         }
     }
