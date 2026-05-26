@@ -239,6 +239,11 @@ pub(super) enum ConfirmAction {
     /// to the "not running" synthetic row; a subsequent Enter
     /// spawns a fresh agent.
     KillOrchestrator,
+    /// Erase the selected (terminal) session from disk: worktree,
+    /// per-session dir (logs, transcript, artifacts), and the
+    /// `meta.json` that keeps it in the sidebar list. Logs are gone
+    /// forever — used to clear the clutter after a botched batch.
+    ForgetSelected,
 }
 
 /// Closed enum so the event loop's dispatch stays exhaustive.
@@ -544,6 +549,13 @@ impl AppState {
             && self.view == View::Sessions
         {
             self.prompt_kill_selected();
+            return Action::None;
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('X'))
+            && self.view == View::Sessions
+        {
+            self.prompt_forget_selected();
             return Action::None;
         }
         if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('A')) {

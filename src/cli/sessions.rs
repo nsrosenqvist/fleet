@@ -291,6 +291,168 @@ pub fn prune_one(
     Ok(PruneOutcome::Pruned)
 }
 
+/// What `fleet sessions forget` should pick up when no explicit id
+/// is given. Collapsed from three sibling bool flags so the CLI's
+/// `clap` layer enforces mutual exclusivity and the downstream
+/// handler doesn't have a "which bool was set" ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgetSelector {
+    /// `--failed` — `Failed` and `Crashed` sessions.
+    Failed,
+    /// `--completed` — `Completed` sessions.
+    Completed,
+    /// `--all` — every terminal session.
+    All,
+}
+
+/// CLI entry point for `fleet sessions forget [id|--failed|--completed|--all]`.
+/// Erases a terminal session's directory (`meta.json`, logs, transcript,
+/// artifacts) along with its worktree — and, with `--with-branch`, the
+/// `fleet/session-<id>` branch. Use to clear the TUI sidebar of dead
+/// sessions when forensics on them are no longer needed.
+///
+/// Refuses on per-session basis to forget `Running` / `AwaitingGate`
+/// sessions; the rest of the batch still goes through. Exit 0 unless
+/// at least one target failed (parse, fs, etc.) — refusals count as
+/// "skipped", not "failed".
+pub fn run_forget(
+    id: Option<&str>,
+    selector: Option<ForgetSelector>,
+    with_branch: bool,
+) -> Result<i32> {
+    if id.is_none() && selector.is_none() {
+        bail!(
+            "fleet sessions forget: specify a session id, --failed, --completed, or \
+             --all (one of them is required)"
+        );
+    }
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = repo::fleet_root(&cwd);
+    let store = SessionStore::for_repo(&root);
+    let invoker: Arc<dyn ProcessInvoker> = Arc::new(RealProcessInvoker);
+
+    let targets = if let Some(s) = id {
+        vec![SessionId::new(s)]
+    } else {
+        let states: &[SessionState] = match selector.expect("validated above") {
+            ForgetSelector::All => &[
+                SessionState::Completed,
+                SessionState::Failed,
+                SessionState::Crashed,
+            ],
+            ForgetSelector::Failed => &[SessionState::Failed, SessionState::Crashed],
+            ForgetSelector::Completed => &[SessionState::Completed],
+        };
+        select_sessions_by_state(&store, states)?
+    };
+
+    let mut report = ForgetReport::default();
+    let now = now_ms();
+    for id in targets {
+        match forget_one(invoker.as_ref(), &root, &store, &id, now, with_branch) {
+            Ok(ForgetOutcome::Forgotten) => report.forgotten.push(id),
+            Ok(ForgetOutcome::RefusedStillLive) => report.refused.push(id),
+            Err(err) => report.failed.push((id, format!("{err:#}"))),
+        }
+    }
+    print!("{}", render_forget_report(&report));
+    Ok(i32::from(!report.failed.is_empty()))
+}
+
+/// Outcome of a single forget attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ForgetOutcome {
+    /// Session dir (and optionally branch) removed.
+    Forgotten,
+    /// Session is still `Running` or `AwaitingGate` — left alone.
+    RefusedStillLive,
+}
+
+/// Bookkeeping for the renderer.
+#[derive(Debug, Default)]
+pub struct ForgetReport {
+    pub forgotten: Vec<SessionId>,
+    pub refused: Vec<SessionId>,
+    pub failed: Vec<(SessionId, String)>,
+}
+
+/// Forget one session: tear down its worktree (if any) via the same
+/// machinery [`prune_one`] uses, optionally delete its branch, then
+/// remove the per-session directory entirely. Refuses on `Running` and
+/// `AwaitingGate` so the user doesn't accidentally orphan a live agent.
+pub fn forget_one(
+    invoker: &dyn ProcessInvoker,
+    root: &Path,
+    store: &SessionStore,
+    id: &SessionId,
+    now: u64,
+    with_branch: bool,
+) -> Result<ForgetOutcome> {
+    // A session whose meta.json is missing or malformed is fair game
+    // — that's *exactly* the sort of junk a user wants to forget.
+    // Treat a load error as "already half-gone, finish the job."
+    let live_session = store.load(id).ok();
+    if let Some(s) = &live_session
+        && matches!(s.state, SessionState::Running | SessionState::AwaitingGate)
+    {
+        return Ok(ForgetOutcome::RefusedStillLive);
+    }
+
+    // Reuse prune's worktree teardown. Skip it for unreadable
+    // sessions — we don't know which worktree (if any) they ever had,
+    // and `prune_worktrees` below mops up administrative leftovers.
+    if live_session.is_some() {
+        // `prune_one` saves the cleared `worktree_path` back to
+        // meta.json, which is wasted work right before we delete the
+        // dir — but it also covers the "worktree exists, branch
+        // exists, want both gone" path cleanly. Cheaper than
+        // duplicating the logic.
+        prune_one(invoker, root, store, id, now, with_branch)?;
+    } else {
+        // No readable meta to drive prune — best-effort sweep of any
+        // stale `git worktree list` entries pointing at the gone
+        // session dir.
+        if let Err(err) = worktree::prune_worktrees(invoker, root) {
+            tracing::warn!(error = %err, "pruning stale worktree metadata failed");
+        }
+    }
+
+    store
+        .delete(id)
+        .with_context(|| format!("deleting session dir for `{id}`"))?;
+    Ok(ForgetOutcome::Forgotten)
+}
+
+/// Pure renderer for `fleet sessions forget`. Stable wording so
+/// scripts can grep `forgotten: N`.
+#[must_use]
+pub fn render_forget_report(report: &ForgetReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "fleet sessions forget:");
+    let _ = writeln!(out, "  forgotten: {}", report.forgotten.len());
+    for id in &report.forgotten {
+        let _ = writeln!(out, "    - {id}");
+    }
+    if !report.refused.is_empty() {
+        let _ = writeln!(
+            out,
+            "  refused (still `Running` or `AwaitingGate`): {}",
+            report.refused.len()
+        );
+        for id in &report.refused {
+            let _ = writeln!(out, "    . {id}");
+        }
+    }
+    if !report.failed.is_empty() {
+        let _ = writeln!(out, "  failed: {}", report.failed.len());
+        for (id, err) in &report.failed {
+            let _ = writeln!(out, "    ! {id}: {err}");
+        }
+    }
+    out
+}
+
 /// Walk the session store and collect ids whose state is in `states`.
 /// Sessions whose meta.json fails to parse are silently skipped —
 /// `fleet sessions list` surfaces those separately; prune shouldn't
@@ -1533,5 +1695,83 @@ mod tests {
         };
         let out = render_unblock_outcome(&with_comment);
         assert!(out.contains("· posted comment"), "got: {out}");
+    }
+
+    // ───────────────────── forget ─────────────────────
+
+    #[test]
+    fn forget_one_removes_terminal_session_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let sid = SessionId::new("s-done");
+        let mut s = Session::new(sid.clone(), "standard", 1);
+        s.transition_to(SessionState::Running, 2).unwrap();
+        s.transition_to(SessionState::Completed, 3).unwrap();
+        store.create(&s).unwrap();
+        // Also drop a transcript + log to confirm they go with it.
+        std::fs::write(store.session_dir(&sid).join("transcript.log"), b"x").unwrap();
+        std::fs::write(store.session_dir(&sid).join("logs/plan.log"), b"y").unwrap();
+
+        let mock = MockProcessInvoker::new(); // no worktree → no git calls.
+        let outcome = forget_one(&mock, dir.path(), &store, &sid, 99, false).unwrap();
+        assert_eq!(outcome, ForgetOutcome::Forgotten);
+        assert!(!store.session_dir(&sid).exists());
+        assert!(store.load(&sid).is_err(), "session must be unloadable");
+    }
+
+    #[test]
+    fn forget_one_refuses_running_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let sid = SessionId::new("s-live");
+        let mut s = Session::new(sid.clone(), "standard", 1);
+        s.transition_to(SessionState::Running, 2).unwrap();
+        store.create(&s).unwrap();
+
+        let mock = MockProcessInvoker::new();
+        let outcome = forget_one(&mock, dir.path(), &store, &sid, 99, false).unwrap();
+        assert_eq!(outcome, ForgetOutcome::RefusedStillLive);
+        // Session dir still on disk — we left it alone.
+        assert!(store.session_dir(&sid).exists());
+    }
+
+    #[test]
+    fn forget_one_tolerates_unreadable_meta() {
+        // The user pointed `fleet sessions forget` at a half-dead
+        // session whose meta.json is corrupt. The fact that it
+        // *can't* be read is precisely why they want it gone —
+        // forget should remove the dir without choking.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(dir.path());
+        let sid = SessionId::new("s-junk");
+        let session_dir = store.session_dir(&sid);
+        std::fs::create_dir_all(session_dir.join("logs")).unwrap();
+        std::fs::write(session_dir.join("meta.json"), b"not json {{{").unwrap();
+
+        let mut mock = MockProcessInvoker::new();
+        // `worktree::prune_worktrees` shells out to git from the
+        // fallback branch — accept any args, return empty.
+        mock.expect_run().returning(|_, _| Ok(String::new()));
+
+        let outcome = forget_one(&mock, dir.path(), &store, &sid, 99, false).unwrap();
+        assert_eq!(outcome, ForgetOutcome::Forgotten);
+        assert!(!session_dir.exists());
+    }
+
+    #[test]
+    fn render_forget_report_groups_outcomes() {
+        let report = ForgetReport {
+            forgotten: vec![SessionId::new("s-1"), SessionId::new("s-2")],
+            refused: vec![SessionId::new("s-3")],
+            failed: vec![(SessionId::new("s-4"), "boom".to_string())],
+        };
+        let out = render_forget_report(&report);
+        assert!(out.contains("forgotten: 2"));
+        assert!(out.contains("- s-1"));
+        assert!(out.contains("- s-2"));
+        assert!(out.contains("refused"));
+        assert!(out.contains(". s-3"));
+        assert!(out.contains("failed: 1"));
+        assert!(out.contains("! s-4: boom"));
     }
 }

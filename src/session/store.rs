@@ -119,6 +119,20 @@ impl SessionStore {
         Ok(session)
     }
 
+    /// Remove a session's directory entirely (meta.json, logs/, artifacts/,
+    /// transcript.log, `.containers/`, …). Idempotent: a missing directory
+    /// is treated as already-deleted, not an error. Callers are expected
+    /// to have already detached any git worktree / container that used to
+    /// live under this id — `delete` does not touch git or the runtime.
+    pub fn delete(&self, id: &SessionId) -> Result<()> {
+        let dir = self.session_dir(id);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(anyhow!(err).context(format!("removing {}", dir.display()))),
+        }
+    }
+
     /// List session ids in directory order. Directory order is unsorted —
     /// callers that want chronological order should sort by id (the
     /// `ClockIdSource` mint format is millisecond-prefixed and lexicographic
@@ -243,6 +257,20 @@ mod tests {
         assert!(sdir.join("logs").is_dir());
         assert!(sdir.join("meta.json").is_file());
         assert!(sdir.join("placeholder").is_file());
+    }
+
+    #[test]
+    fn delete_removes_session_dir_and_is_idempotent() {
+        // The TUI's Shift+X and `fleet sessions forget` both end up
+        // here. Two-call test pins idempotency so a retry after a
+        // partial failure won't surface a "file not found" error.
+        let (_dir, s) = store();
+        let session = session("s-gone");
+        s.create(&session).unwrap();
+        assert!(s.session_dir(&session.id).is_dir());
+        s.delete(&session.id).unwrap();
+        assert!(!s.session_dir(&session.id).exists());
+        s.delete(&session.id).unwrap();
     }
 
     #[test]

@@ -300,6 +300,37 @@ pub enum SessionsSub {
     /// finished) or never existed (foreground run).
     Attach { id: String },
 
+    /// Erase a terminal session entirely: removes its per-session
+    /// directory (meta.json, logs, transcript, artifacts) plus its
+    /// worktree, and — with `--with-branch` — its `fleet/session-<id>`
+    /// branch. The session no longer appears in `fleet sessions list`
+    /// or the TUI sidebar. Refuses to forget a still-`Running` session;
+    /// `--failed` selects `Failed` + `Crashed`, `--completed` selects
+    /// `Completed`, `--all` selects any terminal state. Exactly one
+    /// selector is required. Use [`Self::Prune`] when you want to
+    /// keep logs for forensics.
+    Forget {
+        /// Session id to forget. Refuses if the session is still
+        /// `Running` or `AwaitingGate` — kill / reap / unblock first.
+        id: Option<String>,
+        /// Forget every session in `Failed` or `Crashed` state. The
+        /// common "clear the clutter from a botched batch" path.
+        #[arg(long, conflicts_with_all = &["completed", "all"])]
+        failed: bool,
+        /// Forget every session in `Completed` state.
+        #[arg(long, conflicts_with_all = &["failed", "all"])]
+        completed: bool,
+        /// Forget every terminal session (`Completed` + `Failed` +
+        /// `Crashed`).
+        #[arg(long, conflicts_with_all = &["failed", "completed"])]
+        all: bool,
+        /// Also delete the `fleet/session-<id>` git branch. Off by
+        /// default — branches survive forget so commits an agent
+        /// made stay reachable.
+        #[arg(long = "with-branch")]
+        with_branch: bool,
+    },
+
     /// Remove a session's per-session git worktree, freeing the
     /// checked-out source code from disk. The branch and the
     /// session's logs/artifacts/meta.json are kept — `git checkout
@@ -611,6 +642,24 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             SessionsSub::Reap => sessions::run_reap(),
             SessionsSub::Unblock { id, reason } => sessions::run_unblock(&id, reason.as_deref()),
             SessionsSub::Attach { id } => sessions::run_attach(&id),
+            SessionsSub::Forget {
+                id,
+                failed,
+                completed,
+                all,
+                with_branch,
+            } => {
+                let selector = if all {
+                    Some(sessions::ForgetSelector::All)
+                } else if failed {
+                    Some(sessions::ForgetSelector::Failed)
+                } else if completed {
+                    Some(sessions::ForgetSelector::Completed)
+                } else {
+                    None
+                };
+                sessions::run_forget(id.as_deref(), selector, with_branch)
+            }
             SessionsSub::Prune {
                 id,
                 completed,

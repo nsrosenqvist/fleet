@@ -144,6 +144,37 @@ impl AppState {
         };
     }
 
+    pub(in crate::tui) fn prompt_forget_selected(&mut self) {
+        // Forget is only meaningful for sidebar rows that map to a
+        // worker session (the orchestrator's lifecycle is owned by
+        // the orchestrator store, not the session store).
+        if self.sessions_focus == SessionsFocus::Orchestrator {
+            self.status
+                .flash(" forget: select a worker row first ".to_string());
+            return;
+        }
+        let Some(session) = self.selected() else {
+            self.status.flash(" forget: no session selected ".to_string());
+            return;
+        };
+        if !session.state.is_terminal() {
+            self.status.flash(format!(
+                " {} is {} — kill it first ",
+                session.id,
+                crate::tui::ui::state_word(session.state),
+            ));
+            return;
+        }
+        self.overlay = Overlay::Confirm {
+            prompt: format!(
+                "Forget session {} ({})?\n\nThis deletes logs, transcript, artifacts, \
+                 and the worktree from disk. Non-recoverable.",
+                session.id, session.workflow,
+            ),
+            action: ConfirmAction::ForgetSelected,
+        };
+    }
+
     pub(in crate::tui) fn run_confirm_action(
         &mut self,
         action: &ConfirmAction,
@@ -152,6 +183,53 @@ impl AppState {
         match action {
             ConfirmAction::KillSelected => self.mark_selected_failed(store),
             ConfirmAction::KillOrchestrator => self.kill_orchestrator(store),
+            ConfirmAction::ForgetSelected => self.forget_selected(store),
+        }
+    }
+
+    fn forget_selected(&mut self, store: &SessionStore) {
+        let Some(idx) = self.list_state.selected() else {
+            return;
+        };
+        let Some(session) = self.sessions.get(idx).cloned() else {
+            return;
+        };
+        if !session.state.is_terminal() {
+            // Belt-and-braces — `prompt_forget_selected` already
+            // gated on this, but the user could have raced a kill.
+            self.status
+                .flash(format!(" {} no longer terminal ", session.id));
+            return;
+        }
+        let invoker: std::sync::Arc<dyn crate::process::ProcessInvoker> =
+            std::sync::Arc::new(crate::process::RealProcessInvoker);
+        match crate::cli::sessions::forget_one(
+            invoker.as_ref(),
+            &self.root,
+            store,
+            &session.id,
+            now_ms(),
+            false,
+        ) {
+            Ok(crate::cli::sessions::ForgetOutcome::Forgotten) => {
+                self.status.flash(format!(" {} forgotten ", session.id));
+            }
+            Ok(crate::cli::sessions::ForgetOutcome::RefusedStillLive) => {
+                self.status
+                    .flash(format!(" {} still live, refused ", session.id));
+            }
+            Err(err) => {
+                self.status
+                    .flash_error(format!(" forget {}: {err:#} ", session.id));
+                return;
+            }
+        }
+        // The session is gone from disk — drop the selection cache so
+        // the next refresh_log_tail doesn't think it's still focused.
+        self.last_selected_id = None;
+        if let Err(err) = self.reload(store) {
+            self.status
+                .flash_error(format!(" reload failed: {err:#} "));
         }
     }
 
