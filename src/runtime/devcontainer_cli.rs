@@ -272,6 +272,30 @@ impl DevcontainerCli {
     }
 
     fn invoke(&self, args: &[String]) -> Result<String> {
+        // `up` and `build` both touch `/tmp/devcontainercli-<user>/`
+        // (the CLI's internal tempdir for the synthesised
+        // `updateUID.Dockerfile`). When two parallel `up`s race,
+        // one of them cleans the tempfile out from under the
+        // other and the second fails with `ENOENT: no such file
+        // or directory, rename ... updateUID.Dockerfile-…`. fleet's
+        // autonomous mode reliably triggers this — every scan
+        // interval can fire a fresh spawn, and a backed-up plan
+        // produces N parallel children racing on the same temp.
+        //
+        // Serialise these two verbs through a per-host OS file lock
+        // so only one `devcontainer up` / `build` runs at a time.
+        // `exec` is left unlocked — it reuses an existing container
+        // and doesn't touch the tempdir, so locking it would
+        // serialise unrelated agent work for no benefit.
+        let needs_lock = matches!(
+            args.first().map(String::as_str),
+            Some("up" | "build"),
+        );
+        let _guard = if needs_lock {
+            Some(acquire_devcontainer_lock()?)
+        } else {
+            None
+        };
         self.invoker
             .run("devcontainer", args.to_vec())
             .map_err(|err| {
@@ -287,6 +311,55 @@ impl DevcontainerCli {
                     err
                 }
             })
+    }
+}
+
+/// Take a cross-process exclusive lock against the
+/// devcontainer-CLI tempdir race. Returned guard releases the
+/// lock on drop (or implicitly when the process exits — flock is
+/// kernel-tracked per file descriptor).
+fn acquire_devcontainer_lock() -> Result<DevcontainerLock> {
+    use fs2::FileExt;
+    let path = devcontainer_lock_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening devcontainer lock at {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("acquiring exclusive devcontainer lock at {}", path.display()))?;
+    Ok(DevcontainerLock(file))
+}
+
+/// Resolve the lock path. Prefer `$XDG_RUNTIME_DIR` (per-user,
+/// tmpfs on most distros) so concurrent users don't share a lock
+/// and the file is reclaimed at logout. Fall back to `/tmp` with
+/// the username appended so multi-user hosts still serialise per
+/// user rather than per host.
+fn devcontainer_lock_path() -> std::path::PathBuf {
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return std::path::PathBuf::from(runtime_dir).join("fleet-devcontainer.lock");
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "default".to_string());
+    std::path::PathBuf::from(format!("/tmp/fleet-devcontainer-{user}.lock"))
+}
+
+struct DevcontainerLock(std::fs::File);
+
+impl Drop for DevcontainerLock {
+    fn drop(&mut self) {
+        // Best-effort release. The kernel reclaims the lock when
+        // the fd is closed on Drop regardless, so a failed unlock
+        // here only changes the visible-to-other-fds release
+        // moment by a few microseconds.
+        let _ = fs2::FileExt::unlock(&self.0);
     }
 }
 

@@ -107,6 +107,14 @@ keyring = { version = "3", default-features = false, features = [
 # the scheduler from hot-spinning.
 humantime = "2"
 
+# Cross-process file locks for serialising `devcontainer up/build`
+# invocations. The @devcontainers/cli stores per-host tempfiles
+# under /tmp/devcontainercli-<user>/ and races on cleanup when two
+# parallel `up`s happen — fleet's autonomous mode trivially
+# triggers this. fs2 wraps POSIX flock / Windows LockFile so the
+# lock is released automatically when the process exits.
+fs2 = "0.4"
+
 [dev-dependencies]
 # Mocks `ProcessInvoker` and other traits so tests don't shell out.
 mockall = "0.13"
