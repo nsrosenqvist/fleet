@@ -301,8 +301,22 @@ pub(crate) fn build_attach_script(session: &str) -> String {
     // Order matters: flip to `manual` to make `resize-window` take,
     // then resize, then set `latest` so subsequent detach/reattach
     // cycles continue to fit the latest client automatically.
+    // Modified keys (Shift+Enter, Ctrl+Enter, Alt+Enter, …) need
+    // both ends of the chain to cooperate: the *host terminal*
+    // must send CSI-u (or kitty-keyboard) sequences when they're
+    // pressed, AND tmux must forward those sequences to the inner
+    // program instead of stripping them down to a bare newline.
+    // Default tmux has `extended-keys off`; that's why Shift+Enter
+    // inserts a newline rather than reaching Claude as a distinct
+    // chord. Enabling it server-side here is the half we control;
+    // if the user's terminal doesn't speak CSI-u (older
+    // gnome-terminal, default Apple Terminal) the chord still
+    // won't reach claude, but every modern terminal (Ghostty,
+    // kitty, wezterm, alacritty, recent iTerm2/xterm) will.
     format!(
         "set -e
+tmux set-option -s extended-keys on >/dev/null 2>&1 || true
+tmux set-option -s extended-keys-format csi-u >/dev/null 2>&1 || true
 tmux set-option -t {s} status on >/dev/null 2>&1 || true
 tmux set-option -t {s} status-style 'bg=default,fg=colour250' >/dev/null 2>&1 || true
 tmux set-option -t {s} status-left {q_status_left} >/dev/null 2>&1 || true
@@ -447,6 +461,25 @@ mod tests {
         assert!(
             script.contains(&format!("set-option -t '{TMUX_SESSION_NAME}' status on")),
             "script: {script}"
+        );
+    }
+
+    #[test]
+    fn attach_script_enables_extended_keys_so_modified_chords_reach_the_agent() {
+        // Without `extended-keys on`, tmux strips Shift+Enter,
+        // Ctrl+Enter, etc. down to a bare newline — Claude can't
+        // tell them apart. Enable the modern CSI-u protocol
+        // server-side so any terminal that emits the sequences
+        // (kitty, wezterm, Ghostty, recent xterm/iTerm2) reaches
+        // the agent intact.
+        let script = build_attach_script(TMUX_SESSION_NAME);
+        assert!(
+            script.contains("set-option -s extended-keys on"),
+            "must enable extended-keys; script: {script}"
+        );
+        assert!(
+            script.contains("set-option -s extended-keys-format csi-u"),
+            "must pin csi-u format; script: {script}"
         );
     }
 
