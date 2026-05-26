@@ -289,15 +289,17 @@ impl AppState {
         }
     }
 
-    /// Enter on a worker row: attach if the worker has a live tmux
-    /// pane (refresh thread is publishing captures for it), otherwise
-    /// flash a status-line hint so the keypress isn't silently
-    /// dropped. Foreground/CI-spawned workers don't have a tmux
-    /// pane and can't be attached to.
+    /// Enter on a worker row: attach if the worker's tmux session is
+    /// still alive, otherwise flash a status-line hint so the keypress
+    /// isn't silently dropped. Foreground/CI-spawned workers don't
+    /// have a tmux pane and can't be attached to.
     fn enter_worker_attach(&mut self) -> Action {
         let Some(session) = self.selected() else {
             return Action::None;
         };
+        // Fast path: already terminal in the sidebar. tmux pane is
+        // gone by definition; skip the round-trip and surface the
+        // real reason rather than the generic "no live tmux pane".
         if session.state.is_terminal() {
             self.status.flash(format!(
                 " {} is {} — attach is only for live sessions ",
@@ -306,20 +308,29 @@ impl AppState {
             ));
             return Action::None;
         }
-        // `worker_panes` is populated by the refresh thread when
-        // capture-pane succeeds; "is there an entry?" is our proxy
-        // for "is the tmux pane alive?". This avoids a synchronous
-        // `tmux has-session` round-trip on the input thread.
-        if !self.worker_panes.contains_key(&session.id) {
+        let tmux_name = crate::session::worker_tmux_name(&session.id);
+        // Authoritative check: ask tmux directly. The cheaper
+        // [`Self::worker_panes`] proxy lags reality — the refresh
+        // thread evicts entries on the *next* tick after a tmux
+        // session dies, and only populates ~1.5 s after spawn, so it
+        // produces false negatives in both directions for short
+        // windows. ~5 ms blocking on the input thread is the right
+        // trade for never lying about whether attach will work.
+        let invoker = crate::process::RealProcessInvoker;
+        let tmux_alive = crate::orchestrator::tmux::has_session(&invoker, &tmux_name);
+        if !tmux_alive {
+            // Sidebar `state` still says Running but the tmux pane is
+            // gone — the executor hasn't rewritten meta.json yet.
+            // The auto-reload will flip the row to Failed within
+            // seconds; tell the user what to wait for.
             self.status.flash(format!(
-                " {} has no live tmux pane — was it spawned with --detached? ",
+                " {} has no live tmux pane — agent likely exited; \
+                 row will flip to failed on next auto-reload ",
                 session.id
             ));
             return Action::None;
         }
-        Action::AttachWorker {
-            tmux_name: crate::session::worker_tmux_name(&session.id),
-        }
+        Action::AttachWorker { tmux_name }
     }
 
     pub(in crate::tui) fn toggle_sessions_focus(&mut self) {
