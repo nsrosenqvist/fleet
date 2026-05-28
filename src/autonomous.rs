@@ -273,7 +273,29 @@ pub fn rank_candidates_by_plan(
     deps: &DepsDoc,
 ) -> Vec<IssueContext> {
     use std::collections::HashSet;
-    let open_set: HashSet<String> = open.iter().map(|i| i.human_id.clone()).collect();
+    // Tickets that some plan considers Completed. Used to logically
+    // close out blockers that are still `open` in the tracker (the
+    // workflow's create-pr / close-ticket step was skipped, or the
+    // tracker is updated out-of-band) so downstream items can move.
+    // Without this, "ticket A blocks B" keeps B pinned forever once
+    // A is plan-Completed but the tracker hasn't caught up.
+    let plan_completed: HashSet<String> = plans
+        .iter()
+        .flat_map(|p| p.items.iter())
+        .filter(|it| it.state == PlanItemState::Completed)
+        .map(|it| it.ticket_id.clone())
+        .collect();
+    // `open_set` for the blocker check subtracts plan-completed
+    // tickets so a logically-done blocker no longer holds its
+    // dependents. The candidate iteration below still walks the raw
+    // `open` slice — we want to prioritize / pick from currently
+    // tracker-open tickets, just not consider plan-done ones as
+    // active blockers.
+    let open_set: HashSet<String> = open
+        .iter()
+        .map(|i| i.human_id.clone())
+        .filter(|id| !plan_completed.contains(id))
+        .collect();
     let is_blocked = |ticket: &str| ticket_is_blocked(ticket, &open_set, deps);
 
     // Tickets that appear as a `Failed` item in any plan are
@@ -1267,6 +1289,33 @@ mod tests {
         // 42 is filtered out; the plan-prioritized list contains just
         // 43; leftover (99) trails.
         assert_eq!(ids, vec!["43", "99"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_clears_ticket_block_when_blocker_plan_completed() {
+        // Mirror of the "tracker closed it" path but for the case
+        // where the workflow's create-pr / close-ticket step never
+        // ran (no code_host configured). The blocker is still
+        // tracker-`open` but its plan item is Completed — the
+        // scheduler should unblock dependents anyway so plan
+        // progress doesn't stall waiting for an external close.
+        let open = vec![issue("42"), issue("43")];
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 0);
+        // 43 was completed by an earlier session; tracker hasn't
+        // caught up (still listed in `open`).
+        plan.items[1].state = PlanItemState::Completed;
+        let deps = deps_with(vec![DepEdge {
+            blocked: "42".into(),
+            blocked_on: "43".into(),
+            reason: BlockedReason::Ticket,
+            created_at_ms: 1,
+        }]);
+        let ordered = rank_candidates_by_plan(open, &[plan], &deps);
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        // 43 is suppressed via `already_addressed` (Completed); 42 is
+        // unblocked because its blocker is plan-Completed even though
+        // the tracker still says open.
+        assert_eq!(ids, vec!["42"]);
     }
 
     #[test]
