@@ -150,7 +150,11 @@ if [ -n \"$TOKEN\" ]; then
   printf '{\"claudeAiOauth\":{\"accessToken\":\"%s\",\"scopes\":[\"user:inference\"],\"subscriptionType\":\"subscription\"}}\\n' \"$TOKEN\" > \"$HOME/.claude/.credentials.json\"
   chmod 600 \"$HOME/.claude/.credentials.json\"
 fi
-exec claude --dangerously-skip-permissions -p \"${FLEET_PROMPT:-No prompt provided. Please summarise what claude code is in two sentences.}\"
+PROMPT=\"${FLEET_PROMPT:-No prompt provided. Please summarise what claude code is in two sentences.}\"
+if [ \"${FLEET_MERGE_CONFLICTS:-}\" = \"true\" ]; then
+  PROMPT=\"# Chain merge conflicts — RESOLVE FIRST\n\nYour worktree is in MERGING state from chaining off multiple upstream tickets. Read \\`${FLEET_MERGE_CONTEXT_FILE:-/artifacts/MERGE_CONTEXT.md}\\` for context (parent tickets, branches, conflicted files). Resolve every conflict by preserving the intent of both upstream tickets — use \\`git log\\` against each parent branch or \\`fleet-tracker read <ticket-id>\\` if intent is unclear. \\`git add\\` resolved files, then \\`git commit\\` to finalize. \\`git status\\` must report a clean tree before you proceed with the task below.\n\n---\n\n${PROMPT}\"
+fi
+exec claude --dangerously-skip-permissions -p \"$PROMPT\"
 ";
 
 #[cfg(test)]

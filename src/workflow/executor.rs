@@ -1025,6 +1025,13 @@ impl WorkflowExecutor {
         };
         let prompt = resolve_prompt_artifact(req.workspace, prompt_file)
             .with_context(|| format!("preparing prompt for agent node `{}`", node.id))?;
+        // Per-node merge-state probe: an earlier multi-parent chain
+        // merge that left conflicts persists in the worktree's
+        // `.git/MERGE_HEAD`. The first agent node sees the flag set
+        // (and gets `FLEET_MERGE_*` env); subsequent nodes see a
+        // clean tree because the agent committed the resolution
+        // (and the post-node verify caught any failure to do so).
+        let merge_conflicts = worktree_in_merging_state(req.workspace);
         let agent_ctx = AgentContext {
             persona,
             prompt: prompt.as_ref(),
@@ -1035,6 +1042,7 @@ impl WorkflowExecutor {
             // Same story for `pr`: session is the source of truth so
             // resume after a gate keeps `FLEET_PR_*` env visible.
             pr: session.pr.as_ref(),
+            merge_conflicts,
         };
         let mut env = build_agent_env(agent, &agent_ctx);
         // Overlay any `secrets:`-configured values on top of the
@@ -1258,6 +1266,41 @@ impl WorkflowExecutor {
             crate::session::containers::mark_stopped(&session_dir, container_id.as_str())
         {
             tracing::warn!(?err, container = %container_id, "clearing container marker failed");
+        }
+
+        // Merge-resolution post-check: if the agent entered the node
+        // with a merging worktree (`merge_conflicts` was true) it was
+        // instructed to resolve + commit. If MERGE_HEAD is still
+        // present or any file still has conflict markers, the agent
+        // left the merge half-done and downstream nodes would build
+        // on broken state. Surface as a node failure.
+        if merge_conflicts && worktree_in_merging_state(req.workspace) {
+            bail!(
+                "agent `{agent_name}` in node `{}` left the chain merge in MERGING state \
+                 (MERGE_HEAD still present at {}) — workflow refuses to advance",
+                node.id,
+                req.workspace.join(".git/MERGE_HEAD").display(),
+            );
+        }
+        // Independent of `merge_conflicts`: even if the agent
+        // committed (clearing MERGE_HEAD), unresolved markers in the
+        // committed tree are a worse failure — the agent committed
+        // garbage. Scan and fail loudly.
+        let markered = detect_merge_conflict_markers(req.workspace);
+        if !markered.is_empty() {
+            let listed: Vec<String> = markered
+                .iter()
+                .take(5)
+                .map(|p| p.display().to_string())
+                .collect();
+            bail!(
+                "agent `{agent_name}` in node `{}` left unresolved merge conflict markers in {} \
+                 file(s): {}{}",
+                node.id,
+                markered.len(),
+                listed.join(", "),
+                if markered.len() > listed.len() { " (truncated)" } else { "" },
+            );
         }
 
         run_outcome
@@ -1739,8 +1782,18 @@ impl WorkflowExecutor {
             }
             return Ok(Vec::new());
         };
+        // Base-branch precedence: explicit YAML `base:` > most-recent
+        // chain parent's branch (stacked-PR targeting for a session
+        // that chained off Completed upstream work) > repo's detected
+        // default branch > "main" literal. The chain step picks the
+        // primary parent's session branch — same one the worktree was
+        // cut from — so the PR's diff reads as "B's new work on top
+        // of A's PR" instead of "A's commits + B's commits on top of
+        // main" (which would look like a duplicate of A's PR until
+        // A merges).
         let base = base
             .map(str::to_string)
+            .or_else(|| resolve_chain_pr_base(req, session))
             .or_else(|| crate::policy::detect_default_branch(self.invoker.as_ref(), req.workspace))
             .unwrap_or_else(|| "main".to_string());
         let head = match head {
@@ -2364,6 +2417,12 @@ pub struct AgentContext<'a> {
     /// `FLEET_PR_*` block when set. Independent of [`Self::issue`];
     /// both may be set simultaneously.
     pub pr: Option<&'a PrContext>,
+    /// `true` when the worktree was left in MERGING state by the
+    /// chain-merge step. Exposed as `FLEET_MERGE_CONFLICTS=true` +
+    /// `FLEET_MERGE_CONTEXT_FILE=/artifacts/MERGE_CONTEXT.md` so the
+    /// trampoline can prepend a conflict-resolution preamble to
+    /// `FLEET_PROMPT`. Detected per-node from `<worktree>/.git/MERGE_HEAD`.
+    pub merge_conflicts: bool,
 }
 
 /// Resolved prompt file: the user-authored source path (for
@@ -2426,6 +2485,13 @@ pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String
         env.push(("FLEET_PR_BASE_REF".to_string(), pr.base_ref.clone()));
         env.push(("FLEET_PR_URL".to_string(), pr.url.clone()));
     }
+    if ctx.merge_conflicts {
+        env.push(("FLEET_MERGE_CONFLICTS".to_string(), "true".to_string()));
+        env.push((
+            "FLEET_MERGE_CONTEXT_FILE".to_string(),
+            "/artifacts/MERGE_CONTEXT.md".to_string(),
+        ));
+    }
     env
 }
 
@@ -2436,6 +2502,84 @@ pub fn build_agent_env(agent: &AgentSpec, ctx: &AgentContext<'_>) -> Vec<(String
 /// default registry used pre-refactor.
 fn is_claude_oauth_var(name: &str) -> bool {
     name == "CLAUDE_CODE_OAUTH_TOKEN" || name == "CLAUDE_OAUTH_TOKEN"
+}
+
+/// `true` when `<workspace>/.git/MERGE_HEAD` exists. Indicates the
+/// worktree is in the middle of a `git merge` — either the chain-
+/// merge step left conflicts, or the agent's own work did. The
+/// agent-env builder flips `FLEET_MERGE_CONFLICTS` based on this so
+/// the trampoline can prepend a resolve-first instruction.
+fn worktree_in_merging_state(workspace: &Path) -> bool {
+    workspace.join(".git/MERGE_HEAD").exists()
+}
+
+/// At `create-pr` time, resolve the chain parent's branch to use as
+/// the PR's base when the session has upstream chain parents in
+/// `.fleet/deps.json`. Falls back to `None` when there's no chain or
+/// the session has no bound issue. Repo root is derived from the
+/// session store under `req`.
+fn resolve_chain_pr_base(req: &ExecuteRequest<'_>, session: &Session) -> Option<String> {
+    let issue = session.issue.as_ref()?;
+    // SessionStore.root() = `<repo>/.fleet/sessions`; the repo root
+    // is two parents up. Tolerate weird stores by failing closed.
+    let repo_root = req.store.root().parent()?.parent()?;
+    let parents = crate::cli::workflow::resolve_chain_parents(
+        req.store,
+        repo_root,
+        &issue.human_id,
+    );
+    parents.into_iter().next().map(|p| p.branch)
+}
+
+/// Scan tracked files in `workspace` for unresolved `<<<<<<<` /
+/// `=======` / `>>>>>>>` markers left by an aborted merge resolution.
+/// Pairs with the `.git/MERGE_HEAD` check: an active merge with no
+/// markers means the agent did the right thing but forgot the final
+/// commit; markers without an active merge means the agent committed
+/// without resolving. Both are failures.
+fn detect_merge_conflict_markers(workspace: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = walk_tracked_files(workspace) else {
+        return out;
+    };
+    for path in entries {
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if body.contains("<<<<<<<") && body.contains(">>>>>>>") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Bounded depth-first walk of `workspace` skipping `.git/` and
+/// `node_modules/`. Used by [`detect_merge_conflict_markers`]; not
+/// authoritative for "every tracked file" (a `.gitignore`'d file
+/// with conflict markers would slip through `git ls-files`, but the
+/// agent is unlikely to put them there). Plain fs walk avoids an
+/// extra git invocation on the hot path.
+fn walk_tracked_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == ".git" || name_str == "node_modules" || name_str == "target" {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Walk an env Vec and replace any value whose key has a
@@ -3860,6 +4004,7 @@ nodes:
             prompt: Some(&prompt),
             issue: Some(&issue),
             pr: None,
+            merge_conflicts: false,
         };
         let env = build_agent_env(&spec, &ctx);
         let keys: std::collections::HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();

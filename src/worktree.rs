@@ -69,6 +69,147 @@ pub fn is_git_repo(invoker: &dyn ProcessInvoker, dir: &Path) -> bool {
     matches!(out, Ok(s) if s.trim() == "true")
 }
 
+/// `git fetch origin` in `repo_root`. Best-effort: a missing
+/// remote, no network, or auth failure logs at warn but doesn't
+/// fail the caller — the worker still proceeds against whatever
+/// local state exists. Same posture as the orchestrator's other
+/// "nice to have but not load-bearing" fs/git calls.
+pub fn fetch_origin(invoker: &dyn ProcessInvoker, repo_root: &Path) {
+    let result = invoker.run(
+        "git",
+        vec![
+            "-C".to_string(),
+            repo_root.to_string_lossy().into_owned(),
+            "fetch".to_string(),
+            "origin".to_string(),
+        ],
+    );
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "git fetch origin failed — worker will proceed against local state");
+    }
+}
+
+/// True when `repo_root` has a `remotes/origin/<branch>` ref locally
+/// (i.e., the branch has been published and tracked at some point).
+/// Used to decide whether to substitute `origin/<branch>` for a
+/// local branch ref when cutting a worktree, so a force-push or
+/// follow-up commit on the published branch is what the new worker
+/// starts from.
+#[must_use]
+pub fn has_remote_branch(invoker: &dyn ProcessInvoker, repo_root: &Path, branch: &str) -> bool {
+    let out = invoker.run(
+        "git",
+        vec![
+            "-C".to_string(),
+            repo_root.to_string_lossy().into_owned(),
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "--quiet".to_string(),
+            format!("refs/remotes/origin/{branch}"),
+        ],
+    );
+    out.is_ok()
+}
+
+/// Result of a `git merge` attempt inside a worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// All merges produced a clean auto-merge — worktree is on a
+    /// new commit, no conflict markers, no `MERGE_HEAD`.
+    Clean,
+    /// At least one merge produced conflicts. The worktree is left
+    /// in MERGING state — `MERGE_HEAD` exists, conflicted files have
+    /// `<<<<<<<` markers — for the agent to resolve.
+    Conflicts {
+        /// Branches that failed to merge (post-the-clean ones).
+        unmerged: Vec<String>,
+        /// Conflicted file paths from `git status --porcelain`.
+        conflicted_files: Vec<String>,
+    },
+}
+
+/// `git merge --no-ff -m <msg> <branches...>` one branch at a time
+/// inside `worktree_path`. Stops at the first conflict and returns
+/// [`MergeOutcome::Conflicts`] without aborting — the in-progress
+/// merge state is left for the agent to resolve. Auto-merges produce
+/// a commit each and the loop continues.
+pub fn merge_branches_into_worktree(
+    invoker: &dyn ProcessInvoker,
+    worktree_path: &Path,
+    branches: &[String],
+) -> Result<MergeOutcome> {
+    for (i, branch) in branches.iter().enumerate() {
+        let msg = format!("Chain merge: {branch}");
+        let result = invoker.run(
+            "git",
+            vec![
+                "-C".to_string(),
+                worktree_path.to_string_lossy().into_owned(),
+                "merge".to_string(),
+                "--no-ff".to_string(),
+                "-m".to_string(),
+                msg,
+                branch.clone(),
+            ],
+        );
+        if let Err(err) = result {
+            // Either a conflict (expected — leave state for agent) or
+            // a setup error. Check `MERGE_HEAD` to differentiate.
+            let merging = worktree_path.join(".git/MERGE_HEAD").exists();
+            if merging {
+                let conflicted_files = list_conflicted_files(invoker, worktree_path);
+                let unmerged: Vec<String> = branches[i..].to_vec();
+                return Ok(MergeOutcome::Conflicts {
+                    unmerged,
+                    conflicted_files,
+                });
+            }
+            return Err(err).with_context(|| {
+                format!(
+                    "git merge {branch} failed at {} (not a conflict — \
+                     setup error)",
+                    worktree_path.display()
+                )
+            });
+        }
+    }
+    Ok(MergeOutcome::Clean)
+}
+
+/// Read `git status --porcelain=v1` and pick out conflicted files
+/// (status code `UU`, `AA`, `DD`, etc. — anything with a non-space
+/// in *both* positions). Empty on parse failure.
+fn list_conflicted_files(invoker: &dyn ProcessInvoker, worktree_path: &Path) -> Vec<String> {
+    let Ok(out) = invoker.run(
+        "git",
+        vec![
+            "-C".to_string(),
+            worktree_path.to_string_lossy().into_owned(),
+            "status".to_string(),
+            "--porcelain=v1".to_string(),
+        ],
+    ) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| {
+            // Format: `XY <path>` where conflicts have non-space in
+            // both X and Y.
+            let bytes = line.as_bytes();
+            if bytes.len() < 4 {
+                return None;
+            }
+            let x = bytes[0];
+            let y = bytes[1];
+            // Conflict status codes per git docs: UU, AA, DD, AU,
+            // UA, DU, UD. The common thread: at least one side is
+            // `U`, OR both sides are non-space and identical (AA/DD).
+            let conflict = (x == b'U' || y == b'U') || (x == y && x != b' ');
+            if conflict { Some(line[3..].to_string()) } else { None }
+        })
+        .collect()
+}
+
 /// Return the sha of `HEAD` at `dir`. Caller-friendly error: the
 /// context already names the directory.
 #[allow(dead_code)] // wired in subsequent commits
@@ -678,6 +819,61 @@ mod tests {
             &["main".to_string(), "master".to_string()],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn has_remote_branch_true_when_git_resolves_ref() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run()
+            .withf(|prog, args| {
+                prog == "git"
+                    && args.iter().any(|a| a == "refs/remotes/origin/feature")
+            })
+            .returning(|_, _| Ok("deadbeef".to_string()));
+        assert!(has_remote_branch(&inv, Path::new("/repo"), "feature"));
+    }
+
+    #[test]
+    fn has_remote_branch_false_when_git_fails() {
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run().returning(|_, _| {
+            Err(anyhow::anyhow!("git exited 1"))
+        });
+        assert!(!has_remote_branch(&inv, Path::new("/repo"), "missing"));
+    }
+
+    #[test]
+    fn merge_branches_clean_outcome_when_all_succeed() {
+        let mut inv = MockProcessInvoker::new();
+        // Two merges, both succeed.
+        inv.expect_run()
+            .times(2)
+            .returning(|_, _| Ok(String::new()));
+        let outcome = merge_branches_into_worktree(
+            &inv,
+            Path::new("/wt-nonexistent"),
+            &["fleet/session-A".to_string(), "fleet/session-B".to_string()],
+        )
+        .unwrap();
+        assert_eq!(outcome, MergeOutcome::Clean);
+    }
+
+    #[test]
+    fn merge_branches_returns_setup_error_when_no_merge_head() {
+        // Merge fails AND .git/MERGE_HEAD doesn't exist (no merge
+        // ever started) → propagate as a real error rather than
+        // claiming a conflict.
+        let mut inv = MockProcessInvoker::new();
+        inv.expect_run().returning(|_, _| {
+            Err(anyhow::anyhow!("git exited 128"))
+        });
+        let err = merge_branches_into_worktree(
+            &inv,
+            Path::new("/wt-nonexistent-dir-no-merge-head"),
+            &["fleet/session-X".to_string()],
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("setup error"));
     }
 
     #[test]

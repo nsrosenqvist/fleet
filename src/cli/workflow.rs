@@ -136,10 +136,13 @@ pub fn run_run(
 
     // Provision the per-session worktree. For a PR-bound run the
     // worktree fetches the PR's head ref and bases on it; for the
-    // usual issueless / issue-bound path we cut from HEAD — or, when
-    // this issue's plan deps point at an upstream Completed session,
-    // off that session's branch so ticket B's worker sees ticket A's
-    // changes without waiting for A's PR to merge.
+    // usual issueless / issue-bound path we cut from origin's latest
+    // — or, when this issue's plan deps point at an upstream
+    // Completed session, off that session's published branch so
+    // ticket B's worker sees ticket A's changes without waiting for
+    // A's PR to merge. A `git fetch origin` runs first so the
+    // worker always starts from the canonical remote state
+    // (force-push wins over stale local refs by design).
     let provision = if let Some(p) = pr_context.as_ref() {
         provision_worktree_for_pr(
             invoker.as_ref(),
@@ -151,18 +154,61 @@ pub fn run_run(
             &protected,
         )?
     } else {
-        let base = issue
+        if worktree::is_git_repo(invoker.as_ref(), &root) {
+            worktree::fetch_origin(invoker.as_ref(), &root);
+        }
+        let chain_parents = issue
             .as_ref()
-            .and_then(|i| resolve_chain_base(&store, &root, &i.human_id))
-            .unwrap_or_else(|| "HEAD".to_string());
-        provision_worktree(
+            .map(|i| resolve_chain_parents(&store, &root, &i.human_id))
+            .unwrap_or_default();
+        let base = if chain_parents.is_empty() {
+            resolve_default_base(invoker.as_ref(), &root)
+        } else {
+            prefer_remote_ref(invoker.as_ref(), &root, &chain_parents[0].branch)
+        };
+        let prov = provision_worktree(
             invoker.as_ref(),
             &root,
             &store,
             &session_id,
             &base,
             &protected,
-        )?
+        )?;
+        // Multi-parent: merge the remaining chain parents into the
+        // worktree. Clean merges produce commits; conflicts leave
+        // the worktree in MERGING state and drop MERGE_CONTEXT.md
+        // for the agent to read and resolve before its first task.
+        if let Some(p) = prov.as_ref() {
+            if chain_parents.len() > 1 {
+                let extras: Vec<String> = chain_parents
+                    .iter()
+                    .skip(1)
+                    .map(|cp| prefer_remote_ref(invoker.as_ref(), &root, &cp.branch))
+                    .collect();
+                let outcome = worktree::merge_branches_into_worktree(
+                    invoker.as_ref(),
+                    &p.path,
+                    &extras,
+                )?;
+                if let worktree::MergeOutcome::Conflicts {
+                    unmerged,
+                    conflicted_files,
+                } = outcome
+                {
+                    let artifacts_dir = store.session_dir(&session_id).join("artifacts");
+                    std::fs::create_dir_all(&artifacts_dir).ok();
+                    let body = render_merge_context(
+                        &chain_parents,
+                        &unmerged,
+                        &conflicted_files,
+                    );
+                    std::fs::write(artifacts_dir.join("MERGE_CONTEXT.md"), body).with_context(
+                        || "writing artifacts/MERGE_CONTEXT.md for the agent to resolve",
+                    )?;
+                }
+            }
+        }
+        prov
     };
     let workspace_path: &Path = provision
         .as_ref()
@@ -753,41 +799,139 @@ pub struct WorktreeProvision {
 /// replay: a fresh run bases off `HEAD`, replay bases off the src
 /// session's branch tip so the new worktree starts at the same
 /// commit the prior run ended at.
-/// Resolve a chain-base for an autonomous/manual issue-bound run:
-/// the branch of the most recent Completed session whose ticket
-/// this issue is `blocked_on` per `.fleet/deps.json`. Lets a
-/// downstream worker pick up upstream changes that haven't yet
-/// landed in `main` (e.g. a PR is still open, or there's no PR at
-/// all in a local test repo).
+/// Build the human + agent-readable markdown the trampoline points
+/// the agent at when chain merges left conflicts. Lists every parent
+/// (ticket id, title, session id, branch), which ones merged cleanly
+/// vs. which conflicted, and the conflicted file paths.
+#[must_use]
+pub fn render_merge_context(
+    parents: &[ChainParent],
+    unmerged: &[String],
+    conflicted_files: &[String],
+) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "# Chain merge conflicts\n");
+    let _ = writeln!(
+        s,
+        "Your worktree was chained off {} upstream Completed session(s) \
+         from your plan dependencies. The first parent was used as the \
+         cut-from base; merges of the remaining parent(s) into your \
+         branch produced conflicts.\n",
+        parents.len(),
+    );
+    let _ = writeln!(s, "## Parents\n");
+    for (i, p) in parents.iter().enumerate() {
+        let role = if i == 0 { "base" } else { "merged-in" };
+        let state = if unmerged.iter().any(|b| b == &p.branch) {
+            "CONFLICT"
+        } else if i == 0 {
+            "base"
+        } else {
+            "merged cleanly"
+        };
+        let _ = writeln!(
+            s,
+            "- **{ticket}** — {title}  \n  \
+             session: `{sid}` · branch: `{branch}` · role: {role} · status: **{state}**",
+            ticket = p.ticket_id,
+            title = p.ticket_title,
+            sid = p.session_id,
+            branch = p.branch,
+        );
+    }
+    if !conflicted_files.is_empty() {
+        let _ = writeln!(s, "\n## Conflicted files\n");
+        for f in conflicted_files {
+            let _ = writeln!(s, "- `{f}`");
+        }
+    }
+    let _ = writeln!(
+        s,
+        "\n## How to resolve\n\n\
+         1. `git status` to confirm the conflicted files (matches above).  \n\
+         2. For each conflicted file, read the `<<<<<<<` / `=======` / `>>>>>>>` \
+         markers and resolve by preserving the intent of both upstream tickets. \
+         If unclear, run `git log <branch>` against either parent branch to read \
+         their commit messages, or `fleet-tracker read <ticket-id>` to read the \
+         original ticket text.  \n\
+         3. `git add <files>` for every resolved file.  \n\
+         4. `git commit` to finalize the merge (no `-m` needed; git will pre-fill \
+         a sensible message from MERGE_MSG).  \n\
+         5. `git status` should report a clean tree. Only then proceed with \
+         the task in your prompt.\n",
+    );
+    s
+}
+
+/// Pick the cut-from ref for a worker that isn't part of a chain:
+/// `origin/<default-branch>` when origin is reachable (so we start
+/// from the latest published commit on main, not whatever stale local
+/// `HEAD` happens to point at), falling back to `HEAD` otherwise.
+fn resolve_default_base(invoker: &dyn ProcessInvoker, repo_root: &Path) -> String {
+    if let Some(branch) = crate::policy::detect_default_branch(invoker, repo_root) {
+        if worktree::has_remote_branch(invoker, repo_root, &branch) {
+            return format!("origin/{branch}");
+        }
+    }
+    "HEAD".to_string()
+}
+
+/// Substitute `origin/<branch>` for `branch` when the remote-tracking
+/// ref exists. Lets a force-push or a human's follow-up commit on a
+/// chain parent's published branch be the source of truth — local
+/// stale state never wins. Falls through to the local ref when the
+/// branch hasn't been published.
+fn prefer_remote_ref(invoker: &dyn ProcessInvoker, repo_root: &Path, branch: &str) -> String {
+    if worktree::has_remote_branch(invoker, repo_root, branch) {
+        format!("origin/{branch}")
+    } else {
+        branch.to_string()
+    }
+}
+
+/// One upstream Completed session this issue chains off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainParent {
+    pub session_id: String,
+    pub ticket_id: String,
+    pub ticket_title: String,
+    pub branch: String,
+    pub updated_at_ms: u64,
+}
+
+/// Resolve every Completed upstream session this issue chains off,
+/// one per `blocked_on` edge in `.fleet/deps.json`. For each blocker
+/// the most recently updated Completed session wins; blockers
+/// without any Completed session are skipped (the upstream work
+/// hasn't run yet or failed — chaining off a failed branch would
+/// carry the failure forward).
 ///
-/// Returns `None` when:
-///   - `.fleet/deps.json` is missing or unreadable (no deps to chain)
-///   - this issue has no `blocked_on` edges
-///   - no Completed session exists for any of the blockers (the
-///     upstream work hasn't run yet, or it failed — chaining off a
-///     failed branch would carry the failure forward)
-///
-/// When multiple blockers each have a Completed session, the most
-/// recently updated one wins. Callers must validate the deps graph
-/// is acyclic separately (the plan loader does this); this function
-/// trusts whatever the deps file says.
-fn resolve_chain_base(
+/// Returned in deterministic order: most-recent-update first, so
+/// `[0]` is the natural cut-from and `[1..]` are extras to merge in.
+/// Empty vec means "no chain; cut from default base."
+pub fn resolve_chain_parents(
     store: &SessionStore,
     root: &Path,
     issue_human_id: &str,
-) -> Option<String> {
-    let deps_doc = crate::deps::DepsStore::for_repo(root).load().ok()?;
-    let blockers: Vec<&String> = deps_doc
+) -> Vec<ChainParent> {
+    let Ok(deps_doc) = crate::deps::DepsStore::for_repo(root).load() else {
+        return Vec::new();
+    };
+    let blockers: Vec<String> = deps_doc
         .edges
         .iter()
         .filter(|e| e.blocked == issue_human_id)
-        .map(|e| &e.blocked_on)
+        .map(|e| e.blocked_on.clone())
         .collect();
     if blockers.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let ids = store.list().ok()?;
-    let mut candidate: Option<(u64, String)> = None;
+    let Ok(ids) = store.list() else {
+        return Vec::new();
+    };
+    let mut best: std::collections::HashMap<String, ChainParent> =
+        std::collections::HashMap::new();
     for id in ids {
         let Ok(s) = store.load(&id) else { continue };
         if s.state != crate::session::SessionState::Completed {
@@ -796,17 +940,46 @@ fn resolve_chain_base(
         let Some(issue) = s.issue.as_ref() else {
             continue;
         };
-        if !blockers.iter().any(|b| b.as_str() == issue.human_id) {
+        if !blockers.iter().any(|b| b == &issue.human_id) {
             continue;
         }
         let Some(branch) = s.branch.clone() else {
             continue;
         };
-        if candidate.as_ref().is_none_or(|(t, _)| s.updated_at_ms > *t) {
-            candidate = Some((s.updated_at_ms, branch));
-        }
+        let candidate = ChainParent {
+            session_id: s.id.to_string(),
+            ticket_id: issue.human_id.clone(),
+            ticket_title: issue.title.clone(),
+            branch,
+            updated_at_ms: s.updated_at_ms,
+        };
+        best.entry(issue.human_id.clone())
+            .and_modify(|existing| {
+                if candidate.updated_at_ms > existing.updated_at_ms {
+                    *existing = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
     }
-    candidate.map(|(_, branch)| branch)
+    let mut out: Vec<ChainParent> = best.into_values().collect();
+    out.sort_by_key(|p| std::cmp::Reverse(p.updated_at_ms));
+    out
+}
+
+/// Back-compat wrapper around [`resolve_chain_parents`] that returns
+/// just the primary cut-from branch. Kept for the simpler-test path
+/// where the multi-parent merge isn't exercised; the spawn site
+/// consumes the full list now.
+#[cfg(test)]
+fn resolve_chain_base(
+    store: &SessionStore,
+    root: &Path,
+    issue_human_id: &str,
+) -> Option<String> {
+    resolve_chain_parents(store, root, issue_human_id)
+        .into_iter()
+        .next()
+        .map(|p| p.branch)
 }
 
 fn provision_worktree(
@@ -1306,6 +1479,80 @@ mod tests {
             100,
         );
         assert_eq!(resolve_chain_base(&store, tmp.path(), "72f2132"), None);
+    }
+
+    #[test]
+    fn resolve_chain_parents_returns_one_entry_per_blocker_most_recent_first() {
+        use crate::session::SessionState;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(tmp.path());
+        // 72 is blocked on both 5f and 6a (multi-parent).
+        write_deps(tmp.path(), &[("72f2132", "5f2bf98"), ("72f2132", "6abcdef")]);
+        seed_session(
+            &store,
+            "s-5f-newer",
+            "5f2bf98",
+            SessionState::Completed,
+            Some("fleet/session-5f-newer"),
+            300,
+        );
+        seed_session(
+            &store,
+            "s-5f-older",
+            "5f2bf98",
+            SessionState::Completed,
+            Some("fleet/session-5f-older"),
+            100,
+        );
+        seed_session(
+            &store,
+            "s-6a",
+            "6abcdef",
+            SessionState::Completed,
+            Some("fleet/session-6a"),
+            200,
+        );
+        let parents = resolve_chain_parents(&store, tmp.path(), "72f2132");
+        // One entry per blocker (5f's older session dropped); sorted
+        // most-recent-first by updated_at_ms.
+        assert_eq!(parents.len(), 2);
+        assert_eq!(parents[0].ticket_id, "5f2bf98");
+        assert_eq!(parents[0].branch, "fleet/session-5f-newer");
+        assert_eq!(parents[1].ticket_id, "6abcdef");
+    }
+
+    #[test]
+    fn render_merge_context_lists_parents_and_conflicted_files() {
+        let parents = vec![
+            ChainParent {
+                session_id: "s-A".into(),
+                ticket_id: "42".into(),
+                ticket_title: "API contracts".into(),
+                branch: "fleet/session-A".into(),
+                updated_at_ms: 100,
+            },
+            ChainParent {
+                session_id: "s-B".into(),
+                ticket_id: "43".into(),
+                ticket_title: "Schema migrations".into(),
+                branch: "fleet/session-B".into(),
+                updated_at_ms: 90,
+            },
+        ];
+        let body = render_merge_context(
+            &parents,
+            &["fleet/session-B".to_string()],
+            &["src/schema.rs".to_string(), "README.md".to_string()],
+        );
+        assert!(body.contains("# Chain merge conflicts"));
+        assert!(body.contains("**42** — API contracts"));
+        assert!(body.contains("**43** — Schema migrations"));
+        assert!(body.contains("`fleet/session-A`"));
+        assert!(body.contains("**base**"));
+        assert!(body.contains("**CONFLICT**"));
+        assert!(body.contains("`src/schema.rs`"));
+        assert!(body.contains("`README.md`"));
+        assert!(body.contains("fleet-tracker read"));
     }
 
     #[test]
