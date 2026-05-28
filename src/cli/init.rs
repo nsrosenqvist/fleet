@@ -381,12 +381,17 @@ const DEFAULT_DEVCONTAINER_DOCKERFILE: &str = "\
 # .fleet/config.yaml.
 FROM mcr.microsoft.com/devcontainers/base:ubuntu
 
+# Install as root, then switch back. Without the trailing
+# `USER vscode`, the image's default user stays root — and claude
+# refuses `--dangerously-skip-permissions` when uid 0, which fleet
+# needs in headless mode (see agent::registry::CLAUDE_CODE_ENTRY_SCRIPT).
 USER root
 RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \\
  && apt-get install -y --no-install-recommends nodejs \\
  && rm -rf /var/lib/apt/lists/* \\
  && npm install -g @anthropic-ai/claude-code \\
  && npm cache clean --force
+USER vscode
 ";
 
 /// `.fleet/workflows/standard.yaml` — the canonical planner → coder →
@@ -937,6 +942,14 @@ mod tests {
         assert!(
             dockerfile.contains("npm install -g @anthropic-ai/claude-code"),
             "Dockerfile must install the claude-code CLI",
+        );
+        // The Dockerfile flips to root for apt-get + npm install,
+        // then *must* switch back so the image's effective user
+        // isn't root. Claude refuses `--dangerously-skip-permissions`
+        // when uid 0, which fleet relies on for headless runs.
+        assert!(
+            dockerfile.trim_end().ends_with("USER vscode"),
+            "Dockerfile must end on `USER vscode` so claude doesn't run as root: {dockerfile}",
         );
     }
 
