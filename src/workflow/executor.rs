@@ -1104,6 +1104,14 @@ impl WorkflowExecutor {
                 extra_mounts.push(m);
             }
         }
+        // When the workspace is a `git worktree`-created tree, its
+        // `.git` is a gitlink file referencing host paths that the
+        // workspace mount alone doesn't expose. Bind-mount the
+        // worktree's gitdir + the main repo's `.git/` at their
+        // host-absolute paths so git inside the container can follow
+        // the gitlink and reach shared objects/refs. No-op for
+        // regular (`.git` is a dir) or non-git workspaces.
+        extra_mounts.extend(worktree_git_mounts(req.workspace));
         // When running as a fanout sibling subprocess, the per-
         // sibling tmux dispatcher sets `FLEET_FANOUT_SIBLING` so we
         // can disambiguate the devcontainer CLI container identity
@@ -1694,6 +1702,14 @@ impl WorkflowExecutor {
     /// them, calls `create_pr`, emits `number`, `url`, `head_sha`.
     /// Supersedes the legacy `gh pr create` bash escape hatch in
     /// `standard.yaml`.
+    ///
+    /// When no `code_host:` is configured (the common "local test
+    /// repo, no remote" case), the node logs a "skipped" notice and
+    /// returns `Ok(empty)` instead of failing the whole workflow.
+    /// The legacy bash `open_pr` shelling `gh pr create` would have
+    /// failed in this case too; the difference is that fleet now
+    /// degrades gracefully so plan / implement / review work
+    /// survives.
     #[allow(clippy::too_many_arguments)]
     fn run_create_pr_node(
         &self,
@@ -1706,7 +1722,23 @@ impl WorkflowExecutor {
         draft: bool,
         session: &Session,
     ) -> Result<Vec<((String, String), String)>> {
-        let host = self.require_code_host_for(node)?;
+        let Some(host) = self.code_host.clone() else {
+            tracing::warn!(
+                node = %node.id,
+                "create-pr skipped: no code_host configured \
+                 (set `code_host: github` in .fleet/config.yaml \
+                 or add an `origin` remote that auto-detects)"
+            );
+            let log_path = self.node_log_path(req, session, &node.id);
+            let body_log = "--- create-pr skipped ---\n\
+                            No code_host configured — workflow continues without opening a PR.\n\
+                            Set `code_host: github` in .fleet/config.yaml (and ensure an\n\
+                            authenticated `gh` + an `origin` remote) to enable.\n";
+            if let Err(err) = std::fs::write(&log_path, body_log) {
+                tracing::warn!(?err, log = %log_path.display(), "writing create-pr skip log failed");
+            }
+            return Ok(Vec::new());
+        };
         let base = base
             .map(str::to_string)
             .or_else(|| crate::policy::detect_default_branch(self.invoker.as_ref(), req.workspace))
@@ -1739,7 +1771,9 @@ impl WorkflowExecutor {
     }
 
     /// Host-side `pr-comment` handler. No outputs; runs the
-    /// `pr_comment` write and writes a one-line log entry.
+    /// `pr_comment` write and writes a one-line log entry. Same
+    /// no-code-host degraded mode as [`Self::run_create_pr_node`] —
+    /// skip with a notice rather than failing the workflow.
     fn run_pr_comment_node(
         &self,
         req: &ExecuteRequest<'_>,
@@ -1749,7 +1783,19 @@ impl WorkflowExecutor {
         session: &Session,
         outputs: &OutputMap,
     ) -> Result<()> {
-        let host = self.require_code_host_for(node)?;
+        let Some(host) = self.code_host.clone() else {
+            tracing::warn!(
+                node = %node.id,
+                "pr-comment skipped: no code_host configured",
+            );
+            let log_path = self.node_log_path(req, session, &node.id);
+            let log_body = "--- pr-comment skipped ---\n\
+                            No code_host configured — comment not posted.\n";
+            if let Err(err) = std::fs::write(&log_path, log_body) {
+                tracing::warn!(?err, log = %log_path.display(), "writing pr-comment skip log failed");
+            }
+            return Ok(());
+        };
         let number = resolve_pr_number(node, pr_ref, session, outputs)?;
         host.pr_comment(req.workspace, number, body)
             .with_context(|| format!("pr-comment node `{}`: pr_comment failed", node.id))?;
@@ -2536,6 +2582,104 @@ fn fleet_git_mount(adapter: &dyn RuntimeAdapter, image: &ImageId) -> Option<Moun
         container_path: PathBuf::from("/usr/local/bin/git"),
         read_only: true,
     })
+}
+
+/// When `workspace` is a git worktree (i.e. its `.git` is a *file*,
+/// not a directory), produce bind mounts that make the gitlink
+/// resolvable inside the container.
+///
+/// A `git worktree add` creates two paths on the host that the
+/// container's mount of the worktree dir alone can't see:
+///   1. The worktree's per-instance gitdir at
+///      `<main_repo>/.git/worktrees/<name>/`, referenced by the
+///      `.git` file's `gitdir:` line.
+///   2. The main repo's `.git/`, referenced from the gitdir's
+///      `commondir` file and used for shared `objects/`, `refs/`,
+///      `config`, etc.
+///
+/// Without these, every `git` command inside the container fails
+/// with "fatal: not a git repository: '`<host_path>`'", and agents
+/// observed this as "git worktree was broken" and reactively
+/// `rm .git && git init`'d — disconnecting the session branch from
+/// the main repo and losing the `fleet/session-<id>` ref.
+///
+/// Both mounts are bound at the *same absolute host path* inside the
+/// container so the gitlink + commondir text doesn't have to be
+/// rewritten. Both are read-write because `git commit` needs to
+/// update HEAD/index in the gitdir and write objects/refs in the
+/// commondir.
+///
+/// Returns empty when `.git` is a directory (regular non-worktree
+/// repo), missing (non-git workspace), or unparseable.
+fn worktree_git_mounts(workspace: &Path) -> Vec<MountSpec> {
+    let mut out = Vec::new();
+    let gitlink_path = workspace.join(".git");
+    let Ok(meta) = std::fs::metadata(&gitlink_path) else {
+        return out;
+    };
+    if !meta.is_file() {
+        // Either a regular repo (`.git` is a dir, mounted via the
+        // workspace mount and self-contained) or some other unusual
+        // shape — leave alone in both cases.
+        return out;
+    }
+    let Ok(body) = std::fs::read_to_string(&gitlink_path) else {
+        return out;
+    };
+    let Some(gitdir) = parse_gitlink_gitdir(&body) else {
+        return out;
+    };
+    let main_git = read_commondir(&gitdir);
+
+    out.push(MountSpec {
+        host_path: gitdir.clone(),
+        container_path: gitdir,
+        read_only: false,
+    });
+    if let Some(main) = main_git {
+        out.push(MountSpec {
+            host_path: main.clone(),
+            container_path: main,
+            read_only: false,
+        });
+    }
+    out
+}
+
+/// Parse `gitdir: <path>` out of a `.git` gitlink file body. The
+/// file format is a single trailing-newline line; whitespace tolerant
+/// so a future git format quirk doesn't break us.
+fn parse_gitlink_gitdir(body: &str) -> Option<PathBuf> {
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("gitdir:") {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
+        }
+    }
+    None
+}
+
+/// Resolve `<gitdir>/commondir` to an absolute path. The file usually
+/// contains a relative path (e.g. `../..`) anchored at `gitdir`.
+/// Falls back to `None` when missing or unparseable — caller skips
+/// the main-repo mount in that case (still usable for read-only
+/// inspection of the worktree's own gitdir).
+fn read_commondir(gitdir: &Path) -> Option<PathBuf> {
+    let commondir_file = gitdir.join("commondir");
+    let raw = std::fs::read_to_string(&commondir_file).ok()?;
+    let rel = raw.trim();
+    if rel.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(rel);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        gitdir.join(candidate)
+    };
+    std::fs::canonicalize(&resolved).ok().or(Some(resolved))
 }
 
 fn locate_sibling_binary(name: &str) -> Option<PathBuf> {
@@ -7699,6 +7843,96 @@ nodes:
         // binary and the agent would get "exec format error."
         let adapter = ArchOnlyAdapter::returning(Some("future-arch-9000"));
         assert_eq!(fleet_tracker_mount(&adapter, &ImageId::new("img:1")), None);
+    }
+
+    // ---- worktree gitlink mounts --------------------------------------
+
+    #[test]
+    fn worktree_git_mounts_is_empty_for_non_git_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `.git` at all — not a git workspace.
+        assert!(worktree_git_mounts(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn worktree_git_mounts_is_empty_for_regular_repo_with_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `.git` is a directory — a regular non-worktree repo; the
+        // workspace mount alone covers it, no extra mounts needed.
+        std::fs::create_dir_all(tmp.path().join(".git/objects")).unwrap();
+        assert!(worktree_git_mounts(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn worktree_git_mounts_emits_gitdir_and_commondir_for_worktree() {
+        // Synthesise the shape `git worktree add` produces:
+        //   <main>/.git/                         ← main repo's gitdir
+        //   <main>/.git/worktrees/wt12/          ← per-worktree gitdir
+        //   <main>/.git/worktrees/wt12/commondir contains "../.."
+        //   <wt>/.git is a *file* with `gitdir: <abs path to wt12>`
+        let tmp = tempfile::tempdir().unwrap();
+        let main_git = tmp.path().join("main/.git");
+        let wt_gitdir = main_git.join("worktrees/wt12");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), "../..").unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .unwrap();
+
+        let mounts = worktree_git_mounts(&wt);
+        assert_eq!(mounts.len(), 2, "got {mounts:?}");
+        // First entry is the per-worktree gitdir.
+        let canon_wt_gitdir = std::fs::canonicalize(&wt_gitdir).unwrap();
+        assert_eq!(mounts[0].host_path, wt_gitdir);
+        assert_eq!(mounts[0].container_path, wt_gitdir);
+        assert!(!mounts[0].read_only);
+        // Second entry is the main repo's gitdir, resolved via commondir.
+        let canon_main_git = std::fs::canonicalize(&main_git).unwrap();
+        assert_eq!(mounts[1].host_path, canon_main_git);
+        assert_eq!(mounts[1].container_path, canon_main_git);
+        assert!(!mounts[1].read_only);
+        // Suppress unused-variable warning while we're at it.
+        let _ = canon_wt_gitdir;
+    }
+
+    #[test]
+    fn worktree_git_mounts_skips_main_when_commondir_missing() {
+        // Edge case: worktree gitlink valid but no commondir file —
+        // mount the gitdir alone so the gitlink resolves to *something*,
+        // skip the main repo mount (git may degrade but at least the
+        // gitlink isn't dangling).
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_gitdir = tmp.path().join("orphan/.git/worktrees/wt99");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .unwrap();
+
+        let mounts = worktree_git_mounts(&wt);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].host_path, wt_gitdir);
+    }
+
+    #[test]
+    fn parse_gitlink_gitdir_handles_trailing_newline_and_whitespace() {
+        assert_eq!(
+            parse_gitlink_gitdir("gitdir: /foo/bar\n"),
+            Some(PathBuf::from("/foo/bar")),
+        );
+        assert_eq!(
+            parse_gitlink_gitdir("gitdir:   /weird/  \n"),
+            Some(PathBuf::from("/weird/")),
+        );
+        assert_eq!(parse_gitlink_gitdir("# random comment\n"), None);
+        assert_eq!(parse_gitlink_gitdir("gitdir:\n"), None);
     }
 
     // ---- tracker-create -----------------------------------------------
