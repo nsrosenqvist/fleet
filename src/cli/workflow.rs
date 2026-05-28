@@ -136,9 +136,12 @@ pub fn run_run(
 
     // Provision the per-session worktree. For a PR-bound run the
     // worktree fetches the PR's head ref and bases on it; for the
-    // usual issueless / issue-bound path we cut from HEAD.
-    let provision = match &pr_context {
-        Some(p) => provision_worktree_for_pr(
+    // usual issueless / issue-bound path we cut from HEAD — or, when
+    // this issue's plan deps point at an upstream Completed session,
+    // off that session's branch so ticket B's worker sees ticket A's
+    // changes without waiting for A's PR to merge.
+    let provision = if let Some(p) = pr_context.as_ref() {
+        provision_worktree_for_pr(
             invoker.as_ref(),
             &root,
             &store,
@@ -146,15 +149,20 @@ pub fn run_run(
             p.number,
             &p.head_ref,
             &protected,
-        )?,
-        None => provision_worktree(
+        )?
+    } else {
+        let base = issue
+            .as_ref()
+            .and_then(|i| resolve_chain_base(&store, &root, &i.human_id))
+            .unwrap_or_else(|| "HEAD".to_string());
+        provision_worktree(
             invoker.as_ref(),
             &root,
             &store,
             &session_id,
-            "HEAD",
+            &base,
             &protected,
-        )?,
+        )?
     };
     let workspace_path: &Path = provision
         .as_ref()
@@ -745,6 +753,62 @@ pub struct WorktreeProvision {
 /// replay: a fresh run bases off `HEAD`, replay bases off the src
 /// session's branch tip so the new worktree starts at the same
 /// commit the prior run ended at.
+/// Resolve a chain-base for an autonomous/manual issue-bound run:
+/// the branch of the most recent Completed session whose ticket
+/// this issue is `blocked_on` per `.fleet/deps.json`. Lets a
+/// downstream worker pick up upstream changes that haven't yet
+/// landed in `main` (e.g. a PR is still open, or there's no PR at
+/// all in a local test repo).
+///
+/// Returns `None` when:
+///   - `.fleet/deps.json` is missing or unreadable (no deps to chain)
+///   - this issue has no `blocked_on` edges
+///   - no Completed session exists for any of the blockers (the
+///     upstream work hasn't run yet, or it failed — chaining off a
+///     failed branch would carry the failure forward)
+///
+/// When multiple blockers each have a Completed session, the most
+/// recently updated one wins. Callers must validate the deps graph
+/// is acyclic separately (the plan loader does this); this function
+/// trusts whatever the deps file says.
+fn resolve_chain_base(
+    store: &SessionStore,
+    root: &Path,
+    issue_human_id: &str,
+) -> Option<String> {
+    let deps_doc = crate::deps::DepsStore::for_repo(root).load().ok()?;
+    let blockers: Vec<&String> = deps_doc
+        .edges
+        .iter()
+        .filter(|e| e.blocked == issue_human_id)
+        .map(|e| &e.blocked_on)
+        .collect();
+    if blockers.is_empty() {
+        return None;
+    }
+    let ids = store.list().ok()?;
+    let mut candidate: Option<(u64, String)> = None;
+    for id in ids {
+        let Ok(s) = store.load(&id) else { continue };
+        if s.state != crate::session::SessionState::Completed {
+            continue;
+        }
+        let Some(issue) = s.issue.as_ref() else {
+            continue;
+        };
+        if !blockers.iter().any(|b| b.as_str() == issue.human_id) {
+            continue;
+        }
+        let Some(branch) = s.branch.clone() else {
+            continue;
+        };
+        if candidate.as_ref().is_none_or(|(t, _)| s.updated_at_ms > *t) {
+            candidate = Some((s.updated_at_ms, branch));
+        }
+    }
+    candidate.map(|(_, branch)| branch)
+}
+
 fn provision_worktree(
     invoker: &dyn ProcessInvoker,
     root: &Path,
@@ -1143,6 +1207,131 @@ mod tests {
     fn workflow_path_joins_under_dot_fleet_workflows() {
         let p = workflow_path(Path::new("/repo"), "standard");
         assert_eq!(p, PathBuf::from("/repo/.fleet/workflows/standard.yaml"));
+    }
+
+    // ---- chain-base resolution ----------------------------------------
+
+    fn write_deps(root: &Path, edges: &[(&str, &str)]) {
+        let body = format!(
+            r#"{{ "version": 1, "edges": [{}] }}"#,
+            edges
+                .iter()
+                .map(|(b, on)| format!(
+                    r#"{{"blocked":"{b}","blocked_on":"{on}","reason":"ticket","created_at_ms":1}}"#,
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let p = root.join(".fleet/deps.json");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    fn seed_session(
+        store: &SessionStore,
+        sid: &str,
+        human_id: &str,
+        state: crate::session::SessionState,
+        branch: Option<&str>,
+        updated_at_ms: u64,
+    ) {
+        use crate::session::{IssueContext, Session, SessionId};
+        let mut s = Session::new(SessionId::new(sid), "standard", 1);
+        s.issue = Some(IssueContext {
+            id: format!("gh:{human_id}"),
+            human_id: human_id.to_string(),
+            title: human_id.into(),
+            labels: Vec::new(),
+        });
+        let _ = s.transition_to(crate::session::SessionState::Running, 2);
+        if state != crate::session::SessionState::Running {
+            let _ = s.transition_to(state, 3);
+        }
+        if let Some(b) = branch {
+            s.set_worktree(PathBuf::from("/tmp/x"), b, updated_at_ms);
+        }
+        s.updated_at_ms = updated_at_ms;
+        store.create(&s).unwrap();
+        store.save(&s).unwrap();
+    }
+
+    #[test]
+    fn resolve_chain_base_returns_none_when_no_deps_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(tmp.path());
+        assert_eq!(resolve_chain_base(&store, tmp.path(), "anything"), None);
+    }
+
+    #[test]
+    fn resolve_chain_base_returns_none_when_ticket_has_no_blockers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(tmp.path());
+        write_deps(tmp.path(), &[("99", "42")]); // 99 → 42, unrelated to "1"
+        assert_eq!(resolve_chain_base(&store, tmp.path(), "1"), None);
+    }
+
+    #[test]
+    fn resolve_chain_base_picks_completed_blocker_branch() {
+        use crate::session::SessionState;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(tmp.path());
+        write_deps(tmp.path(), &[("72f2132", "5f2bf98")]); // 72 blocked on 5f
+        // Completed session for 5f bound to its session branch.
+        seed_session(
+            &store,
+            "s-old",
+            "5f2bf98",
+            SessionState::Completed,
+            Some("fleet/session-old"),
+            100,
+        );
+        let base = resolve_chain_base(&store, tmp.path(), "72f2132");
+        assert_eq!(base.as_deref(), Some("fleet/session-old"));
+    }
+
+    #[test]
+    fn resolve_chain_base_ignores_failed_sessions() {
+        use crate::session::SessionState;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(tmp.path());
+        write_deps(tmp.path(), &[("72f2132", "5f2bf98")]);
+        // Failed session for 5f — must not be chained off (would
+        // carry the failure forward).
+        seed_session(
+            &store,
+            "s-bad",
+            "5f2bf98",
+            SessionState::Failed,
+            Some("fleet/session-bad"),
+            100,
+        );
+        assert_eq!(resolve_chain_base(&store, tmp.path(), "72f2132"), None);
+    }
+
+    #[test]
+    fn resolve_chain_base_picks_most_recently_updated_when_multiple_completed() {
+        use crate::session::SessionState;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_repo(tmp.path());
+        write_deps(tmp.path(), &[("72f2132", "5f2bf98")]);
+        seed_session(
+            &store,
+            "s-older",
+            "5f2bf98",
+            SessionState::Completed,
+            Some("fleet/session-older"),
+            100,
+        );
+        seed_session(
+            &store,
+            "s-newer",
+            "5f2bf98",
+            SessionState::Completed,
+            Some("fleet/session-newer"),
+            200,
+        );
+        let base = resolve_chain_base(&store, tmp.path(), "72f2132");
+        assert_eq!(base.as_deref(), Some("fleet/session-newer"));
     }
 
     fn make_issue(human_id: &str, title: &str) -> Issue {
