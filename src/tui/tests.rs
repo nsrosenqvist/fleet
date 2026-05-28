@@ -290,6 +290,26 @@ fn tail_lines_returns_empty_for_empty_input() {
 }
 
 #[test]
+fn wrapped_row_count_counts_visual_rows_not_source_lines() {
+    use ratatui::text::{Line, Text};
+    // One short line + one line that wraps to 3 rows at width=10 +
+    // one empty line. Total = 1 + 3 + 1 = 5.
+    let text = Text::from(vec![
+        Line::raw("short"),
+        Line::raw("aaaaaaaaaaaaaaaaaaaaaaaaaaa"), // 27 chars → ceil(27/10) = 3 rows
+        Line::raw(""),
+    ]);
+    assert_eq!(wrapped_row_count(&text, 10), 5);
+}
+
+#[test]
+fn wrapped_row_count_handles_zero_width_without_dividing_by_zero() {
+    use ratatui::text::{Line, Text};
+    let text = Text::from(vec![Line::raw("anything"), Line::raw("else")]);
+    assert_eq!(wrapped_row_count(&text, 0), 2);
+}
+
+#[test]
 fn read_latest_log_tail_returns_empty_when_dir_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let tail = read_latest_log_tail(&tmp.path().join("nonexistent"), 10);

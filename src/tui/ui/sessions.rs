@@ -606,19 +606,44 @@ fn render_orchestrator_output(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 /// Render `body` (raw bytes from `tmux capture-pane -e`) as styled
-/// spans in `area`, tailed to fit. Falls back to plain text on ANSI
-/// parse failure so a malformed capture never blanks the pane.
+/// spans in `area`, pinned to the bottom so the freshest output is
+/// always visible. Falls back to plain text on ANSI parse failure so
+/// a malformed capture never blanks the pane.
+///
+/// We count visual rows (not source lines) before scrolling: a long
+/// agent message that wraps to many rows would otherwise spill below
+/// the area and hide later content. Ratatui 0.30's
+/// `Paragraph::line_count` is private, so we replicate its behaviour
+/// inline via `Line::width()` and ceil-div against `area.width`.
 fn render_ansi_pane(f: &mut Frame<'_>, area: Rect, body: &str) {
     let text: ratatui::text::Text<'_> = ansi_to_tui::IntoText::into_text(&body)
         .unwrap_or_else(|_| ratatui::text::Text::raw(body.to_string()));
-    let line_count = text.lines.len();
-    let take = area.height as usize;
-    let tail: Vec<Line<'_>> = text
-        .lines
-        .into_iter()
-        .skip(line_count.saturating_sub(take))
-        .collect();
-    f.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), area);
+    let total_rows = wrapped_row_count(&text, area.width);
+    let scroll_y = total_rows.saturating_sub(area.height as usize);
+    let scroll_y = u16::try_from(scroll_y).unwrap_or(u16::MAX);
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
+    f.render_widget(paragraph, area);
+}
+
+/// How many visual rows `text` will occupy when wrapped at
+/// `width` columns. Empty lines still count as one row. Matches
+/// ratatui's `Wrap { trim: false }` behaviour closely enough for the
+/// "scroll to bottom" calculation; the renderer itself does the
+/// authoritative wrap on draw.
+pub(in crate::tui) fn wrapped_row_count(text: &ratatui::text::Text<'_>, width: u16) -> usize {
+    if width == 0 {
+        return text.lines.len();
+    }
+    let w = width as usize;
+    text.lines
+        .iter()
+        .map(|line| {
+            let visible = line.width();
+            if visible == 0 { 1 } else { visible.div_ceil(w) }
+        })
+        .sum()
 }
 
 fn render_output_placeholder(f: &mut Frame<'_>, area: Rect, text: &str) {
