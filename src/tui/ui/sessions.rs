@@ -16,9 +16,9 @@ use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Padding, Paragra
 use crate::orchestrator::{OrchestratorSession, OrchestratorState};
 use crate::plans::{Plan, PlanState};
 use crate::session::Session;
-use crate::tui::app::{AppState, SessionsFocus};
+use crate::tui::app::{AppState, BranchGlyph, NodeStatus, ProgressRow, SessionsFocus};
 use crate::tui::theme::{
-    ACCENT, IDENT, MUTED, OK, SELECT_BG, SELECT_FG, WARN, framed_block, framed_block_accent,
+    ACCENT, ERR, IDENT, MUTED, OK, SELECT_BG, SELECT_FG, WARN, framed_block, framed_block_accent,
     framed_block_titled, kv_line,
 };
 
@@ -335,22 +335,62 @@ pub(super) fn render_detail(f: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
 
     // Stack details on top (kv pairs — small, fixed-ish height per
-    // case) and the output preview below (grows to fill). Mirrors the
-    // pre-AO/Lima layout: two distinct framed blocks rather than one
-    // big paragraph, so the eye reads details / output as separate
-    // sections.
+    // case), workflow progress in the middle (worker only — orch
+    // skips this section), and the output preview below (grows to
+    // fill). Mirrors the pre-AO/Lima layout: distinct framed blocks
+    // so the eye reads sections as separate units.
     let detail_lines = detail_lines_for(&target);
-    // +2 for the block's top/bottom border rows; clamp so a wildly
-    // long details section can't starve the output preview.
     let details_height = u16::try_from(detail_lines.len() + 2)
         .unwrap_or(u16::MAX)
         .clamp(3, 18);
+    let workflow_height = workflow_section_height(&target, state);
+    let constraints: Vec<Constraint> = if workflow_height > 0 {
+        vec![
+            Constraint::Length(details_height),
+            Constraint::Length(workflow_height),
+            Constraint::Min(0),
+        ]
+    } else {
+        vec![Constraint::Length(details_height), Constraint::Min(0)]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(details_height), Constraint::Min(0)])
+        .constraints(constraints)
         .split(area);
     render_details_section(f, chunks[0], &target, detail_lines);
-    render_output_section(f, chunks[1], &target, state);
+    if workflow_height > 0 {
+        render_workflow_section(f, chunks[1], state);
+        render_output_section(f, chunks[2], &target, state);
+    } else {
+        render_output_section(f, chunks[1], &target, state);
+    }
+}
+
+/// Bordered-block height for the workflow progress section, or 0
+/// when the section shouldn't render (orchestrator target, no
+/// loaded workflow). Clamped so the output preview keeps a usable
+/// minimum height regardless of node count.
+fn workflow_section_height(target: &DetailTarget<'_>, state: &AppState) -> u16 {
+    if !matches!(target, DetailTarget::Worker(_)) {
+        return 0;
+    }
+    let Some(progress) = state.workflow_progress.as_ref() else {
+        return 0;
+    };
+    let rows = if progress.load_error.is_some() {
+        1
+    } else if progress.rows.is_empty() {
+        0
+    } else {
+        progress.rows.len()
+    };
+    if rows == 0 {
+        return 0;
+    }
+    // +2 for the block's top/bottom border rows; clamp to leave
+    // the output preview at least ~8 rows. 14 is the cap so even a
+    // huge workflow doesn't starve the output.
+    u16::try_from(rows + 2).unwrap_or(u16::MAX).clamp(3, 14)
 }
 
 fn render_detail_empty(f: &mut Frame<'_>, area: Rect) {
@@ -591,6 +631,98 @@ fn render_worker_output(f: &mut Frame<'_>, area: Rect, state: &AppState) {
         .map(|l| Line::from(l.clone()))
         .collect();
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Render the workflow-progress section: tree of nodes with status
+/// glyphs, costs, and loop-edge annotations. No-op when no worker is
+/// selected (caller already gated `workflow_section_height` to 0).
+fn render_workflow_section(f: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let block = framed_block(" workflow ").padding(Padding::horizontal(2));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let Some(progress) = state.workflow_progress.as_ref() else {
+        return;
+    };
+    if let Some(err) = progress.load_error.as_deref() {
+        let muted = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+        let line = Line::from(Span::styled(format!("workflow yaml: {err}"), muted));
+        f.render_widget(Paragraph::new(line), inner);
+        return;
+    }
+    let lines: Vec<Line<'_>> = progress
+        .rows
+        .iter()
+        .map(progress_row_to_line)
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render one [`ProgressRow`] into a styled `Line`:
+///
+/// `  ├─▶ ✓ implement (agent) $0.45`
+/// `  ├─▶ ▶ review (agent) running`
+/// `  ├─▶ · revise (agent) skipped (when: changes_requested)`
+/// `      └─▶ ↺ review`
+fn progress_row_to_line(row: &ProgressRow) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Indent — two spaces per depth, then the branch glyph.
+    let indent = "  ".repeat(row.depth.saturating_sub(usize::from(row.depth > 0)));
+    if !indent.is_empty() {
+        spans.push(Span::raw(indent));
+    }
+    let muted = Style::default().fg(MUTED);
+    match row.branch {
+        BranchGlyph::None => {}
+        BranchGlyph::Mid => spans.push(Span::styled("├─▶ ", muted)),
+        BranchGlyph::Last => spans.push(Span::styled("└─▶ ", muted)),
+    }
+
+    if let Some(target) = row.loop_back.as_deref() {
+        // Loop-back / join annotation row — no status glyph, just a
+        // muted `↺ <target>` so the reader sees the back-edge.
+        spans.push(Span::styled(
+            format!("↺ {target}"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::ITALIC),
+        ));
+        return Line::from(spans);
+    }
+
+    let (marker, marker_style) = status_marker(row.status);
+    spans.push(Span::styled(format!("{marker} "), marker_style));
+    spans.push(Span::styled(
+        row.node_id.clone(),
+        Style::default()
+            .fg(IDENT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(format!(" ({})", row.kind_label), muted));
+    if let Some(cost) = row.cost_usd {
+        spans.push(Span::styled(format!(" ${cost:.2}"), muted));
+    } else if matches!(row.status, NodeStatus::Running) {
+        spans.push(Span::styled(" running".to_string(), muted));
+    } else if matches!(row.status, NodeStatus::Failed) {
+        spans.push(Span::styled(" failed".to_string(), Style::default().fg(ERR)));
+    } else if matches!(row.status, NodeStatus::SkippedByGate) {
+        spans.push(Span::styled(" skipped".to_string(), muted));
+    } else if matches!(row.status, NodeStatus::Pending) {
+        spans.push(Span::styled(" pending".to_string(), muted));
+    }
+    if let Some(expr) = row.when_expr.as_deref() {
+        spans.push(Span::styled(format!(" (when: {expr})"), muted));
+    }
+    Line::from(spans)
+}
+
+const fn status_marker(s: NodeStatus) -> (&'static str, Style) {
+    match s {
+        NodeStatus::Done => ("✓", Style::new().fg(OK)),
+        NodeStatus::Running => ("▶", Style::new().fg(WARN)),
+        NodeStatus::Failed => ("✗", Style::new().fg(ERR)),
+        // Skipped + pending share the muted dot glyph — the
+        // trailing "skipped" / "pending" word in the row body
+        // carries the distinction.
+        NodeStatus::SkippedByGate | NodeStatus::Pending => ("·", Style::new().fg(MUTED)),
+    }
 }
 
 fn render_orchestrator_output(f: &mut Frame<'_>, area: Rect, state: &AppState) {

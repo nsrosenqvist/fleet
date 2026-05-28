@@ -24,7 +24,11 @@ mod plans;
 mod sessions;
 mod spawn;
 mod status;
+mod workflow_progress;
 pub(in crate::tui) use status::{FlashKind, StatusBar};
+pub(in crate::tui) use workflow_progress::{
+    BranchGlyph, NodeStatus, ProgressRow, WorkflowProgress,
+};
 
 // Re-exports — anything the input/event-loop side, tests, or sibling
 // `tui` modules reach for through `super::app::*` lives here. Types
@@ -94,6 +98,12 @@ pub(super) struct AppState {
     /// `render_ansi_pane`. Refreshed on selection change and on each
     /// `WorkerPane` update for the selected worker.
     pub(super) transcript_tail: Option<String>,
+    /// Per-session workflow progress (depth-first tree of nodes +
+    /// status glyphs) shown in the worker detail pane between
+    /// details (top) and output (bottom). Rebuilt on selection change
+    /// and on each auto-reload so live state transitions show up
+    /// without manual `r`. `None` when no worker is selected.
+    pub(super) workflow_progress: Option<WorkflowProgress>,
     pub(super) last_selected_id: Option<String>,
     /// Encapsulated bottom-bar state. Owns the transient flash
     /// message + TTL + dismiss-on-keystroke semantics. Replaces
@@ -296,6 +306,7 @@ impl AppState {
             list_state: ListState::default(),
             log_tail: Vec::new(),
             transcript_tail: None,
+            workflow_progress: None,
             last_selected_id: None,
             status: StatusBar::default(),
             view: View::Sessions,
@@ -422,6 +433,10 @@ impl AppState {
             self.status
                 .flash_error(format!(" auto-reload failed: {err:#} "));
         }
+        // Reload only refreshes the in-memory `sessions` Vec — the
+        // workflow progress derives its status from session fields
+        // that just changed, so re-derive too.
+        self.refresh_workflow_progress();
     }
 
     /// Start the background refresh thread that polls `tmux

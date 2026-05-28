@@ -35,6 +35,7 @@ impl AppState {
         let Some((current_id, logs_dir)) = id_and_logs_dir else {
             self.log_tail.clear();
             self.transcript_tail = None;
+            self.workflow_progress = None;
             self.last_selected_id = None;
             return;
         };
@@ -44,6 +45,28 @@ impl AppState {
         self.last_selected_id = Some(current_id);
         self.log_tail = read_latest_log_tail(&logs_dir, LOG_TAIL_LINES);
         self.refresh_transcript_tail();
+        self.refresh_workflow_progress();
+    }
+
+    /// Rebuild the workflow-progress view for the currently selected
+    /// session. Called on selection change and (cheaply) on every
+    /// auto-reload tick so node-status transitions surface without
+    /// a manual `r`. No-op when no worker is selected.
+    pub(in crate::tui) fn refresh_workflow_progress(&mut self) {
+        let Some(session) = self.selected().cloned() else {
+            self.workflow_progress = None;
+            return;
+        };
+        let session_dir = self
+            .root
+            .join(".fleet/sessions")
+            .join(session.id.as_str());
+        let workflows_root = self.root.join(".fleet/workflows");
+        self.workflow_progress = Some(super::workflow_progress::WorkflowProgress::build(
+            &session,
+            &session_dir,
+            &workflows_root,
+        ));
     }
 
     /// Re-tail the selected session's `transcript.log`. Cheap (bounded
