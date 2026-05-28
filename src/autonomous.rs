@@ -246,6 +246,28 @@ pub fn rank_candidates_by_plan(
         .map(|it| it.ticket_id.clone())
         .collect();
 
+    // Tickets that any plan has already addressed — Completed (a
+    // prior session finished successfully), InProgress (a session is
+    // working on it, the claim filter would also catch this but
+    // belt-and-braces against a stale session pointer), or Skipped
+    // (user marked it as not needed). Without this, a ticket the
+    // tracker still shows as `open` (because the workflow's open_pr
+    // step was skipped, or because the user closes tickets manually
+    // out-of-band) silently gets re-spawned on the next tick after
+    // its first session completes — observed as "two agents working
+    // on the same plan item in parallel."
+    let already_addressed: HashSet<String> = plans
+        .iter()
+        .flat_map(|p| p.items.iter())
+        .filter(|it| {
+            matches!(
+                it.state,
+                PlanItemState::Completed | PlanItemState::InProgress | PlanItemState::Skipped,
+            )
+        })
+        .map(|it| it.ticket_id.clone())
+        .collect();
+
     let mut prioritized: Vec<IssueContext> = Vec::new();
     let mut leftover = open;
 
@@ -278,8 +300,15 @@ pub fn rank_candidates_by_plan(
     }
     // Append non-blocked leftover (the any-open-issue fallback) so
     // tickets not currently in any plan still get picked once the
-    // plan queue is exhausted.
-    leftover.retain(|i| !is_blocked(&i.human_id) && !suppressed_by_failure.contains(&i.human_id));
+    // plan queue is exhausted. `already_addressed` mirrors the
+    // plan-loop's "Pending only" filter so a ticket the prioritized
+    // pass *deliberately* skipped (because its item is already done)
+    // doesn't sneak back in through the fallback.
+    leftover.retain(|i| {
+        !is_blocked(&i.human_id)
+            && !suppressed_by_failure.contains(&i.human_id)
+            && !already_addressed.contains(&i.human_id)
+    });
     prioritized.extend(leftover);
     prioritized
 }
@@ -1025,12 +1054,46 @@ mod tests {
         let open = vec![issue("99"), issue("42"), issue("43")];
         let mut plan = plan_with("plan-1", "p", &["42", "43"], 0);
         // Item 0 (42) is already in progress; should not be
-        // re-prioritized. Item 1 (43) stays pending.
+        // re-prioritized AND not appear in the leftover fallback.
+        // Item 1 (43) stays pending.
         plan.items[0].state = PlanItemState::InProgress;
         let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
         let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
-        // Only 43 is prioritized; 99 + 42 fall through as leftover.
-        assert_eq!(ids, vec!["43", "99", "42"]);
+        // Only 43 (Pending) is prioritized; 99 (not in any plan)
+        // still falls through as leftover. 42 is fully suppressed —
+        // the `already_addressed` filter mirrors the prioritized
+        // pass's "Pending only" rule so a ticket the plan author
+        // explicitly marked as InProgress doesn't get re-spawned
+        // through the fallback path.
+        assert_eq!(ids, vec!["43", "99"]);
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_suppresses_completed_items_to_prevent_respawn() {
+        // Regression: after a session completed for a plan item, the
+        // tracker still listed the ticket as `open` (workflow's
+        // open_pr / close-ticket step skipped, manual close pending,
+        // etc.). The Completed plan item was correctly skipped in
+        // the prioritized pass but the leftover fallback let the
+        // ticket through, so the next autonomous tick re-spawned a
+        // second session against the same item.
+        let open = vec![issue("42"), issue("43")];
+        let mut plan = plan_with("plan-1", "p", &["42", "43"], 0);
+        plan.items[0].state = PlanItemState::Completed;
+        let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
+        let ids: Vec<&str> = ordered.iter().map(|i| i.human_id.as_str()).collect();
+        assert_eq!(ids, vec!["43"], "Completed item must not appear in candidates");
+    }
+
+    #[test]
+    fn rank_candidates_by_plan_suppresses_skipped_items() {
+        // A plan item the user explicitly marked Skipped shouldn't
+        // come back through the leftover fallback.
+        let open = vec![issue("42")];
+        let mut plan = plan_with("plan-1", "p", &["42"], 0);
+        plan.items[0].state = PlanItemState::Skipped;
+        let ordered = rank_candidates_by_plan(open, &[plan], &empty_deps());
+        assert!(ordered.is_empty(), "Skipped item must not appear in candidates");
     }
 
     #[test]
