@@ -290,6 +290,45 @@ fn tail_lines_returns_empty_for_empty_input() {
 }
 
 #[test]
+fn node_transition_hr_matches_starting_line() {
+    use ratatui::text::Line;
+    let line = Line::raw("fleet: ▸ node `plan` (agent) starting");
+    let hr = node_transition_hr(&line, 60).expect("starting line should match");
+    let text: String = hr.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("▸ plan (agent) starting"), "got: {text}");
+    assert!(text.starts_with('─'));
+    assert!(text.ends_with('─'));
+}
+
+#[test]
+fn node_transition_hr_matches_done_line() {
+    use ratatui::text::Line;
+    let line = Line::raw("fleet: ✓ node `implement` done");
+    let hr = node_transition_hr(&line, 80).expect("done line should match");
+    let text: String = hr.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("✓ implement done"), "got: {text}");
+}
+
+#[test]
+fn node_transition_hr_matches_failed_line_and_strips_transcript_hint() {
+    use ratatui::text::Line;
+    let line = Line::raw(
+        "fleet: ✗ node `review` failed: agent `claude-code` in node `review` exited with code 1 (see transcript)",
+    );
+    let hr = node_transition_hr(&line, 120).expect("failed line should match");
+    let text: String = hr.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("✗ review failed:"), "got: {text}");
+    assert!(!text.contains("(see transcript)"), "trailing hint should be stripped: {text}");
+}
+
+#[test]
+fn node_transition_hr_returns_none_for_ordinary_agent_output() {
+    use ratatui::text::Line;
+    let line = Line::raw("Writing plan.md…");
+    assert!(node_transition_hr(&line, 80).is_none());
+}
+
+#[test]
 fn wrapped_row_count_counts_visual_rows_not_source_lines() {
     use ratatui::text::{Line, Text};
     // One short line + one line that wraps to 3 rows at width=10 +

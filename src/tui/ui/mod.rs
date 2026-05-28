@@ -42,7 +42,7 @@ pub(super) use plans::{
 #[cfg(test)]
 pub(super) use sessions::{orchestrator_row_label, session_row_label};
 #[cfg(test)]
-pub(in crate::tui) use sessions::wrapped_row_count;
+pub(in crate::tui) use sessions::{node_transition_hr, wrapped_row_count};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

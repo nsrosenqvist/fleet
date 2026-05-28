@@ -9,7 +9,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap};
 
@@ -748,8 +748,18 @@ fn render_orchestrator_output(f: &mut Frame<'_>, area: Rect, state: &AppState) {
 /// `Paragraph::line_count` is private, so we replicate its behaviour
 /// inline via `Line::width()` and ceil-div against `area.width`.
 fn render_ansi_pane(f: &mut Frame<'_>, area: Rect, body: &str) {
-    let text: ratatui::text::Text<'_> = ansi_to_tui::IntoText::into_text(&body)
+    let parsed: ratatui::text::Text<'_> = ansi_to_tui::IntoText::into_text(&body)
         .unwrap_or_else(|_| ratatui::text::Text::raw(body.to_string()));
+    // Replace executor-emitted node-transition lines with full-width
+    // colored HRs so the eye picks up "we just moved from one node to
+    // the next" without parsing the prose. Pass-through for any line
+    // that doesn't match the marker patterns.
+    let lines: Vec<Line<'static>> = parsed
+        .lines
+        .into_iter()
+        .map(|line| node_transition_hr(&line, area.width).unwrap_or_else(|| owned_line(&line)))
+        .collect();
+    let text = ratatui::text::Text::from(lines);
     let total_rows = wrapped_row_count(&text, area.width);
     let scroll_y = total_rows.saturating_sub(area.height as usize);
     let scroll_y = u16::try_from(scroll_y).unwrap_or(u16::MAX);
@@ -757,6 +767,89 @@ fn render_ansi_pane(f: &mut Frame<'_>, area: Rect, body: &str) {
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     f.render_widget(paragraph, area);
+}
+
+/// Deep-clone a borrowed `Line` into a `'static`-lived one.
+/// `ansi_to_tui` returns spans whose `Cow::Borrowed` content
+/// references the input string; we need owned strings to stuff the
+/// line into the post-processed Vec without lifetime gymnastics.
+fn owned_line(line: &Line<'_>) -> Line<'static> {
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .iter()
+        .map(|s| Span::styled(s.content.to_string(), s.style))
+        .collect();
+    Line::from(spans).style(line.style)
+}
+
+/// Match a parsed line against fleet's executor-emitted node markers
+/// — `fleet: ▸ node X (kind) starting`, `fleet: ✓ node X done`,
+/// `fleet: ✗ node X failed: …` — and rewrite it as a centered colored
+/// HR filling `width` columns. Returns `None` when the line is
+/// ordinary agent output (the vast majority).
+pub(in crate::tui) fn node_transition_hr(line: &Line<'_>, width: u16) -> Option<Line<'static>> {
+    let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let trimmed = plain.trim_end();
+    let (glyph, color, body) = parse_node_marker(trimmed)?;
+    Some(hr_line(glyph, color, &body, width))
+}
+
+/// Extract `(glyph, color, body)` from a node marker line, or
+/// `None` if it isn't one. Pure for tests.
+fn parse_node_marker(line: &str) -> Option<(&'static str, Color, String)> {
+    if let Some(rest) = line.strip_prefix("fleet: ▸ node `") {
+        // `<id>` (`<kind>`) starting
+        let (id, after_id) = rest.split_once("` ")?;
+        let kind = after_id
+            .strip_prefix('(')
+            .and_then(|s| s.split_once(')'))
+            .map(|(k, _)| k);
+        let body = kind.map_or_else(
+            || format!("▸ {id} starting"),
+            |k| format!("▸ {id} ({k}) starting"),
+        );
+        return Some(("▸", ACCENT, body));
+    }
+    if let Some(rest) = line.strip_prefix("fleet: ✓ node `") {
+        let id = rest.split_once('`').map_or(rest, |(id, _)| id);
+        return Some(("✓", OK, format!("✓ {id} done")));
+    }
+    if let Some(rest) = line.strip_prefix("fleet: ✗ node `") {
+        let (id, after) = rest.split_once("` failed: ")?;
+        // Trim the trailing executor hint that's almost always
+        // "(see transcript)" — it's redundant in the HR.
+        let reason = after.trim_end_matches(" (see transcript)");
+        return Some(("✗", ERR, format!("✗ {id} failed: {reason}")));
+    }
+    None
+}
+
+/// Compose a centered HR: `───── {body} ─────` filling `width`
+/// columns, styled in `color`. Falls back to the body alone when
+/// width is too narrow to fit even the padding.
+fn hr_line(_glyph: &str, color: Color, body: &str, width: u16) -> Line<'static> {
+    use ratatui::style::Modifier;
+    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let w = width as usize;
+    let body_with_padding_len = body.chars().count() + 2; // " body "
+    if w <= body_with_padding_len + 2 {
+        // Too narrow for HR padding — just style the body.
+        return Line::from(Span::styled(body.to_string(), style));
+    }
+    let dashes_total = w - body_with_padding_len;
+    let left = dashes_total / 2;
+    let right = dashes_total - left;
+    let mut s = String::with_capacity(w);
+    for _ in 0..left {
+        s.push('─');
+    }
+    s.push(' ');
+    s.push_str(body);
+    s.push(' ');
+    for _ in 0..right {
+        s.push('─');
+    }
+    Line::from(Span::styled(s, style))
 }
 
 /// How many visual rows `text` will occupy when wrapped at
