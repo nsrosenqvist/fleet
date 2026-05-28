@@ -976,6 +976,10 @@ impl AppState {
         {
             self.autonomous
                 .set_status(format!("autonomous: ON · {msg}"));
+            // Spawn refused before fork → engine's pending claim is
+            // bogus; clear it so the next tick can try again instead
+            // of waiting out SPAWN_GRACE.
+            self.autonomous.clear_pending_claim(&cmd.issue.id);
             return;
         }
         let binary = match resolve_fleet_binary() {
@@ -983,6 +987,7 @@ impl AppState {
             Err(err) => {
                 self.autonomous
                     .set_status(format!("autonomous: ON · spawn failed: {err:#}"));
+                self.autonomous.clear_pending_claim(&cmd.issue.id);
                 return;
             }
         };
@@ -1006,6 +1011,7 @@ impl AppState {
                     "autonomous: ON · spawn `{}` for #{} failed: {err:#}",
                     cmd.workflow, cmd.issue.human_id,
                 ));
+                self.autonomous.clear_pending_claim(&cmd.issue.id);
             }
         }
     }

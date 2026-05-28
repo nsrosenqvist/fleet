@@ -22,6 +22,7 @@
 //!   on disk; the cooldown gives the in-flight count time to
 //!   reflect reality before claim-avoidance runs again.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -32,12 +33,27 @@ use crate::plans::{Plan, PlanItemState, PlanState};
 use crate::repo_config::AutonomousConfig;
 use crate::session::{IssueContext, Session, SessionState};
 
+/// How long an in-engine spawn claim survives before being treated
+/// as stale (the subprocess presumably crashed during fork and
+/// never wrote meta.json). 5 minutes covers the worst-case fresh
+/// devcontainer build + image pull without forever blocking a
+/// genuinely failed spawn from being retried.
+const SPAWN_GRACE: Duration = Duration::from_secs(5 * 60);
+
 /// State carried across ticks. Created once, toggled on/off via
 /// [`Self::toggle`], and stepped each event-loop iteration.
 pub struct AutonomousEngine {
     enabled: bool,
     last_scan_at: Option<Instant>,
     last_spawn_at: Option<Instant>,
+    /// Tickets the engine has emitted a `Spawn` outcome for
+    /// recently. Bridges the window between the caller forking the
+    /// subprocess and the subprocess writing `meta.json` — during
+    /// that window the `in_flight` session list contains no row for
+    /// the new session, so the claim filter alone can't see the
+    /// pending work. Entries expire after [`SPAWN_GRACE`] so a
+    /// genuinely failed spawn doesn't block the ticket forever.
+    pending_claims: HashMap<String, Instant>,
     /// Human-readable line for the TUI status bar. Updated by
     /// [`Self::step`] each time it decides anything interesting.
     status: String,
@@ -56,6 +72,7 @@ impl AutonomousEngine {
             enabled: false,
             last_scan_at: None,
             last_spawn_at: None,
+            pending_claims: HashMap::new(),
             status: String::from("autonomous: OFF"),
         }
     }
@@ -80,11 +97,23 @@ impl AutonomousEngine {
         self.enabled = !self.enabled;
         self.last_scan_at = None;
         self.last_spawn_at = None;
+        // Drop stale pending claims on toggle — a flip to OFF then
+        // back ON is the user explicitly resetting, and any stuck
+        // claim from a previous run shouldn't carry over.
+        self.pending_claims.clear();
         self.status = if self.enabled {
             String::from("autonomous: ON")
         } else {
             String::from("autonomous: OFF")
         };
+    }
+
+    /// Release the engine's pending claim on `ticket_id`. Called by
+    /// the dispatcher when the actual `subprocess.spawn()` fails —
+    /// without this the engine would refuse to retry the same ticket
+    /// until [`SPAWN_GRACE`] elapsed.
+    pub fn clear_pending_claim(&mut self, ticket_id: &str) {
+        self.pending_claims.remove(ticket_id);
     }
 
     /// Override the status line. Used by the TUI when the engine is
@@ -160,6 +189,11 @@ impl AutonomousEngine {
                 return AutonomousOutcome::WaitedFor(PauseReason::TrackerError(err));
             }
         };
+        // Sweep expired pending claims before reading them so a stuck
+        // ticket can be retried after the grace period without an
+        // explicit `clear_pending_claim` call.
+        self.pending_claims
+            .retain(|_, t| now.duration_since(*t) < SPAWN_GRACE);
         // Only sessions still doing work hold their issue's claim.
         // Failed / Completed / Crashed sessions are terminal — leaving
         // them in `claimed` would silently block a `fleet plan retry`
@@ -169,11 +203,19 @@ impl AutonomousEngine {
         // as the slot-count above, intentionally — "in-flight for
         // slot accounting" and "in-flight for claim accounting" are
         // the same set.
-        let claimed: std::collections::HashSet<String> = in_flight
+        //
+        // Union with `pending_claims`: tickets the engine has *just*
+        // dispatched a Spawn for but whose subprocess hasn't written
+        // meta.json yet. Without this the next tick's scan (10s by
+        // default) can fire before the new session is visible on
+        // disk and re-spawn the same ticket — observed as "two
+        // workers on the same ticket in parallel."
+        let mut claimed: std::collections::HashSet<String> = in_flight
             .iter()
             .filter(|s| matches!(s.state, SessionState::Running | SessionState::AwaitingGate))
             .filter_map(|s| s.issue.as_ref().map(|i| i.id.clone()))
             .collect();
+        claimed.extend(self.pending_claims.keys().cloned());
         let Some(candidate) = open_issues.into_iter().find(|i| !claimed.contains(&i.id)) else {
             self.status = format!(
                 "autonomous: ON · {in_flight_count}/{cap} in-flight · no unclaimed open issues",
@@ -190,10 +232,14 @@ impl AutonomousEngine {
         // config author's contract.
         let workflow = config.resolve_workflow_for(&candidate.labels).to_string();
 
-        // Found a candidate. Set the spawn timestamp BEFORE returning
-        // so a panic in the caller's spawn path doesn't leak into a
-        // tight retry loop on the next tick.
+        // Found a candidate. Set the spawn timestamp + pending claim
+        // BEFORE returning so a panic in the caller's spawn path
+        // doesn't leak into a tight retry loop on the next tick.
+        // The caller is expected to call `clear_pending_claim` if
+        // the subprocess.spawn() itself errors so the ticket frees
+        // up before SPAWN_GRACE expires.
         self.last_spawn_at = Some(now);
+        self.pending_claims.insert(candidate.id.clone(), now);
         self.status = format!(
             "autonomous: ON · spawned `{workflow}` for #{human}",
             human = candidate.human_id,
@@ -640,6 +686,84 @@ mod tests {
             AutonomousOutcome::Spawn(cmd) => assert_eq!(cmd.issue.human_id, "43"),
             other => panic!("expected Spawn(#43), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn step_suppresses_recently_spawned_ticket_until_grace_expires() {
+        // Regression: between dispatch_autonomous_spawn forking the
+        // subprocess and the subprocess writing meta.json, the
+        // in_flight slice contains no session for the ticket. The
+        // next tick (10s later) would see the ticket as unclaimed
+        // and spawn a second worker against the same plan item.
+        // The engine now records its own pending claim that bridges
+        // the gap.
+        let mut e = AutonomousEngine::new();
+        e.toggle();
+        let cfg = cfg();
+        let now = Instant::now();
+        // First tick spawns for #42.
+        let out = e.step(now, &cfg, &[], || Ok(vec![issue("42"), issue("43")]));
+        assert!(matches!(out, AutonomousOutcome::Spawn(ref c) if c.issue.human_id == "42"));
+
+        // Second tick, AFTER the scan interval but BEFORE the subprocess
+        // has written meta.json (so in_flight is still empty). The
+        // pending claim must suppress #42 — engine picks #43 instead.
+        let out2 = e.step(
+            now + Duration::from_secs(15),
+            &cfg,
+            &[],
+            || Ok(vec![issue("42"), issue("43")]),
+        );
+        assert!(
+            matches!(out2, AutonomousOutcome::Spawn(ref c) if c.issue.human_id == "43"),
+            "expected Spawn(#43) — #42's pending claim should suppress it, got {out2:?}",
+        );
+    }
+
+    #[test]
+    fn step_pending_claim_expires_after_grace_period() {
+        // If the subprocess crashes during fork and never writes
+        // meta.json, the pending claim must eventually expire so the
+        // ticket can be retried. 5 minutes is the grace.
+        let mut e = AutonomousEngine::new();
+        e.toggle();
+        let cfg = cfg();
+        let now = Instant::now();
+        let _ = e.step(now, &cfg, &[], || Ok(vec![issue("42")]));
+        // 6 minutes later — grace expired, no real session ever
+        // showed up, ticket should be eligible again.
+        let out = e.step(
+            now + Duration::from_secs(6 * 60),
+            &cfg,
+            &[],
+            || Ok(vec![issue("42")]),
+        );
+        assert!(
+            matches!(out, AutonomousOutcome::Spawn(ref c) if c.issue.human_id == "42"),
+            "ticket should be eligible after grace period: {out:?}",
+        );
+    }
+
+    #[test]
+    fn clear_pending_claim_releases_ticket_for_immediate_retry() {
+        // When the caller's subprocess.spawn() itself fails, the
+        // dispatcher calls clear_pending_claim so the ticket isn't
+        // stuck until SPAWN_GRACE elapses.
+        let mut e = AutonomousEngine::new();
+        e.toggle();
+        let cfg = cfg();
+        let now = Instant::now();
+        let out = e.step(now, &cfg, &[], || Ok(vec![issue("42")]));
+        let cmd = match out {
+            AutonomousOutcome::Spawn(c) => c,
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+        e.clear_pending_claim(&cmd.issue.id);
+        // Immediately after the scan interval, #42 is eligible again.
+        let out2 = e.step(now + Duration::from_secs(15), &cfg, &[], || {
+            Ok(vec![issue("42")])
+        });
+        assert!(matches!(out2, AutonomousOutcome::Spawn(ref c) if c.issue.human_id == "42"));
     }
 
     #[test]
