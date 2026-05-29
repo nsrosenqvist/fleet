@@ -859,6 +859,56 @@ mod tests {
     }
 
     #[test]
+    fn merge_branches_returns_conflicts_when_merge_head_appears() {
+        // The function differentiates "merge failed but MERGE_HEAD
+        // exists (conflict)" from "merge failed and no MERGE_HEAD
+        // (setup error)" by probing the worktree on disk. Use a real
+        // tempdir + fake `.git/MERGE_HEAD` so the path branch fires.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        // First merge: git command fails. We pre-create MERGE_HEAD so
+        // the "is this a conflict?" probe says yes.
+        std::fs::write(tmp.path().join(".git/MERGE_HEAD"), "deadbeef\n").unwrap();
+        let mut inv = MockProcessInvoker::new();
+        // Expect two calls: the failing `git merge`, then the
+        // `git status --porcelain=v1` to list conflicted files.
+        inv.expect_run()
+            .withf(|prog, args| prog == "git" && args.iter().any(|a| a == "merge"))
+            .returning(|_, _| Err(anyhow::anyhow!("CONFLICT (content): Merge conflict in foo")));
+        inv.expect_run()
+            .withf(|prog, args| prog == "git" && args.iter().any(|a| a == "status"))
+            .returning(|_, _| Ok("UU foo.txt\nM  unmodified.txt\nAA bar.json\n".to_string()));
+        let outcome = merge_branches_into_worktree(
+            &inv,
+            tmp.path(),
+            &[
+                "fleet/session-A".to_string(),
+                "fleet/session-B".to_string(),
+            ],
+        )
+        .unwrap();
+        match outcome {
+            MergeOutcome::Conflicts { unmerged, conflicted_files } => {
+                // Both branches reported as unmerged (we bailed at the
+                // first one, so the rest never got a chance).
+                assert_eq!(
+                    unmerged,
+                    vec![
+                        "fleet/session-A".to_string(),
+                        "fleet/session-B".to_string(),
+                    ]
+                );
+                // `UU` and `AA` qualify as conflicted; `M  ` (modified
+                // but not conflicted) is filtered out.
+                assert!(conflicted_files.contains(&"foo.txt".to_string()));
+                assert!(conflicted_files.contains(&"bar.json".to_string()));
+                assert!(!conflicted_files.contains(&"unmodified.txt".to_string()));
+            }
+            MergeOutcome::Clean => panic!("expected Conflicts, got Clean"),
+        }
+    }
+
+    #[test]
     fn merge_branches_returns_setup_error_when_no_merge_head() {
         // Merge fails AND .git/MERGE_HEAD doesn't exist (no merge
         // ever started) → propagate as a real error rather than

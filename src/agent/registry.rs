@@ -222,6 +222,35 @@ mod tests {
     }
 
     #[test]
+    fn default_claude_code_prepends_merge_conflict_preamble_when_flag_set() {
+        // Pins the bash branch that fires when FLEET_MERGE_CONFLICTS=true:
+        // the trampoline must rewrap FLEET_PROMPT with a RESOLVE FIRST
+        // preamble pointing at the context file before exec'ing claude.
+        // A regression here silently leaves the agent unaware that the
+        // worktree is in MERGING state — it would happily start its
+        // task on top of conflict markers.
+        let script = &claude_code_default().command[2];
+        assert!(
+            script.contains("FLEET_MERGE_CONFLICTS"),
+            "trampoline must read the conflict flag: {script}",
+        );
+        assert!(
+            script.contains("FLEET_MERGE_CONTEXT_FILE"),
+            "trampoline must reference the context-file env var: {script}",
+        );
+        assert!(
+            script.contains("RESOLVE FIRST"),
+            "preamble must be loud enough that the agent can't miss it: {script}",
+        );
+        // The preamble is prepended to the existing prompt, not
+        // appended — the agent reads top-to-bottom, the resolution
+        // instruction needs to land first.
+        let pos_preamble = script.find("RESOLVE FIRST").unwrap();
+        let pos_exec = script.find("exec claude").unwrap();
+        assert!(pos_preamble < pos_exec);
+    }
+
+    #[test]
     fn get_returns_none_for_unknown_name() {
         let r = AgentRegistry::default();
         assert!(r.get("nope").is_none());

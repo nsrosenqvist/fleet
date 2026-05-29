@@ -1274,34 +1274,7 @@ impl WorkflowExecutor {
         // present or any file still has conflict markers, the agent
         // left the merge half-done and downstream nodes would build
         // on broken state. Surface as a node failure.
-        if merge_conflicts && worktree_in_merging_state(req.workspace) {
-            bail!(
-                "agent `{agent_name}` in node `{}` left the chain merge in MERGING state \
-                 (MERGE_HEAD still present at {}) — workflow refuses to advance",
-                node.id,
-                req.workspace.join(".git/MERGE_HEAD").display(),
-            );
-        }
-        // Independent of `merge_conflicts`: even if the agent
-        // committed (clearing MERGE_HEAD), unresolved markers in the
-        // committed tree are a worse failure — the agent committed
-        // garbage. Scan and fail loudly.
-        let markered = detect_merge_conflict_markers(req.workspace);
-        if !markered.is_empty() {
-            let listed: Vec<String> = markered
-                .iter()
-                .take(5)
-                .map(|p| p.display().to_string())
-                .collect();
-            bail!(
-                "agent `{agent_name}` in node `{}` left unresolved merge conflict markers in {} \
-                 file(s): {}{}",
-                node.id,
-                markered.len(),
-                listed.join(", "),
-                if markered.len() > listed.len() { " (truncated)" } else { "" },
-            );
-        }
+        verify_merge_resolved(req.workspace, merge_conflicts, agent_name, &node.id)?;
 
         run_outcome
     }
@@ -1793,7 +1766,7 @@ impl WorkflowExecutor {
         // A merges).
         let base = base
             .map(str::to_string)
-            .or_else(|| resolve_chain_pr_base(req, session))
+            .or_else(|| resolve_chain_pr_base(req.store, session))
             .or_else(|| crate::policy::detect_default_branch(self.invoker.as_ref(), req.workspace))
             .unwrap_or_else(|| "main".to_string());
         let head = match head {
@@ -2509,22 +2482,62 @@ fn is_claude_oauth_var(name: &str) -> bool {
 /// merge step left conflicts, or the agent's own work did. The
 /// agent-env builder flips `FLEET_MERGE_CONFLICTS` based on this so
 /// the trampoline can prepend a resolve-first instruction.
-fn worktree_in_merging_state(workspace: &Path) -> bool {
+pub fn worktree_in_merging_state(workspace: &Path) -> bool {
     workspace.join(".git/MERGE_HEAD").exists()
+}
+
+/// Post-agent-node check that any chain-merge conflicts the node
+/// inherited got resolved + committed. Two failure modes:
+///   1. Agent abandoned the merge (`MERGE_HEAD` still present after
+///      a node that started with `merge_conflicts == true`).
+///   2. Agent committed but left `<<<<<<<` markers in tracked files
+///      — even worse, since downstream nodes would build on broken
+///      state thinking the merge was done.
+///
+/// `agent_name` + `node_id` are used to attribute the failure in
+/// the bail message; pure helper so unit tests can exercise both
+/// branches without standing up a full agent node.
+pub fn verify_merge_resolved(
+    workspace: &Path,
+    expected_initial_merging: bool,
+    agent_name: &str,
+    node_id: &str,
+) -> Result<()> {
+    if expected_initial_merging && worktree_in_merging_state(workspace) {
+        bail!(
+            "agent `{agent_name}` in node `{node_id}` left the chain merge in MERGING state \
+             (MERGE_HEAD still present at {}) — workflow refuses to advance",
+            workspace.join(".git/MERGE_HEAD").display(),
+        );
+    }
+    let markered = detect_merge_conflict_markers(workspace);
+    if !markered.is_empty() {
+        let listed: Vec<String> = markered
+            .iter()
+            .take(5)
+            .map(|p| p.display().to_string())
+            .collect();
+        bail!(
+            "agent `{agent_name}` in node `{node_id}` left unresolved merge conflict markers in {} \
+             file(s): {}{}",
+            markered.len(),
+            listed.join(", "),
+            if markered.len() > listed.len() { " (truncated)" } else { "" },
+        );
+    }
+    Ok(())
 }
 
 /// At `create-pr` time, resolve the chain parent's branch to use as
 /// the PR's base when the session has upstream chain parents in
 /// `.fleet/deps.json`. Falls back to `None` when there's no chain or
 /// the session has no bound issue. Repo root is derived from the
-/// session store under `req`.
-fn resolve_chain_pr_base(req: &ExecuteRequest<'_>, session: &Session) -> Option<String> {
+/// session store's root (`<repo>/.fleet/sessions` → two parents up).
+pub fn resolve_chain_pr_base(store: &SessionStore, session: &Session) -> Option<String> {
     let issue = session.issue.as_ref()?;
-    // SessionStore.root() = `<repo>/.fleet/sessions`; the repo root
-    // is two parents up. Tolerate weird stores by failing closed.
-    let repo_root = req.store.root().parent()?.parent()?;
+    let repo_root = store.root().parent()?.parent()?;
     let parents = crate::cli::workflow::resolve_chain_parents(
-        req.store,
+        store,
         repo_root,
         &issue.human_id,
     );
@@ -2537,7 +2550,7 @@ fn resolve_chain_pr_base(req: &ExecuteRequest<'_>, session: &Session) -> Option<
 /// markers means the agent did the right thing but forgot the final
 /// commit; markers without an active merge means the agent committed
 /// without resolving. Both are failures.
-fn detect_merge_conflict_markers(workspace: &Path) -> Vec<PathBuf> {
+pub fn detect_merge_conflict_markers(workspace: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = walk_tracked_files(workspace) else {
         return out;
@@ -4143,6 +4156,238 @@ nodes:
         };
         let env = build_agent_env(&spec, &AgentContext::default());
         assert!(!env.iter().any(|(k, _)| k.starts_with("FLEET_PR_")));
+    }
+
+    #[test]
+    fn build_agent_env_emits_merge_conflict_vars_when_flag_set() {
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: Vec::new(),
+        };
+        let ctx = AgentContext {
+            merge_conflicts: true,
+            ..AgentContext::default()
+        };
+        let env = build_agent_env(&spec, &ctx);
+        let has = |key: &str, val: &str| env.iter().any(|(k, v)| k == key && v == val);
+        assert!(has("FLEET_MERGE_CONFLICTS", "true"));
+        assert!(has(
+            "FLEET_MERGE_CONTEXT_FILE",
+            "/artifacts/MERGE_CONTEXT.md",
+        ));
+    }
+
+    #[test]
+    fn build_agent_env_omits_merge_conflict_vars_by_default() {
+        let spec = AgentSpec {
+            command: vec!["agent".to_string()],
+            env_passthrough: Vec::new(),
+        };
+        let env = build_agent_env(&spec, &AgentContext::default());
+        assert!(!env.iter().any(|(k, _)| k.starts_with("FLEET_MERGE_")));
+    }
+
+    // ---- merge-resolution verification --------------------------------
+
+    #[test]
+    fn worktree_in_merging_state_detects_merge_head_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        assert!(!worktree_in_merging_state(tmp.path()));
+        std::fs::write(git_dir.join("MERGE_HEAD"), "deadbeef\n").unwrap();
+        assert!(worktree_in_merging_state(tmp.path()));
+    }
+
+    #[test]
+    fn detect_merge_conflict_markers_finds_files_with_diff3_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Sentinel file with full set of markers — a real conflict
+        // would look like this.
+        std::fs::write(
+            tmp.path().join("a.txt"),
+            "head\n<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch\ntail\n",
+        )
+        .unwrap();
+        // File with only a partial marker (`<<<<<<<` mentioned in a
+        // comment, no closing) → not a real conflict.
+        std::fs::write(tmp.path().join("b.md"), "talking about <<<<<<<\n").unwrap();
+        let hits = detect_merge_conflict_markers(tmp.path());
+        let names: Vec<String> = hits
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"a.txt".to_string()));
+        assert!(!names.contains(&"b.md".to_string()));
+    }
+
+    #[test]
+    fn detect_merge_conflict_markers_skips_dot_git_and_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Conflict markers inside .git/ and node_modules/ — the walk
+        // must skip these so we don't scan packed object data or
+        // megabytes of vendored deps.
+        std::fs::create_dir_all(tmp.path().join(".git/refs")).unwrap();
+        std::fs::write(
+            tmp.path().join(".git/refs/heads"),
+            "<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules/lib")).unwrap();
+        std::fs::write(
+            tmp.path().join("node_modules/lib/x.js"),
+            "<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> b\n",
+        )
+        .unwrap();
+        assert!(detect_merge_conflict_markers(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn verify_merge_resolved_passes_on_clean_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("hello.txt"), "world\n").unwrap();
+        verify_merge_resolved(tmp.path(), true, "agent", "node-1").unwrap();
+        verify_merge_resolved(tmp.path(), false, "agent", "node-1").unwrap();
+    }
+
+    #[test]
+    fn verify_merge_resolved_bails_when_merge_head_still_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".git/MERGE_HEAD"), "deadbeef\n").unwrap();
+        let err = verify_merge_resolved(tmp.path(), true, "claude-code", "implement")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("MERGING state"), "got: {msg}");
+        assert!(msg.contains("implement"));
+        assert!(msg.contains("claude-code"));
+    }
+
+    #[test]
+    fn verify_merge_resolved_bails_when_committed_with_unresolved_markers() {
+        // Worse failure mode: agent committed (no MERGE_HEAD) but
+        // left `<<<<<<<` markers in tracked files. Downstream nodes
+        // would build on broken state — bail.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("schema.json"),
+            "{\n<<<<<<< HEAD\n  a: 1\n=======\n  a: 2\n>>>>>>> b\n}\n",
+        )
+        .unwrap();
+        let err = verify_merge_resolved(tmp.path(), true, "claude-code", "implement")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unresolved merge conflict markers"), "got: {msg}");
+        assert!(msg.contains("schema.json"));
+    }
+
+    // ---- chain-aware create-pr base resolution ------------------------
+
+    #[test]
+    fn resolve_chain_pr_base_returns_none_when_session_has_no_issue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_root = tmp.path().join(".fleet/sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let store = SessionStore::at(sessions_root);
+        let session = Session::new(SessionId::new("s-1"), "standard", 1);
+        assert_eq!(resolve_chain_pr_base(&store, &session), None);
+    }
+
+    #[test]
+    fn resolve_chain_pr_base_returns_chain_parent_branch_when_session_has_blockers() {
+        // End-to-end through resolve_chain_parents: deps.json points
+        // ticket 72 at blocker 5f; a Completed session for 5f with
+        // branch fleet/session-old exists; create-pr for ticket 72's
+        // session should pick fleet/session-old as the PR base.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".fleet")).unwrap();
+        let sessions_root = repo_root.join(".fleet/sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        std::fs::write(
+            repo_root.join(".fleet/deps.json"),
+            r#"{"version":1,"edges":[{"blocked":"72","blocked_on":"5f","reason":"ticket","created_at_ms":1}]}"#,
+        )
+        .unwrap();
+        let store = SessionStore::at(sessions_root);
+        // Seed the upstream Completed session bound to 5f.
+        let mut up = Session::new(SessionId::new("s-old"), "standard", 1);
+        up.issue = Some(IssueContext {
+            id: "gh:5f".to_string(),
+            human_id: "5f".to_string(),
+            title: "API contracts".to_string(),
+            labels: Vec::new(),
+        });
+        up.transition_to(SessionState::Running, 2).unwrap();
+        up.transition_to(SessionState::Completed, 3).unwrap();
+        up.set_worktree(
+            PathBuf::from("/tmp/wt-old"),
+            "fleet/session-old",
+            100,
+        );
+        store.create(&up).unwrap();
+        store.save(&up).unwrap();
+        // The downstream session under test — bound to ticket 72.
+        let mut down = Session::new(SessionId::new("s-new"), "standard", 1);
+        down.issue = Some(IssueContext {
+            id: "gh:72".to_string(),
+            human_id: "72".to_string(),
+            title: "Implement endpoints".to_string(),
+            labels: Vec::new(),
+        });
+        assert_eq!(
+            resolve_chain_pr_base(&store, &down),
+            Some("fleet/session-old".to_string()),
+        );
+    }
+
+    #[test]
+    fn resolve_chain_pr_base_returns_none_when_blocker_has_no_completed_session() {
+        // deps point at a blocker but no session has Completed for it
+        // yet — `resolve_chain_parents` returns empty; PR base falls
+        // back to the default branch (caller's responsibility), this
+        // helper just returns None.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join(".fleet")).unwrap();
+        let sessions_root = repo_root.join(".fleet/sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        std::fs::write(
+            repo_root.join(".fleet/deps.json"),
+            r#"{"version":1,"edges":[{"blocked":"72","blocked_on":"5f","reason":"ticket","created_at_ms":1}]}"#,
+        )
+        .unwrap();
+        let store = SessionStore::at(sessions_root);
+        let mut down = Session::new(SessionId::new("s-new"), "standard", 1);
+        down.issue = Some(IssueContext {
+            id: "gh:72".to_string(),
+            human_id: "72".to_string(),
+            title: "Implement endpoints".to_string(),
+            labels: Vec::new(),
+        });
+        assert_eq!(resolve_chain_pr_base(&store, &down), None);
+    }
+
+    #[test]
+    fn verify_merge_resolved_scans_for_markers_even_when_no_initial_merge_state() {
+        // The marker check runs regardless of `expected_initial_merging`
+        // so a node that happened to commit something with conflict
+        // markers (e.g. test fixtures) still gets caught. Belt-and-
+        // braces against the "agent didn't know it was supposed to
+        // resolve a merge" case where merge_conflicts was false but
+        // a previous run left stale markers in a file.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("broken.py"),
+            "<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch\n",
+        )
+        .unwrap();
+        let err = verify_merge_resolved(tmp.path(), false, "claude-code", "implement")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("broken.py"));
     }
 
     #[test]
