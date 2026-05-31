@@ -9,7 +9,7 @@ use crate::plans::store::PlanStore;
 use crate::plans::{Plan, PlanState};
 use crate::session::now_ms;
 
-use super::{Action, AppState, PlansFocus, View};
+use super::{Action, AppState, ConfirmAction, Overlay, PlansFocus, View};
 
 impl AppState {
     pub(in crate::tui) fn handle_key_plans(&mut self, key: KeyEvent) -> Action {
@@ -22,7 +22,7 @@ impl AppState {
             return Action::None;
         }
         if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Char('R')) {
-            self.retry_failed_plan_items();
+            self.prompt_reset_selected_plan();
             return Action::None;
         }
         match key.code {
@@ -53,11 +53,12 @@ impl AppState {
                 self.unblock_selected_plan_item();
                 Action::None
             }
+            // `r` retries failed items (used to be reload — auto-reload
+            // covers periodic refresh of plans + sessions now, so a
+            // manual reload here would be redundant for almost every
+            // workflow). `Shift+R` resets the whole plan.
             KeyCode::Char('r') => {
-                self.focused_issue_cache.clear();
-                self.refresh_plans();
-                self.refresh_ticket_titles();
-                self.refresh_focused_issue();
+                self.retry_failed_plan_items();
                 Action::None
             }
             _ => Action::None,
@@ -226,6 +227,55 @@ impl AppState {
                 self.set_flash(format!(" plan save failed: {err} "));
             }
         }
+    }
+
+    /// Open the confirm overlay for `Shift+R` reset on the selected
+    /// plan. Spelled-out flash + confirm because reset wipes progress
+    /// across every item — accidental is expensive (you lose the
+    /// `session_id` audit trail and the engine respawns from scratch).
+    fn prompt_reset_selected_plan(&mut self) {
+        let Some(plan) = self.selected_plan() else {
+            self.set_flash(" no plan selected ");
+            return;
+        };
+        let (done, total) = plan.progress();
+        let plan_id = plan.id.to_string();
+        let plan_name = plan.name.clone();
+        self.overlay = Overlay::Confirm {
+            prompt: format!(
+                "Reset plan `{plan_name}` ({plan_id})?\n\n\
+                 Every item flips back to Pending; {done}/{total} completed item(s) lose their \
+                 `session_id` audit pointer. Session directories on disk aren't touched — \
+                 use Shift+X / `fleet sessions forget` for a full from-scratch rerun."
+            ),
+            action: ConfirmAction::ResetSelectedPlan { plan_id },
+        };
+    }
+
+    /// Apply the reset on the selected plan after the user confirms.
+    /// Same on-disk effect as `fleet plan reset <id>`. Refreshes the
+    /// in-memory plans list so the sidebar reflects the new state
+    /// immediately.
+    pub(in crate::tui) fn reset_plan_by_id(&mut self, plan_id: &str) {
+        let store = crate::plans::store::PlanStore::for_repo(&self.root);
+        let mut plan = match store.load(&crate::plans::PlanId::new(plan_id)) {
+            Ok(p) => p,
+            Err(err) => {
+                self.set_flash(format!(" load `{plan_id}` failed: {err:#} "));
+                return;
+            }
+        };
+        let changed = plan.reset_items(now_ms());
+        if changed == 0 {
+            self.set_flash(format!(" plan `{plan_id}`: nothing to reset "));
+            return;
+        }
+        if let Err(err) = store.save(&plan) {
+            self.set_flash(format!(" plan save failed: {err:#} "));
+            return;
+        }
+        self.set_flash(format!(" plan `{plan_id}`: reset {changed} item(s) "));
+        self.refresh_plans();
     }
 
     fn unblock_selected_plan_item(&mut self) {

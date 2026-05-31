@@ -226,6 +226,41 @@ impl Plan {
                 .all(|i| i.state == PlanItemState::Completed)
     }
 
+    /// Flip every item back to `Pending`, clear `session_id`, and
+    /// zero `retry_count`. Returns the number of items that were
+    /// not already in their reset state — callers use this to decide
+    /// whether the on-disk plan actually needs a re-save.
+    ///
+    /// `now_ms` is the caller-provided wallclock used to stamp
+    /// `updated_at_ms`. Set to the current time so the reconcile
+    /// watermark filter still picks up any future session whose
+    /// `updated_at_ms > now`. **Do not set this to a future
+    /// timestamp** — reconcile silently drops every session whose
+    /// `updated_at_ms <= plan.updated_at_ms`, so a plan stuck in
+    /// the future never gets its items advanced even as workers
+    /// complete.
+    pub fn reset_items(&mut self, now_ms: u64) -> usize {
+        let mut changed = 0;
+        for it in &mut self.items {
+            let was_dirty = it.state != PlanItemState::Pending
+                || it.session_id.is_some()
+                || it.retry_count != 0;
+            if was_dirty {
+                it.state = PlanItemState::Pending;
+                it.session_id = None;
+                it.retry_count = 0;
+                changed += 1;
+            }
+        }
+        if changed > 0 || self.state == PlanState::Paused {
+            // Resume a plan paused by an `on_item_failure: stop` — a
+            // reset is the user explicitly clearing the failure.
+            self.state = PlanState::Active;
+            self.updated_at_ms = now_ms;
+        }
+        changed
+    }
+
     /// (#completed, #total). The Plans CLI / TUI surface this as
     /// `n/N` for progress display.
     #[must_use]
@@ -267,6 +302,87 @@ impl PlanIdSource for ClockPlanIdSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_with_items(items: Vec<PlanItem>) -> Plan {
+        Plan {
+            id: PlanId::new("plan-x"),
+            name: "x".into(),
+            items,
+            state: PlanState::Active,
+            on_item_failure: ItemFailurePolicy::default(),
+            epic_ref: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn reset_items_flips_every_non_pending_back_to_pending() {
+        let mut plan = plan_with_items(vec![
+            PlanItem {
+                ticket_id: "a".into(),
+                state: PlanItemState::Completed,
+                session_id: Some(SessionId::new("s-1")),
+                injected: false,
+                retry_count: 0,
+            },
+            PlanItem {
+                ticket_id: "b".into(),
+                state: PlanItemState::InProgress,
+                session_id: Some(SessionId::new("s-2")),
+                injected: false,
+                retry_count: 1,
+            },
+            PlanItem {
+                ticket_id: "c".into(),
+                state: PlanItemState::Failed,
+                session_id: Some(SessionId::new("s-3")),
+                injected: false,
+                retry_count: 2,
+            },
+            PlanItem {
+                ticket_id: "d".into(),
+                state: PlanItemState::Pending,
+                session_id: None,
+                injected: false,
+                retry_count: 0,
+            },
+        ]);
+        let changed = plan.reset_items(1234);
+        assert_eq!(changed, 3, "three dirty items, one already pending");
+        for it in &plan.items {
+            assert_eq!(it.state, PlanItemState::Pending);
+            assert!(it.session_id.is_none());
+            assert_eq!(it.retry_count, 0);
+        }
+        assert_eq!(plan.updated_at_ms, 1234);
+    }
+
+    #[test]
+    fn reset_items_resumes_a_paused_plan_even_when_all_items_were_pending() {
+        // Edge case: plan is Paused (e.g. by `on_item_failure: stop`)
+        // but every item happens to already be Pending. Reset must
+        // still resume the plan — the user pressing Shift+R is the
+        // explicit signal that the failure is cleared.
+        let mut plan = plan_with_items(vec![PlanItem::pending("a")]);
+        plan.state = PlanState::Paused;
+        let changed = plan.reset_items(99);
+        assert_eq!(changed, 0, "no items were dirty");
+        assert_eq!(plan.state, PlanState::Active);
+        assert_eq!(plan.updated_at_ms, 99);
+    }
+
+    #[test]
+    fn reset_items_is_noop_when_all_pending_and_plan_active() {
+        let mut plan = plan_with_items(vec![PlanItem::pending("a"), PlanItem::pending("b")]);
+        let before_updated_at = plan.updated_at_ms;
+        let changed = plan.reset_items(999);
+        assert_eq!(changed, 0);
+        // updated_at_ms is NOT bumped — the plan didn't actually
+        // change, so the on-disk file shouldn't either (callers
+        // skip the save on changed == 0 && state still Active).
+        assert_eq!(plan.updated_at_ms, before_updated_at);
+    }
 
     #[test]
     fn plan_id_round_trips_through_string() {

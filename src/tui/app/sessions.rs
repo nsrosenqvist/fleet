@@ -207,6 +207,7 @@ impl AppState {
             ConfirmAction::KillSelected => self.mark_selected_failed(store),
             ConfirmAction::KillOrchestrator => self.kill_orchestrator(store),
             ConfirmAction::ForgetSelected => self.forget_selected(store),
+            ConfirmAction::ResetSelectedPlan { plan_id } => self.reset_plan_by_id(plan_id),
         }
     }
 

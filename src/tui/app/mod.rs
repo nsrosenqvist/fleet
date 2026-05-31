@@ -265,6 +265,13 @@ pub(super) enum ConfirmAction {
     /// `meta.json` that keeps it in the sidebar list. Logs are gone
     /// forever — used to clear the clutter after a botched batch.
     ForgetSelected,
+    /// Wipe progress on the selected plan: every item flips back to
+    /// `Pending`, `session_id` is cleared, `updated_at_ms` is
+    /// re-stamped so reconcile picks up future sessions. Mirrors
+    /// `fleet plan reset <id>`. Session directories on disk aren't
+    /// touched; pair with Shift+X / `fleet sessions forget` for a
+    /// full from-scratch rerun.
+    ResetSelectedPlan { plan_id: String },
 }
 
 /// Closed enum so the event loop's dispatch stays exhaustive.

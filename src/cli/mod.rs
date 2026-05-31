@@ -506,6 +506,21 @@ pub enum PlanSub {
     /// stop` policy. Per-item `retry_count` and the prior session
     /// id are kept for forensics — re-runs spawn fresh sessions.
     Retry { id: String },
+
+    /// Wipe progress on a plan: flip every item back to `Pending`,
+    /// clear `session_id`, zero `retry_count`, resume if paused.
+    /// `updated_at_ms` is stamped to `now` so reconcile picks up
+    /// future sessions cleanly. Doesn't touch session directories —
+    /// pair with `fleet sessions forget --all --with-branch` for a
+    /// full from-scratch rerun.
+    Reset {
+        /// Plan id to reset. Mutually exclusive with `--all`.
+        id: Option<String>,
+        /// Reset every plan in the store. Useful when wiping a
+        /// whole repo's plans before a re-run.
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -721,6 +736,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             PlanSub::Complete { id } => plan::run_complete(&id),
             PlanSub::Abandon { id, reason } => plan::run_abandon(&id, reason.as_deref()),
             PlanSub::Retry { id } => plan::run_retry(&id),
+            PlanSub::Reset { id, all } => plan::run_reset(id.as_deref(), all),
             PlanSub::Sync { id } => plan::run_sync(&id),
             PlanSub::Inject { id, ticket, before } => {
                 plan::run_inject(&id, &ticket, before.as_deref())

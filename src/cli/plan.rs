@@ -107,6 +107,56 @@ pub fn run_abandon(id: &str, reason: Option<&str>) -> Result<i32> {
 /// Stdout reports how many items were flipped + whether the plan
 /// was resumed, so a scripted caller can confirm without a follow-up
 /// `plan show`.
+/// `fleet plan reset [<id>|--all]`. Flips every non-Pending item on
+/// the named plan(s) back to `Pending`, clears `session_id`, zeroes
+/// `retry_count`, and resumes the plan if it was paused. Stamps
+/// `updated_at_ms` to `now_ms()` so reconcile's watermark filter
+/// picks up any future session — **never set this to a future time;
+/// reconcile drops every session with `updated_at <= watermark` so a
+/// future-stamped plan silently loses every result.**
+///
+/// Doesn't touch the per-session directories on disk — pair with
+/// `fleet sessions forget --all --with-branch` when you also want to
+/// drop the worktrees and branches the prior run produced.
+pub fn run_reset(id: Option<&str>, all: bool) -> Result<i32> {
+    if id.is_none() && !all {
+        bail!("fleet plan reset: specify a plan id or --all (one is required)");
+    }
+    let store = open_store()?;
+    let now = now_ms();
+    let targets: Vec<PlanId> = if all {
+        store.list().context("listing plans")?
+    } else {
+        // run_retry uses load_plan for ergonomic error wording.
+        // Mirror that here.
+        let plan = load_plan(&store, id.expect("validated above"))?;
+        vec![plan.id]
+    };
+    let mut total_changed = 0;
+    for plan_id in &targets {
+        let mut plan = store
+            .load(plan_id)
+            .with_context(|| format!("loading plan `{plan_id}` for reset"))?;
+        let changed = plan.reset_items(now);
+        if changed > 0 {
+            store
+                .save(&plan)
+                .with_context(|| format!("saving plan `{plan_id}` after reset"))?;
+        }
+        total_changed += changed;
+        println!(
+            "plan {}: reset {} item{}",
+            plan.id,
+            changed,
+            if changed == 1 { "" } else { "s" },
+        );
+    }
+    if total_changed == 0 {
+        eprintln!("(no items needed resetting — all were already pending)");
+    }
+    Ok(0)
+}
+
 pub fn run_retry(id: &str) -> Result<i32> {
     let store = open_store()?;
     let mut plan = load_plan(&store, id)?;
